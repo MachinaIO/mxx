@@ -9,8 +9,6 @@ use crate::{
     program::ExponentLutProgram,
     refresh::{RefreshDeclaration, TopReference, top::TopRefreshDeclaration},
 };
-use std::collections::BTreeSet;
-
 /// `refresh/<spec>/<role>`: the namespace of every refresh artifact.
 pub(crate) fn refresh_artifact_name(spec: [u8; 32], role: &str) -> String {
     format!("refresh/{}/{role}", decoder_commitment_hex(spec))
@@ -339,19 +337,11 @@ impl RnsBggParameters {
     }
 }
 
-/// The common LUT input level of the outputs of a refresh child of
+/// The LUT input level of the output of a refresh child of
 /// [`crate::refresh::FreshNoiseProgram`] shape.
 fn noise_program_level(program: &crate::refresh::FreshNoiseProgram) -> Result<usize, RnsBggError> {
     let workload = RnsBggDerivedWorkload::from_program(program.program())?;
-    let levels = program
-        .outputs()
-        .iter()
-        .map(|wire| workload.level(*wire))
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    match levels.into_iter().collect::<Vec<_>>().as_slice() {
-        [level] => Ok(*level),
-        _ => Err(RnsBggError::Parameters("refresh child outputs on different levels")),
-    }
+    workload.level(program.output())
 }
 
 /// The reference ring of `reference`: its level-0 primes in canonical order.
@@ -396,45 +386,37 @@ pub(crate) fn top_matrix(
 /// The ring of the product `P` of a top refresh's refreshed primes (`Q_0` when every slot is
 /// refreshed), towers in canonical order.
 pub(crate) fn top_output_ring(top: &TopRefreshDeclaration) -> Ring {
-    Ring::from_crt_moduli(
-        top.output_primes().into_iter().map(IntExpr::from).collect(),
-        top.reference().ring_dimension,
-    )
+    output_ring(&top.output_primes(), top.reference().ring_dimension)
 }
 
-/// `y_j mod P` of a top refresh from its residues, one `1 x w_0` row per
-/// chain in the ring of that chain's output prime (chain order), in the ring
-/// of [`top_output_ring`]: one residue is the row itself; otherwise each
-/// centered residue re-encoded in that ring times its CRT coefficient
-/// `P / q ((P / q)^-1 mod q)`, summed.
-pub(crate) fn top_refresh_combine(
-    top: &TopRefreshDeclaration,
-    residues: Vec<Mat>,
+fn output_ring(primes: &[u64], ring_dimension: u32) -> Ring {
+    Ring::from_crt_moduli(primes.iter().copied().map(IntExpr::from).collect(), ring_dimension)
+}
+
+/// A top-refresh part's term of `y_j mod P` ([`top_output_ring`]): its
+/// residue `y_j mod q` (a `1 x w_0` row in the ring of its output prime
+/// `q`), centered and re-encoded in the ring of `P`, times its CRT
+/// coefficient `P / q ((P / q)^-1 mod q)`; the terms of every chain sum to
+/// `y_j mod P`. With one refreshed prime the term is the residue itself.
+/// Every part's term has the same type, so the parts' terms form one family.
+pub(crate) fn top_residue_term(
+    part: &crate::refresh::TopRefreshPart,
+    residue: Mat,
 ) -> Result<Mat, RnsBggError> {
-    let primes = top.output_primes();
-    if residues.len() != primes.len() {
-        return Err(RnsBggError::Parameters("one residue per refreshed prime of the top refresh"));
+    let primes = part.output_moduli();
+    if primes.len() == 1 {
+        return Ok(residue);
     }
-    if residues.len() == 1 {
-        return Ok(residues.into_iter().next().expect("one residue"));
-    }
-    let ring = top_output_ring(top);
+    let ring = output_ring(primes, part.reference().ring_dimension);
     let modulus: BigUint = primes.iter().map(|prime| BigUint::from(*prime)).product();
-    residues
-        .into_iter()
-        .zip(&primes)
-        .map(|(residue, prime)| {
-            let prime = BigUint::from(*prime);
-            let cofactor = &modulus / &prime;
-            let coefficient = (&cofactor % &prime)
-                .modinv(&prime)
-                .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
-                cofactor %
-                &modulus;
-            Ok(residue.centered_rebase(&ring) * ring.polynomial([BigInt::from(coefficient).into()]))
-        })
-        .reduce(|sum, term| Ok(sum? + term?))
-        .ok_or(RnsBggError::Parameters("one residue per refreshed prime of the top refresh"))?
+    let prime = BigUint::from(part.output_modulus());
+    let cofactor = &modulus / &prime;
+    let coefficient = (&cofactor % &prime)
+        .modinv(&prime)
+        .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
+        cofactor %
+        &modulus;
+    Ok(residue.centered_rebase(&ring) * ring.polynomial([BigInt::from(coefficient).into()]))
 }
 
 impl RnsBggParameters {
@@ -488,33 +470,59 @@ impl RnsBggParameters {
 
 /// `d_i = one X_i - target Y_i + [fresh_j z_i]_j` for one component: the two
 /// one-encoding blocks `(one_0, one_1)` (`1 x m` each), the target's
-/// component-1 block (`1 x w`) and every fresh carrier's component-1 block
-/// (`1 x m`). Applied to the key rows it gives the decoded key `K_i`, applied
-/// to the rows it gives the decoded row `d_i` (`1 x m`).
+/// component-1 block (`1 x w`) and the fresh child's component-1 row of
+/// `columns` blocks `fresh_j` (`1 x m` each, the row `Sum` of the child, see
+/// [`crate::refresh::FreshNoiseProgram`]). Applied to the key rows it gives
+/// the decoded key `K_i`, applied to the rows it gives the decoded row `d_i`
+/// (`1 x columns`).
 pub(crate) fn refresh_combination(
     one: (Mat, Mat),
     target: Mat,
-    fresh: &[Mat],
+    (fresh, columns): (Mat, usize),
     actions: &RefreshActions,
-) -> Mat {
+) -> Result<Mat, RnsBggError> {
     let one = Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![one.0, one.1])
         .mul_small_rhs(actions.x.clone());
-    let fresh = Mat::concat(
-        mxx_ir_core::node::ConcatAxis::Columns,
-        fresh.iter().map(|carrier| carrier.clone().mul_small_rhs(actions.z.clone())).collect(),
-    );
-    one - target.mul_small_rhs(actions.y.clone()) + fresh
+    Ok(one - target.mul_small_rhs(actions.y.clone()) +
+        blockwise_mul_small_rhs(fresh, columns, &actions.z)?)
 }
 
-/// Column `column` of a one-row matrix.
-pub(crate) fn refresh_column(row: Mat, column: usize) -> Mat {
-    row.slice(
-        None,
-        Some(mxx_ir_core::node::IndexRange {
-            start: IntExpr::constant(column),
-            end: IntExpr::constant(column + 1),
-        }),
-    )
+/// `[row_j rhs]_j` for a row of `blocks` equal blocks `row_j` and a small
+/// `rhs` of one column: one product for one block, else a sequential loop
+/// that places each block's product in its column (see
+/// [`super::place_in_column`]), so the graph does not grow with `blocks`.
+fn blockwise_mul_small_rhs(
+    row: Mat,
+    blocks: usize,
+    rhs: &mxx_dsl::SmallMatrix,
+) -> Result<Mat, RnsBggError> {
+    if blocks == 1 {
+        return Ok(row.mul_small_rhs(rhs.clone()));
+    }
+    let width = match row.matrix_type().columns.canonicalize() {
+        IntExpr::Const(columns) => columns
+            .to_usize()
+            .filter(|columns| columns % blocks == 0)
+            .map(|columns| columns / blocks)
+            .ok_or(RnsBggError::Parameters("a block row has a malformed width"))?,
+        _ => return Err(RnsBggError::Parameters("a block row needs a constant width")),
+    };
+    let block = |index: &IntExpr| {
+        let start = IntExpr::Mul(Box::new(index.clone()), Box::new(IntExpr::constant(width)))
+            .canonicalize();
+        let end = IntExpr::Add(Box::new(start.clone()), Box::new(IntExpr::constant(width)))
+            .canonicalize();
+        let product = row
+            .clone()
+            .slice(None, Some(mxx_ir_core::node::IndexRange { start, end }))
+            .mul_small_rhs(rhs.clone());
+        super::place_in_column(product, blocks, index)
+    };
+    mxx_dsl::iterate(blocks - 1, block(&IntExpr::constant(0)), |index, sum| {
+        let index = index.add(1usize).expression()?;
+        Ok(sum + block(&index))
+    })
+    .map_err(|error| RnsBggError::Graph(error.to_string()))
 }
 
 #[cfg(test)]
@@ -527,6 +535,7 @@ pub(crate) mod tests {
     };
     use mxx_backends::{RuntimeValue, matrix::PolyMatrix, poly::Poly};
     use mxx_dsl::DslContext;
+    use std::collections::BTreeSet;
 
     /// The identity Program of one private input, and that input.
     pub(crate) fn identity_source() -> (ExponentLutProgram, WireId) {
@@ -551,12 +560,10 @@ pub(crate) mod tests {
         let profile = crate::decoder::decoding::fixture::profile();
         let n = profile.ring_dimension().unwrap();
         let fresh = crate::decoder::decoding::fixture::keys(columns * n);
-        let smudges = (0..primes * columns)
-            .map(|_| crate::decoder::decoding::fixture::keys(n * digits))
+        let smudges = (0..primes)
+            .map(|_| crate::decoder::decoding::fixture::keys(columns * n * digits))
             .collect::<Vec<_>>();
-        let layouts = |keys: &[PbcGeneratedKeyLayout]| {
-            keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>()
-        };
+        let shape = crate::decoder::decoding::fixture::shape;
         let declaration = RefreshDeclaration::new(
             source,
             target,
@@ -565,8 +572,8 @@ pub(crate) mod tests {
             primes,
             columns,
             digits,
-            layouts(&fresh),
-            smudges.iter().map(|keys| layouts(keys)).collect(),
+            shape(&fresh),
+            smudges.iter().map(|keys| shape(keys)).collect(),
             b"refresh-test".to_vec(),
         )
         .unwrap();
@@ -625,7 +632,8 @@ pub(crate) mod tests {
                 .reduce_modulus(&ring_of(q));
             let direct = value.clone().reduce_modulus(&ring_of(q));
             let through_chain = value.clone().reduce_modulus(&ring).reduce_modulus(&ring_of(q));
-            residues.push(direct.clone());
+            let part = top.part(chain, 0).unwrap().top().unwrap();
+            residues.push(top_residue_term(part, direct.clone()).unwrap());
             graph = graph
                 .output(format!("action-{chain}"), lhs - rhs)
                 .unwrap()
@@ -634,7 +642,7 @@ pub(crate) mod tests {
                 .output(format!("order-{chain}"), direct - through_chain)
                 .unwrap();
         }
-        let combined = top_refresh_combine(&top, residues).unwrap();
+        let combined = residues.into_iter().reduce(|sum, term| sum + term).unwrap();
         let graph = graph.output("combine", combined - value).unwrap().build().unwrap();
         parameters.push(reference_pool);
         assert_eq!(primes().len(), 16);
@@ -742,20 +750,32 @@ pub(crate) mod tests {
         for (prime, q_i) in parameters.level(0).unwrap().to_crt().0.into_iter().enumerate() {
             let actions =
                 parameters.refresh_actions(0, prime, a_prime.clone(), &declaration).unwrap();
-            let decoded =
-                refresh_combination(one_row.clone(), target_row.clone(), &fresh_rows, &actions);
+            // The fresh carriers as one row of column blocks, as the fresh
+            // child's row `Sum` returns them.
+            let blocks = |rows: Vec<Mat>| {
+                (Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, rows), columns)
+            };
+            let decoded = refresh_combination(
+                one_row.clone(),
+                target_row.clone(),
+                blocks(fresh_rows.clone()),
+                &actions,
+            )
+            .unwrap();
             let top = refresh_combination(
                 (one.0.0.clone(), one.0.1.clone()),
                 target.0.clone(),
-                &fresh_keys.iter().map(|key| key.0.clone()).collect::<Vec<_>>(),
+                blocks(fresh_keys.iter().map(|key| key.0.clone()).collect()),
                 &actions,
-            );
+            )
+            .unwrap();
             let bottom = refresh_combination(
                 (one.1.0.clone(), one.1.1.clone()),
                 target.1.clone(),
-                &fresh_keys.iter().map(|key| key.1.clone()).collect::<Vec<_>>(),
+                blocks(fresh_keys.iter().map(|key| key.1.clone()).collect()),
                 &actions,
-            );
+            )
+            .unwrap();
             let cofactor = parameters.scalar(0, BigInt::from(&modulus / q_i)).unwrap();
             let residual = decoded - (s0.clone() * top + bottom) + cofactor * refreshed.clone();
             graph = graph

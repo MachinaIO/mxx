@@ -59,7 +59,7 @@ use mxx_exponent_lut::{
     },
     program_gadgets::{
         pbc::{PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, generate_key_layout},
-        prf::SparseLwrPrfProfile,
+        prf::{PrfKeyShape, SparseLwrPrfProfile},
     },
     rns_bgg::{
         RhsMode, RnsBggNoiseBindings, RnsBggNoiseValue, RnsBggPlanRequest, RnsEncryptBuild,
@@ -106,7 +106,8 @@ fn identity_source() -> (ExponentLutProgram, WireId) {
 
 /// `count` random weight-one PRF keys over the LWR coordinates, in two buckets.
 fn smudge_keys(count: usize) -> Vec<PbcGeneratedKeyLayout> {
-    let parameters = PbcParameters::custom(LWR_DIMENSION, 1, 2, 2, 64, None);
+    // Every coordinate lies in both buckets, so each bucket has `nu` real cells and a dummy.
+    let parameters = PbcParameters::custom(LWR_DIMENSION, 1, 2, 2, 64, Some(LWR_DIMENSION + 1));
     (0..count)
         .map(|_| {
             let support = vec![rand::random::<u32>() as usize % LWR_DIMENSION];
@@ -170,16 +171,17 @@ fn search(source: &ExponentLutProgram, input: WireId) -> Accepted {
         )
         .expect("smudge PRF profile");
         let generated = RefCell::new(BTreeMap::new());
-        let layouts = |members: usize| {
+        let shapes = |members: usize| {
             let keys = smudge_keys(members);
-            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect();
+            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+            let shape = PrfKeyShape::new(&layouts).map_err(|error| error.to_string());
             generated.borrow_mut().insert(members, keys);
-            Ok(layouts)
+            shape
         };
         let decoder = DecoderRequest {
             output: input,
             profile,
-            layouts: &layouts,
+            keys: &shapes,
             statistical_bits,
             unmask_sigma: trapdoor_sigma.to_f64().expect("finite trapdoor sigma"),
         };
@@ -283,11 +285,11 @@ fn decoder_round_trip() {
     let smudge_program = declaration.smudge().program();
     let level = parameters.levels()[0].clone();
     let smudge_level = smudge_parameters.levels()[0].clone();
-    let selectors = declaration
+    let (selectors, tables) = declaration
         .smudge()
         .prf()
-        .selector_plaintexts::<DCRTPoly>(&smudge_level, &keys)
-        .expect("smudge selector plaintexts");
+        .key_inputs::<DCRTPoly>(&smudge_level, &keys)
+        .expect("smudge selector plaintexts and tables");
     let a = (0..LWR_DIMENSION)
         .map(|_| rand::random::<u32>() as usize % (1 << PRF_WIDTH_LOG2))
         .collect::<Vec<_>>();
@@ -322,12 +324,13 @@ fn decoder_round_trip() {
     let payload = RnsEncryptBuild::new(&parameters, context)
         .sample_payload_secret(&mut runtime, &mut store, |_| Ok(()))
         .expect("payload secret");
-    let mut smudge_preprocess = RnsPreprocessBuild::new(&smudge_parameters, context);
+    let mut smudge_preprocess =
+        RnsPreprocessBuild::new(&smudge_parameters, context).with_data(tables);
     smudge_preprocess
         .bind_rhs_inputs(
             smudge_program,
             &env,
-            &selectors,
+            Some(&selectors),
             Some(&payload.at_level(&smudge_parameters, 0).expect("smudge payload")),
             &hash_key,
         )
@@ -365,7 +368,7 @@ fn decoder_round_trip() {
         .bind_lhs_inputs(
             &smudge_program.encryption_inputs(),
             &env,
-            &smudge_lhs,
+            Some(&smudge_lhs),
             &payload.at_level(&smudge_parameters, 0).expect("smudge payload"),
             Some(&mask.at_level(&smudge_parameters, 0).expect("smudge mask")),
             &hash_key,

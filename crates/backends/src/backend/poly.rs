@@ -952,6 +952,19 @@ impl CpuDcrtBackend {
                     vec![vec![DCRTPoly::from_biguints(parameters, &coefficients)]],
                 )
             }
+            ConstantMatrix::AllCoefficients { value } => {
+                let modulus: Arc<BigUint> = parameters.modulus().into();
+                let modulus = BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone());
+                let value = value
+                    .evaluate(env)
+                    .map_err(|_| PolyBackendError::InvalidInteger)?
+                    .mod_floor(&modulus)
+                    .to_biguint()
+                    .ok_or(PolyBackendError::InvalidInteger)?;
+                let coefficients = vec![value; ty.ring.ring_dimension() as usize];
+                let entry = DCRTPoly::from_biguints(parameters, &coefficients);
+                DCRTPolyMatrix::from_poly_vec(parameters, vec![vec![entry; ty.columns]; ty.rows])
+            }
             ConstantMatrix::Identity |
             ConstantMatrix::UnitRow { .. } |
             ConstantMatrix::UnitColumn { .. } |
@@ -2099,6 +2112,33 @@ mod tests {
             backend.polynomial_from_values(&unknown_ring, &input, false),
             Err(PolyBackendError::MissingParameters(_))
         ));
+    }
+
+    #[test]
+    fn test_all_coefficients_constant_matches_dense_polynomial() {
+        let parameters = DCRTPolyParams::new(8, 2, 17, 2, None, None);
+        let ty = matrix_type(&parameters, 2, 3);
+        let value =
+            mxx_ir_core::IntExpr::constant(BigInt::from(rand::random::<i64>()) % ty.ring.modulus());
+        let mut backend = cpu_backend([parameters.clone()]);
+        let env = ParamEnv::default();
+        let all = backend
+            .constant_matrix(&ty, &ConstantMatrix::AllCoefficients { value: value.clone() }, &env)
+            .unwrap();
+        let dense = backend
+            .constant_matrix(
+                &matrix_type(&parameters, 1, 1),
+                &ConstantMatrix::Polynomial {
+                    coefficients: vec![value; ty.ring.ring_dimension() as usize],
+                },
+                &env,
+            )
+            .unwrap();
+        for row in 0..ty.rows {
+            for column in 0..ty.columns {
+                assert_eq!(all.entry(row, column), dense.entry(0, 0));
+            }
+        }
     }
 
     #[test]

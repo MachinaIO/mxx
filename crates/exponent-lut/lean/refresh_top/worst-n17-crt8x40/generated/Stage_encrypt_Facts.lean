@@ -1,0 +1,3717 @@
+import Stage_encrypt
+
+set_option maxRecDepth 16384
+set_option maxHeartbeats 2000000
+set_option linter.unusedVariables false
+
+-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a
+-- projection against its field type expands it at the ring dimension.
+attribute [local irreducible] Mxx.Primitives.negacyclicModulus
+
+noncomputable section
+
+namespace Stage_encrypt
+
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 131072 1 164
+local notation "mxxMat1" => Mxx.Primitives.ExactMatrix modulus_29 131072 1 1
+local notation "mxxMat2" => Mxx.Primitives.ExactMatrix modulus_0 131072 1 168
+local notation "mxxMat3" => Mxx.Primitives.ExactMatrix modulus_35 131072 1 168
+local notation "mxxMat4" => Mxx.Primitives.ExactMatrix modulus_35 131072 1 172
+local notation "mxxMat5" => Mxx.Primitives.ExactMatrix modulus_0 131072 1 1
+local notation "mxxMat6" => Mxx.Primitives.ExactMatrix modulus_1 131072 1 164
+local notation "mxxMat7" => Mxx.Primitives.ExactMatrix modulus_1 131072 1 160
+local notation "mxxMat8" => Mxx.Primitives.ExactMatrix modulus_3 131072 1 124
+local notation "mxxMat9" => Mxx.Primitives.ExactMatrix modulus_4 131072 1 120
+local notation "mxxMat10" => Mxx.Primitives.ExactMatrix modulus_5 131072 1 116
+local notation "mxxMat11" => Mxx.Primitives.ExactMatrix modulus_6 131072 1 112
+local notation "mxxMat12" => Mxx.Primitives.ExactMatrix modulus_7 131072 1 108
+local notation "mxxMat13" => Mxx.Primitives.ExactMatrix modulus_8 131072 1 104
+local notation "mxxMat14" => Mxx.Primitives.ExactMatrix modulus_9 131072 1 100
+local notation "mxxMat15" => Mxx.Primitives.ExactMatrix modulus_10 131072 1 96
+local notation "mxxMat16" => Mxx.Primitives.ExactMatrix modulus_11 131072 1 92
+local notation "mxxMat17" => Mxx.Primitives.ExactMatrix modulus_12 131072 1 88
+local notation "mxxMat18" => Mxx.Primitives.ExactMatrix modulus_2 131072 1 156
+local notation "mxxMat19" => Mxx.Primitives.ExactMatrix modulus_13 131072 1 84
+local notation "mxxMat20" => Mxx.Primitives.ExactMatrix modulus_15 131072 1 80
+local notation "mxxMat21" => Mxx.Primitives.ExactMatrix modulus_16 131072 1 76
+local notation "mxxMat22" => Mxx.Primitives.ExactMatrix modulus_17 131072 1 72
+local notation "mxxMat23" => Mxx.Primitives.ExactMatrix modulus_18 131072 1 68
+local notation "mxxMat24" => Mxx.Primitives.ExactMatrix modulus_19 131072 1 64
+local notation "mxxMat25" => Mxx.Primitives.ExactMatrix modulus_20 131072 1 60
+local notation "mxxMat26" => Mxx.Primitives.ExactMatrix modulus_21 131072 1 56
+local notation "mxxMat27" => Mxx.Primitives.ExactMatrix modulus_22 131072 1 52
+local notation "mxxMat28" => Mxx.Primitives.ExactMatrix modulus_23 131072 1 48
+local notation "mxxMat29" => Mxx.Primitives.ExactMatrix modulus_14 131072 1 152
+local notation "mxxMat30" => Mxx.Primitives.ExactMatrix modulus_24 131072 1 44
+local notation "mxxMat31" => Mxx.Primitives.ExactMatrix modulus_26 131072 1 40
+local notation "mxxMat32" => Mxx.Primitives.ExactMatrix modulus_27 131072 1 36
+local notation "mxxMat33" => Mxx.Primitives.ExactMatrix modulus_28 131072 1 32
+local notation "mxxMat34" => Mxx.Primitives.ExactMatrix modulus_29 131072 1 28
+local notation "mxxMat35" => Mxx.Primitives.ExactMatrix modulus_25 131072 1 148
+local notation "mxxMat36" => Mxx.Primitives.ExactMatrix modulus_30 131072 1 144
+local notation "mxxMat37" => Mxx.Primitives.ExactMatrix modulus_31 131072 1 140
+local notation "mxxMat38" => Mxx.Primitives.ExactMatrix modulus_32 131072 1 136
+local notation "mxxMat39" => Mxx.Primitives.ExactMatrix modulus_33 131072 1 132
+local notation "mxxMat40" => Mxx.Primitives.ExactMatrix modulus_34 131072 1 128
+local notation "mxxMat41" => Mxx.Primitives.ExactMatrix modulus_35 131072 1 1
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure parallel_generatedRoot_45.Ctx (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) where
+  inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat1 × mxxMat1 × Int × Int × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → Int) × (Fin 1025 → Int) × ByteArray × ByteArray × Int × Int × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Int × Int × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → Int) × (Fin 1025 → Int) × ByteArray × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Int × Int × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → Int) × (Fin 1025 → Int) × ByteArray × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 2 60 × Unit
+  witness : parallel_generatedRoot_45.Witness
+
+def parallel_generatedRoot_45.w_0_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.inputs.1
+
+def parallel_generatedRoot_45.w_1_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.inputs.2.1
+
+def parallel_generatedRoot_45.w_2_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.inputs.2.2.1
+
+def parallel_generatedRoot_45.w_3_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.inputs.2.2.2.1
+
+def parallel_generatedRoot_45.w_4_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  ctx.inputs.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_11_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  ctx.inputs.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_17_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_19_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_36_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_37_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_38_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_39_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_40_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_41_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_43_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_79_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_89_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_91_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_110_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_111_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_112_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_113_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_124_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_126_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_142_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_143_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_144_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_145_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_146_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_147_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_149_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_222_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_223_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_224_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_225_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_236_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_238_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_254_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_255_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_256_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_257_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_258_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_259_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_261_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_360_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 2 60 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def parallel_generatedRoot_45.w_5_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  ctx.witness.w_5_0
+
+def parallel_generatedRoot_45.w_6_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_5_0 ctx) (parallel_generatedRoot_45.w_0_0 ctx)
+
+def parallel_generatedRoot_45.w_7_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  (1 : mxxMat1)
+
+def parallel_generatedRoot_45.w_8_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  ctx.witness.w_8_0
+
+def parallel_generatedRoot_45.w_9_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_8_0 ctx) (parallel_generatedRoot_45.w_2_0 ctx)
+
+def parallel_generatedRoot_45.w_10_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_6_0 ctx) (parallel_generatedRoot_45.w_9_0 ctx)
+
+def parallel_generatedRoot_45.w_12_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  ctx.witness.w_12_0
+
+def parallel_generatedRoot_45.w_13_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat6 :=
+  ctx.witness.w_13_0
+
+def parallel_generatedRoot_45.w_14_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.witness.w_14_0
+
+def parallel_generatedRoot_45.w_15_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_12_0 ctx) (parallel_generatedRoot_45.w_14_0 ctx)
+
+def parallel_generatedRoot_45.w_16_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  (MxxRuntime.matrixPolynomial [(1099381866497)] : mxxMat5)
+
+def parallel_generatedRoot_45.w_18_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  MxxRuntime.liftInteger (parallel_generatedRoot_45.w_17_0 ctx)
+
+def parallel_generatedRoot_45.w_20_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  MxxRuntime.multiplyMonomial (parallel_generatedRoot_45.w_18_0 ctx) (parallel_generatedRoot_45.w_19_0 ctx)
+
+def parallel_generatedRoot_45.w_21_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_16_0 ctx) (parallel_generatedRoot_45.w_20_0 ctx)
+
+def parallel_generatedRoot_45.w_22_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_15_0 ctx) (parallel_generatedRoot_45.w_21_0 ctx)
+
+def parallel_generatedRoot_45.w_23_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_10_0 ctx) (parallel_generatedRoot_45.w_22_0 ctx)
+
+def parallel_generatedRoot_45.w_24_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.witness.w_24_0
+
+def parallel_generatedRoot_45.w_25_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_23_0 ctx) (parallel_generatedRoot_45.w_24_0 ctx)
+
+def parallel_generatedRoot_45.w_26_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_5_0 ctx) (parallel_generatedRoot_45.w_1_0 ctx)
+
+def parallel_generatedRoot_45.w_27_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_8_0 ctx) (parallel_generatedRoot_45.w_3_0 ctx)
+
+def parallel_generatedRoot_45.w_28_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_26_0 ctx) (parallel_generatedRoot_45.w_27_0 ctx)
+
+def parallel_generatedRoot_45.w_29_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  (1 : mxxMat1)
+
+def parallel_generatedRoot_45.w_30_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat5 :=
+  ctx.witness.w_30_0
+
+def parallel_generatedRoot_45.w_31_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_30_0 ctx) (parallel_generatedRoot_45.w_14_0 ctx)
+
+def parallel_generatedRoot_45.w_32_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_31_0 ctx) (parallel_generatedRoot_45.w_21_0 ctx)
+
+def parallel_generatedRoot_45.w_33_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_28_0 ctx) (parallel_generatedRoot_45.w_32_0 ctx)
+
+def parallel_generatedRoot_45.w_34_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  ctx.witness.w_34_0
+
+def parallel_generatedRoot_45.w_35_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat0 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_33_0 ctx) (parallel_generatedRoot_45.w_34_0 ctx)
+
+def parallel_generatedRoot_45.w_42_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.witness.w_42_0
+
+def parallel_generatedRoot_45.w_42_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.witness.w_42_1
+
+def parallel_generatedRoot_45.w_42_2 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.witness.w_42_2
+
+def parallel_generatedRoot_45.w_42_3 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.witness.w_42_3
+
+def parallel_generatedRoot_45.w_42_4 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.witness.w_42_4
+
+def parallel_generatedRoot_45.w_42_5 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat2 :=
+  ctx.witness.w_42_5
+
+def parallel_generatedRoot_45.w_42_6 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat5 :=
+  ctx.witness.w_42_6
+
+def parallel_generatedRoot_45.w_44_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat0 :=
+  ctx.witness.w_44_0
+
+def parallel_generatedRoot_45.w_44_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat0 :=
+  ctx.witness.w_44_1
+
+def parallel_generatedRoot_45.w_45_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_0
+
+def parallel_generatedRoot_45.w_45_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_1
+
+def parallel_generatedRoot_45.w_46_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat8 :=
+  ctx.witness.w_46_0
+
+def parallel_generatedRoot_45.w_46_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat8 :=
+  ctx.witness.w_46_1
+
+def parallel_generatedRoot_45.w_47_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat9 :=
+  ctx.witness.w_47_0
+
+def parallel_generatedRoot_45.w_47_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat9 :=
+  ctx.witness.w_47_1
+
+def parallel_generatedRoot_45.w_48_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat10 :=
+  ctx.witness.w_48_0
+
+def parallel_generatedRoot_45.w_48_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat10 :=
+  ctx.witness.w_48_1
+
+def parallel_generatedRoot_45.w_49_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat11 :=
+  ctx.witness.w_49_0
+
+def parallel_generatedRoot_45.w_49_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat11 :=
+  ctx.witness.w_49_1
+
+def parallel_generatedRoot_45.w_50_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat12 :=
+  ctx.witness.w_50_0
+
+def parallel_generatedRoot_45.w_50_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat12 :=
+  ctx.witness.w_50_1
+
+def parallel_generatedRoot_45.w_51_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat13 :=
+  ctx.witness.w_51_0
+
+def parallel_generatedRoot_45.w_51_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat13 :=
+  ctx.witness.w_51_1
+
+def parallel_generatedRoot_45.w_52_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat14 :=
+  ctx.witness.w_52_0
+
+def parallel_generatedRoot_45.w_52_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat14 :=
+  ctx.witness.w_52_1
+
+def parallel_generatedRoot_45.w_53_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat15 :=
+  ctx.witness.w_53_0
+
+def parallel_generatedRoot_45.w_53_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat15 :=
+  ctx.witness.w_53_1
+
+def parallel_generatedRoot_45.w_54_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat16 :=
+  ctx.witness.w_54_0
+
+def parallel_generatedRoot_45.w_54_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat16 :=
+  ctx.witness.w_54_1
+
+def parallel_generatedRoot_45.w_55_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat17 :=
+  ctx.witness.w_55_0
+
+def parallel_generatedRoot_45.w_55_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat17 :=
+  ctx.witness.w_55_1
+
+def parallel_generatedRoot_45.w_56_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat18 :=
+  ctx.witness.w_56_0
+
+def parallel_generatedRoot_45.w_56_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat18 :=
+  ctx.witness.w_56_1
+
+def parallel_generatedRoot_45.w_57_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat19 :=
+  ctx.witness.w_57_0
+
+def parallel_generatedRoot_45.w_57_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat19 :=
+  ctx.witness.w_57_1
+
+def parallel_generatedRoot_45.w_58_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat20 :=
+  ctx.witness.w_58_0
+
+def parallel_generatedRoot_45.w_58_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat20 :=
+  ctx.witness.w_58_1
+
+def parallel_generatedRoot_45.w_59_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat21 :=
+  ctx.witness.w_59_0
+
+def parallel_generatedRoot_45.w_59_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat21 :=
+  ctx.witness.w_59_1
+
+def parallel_generatedRoot_45.w_60_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat22 :=
+  ctx.witness.w_60_0
+
+def parallel_generatedRoot_45.w_60_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat22 :=
+  ctx.witness.w_60_1
+
+def parallel_generatedRoot_45.w_61_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat23 :=
+  ctx.witness.w_61_0
+
+def parallel_generatedRoot_45.w_61_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat23 :=
+  ctx.witness.w_61_1
+
+def parallel_generatedRoot_45.w_62_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat24 :=
+  ctx.witness.w_62_0
+
+def parallel_generatedRoot_45.w_62_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat24 :=
+  ctx.witness.w_62_1
+
+def parallel_generatedRoot_45.w_63_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat25 :=
+  ctx.witness.w_63_0
+
+def parallel_generatedRoot_45.w_63_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat25 :=
+  ctx.witness.w_63_1
+
+def parallel_generatedRoot_45.w_64_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat26 :=
+  ctx.witness.w_64_0
+
+def parallel_generatedRoot_45.w_64_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat26 :=
+  ctx.witness.w_64_1
+
+def parallel_generatedRoot_45.w_65_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat27 :=
+  ctx.witness.w_65_0
+
+def parallel_generatedRoot_45.w_65_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat27 :=
+  ctx.witness.w_65_1
+
+def parallel_generatedRoot_45.w_66_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat28 :=
+  ctx.witness.w_66_0
+
+def parallel_generatedRoot_45.w_66_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat28 :=
+  ctx.witness.w_66_1
+
+def parallel_generatedRoot_45.w_67_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat29 :=
+  ctx.witness.w_67_0
+
+def parallel_generatedRoot_45.w_67_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat29 :=
+  ctx.witness.w_67_1
+
+def parallel_generatedRoot_45.w_68_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat30 :=
+  ctx.witness.w_68_0
+
+def parallel_generatedRoot_45.w_68_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat30 :=
+  ctx.witness.w_68_1
+
+def parallel_generatedRoot_45.w_69_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat31 :=
+  ctx.witness.w_69_0
+
+def parallel_generatedRoot_45.w_69_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat31 :=
+  ctx.witness.w_69_1
+
+def parallel_generatedRoot_45.w_70_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat32 :=
+  ctx.witness.w_70_0
+
+def parallel_generatedRoot_45.w_70_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat32 :=
+  ctx.witness.w_70_1
+
+def parallel_generatedRoot_45.w_71_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat33 :=
+  ctx.witness.w_71_0
+
+def parallel_generatedRoot_45.w_71_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat33 :=
+  ctx.witness.w_71_1
+
+def parallel_generatedRoot_45.w_72_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat34 :=
+  ctx.witness.w_72_0
+
+def parallel_generatedRoot_45.w_72_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat34 :=
+  ctx.witness.w_72_1
+
+def parallel_generatedRoot_45.w_73_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat35 :=
+  ctx.witness.w_73_0
+
+def parallel_generatedRoot_45.w_73_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat35 :=
+  ctx.witness.w_73_1
+
+def parallel_generatedRoot_45.w_74_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat36 :=
+  ctx.witness.w_74_0
+
+def parallel_generatedRoot_45.w_74_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat36 :=
+  ctx.witness.w_74_1
+
+def parallel_generatedRoot_45.w_75_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat37 :=
+  ctx.witness.w_75_0
+
+def parallel_generatedRoot_45.w_75_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat37 :=
+  ctx.witness.w_75_1
+
+def parallel_generatedRoot_45.w_76_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat38 :=
+  ctx.witness.w_76_0
+
+def parallel_generatedRoot_45.w_76_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat38 :=
+  ctx.witness.w_76_1
+
+def parallel_generatedRoot_45.w_77_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat39 :=
+  ctx.witness.w_77_0
+
+def parallel_generatedRoot_45.w_77_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat39 :=
+  ctx.witness.w_77_1
+
+def parallel_generatedRoot_45.w_78_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat40 :=
+  ctx.witness.w_78_0
+
+def parallel_generatedRoot_45.w_78_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat40 :=
+  ctx.witness.w_78_1
+
+def parallel_generatedRoot_45.w_80_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_80_0
+
+def parallel_generatedRoot_45.w_81_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_80_0 ctx)
+
+def parallel_generatedRoot_45.w_82_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_82_0
+
+def parallel_generatedRoot_45.w_83_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_82_0 ctx)
+
+def parallel_generatedRoot_45.w_84_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_81_0 ctx) (parallel_generatedRoot_45.w_83_0 ctx)
+
+def parallel_generatedRoot_45.w_85_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_85_0
+
+def parallel_generatedRoot_45.w_86_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_86_0
+
+def parallel_generatedRoot_45.w_87_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_86_0 ctx)
+
+def parallel_generatedRoot_45.w_88_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  (MxxRuntime.matrixPolynomial [((sel_1 ((Int.ofNat i_0))))] : mxxMat1)
+
+def parallel_generatedRoot_45.w_90_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  MxxRuntime.liftInteger (parallel_generatedRoot_45.w_89_0 ctx)
+
+def parallel_generatedRoot_45.w_92_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  MxxRuntime.multiplyMonomial (parallel_generatedRoot_45.w_90_0 ctx) (parallel_generatedRoot_45.w_91_0 ctx)
+
+def parallel_generatedRoot_45.w_93_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat1 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_88_0 ctx) (parallel_generatedRoot_45.w_92_0 ctx)
+
+def parallel_generatedRoot_45.w_94_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_87_0 ctx) (parallel_generatedRoot_45.w_93_0 ctx)
+
+def parallel_generatedRoot_45.w_95_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_84_0 ctx) (parallel_generatedRoot_45.w_94_0 ctx)
+
+def parallel_generatedRoot_45.w_96_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_96_0
+
+def parallel_generatedRoot_45.w_97_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_95_0 ctx) (parallel_generatedRoot_45.w_96_0 ctx)
+
+def parallel_generatedRoot_45.w_98_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_98_0
+
+def parallel_generatedRoot_45.w_99_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_98_0 ctx)
+
+def parallel_generatedRoot_45.w_100_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_100_0
+
+def parallel_generatedRoot_45.w_101_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_100_0 ctx)
+
+def parallel_generatedRoot_45.w_102_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_99_0 ctx) (parallel_generatedRoot_45.w_101_0 ctx)
+
+def parallel_generatedRoot_45.w_103_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_86_0 ctx)
+
+def parallel_generatedRoot_45.w_104_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_103_0 ctx) (parallel_generatedRoot_45.w_93_0 ctx)
+
+def parallel_generatedRoot_45.w_105_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_102_0 ctx) (parallel_generatedRoot_45.w_104_0 ctx)
+
+def parallel_generatedRoot_45.w_106_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  ctx.witness.w_106_0
+
+def parallel_generatedRoot_45.w_107_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat34 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_105_0 ctx) (parallel_generatedRoot_45.w_106_0 ctx)
+
+def parallel_generatedRoot_45.w_108_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 2 → mxxMat34 :=
+  ctx.witness.w_108_0
+
+def parallel_generatedRoot_45.w_108_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 2 → mxxMat34 :=
+  ctx.witness.w_108_1
+
+def parallel_generatedRoot_45.w_109_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : ((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24) :=
+  ctx.witness.w_109_0
+
+def parallel_generatedRoot_45.w_109_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : ((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24) :=
+  ctx.witness.w_109_1
+
+def parallel_generatedRoot_45.w_114_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_114_0
+
+def parallel_generatedRoot_45.w_115_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_110_0 ctx)
+
+def parallel_generatedRoot_45.w_116_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_116_0
+
+def parallel_generatedRoot_45.w_117_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_112_0 ctx)
+
+def parallel_generatedRoot_45.w_118_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_115_0 ctx) (parallel_generatedRoot_45.w_117_0 ctx)
+
+def parallel_generatedRoot_45.w_119_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_119_0
+
+def parallel_generatedRoot_45.w_120_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat2 :=
+  ctx.witness.w_120_0
+
+def parallel_generatedRoot_45.w_121_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.witness.w_121_0
+
+def parallel_generatedRoot_45.w_122_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_119_0 ctx) (parallel_generatedRoot_45.w_121_0 ctx)
+
+def parallel_generatedRoot_45.w_123_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  (MxxRuntime.matrixPolynomial [(1099380817921)] : mxxMat41)
+
+def parallel_generatedRoot_45.w_125_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  MxxRuntime.liftInteger (parallel_generatedRoot_45.w_124_0 ctx)
+
+def parallel_generatedRoot_45.w_127_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  MxxRuntime.multiplyMonomial (parallel_generatedRoot_45.w_125_0 ctx) (parallel_generatedRoot_45.w_126_0 ctx)
+
+def parallel_generatedRoot_45.w_128_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_123_0 ctx) (parallel_generatedRoot_45.w_127_0 ctx)
+
+def parallel_generatedRoot_45.w_129_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_122_0 ctx) (parallel_generatedRoot_45.w_128_0 ctx)
+
+def parallel_generatedRoot_45.w_130_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_118_0 ctx) (parallel_generatedRoot_45.w_129_0 ctx)
+
+def parallel_generatedRoot_45.w_131_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.witness.w_131_0
+
+def parallel_generatedRoot_45.w_132_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_130_0 ctx) (parallel_generatedRoot_45.w_131_0 ctx)
+
+def parallel_generatedRoot_45.w_133_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_111_0 ctx)
+
+def parallel_generatedRoot_45.w_134_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_113_0 ctx)
+
+def parallel_generatedRoot_45.w_135_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_133_0 ctx) (parallel_generatedRoot_45.w_134_0 ctx)
+
+def parallel_generatedRoot_45.w_136_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_136_0
+
+def parallel_generatedRoot_45.w_137_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_136_0 ctx) (parallel_generatedRoot_45.w_121_0 ctx)
+
+def parallel_generatedRoot_45.w_138_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_137_0 ctx) (parallel_generatedRoot_45.w_128_0 ctx)
+
+def parallel_generatedRoot_45.w_139_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_135_0 ctx) (parallel_generatedRoot_45.w_138_0 ctx)
+
+def parallel_generatedRoot_45.w_140_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.witness.w_140_0
+
+def parallel_generatedRoot_45.w_141_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_139_0 ctx) (parallel_generatedRoot_45.w_140_0 ctx)
+
+def parallel_generatedRoot_45.w_148_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_148_0
+
+def parallel_generatedRoot_45.w_148_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_148_1
+
+def parallel_generatedRoot_45.w_148_2 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_148_2
+
+def parallel_generatedRoot_45.w_148_3 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_148_3
+
+def parallel_generatedRoot_45.w_148_4 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_148_4
+
+def parallel_generatedRoot_45.w_148_5 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_148_5
+
+def parallel_generatedRoot_45.w_148_6 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat41 :=
+  ctx.witness.w_148_6
+
+def parallel_generatedRoot_45.w_150_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat3 :=
+  ctx.witness.w_150_0
+
+def parallel_generatedRoot_45.w_150_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat3 :=
+  ctx.witness.w_150_1
+
+def parallel_generatedRoot_45.w_151_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat3 :=
+  ctx.witness.w_151_0
+
+def parallel_generatedRoot_45.w_151_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat3 :=
+  ctx.witness.w_151_1
+
+def parallel_generatedRoot_45.w_152_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat0 :=
+  ctx.witness.w_152_0
+
+def parallel_generatedRoot_45.w_152_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat0 :=
+  ctx.witness.w_152_1
+
+def parallel_generatedRoot_45.w_153_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat0 :=
+  ctx.witness.w_153_0
+
+def parallel_generatedRoot_45.w_153_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat0 :=
+  ctx.witness.w_153_1
+
+def parallel_generatedRoot_45.w_154_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat40 :=
+  ctx.witness.w_154_0
+
+def parallel_generatedRoot_45.w_154_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat40 :=
+  ctx.witness.w_154_1
+
+def parallel_generatedRoot_45.w_155_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat40 :=
+  ctx.witness.w_155_0
+
+def parallel_generatedRoot_45.w_155_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat40 :=
+  ctx.witness.w_155_1
+
+def parallel_generatedRoot_45.w_156_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat8 :=
+  ctx.witness.w_156_0
+
+def parallel_generatedRoot_45.w_156_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat8 :=
+  ctx.witness.w_156_1
+
+def parallel_generatedRoot_45.w_157_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat8 :=
+  ctx.witness.w_157_0
+
+def parallel_generatedRoot_45.w_157_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat8 :=
+  ctx.witness.w_157_1
+
+def parallel_generatedRoot_45.w_158_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat9 :=
+  ctx.witness.w_158_0
+
+def parallel_generatedRoot_45.w_158_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat9 :=
+  ctx.witness.w_158_1
+
+def parallel_generatedRoot_45.w_159_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat9 :=
+  ctx.witness.w_159_0
+
+def parallel_generatedRoot_45.w_159_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat9 :=
+  ctx.witness.w_159_1
+
+def parallel_generatedRoot_45.w_160_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat10 :=
+  ctx.witness.w_160_0
+
+def parallel_generatedRoot_45.w_160_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat10 :=
+  ctx.witness.w_160_1
+
+def parallel_generatedRoot_45.w_161_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat10 :=
+  ctx.witness.w_161_0
+
+def parallel_generatedRoot_45.w_161_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat10 :=
+  ctx.witness.w_161_1
+
+def parallel_generatedRoot_45.w_162_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat11 :=
+  ctx.witness.w_162_0
+
+def parallel_generatedRoot_45.w_162_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat11 :=
+  ctx.witness.w_162_1
+
+def parallel_generatedRoot_45.w_163_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat11 :=
+  ctx.witness.w_163_0
+
+def parallel_generatedRoot_45.w_163_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat11 :=
+  ctx.witness.w_163_1
+
+def parallel_generatedRoot_45.w_164_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat12 :=
+  ctx.witness.w_164_0
+
+def parallel_generatedRoot_45.w_164_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat12 :=
+  ctx.witness.w_164_1
+
+def parallel_generatedRoot_45.w_165_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat12 :=
+  ctx.witness.w_165_0
+
+def parallel_generatedRoot_45.w_165_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat12 :=
+  ctx.witness.w_165_1
+
+def parallel_generatedRoot_45.w_166_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat13 :=
+  ctx.witness.w_166_0
+
+def parallel_generatedRoot_45.w_166_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat13 :=
+  ctx.witness.w_166_1
+
+def parallel_generatedRoot_45.w_167_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat13 :=
+  ctx.witness.w_167_0
+
+def parallel_generatedRoot_45.w_167_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat13 :=
+  ctx.witness.w_167_1
+
+def parallel_generatedRoot_45.w_168_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat14 :=
+  ctx.witness.w_168_0
+
+def parallel_generatedRoot_45.w_168_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat14 :=
+  ctx.witness.w_168_1
+
+def parallel_generatedRoot_45.w_169_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat14 :=
+  ctx.witness.w_169_0
+
+def parallel_generatedRoot_45.w_169_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat14 :=
+  ctx.witness.w_169_1
+
+def parallel_generatedRoot_45.w_170_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat15 :=
+  ctx.witness.w_170_0
+
+def parallel_generatedRoot_45.w_170_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat15 :=
+  ctx.witness.w_170_1
+
+def parallel_generatedRoot_45.w_171_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat15 :=
+  ctx.witness.w_171_0
+
+def parallel_generatedRoot_45.w_171_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat15 :=
+  ctx.witness.w_171_1
+
+def parallel_generatedRoot_45.w_172_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat16 :=
+  ctx.witness.w_172_0
+
+def parallel_generatedRoot_45.w_172_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat16 :=
+  ctx.witness.w_172_1
+
+def parallel_generatedRoot_45.w_173_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat16 :=
+  ctx.witness.w_173_0
+
+def parallel_generatedRoot_45.w_173_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat16 :=
+  ctx.witness.w_173_1
+
+def parallel_generatedRoot_45.w_174_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat7 :=
+  ctx.witness.w_174_0
+
+def parallel_generatedRoot_45.w_174_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat7 :=
+  ctx.witness.w_174_1
+
+def parallel_generatedRoot_45.w_175_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat7 :=
+  ctx.witness.w_175_0
+
+def parallel_generatedRoot_45.w_175_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat7 :=
+  ctx.witness.w_175_1
+
+def parallel_generatedRoot_45.w_176_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat17 :=
+  ctx.witness.w_176_0
+
+def parallel_generatedRoot_45.w_176_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat17 :=
+  ctx.witness.w_176_1
+
+def parallel_generatedRoot_45.w_177_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat17 :=
+  ctx.witness.w_177_0
+
+def parallel_generatedRoot_45.w_177_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat17 :=
+  ctx.witness.w_177_1
+
+def parallel_generatedRoot_45.w_178_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat19 :=
+  ctx.witness.w_178_0
+
+def parallel_generatedRoot_45.w_178_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat19 :=
+  ctx.witness.w_178_1
+
+def parallel_generatedRoot_45.w_179_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat19 :=
+  ctx.witness.w_179_0
+
+def parallel_generatedRoot_45.w_179_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat19 :=
+  ctx.witness.w_179_1
+
+def parallel_generatedRoot_45.w_180_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat20 :=
+  ctx.witness.w_180_0
+
+def parallel_generatedRoot_45.w_180_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat20 :=
+  ctx.witness.w_180_1
+
+def parallel_generatedRoot_45.w_181_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat20 :=
+  ctx.witness.w_181_0
+
+def parallel_generatedRoot_45.w_181_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat20 :=
+  ctx.witness.w_181_1
+
+def parallel_generatedRoot_45.w_182_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat21 :=
+  ctx.witness.w_182_0
+
+def parallel_generatedRoot_45.w_182_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat21 :=
+  ctx.witness.w_182_1
+
+def parallel_generatedRoot_45.w_183_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat21 :=
+  ctx.witness.w_183_0
+
+def parallel_generatedRoot_45.w_183_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat21 :=
+  ctx.witness.w_183_1
+
+def parallel_generatedRoot_45.w_184_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat22 :=
+  ctx.witness.w_184_0
+
+def parallel_generatedRoot_45.w_184_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat22 :=
+  ctx.witness.w_184_1
+
+def parallel_generatedRoot_45.w_185_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat22 :=
+  ctx.witness.w_185_0
+
+def parallel_generatedRoot_45.w_185_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat22 :=
+  ctx.witness.w_185_1
+
+def parallel_generatedRoot_45.w_186_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat23 :=
+  ctx.witness.w_186_0
+
+def parallel_generatedRoot_45.w_186_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat23 :=
+  ctx.witness.w_186_1
+
+def parallel_generatedRoot_45.w_187_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat23 :=
+  ctx.witness.w_187_0
+
+def parallel_generatedRoot_45.w_187_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat23 :=
+  ctx.witness.w_187_1
+
+def parallel_generatedRoot_45.w_188_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat24 :=
+  ctx.witness.w_188_0
+
+def parallel_generatedRoot_45.w_188_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat24 :=
+  ctx.witness.w_188_1
+
+def parallel_generatedRoot_45.w_189_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat24 :=
+  ctx.witness.w_189_0
+
+def parallel_generatedRoot_45.w_189_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat24 :=
+  ctx.witness.w_189_1
+
+def parallel_generatedRoot_45.w_190_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat25 :=
+  ctx.witness.w_190_0
+
+def parallel_generatedRoot_45.w_190_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat25 :=
+  ctx.witness.w_190_1
+
+def parallel_generatedRoot_45.w_191_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat25 :=
+  ctx.witness.w_191_0
+
+def parallel_generatedRoot_45.w_191_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat25 :=
+  ctx.witness.w_191_1
+
+def parallel_generatedRoot_45.w_192_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat26 :=
+  ctx.witness.w_192_0
+
+def parallel_generatedRoot_45.w_192_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat26 :=
+  ctx.witness.w_192_1
+
+def parallel_generatedRoot_45.w_193_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat26 :=
+  ctx.witness.w_193_0
+
+def parallel_generatedRoot_45.w_193_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat26 :=
+  ctx.witness.w_193_1
+
+def parallel_generatedRoot_45.w_194_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat27 :=
+  ctx.witness.w_194_0
+
+def parallel_generatedRoot_45.w_194_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat27 :=
+  ctx.witness.w_194_1
+
+def parallel_generatedRoot_45.w_195_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat27 :=
+  ctx.witness.w_195_0
+
+def parallel_generatedRoot_45.w_195_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat27 :=
+  ctx.witness.w_195_1
+
+def parallel_generatedRoot_45.w_196_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat18 :=
+  ctx.witness.w_196_0
+
+def parallel_generatedRoot_45.w_196_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat18 :=
+  ctx.witness.w_196_1
+
+def parallel_generatedRoot_45.w_197_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat18 :=
+  ctx.witness.w_197_0
+
+def parallel_generatedRoot_45.w_197_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat18 :=
+  ctx.witness.w_197_1
+
+def parallel_generatedRoot_45.w_198_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat28 :=
+  ctx.witness.w_198_0
+
+def parallel_generatedRoot_45.w_198_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat28 :=
+  ctx.witness.w_198_1
+
+def parallel_generatedRoot_45.w_199_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat28 :=
+  ctx.witness.w_199_0
+
+def parallel_generatedRoot_45.w_199_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat28 :=
+  ctx.witness.w_199_1
+
+def parallel_generatedRoot_45.w_200_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat30 :=
+  ctx.witness.w_200_0
+
+def parallel_generatedRoot_45.w_200_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat30 :=
+  ctx.witness.w_200_1
+
+def parallel_generatedRoot_45.w_201_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat30 :=
+  ctx.witness.w_201_0
+
+def parallel_generatedRoot_45.w_201_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat30 :=
+  ctx.witness.w_201_1
+
+def parallel_generatedRoot_45.w_202_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat31 :=
+  ctx.witness.w_202_0
+
+def parallel_generatedRoot_45.w_202_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat31 :=
+  ctx.witness.w_202_1
+
+def parallel_generatedRoot_45.w_203_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat31 :=
+  ctx.witness.w_203_0
+
+def parallel_generatedRoot_45.w_203_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat31 :=
+  ctx.witness.w_203_1
+
+def parallel_generatedRoot_45.w_204_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat32 :=
+  ctx.witness.w_204_0
+
+def parallel_generatedRoot_45.w_204_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat32 :=
+  ctx.witness.w_204_1
+
+def parallel_generatedRoot_45.w_205_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat32 :=
+  ctx.witness.w_205_0
+
+def parallel_generatedRoot_45.w_205_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat32 :=
+  ctx.witness.w_205_1
+
+def parallel_generatedRoot_45.w_206_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat33 :=
+  ctx.witness.w_206_0
+
+def parallel_generatedRoot_45.w_206_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat33 :=
+  ctx.witness.w_206_1
+
+def parallel_generatedRoot_45.w_207_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat33 :=
+  ctx.witness.w_207_0
+
+def parallel_generatedRoot_45.w_207_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat33 :=
+  ctx.witness.w_207_1
+
+def parallel_generatedRoot_45.w_208_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat34 :=
+  ctx.witness.w_208_0
+
+def parallel_generatedRoot_45.w_208_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat34 :=
+  ctx.witness.w_208_1
+
+def parallel_generatedRoot_45.w_209_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat34 :=
+  ctx.witness.w_209_0
+
+def parallel_generatedRoot_45.w_209_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat34 :=
+  ctx.witness.w_209_1
+
+def parallel_generatedRoot_45.w_210_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat29 :=
+  ctx.witness.w_210_0
+
+def parallel_generatedRoot_45.w_210_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat29 :=
+  ctx.witness.w_210_1
+
+def parallel_generatedRoot_45.w_211_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat29 :=
+  ctx.witness.w_211_0
+
+def parallel_generatedRoot_45.w_211_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat29 :=
+  ctx.witness.w_211_1
+
+def parallel_generatedRoot_45.w_212_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat35 :=
+  ctx.witness.w_212_0
+
+def parallel_generatedRoot_45.w_212_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat35 :=
+  ctx.witness.w_212_1
+
+def parallel_generatedRoot_45.w_213_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat35 :=
+  ctx.witness.w_213_0
+
+def parallel_generatedRoot_45.w_213_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat35 :=
+  ctx.witness.w_213_1
+
+def parallel_generatedRoot_45.w_214_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat36 :=
+  ctx.witness.w_214_0
+
+def parallel_generatedRoot_45.w_214_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat36 :=
+  ctx.witness.w_214_1
+
+def parallel_generatedRoot_45.w_215_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat36 :=
+  ctx.witness.w_215_0
+
+def parallel_generatedRoot_45.w_215_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat36 :=
+  ctx.witness.w_215_1
+
+def parallel_generatedRoot_45.w_216_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat37 :=
+  ctx.witness.w_216_0
+
+def parallel_generatedRoot_45.w_216_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat37 :=
+  ctx.witness.w_216_1
+
+def parallel_generatedRoot_45.w_217_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat37 :=
+  ctx.witness.w_217_0
+
+def parallel_generatedRoot_45.w_217_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat37 :=
+  ctx.witness.w_217_1
+
+def parallel_generatedRoot_45.w_218_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat38 :=
+  ctx.witness.w_218_0
+
+def parallel_generatedRoot_45.w_218_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat38 :=
+  ctx.witness.w_218_1
+
+def parallel_generatedRoot_45.w_219_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat38 :=
+  ctx.witness.w_219_0
+
+def parallel_generatedRoot_45.w_219_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat38 :=
+  ctx.witness.w_219_1
+
+def parallel_generatedRoot_45.w_220_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat39 :=
+  ctx.witness.w_220_0
+
+def parallel_generatedRoot_45.w_220_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat39 :=
+  ctx.witness.w_220_1
+
+def parallel_generatedRoot_45.w_221_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat39 :=
+  ctx.witness.w_221_0
+
+def parallel_generatedRoot_45.w_221_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat39 :=
+  ctx.witness.w_221_1
+
+def parallel_generatedRoot_45.w_226_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_226_0
+
+def parallel_generatedRoot_45.w_227_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_222_0 ctx)
+
+def parallel_generatedRoot_45.w_228_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_228_0
+
+def parallel_generatedRoot_45.w_229_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_224_0 ctx)
+
+def parallel_generatedRoot_45.w_230_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_227_0 ctx) (parallel_generatedRoot_45.w_229_0 ctx)
+
+def parallel_generatedRoot_45.w_231_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_231_0
+
+def parallel_generatedRoot_45.w_232_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat2 :=
+  ctx.witness.w_232_0
+
+def parallel_generatedRoot_45.w_233_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.witness.w_233_0
+
+def parallel_generatedRoot_45.w_234_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_231_0 ctx) (parallel_generatedRoot_45.w_233_0 ctx)
+
+def parallel_generatedRoot_45.w_235_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  (MxxRuntime.matrixPolynomial [(1099380817921)] : mxxMat41)
+
+def parallel_generatedRoot_45.w_237_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  MxxRuntime.liftInteger (parallel_generatedRoot_45.w_236_0 ctx)
+
+def parallel_generatedRoot_45.w_239_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  MxxRuntime.multiplyMonomial (parallel_generatedRoot_45.w_237_0 ctx) (parallel_generatedRoot_45.w_238_0 ctx)
+
+def parallel_generatedRoot_45.w_240_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_235_0 ctx) (parallel_generatedRoot_45.w_239_0 ctx)
+
+def parallel_generatedRoot_45.w_241_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_234_0 ctx) (parallel_generatedRoot_45.w_240_0 ctx)
+
+def parallel_generatedRoot_45.w_242_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_230_0 ctx) (parallel_generatedRoot_45.w_241_0 ctx)
+
+def parallel_generatedRoot_45.w_243_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.witness.w_243_0
+
+def parallel_generatedRoot_45.w_244_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_242_0 ctx) (parallel_generatedRoot_45.w_243_0 ctx)
+
+def parallel_generatedRoot_45.w_245_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_223_0 ctx)
+
+def parallel_generatedRoot_45.w_246_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_225_0 ctx)
+
+def parallel_generatedRoot_45.w_247_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_245_0 ctx) (parallel_generatedRoot_45.w_246_0 ctx)
+
+def parallel_generatedRoot_45.w_248_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat41 :=
+  ctx.witness.w_248_0
+
+def parallel_generatedRoot_45.w_249_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_248_0 ctx) (parallel_generatedRoot_45.w_233_0 ctx)
+
+def parallel_generatedRoot_45.w_250_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixMulScalarRight (parallel_generatedRoot_45.w_249_0 ctx) (parallel_generatedRoot_45.w_240_0 ctx)
+
+def parallel_generatedRoot_45.w_251_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_247_0 ctx) (parallel_generatedRoot_45.w_250_0 ctx)
+
+def parallel_generatedRoot_45.w_252_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  ctx.witness.w_252_0
+
+def parallel_generatedRoot_45.w_253_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : mxxMat3 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_251_0 ctx) (parallel_generatedRoot_45.w_252_0 ctx)
+
+def parallel_generatedRoot_45.w_260_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_260_0
+
+def parallel_generatedRoot_45.w_260_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_260_1
+
+def parallel_generatedRoot_45.w_260_2 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_260_2
+
+def parallel_generatedRoot_45.w_260_3 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_260_3
+
+def parallel_generatedRoot_45.w_260_4 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_260_4
+
+def parallel_generatedRoot_45.w_260_5 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat4 :=
+  ctx.witness.w_260_5
+
+def parallel_generatedRoot_45.w_260_6 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 1025 → mxxMat41 :=
+  ctx.witness.w_260_6
+
+def parallel_generatedRoot_45.w_262_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat3 :=
+  ctx.witness.w_262_0
+
+def parallel_generatedRoot_45.w_262_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat3 :=
+  ctx.witness.w_262_1
+
+def parallel_generatedRoot_45.w_263_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat3 :=
+  ctx.witness.w_263_0
+
+def parallel_generatedRoot_45.w_263_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat3 :=
+  ctx.witness.w_263_1
+
+def parallel_generatedRoot_45.w_264_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat0 :=
+  ctx.witness.w_264_0
+
+def parallel_generatedRoot_45.w_264_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat0 :=
+  ctx.witness.w_264_1
+
+def parallel_generatedRoot_45.w_265_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat0 :=
+  ctx.witness.w_265_0
+
+def parallel_generatedRoot_45.w_265_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat0 :=
+  ctx.witness.w_265_1
+
+def parallel_generatedRoot_45.w_266_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat40 :=
+  ctx.witness.w_266_0
+
+def parallel_generatedRoot_45.w_266_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat40 :=
+  ctx.witness.w_266_1
+
+def parallel_generatedRoot_45.w_267_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat40 :=
+  ctx.witness.w_267_0
+
+def parallel_generatedRoot_45.w_267_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat40 :=
+  ctx.witness.w_267_1
+
+def parallel_generatedRoot_45.w_268_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat8 :=
+  ctx.witness.w_268_0
+
+def parallel_generatedRoot_45.w_268_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat8 :=
+  ctx.witness.w_268_1
+
+def parallel_generatedRoot_45.w_269_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat8 :=
+  ctx.witness.w_269_0
+
+def parallel_generatedRoot_45.w_269_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat8 :=
+  ctx.witness.w_269_1
+
+def parallel_generatedRoot_45.w_270_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat9 :=
+  ctx.witness.w_270_0
+
+def parallel_generatedRoot_45.w_270_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat9 :=
+  ctx.witness.w_270_1
+
+def parallel_generatedRoot_45.w_271_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat9 :=
+  ctx.witness.w_271_0
+
+def parallel_generatedRoot_45.w_271_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat9 :=
+  ctx.witness.w_271_1
+
+def parallel_generatedRoot_45.w_272_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat10 :=
+  ctx.witness.w_272_0
+
+def parallel_generatedRoot_45.w_272_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat10 :=
+  ctx.witness.w_272_1
+
+def parallel_generatedRoot_45.w_273_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat10 :=
+  ctx.witness.w_273_0
+
+def parallel_generatedRoot_45.w_273_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat10 :=
+  ctx.witness.w_273_1
+
+def parallel_generatedRoot_45.w_274_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat11 :=
+  ctx.witness.w_274_0
+
+def parallel_generatedRoot_45.w_274_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat11 :=
+  ctx.witness.w_274_1
+
+def parallel_generatedRoot_45.w_275_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat11 :=
+  ctx.witness.w_275_0
+
+def parallel_generatedRoot_45.w_275_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat11 :=
+  ctx.witness.w_275_1
+
+def parallel_generatedRoot_45.w_276_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat12 :=
+  ctx.witness.w_276_0
+
+def parallel_generatedRoot_45.w_276_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat12 :=
+  ctx.witness.w_276_1
+
+def parallel_generatedRoot_45.w_277_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat12 :=
+  ctx.witness.w_277_0
+
+def parallel_generatedRoot_45.w_277_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat12 :=
+  ctx.witness.w_277_1
+
+def parallel_generatedRoot_45.w_278_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat13 :=
+  ctx.witness.w_278_0
+
+def parallel_generatedRoot_45.w_278_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat13 :=
+  ctx.witness.w_278_1
+
+def parallel_generatedRoot_45.w_279_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat13 :=
+  ctx.witness.w_279_0
+
+def parallel_generatedRoot_45.w_279_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat13 :=
+  ctx.witness.w_279_1
+
+def parallel_generatedRoot_45.w_280_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat14 :=
+  ctx.witness.w_280_0
+
+def parallel_generatedRoot_45.w_280_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat14 :=
+  ctx.witness.w_280_1
+
+def parallel_generatedRoot_45.w_281_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat14 :=
+  ctx.witness.w_281_0
+
+def parallel_generatedRoot_45.w_281_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat14 :=
+  ctx.witness.w_281_1
+
+def parallel_generatedRoot_45.w_282_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat15 :=
+  ctx.witness.w_282_0
+
+def parallel_generatedRoot_45.w_282_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat15 :=
+  ctx.witness.w_282_1
+
+def parallel_generatedRoot_45.w_283_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat15 :=
+  ctx.witness.w_283_0
+
+def parallel_generatedRoot_45.w_283_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat15 :=
+  ctx.witness.w_283_1
+
+def parallel_generatedRoot_45.w_284_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat16 :=
+  ctx.witness.w_284_0
+
+def parallel_generatedRoot_45.w_284_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat16 :=
+  ctx.witness.w_284_1
+
+def parallel_generatedRoot_45.w_285_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat16 :=
+  ctx.witness.w_285_0
+
+def parallel_generatedRoot_45.w_285_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat16 :=
+  ctx.witness.w_285_1
+
+def parallel_generatedRoot_45.w_286_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat7 :=
+  ctx.witness.w_286_0
+
+def parallel_generatedRoot_45.w_286_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat7 :=
+  ctx.witness.w_286_1
+
+def parallel_generatedRoot_45.w_287_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat7 :=
+  ctx.witness.w_287_0
+
+def parallel_generatedRoot_45.w_287_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat7 :=
+  ctx.witness.w_287_1
+
+def parallel_generatedRoot_45.w_288_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat17 :=
+  ctx.witness.w_288_0
+
+def parallel_generatedRoot_45.w_288_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat17 :=
+  ctx.witness.w_288_1
+
+def parallel_generatedRoot_45.w_289_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat17 :=
+  ctx.witness.w_289_0
+
+def parallel_generatedRoot_45.w_289_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat17 :=
+  ctx.witness.w_289_1
+
+def parallel_generatedRoot_45.w_290_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat19 :=
+  ctx.witness.w_290_0
+
+def parallel_generatedRoot_45.w_290_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat19 :=
+  ctx.witness.w_290_1
+
+def parallel_generatedRoot_45.w_291_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat19 :=
+  ctx.witness.w_291_0
+
+def parallel_generatedRoot_45.w_291_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat19 :=
+  ctx.witness.w_291_1
+
+def parallel_generatedRoot_45.w_292_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat20 :=
+  ctx.witness.w_292_0
+
+def parallel_generatedRoot_45.w_292_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat20 :=
+  ctx.witness.w_292_1
+
+def parallel_generatedRoot_45.w_293_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat20 :=
+  ctx.witness.w_293_0
+
+def parallel_generatedRoot_45.w_293_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat20 :=
+  ctx.witness.w_293_1
+
+def parallel_generatedRoot_45.w_294_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat21 :=
+  ctx.witness.w_294_0
+
+def parallel_generatedRoot_45.w_294_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat21 :=
+  ctx.witness.w_294_1
+
+def parallel_generatedRoot_45.w_295_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat21 :=
+  ctx.witness.w_295_0
+
+def parallel_generatedRoot_45.w_295_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat21 :=
+  ctx.witness.w_295_1
+
+def parallel_generatedRoot_45.w_296_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat22 :=
+  ctx.witness.w_296_0
+
+def parallel_generatedRoot_45.w_296_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat22 :=
+  ctx.witness.w_296_1
+
+def parallel_generatedRoot_45.w_297_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat22 :=
+  ctx.witness.w_297_0
+
+def parallel_generatedRoot_45.w_297_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat22 :=
+  ctx.witness.w_297_1
+
+def parallel_generatedRoot_45.w_298_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat23 :=
+  ctx.witness.w_298_0
+
+def parallel_generatedRoot_45.w_298_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat23 :=
+  ctx.witness.w_298_1
+
+def parallel_generatedRoot_45.w_299_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat23 :=
+  ctx.witness.w_299_0
+
+def parallel_generatedRoot_45.w_299_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat23 :=
+  ctx.witness.w_299_1
+
+def parallel_generatedRoot_45.w_300_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat24 :=
+  ctx.witness.w_300_0
+
+def parallel_generatedRoot_45.w_300_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat24 :=
+  ctx.witness.w_300_1
+
+def parallel_generatedRoot_45.w_301_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat24 :=
+  ctx.witness.w_301_0
+
+def parallel_generatedRoot_45.w_301_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat24 :=
+  ctx.witness.w_301_1
+
+def parallel_generatedRoot_45.w_302_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat25 :=
+  ctx.witness.w_302_0
+
+def parallel_generatedRoot_45.w_302_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat25 :=
+  ctx.witness.w_302_1
+
+def parallel_generatedRoot_45.w_303_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat25 :=
+  ctx.witness.w_303_0
+
+def parallel_generatedRoot_45.w_303_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat25 :=
+  ctx.witness.w_303_1
+
+def parallel_generatedRoot_45.w_304_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat26 :=
+  ctx.witness.w_304_0
+
+def parallel_generatedRoot_45.w_304_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat26 :=
+  ctx.witness.w_304_1
+
+def parallel_generatedRoot_45.w_305_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat26 :=
+  ctx.witness.w_305_0
+
+def parallel_generatedRoot_45.w_305_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat26 :=
+  ctx.witness.w_305_1
+
+def parallel_generatedRoot_45.w_306_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat27 :=
+  ctx.witness.w_306_0
+
+def parallel_generatedRoot_45.w_306_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat27 :=
+  ctx.witness.w_306_1
+
+def parallel_generatedRoot_45.w_307_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat27 :=
+  ctx.witness.w_307_0
+
+def parallel_generatedRoot_45.w_307_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat27 :=
+  ctx.witness.w_307_1
+
+def parallel_generatedRoot_45.w_308_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat18 :=
+  ctx.witness.w_308_0
+
+def parallel_generatedRoot_45.w_308_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat18 :=
+  ctx.witness.w_308_1
+
+def parallel_generatedRoot_45.w_309_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat18 :=
+  ctx.witness.w_309_0
+
+def parallel_generatedRoot_45.w_309_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat18 :=
+  ctx.witness.w_309_1
+
+def parallel_generatedRoot_45.w_310_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat28 :=
+  ctx.witness.w_310_0
+
+def parallel_generatedRoot_45.w_310_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat28 :=
+  ctx.witness.w_310_1
+
+def parallel_generatedRoot_45.w_311_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat28 :=
+  ctx.witness.w_311_0
+
+def parallel_generatedRoot_45.w_311_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat28 :=
+  ctx.witness.w_311_1
+
+def parallel_generatedRoot_45.w_312_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat30 :=
+  ctx.witness.w_312_0
+
+def parallel_generatedRoot_45.w_312_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat30 :=
+  ctx.witness.w_312_1
+
+def parallel_generatedRoot_45.w_313_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat30 :=
+  ctx.witness.w_313_0
+
+def parallel_generatedRoot_45.w_313_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat30 :=
+  ctx.witness.w_313_1
+
+def parallel_generatedRoot_45.w_314_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat31 :=
+  ctx.witness.w_314_0
+
+def parallel_generatedRoot_45.w_314_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat31 :=
+  ctx.witness.w_314_1
+
+def parallel_generatedRoot_45.w_315_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat31 :=
+  ctx.witness.w_315_0
+
+def parallel_generatedRoot_45.w_315_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat31 :=
+  ctx.witness.w_315_1
+
+def parallel_generatedRoot_45.w_316_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat32 :=
+  ctx.witness.w_316_0
+
+def parallel_generatedRoot_45.w_316_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat32 :=
+  ctx.witness.w_316_1
+
+def parallel_generatedRoot_45.w_317_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat32 :=
+  ctx.witness.w_317_0
+
+def parallel_generatedRoot_45.w_317_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat32 :=
+  ctx.witness.w_317_1
+
+def parallel_generatedRoot_45.w_318_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat33 :=
+  ctx.witness.w_318_0
+
+def parallel_generatedRoot_45.w_318_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat33 :=
+  ctx.witness.w_318_1
+
+def parallel_generatedRoot_45.w_319_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat33 :=
+  ctx.witness.w_319_0
+
+def parallel_generatedRoot_45.w_319_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat33 :=
+  ctx.witness.w_319_1
+
+def parallel_generatedRoot_45.w_320_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat34 :=
+  ctx.witness.w_320_0
+
+def parallel_generatedRoot_45.w_320_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat34 :=
+  ctx.witness.w_320_1
+
+def parallel_generatedRoot_45.w_321_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat34 :=
+  ctx.witness.w_321_0
+
+def parallel_generatedRoot_45.w_321_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat34 :=
+  ctx.witness.w_321_1
+
+def parallel_generatedRoot_45.w_322_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat29 :=
+  ctx.witness.w_322_0
+
+def parallel_generatedRoot_45.w_322_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat29 :=
+  ctx.witness.w_322_1
+
+def parallel_generatedRoot_45.w_323_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat29 :=
+  ctx.witness.w_323_0
+
+def parallel_generatedRoot_45.w_323_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat29 :=
+  ctx.witness.w_323_1
+
+def parallel_generatedRoot_45.w_324_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat35 :=
+  ctx.witness.w_324_0
+
+def parallel_generatedRoot_45.w_324_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat35 :=
+  ctx.witness.w_324_1
+
+def parallel_generatedRoot_45.w_325_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat35 :=
+  ctx.witness.w_325_0
+
+def parallel_generatedRoot_45.w_325_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat35 :=
+  ctx.witness.w_325_1
+
+def parallel_generatedRoot_45.w_326_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat36 :=
+  ctx.witness.w_326_0
+
+def parallel_generatedRoot_45.w_326_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat36 :=
+  ctx.witness.w_326_1
+
+def parallel_generatedRoot_45.w_327_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat36 :=
+  ctx.witness.w_327_0
+
+def parallel_generatedRoot_45.w_327_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat36 :=
+  ctx.witness.w_327_1
+
+def parallel_generatedRoot_45.w_328_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat37 :=
+  ctx.witness.w_328_0
+
+def parallel_generatedRoot_45.w_328_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat37 :=
+  ctx.witness.w_328_1
+
+def parallel_generatedRoot_45.w_329_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat37 :=
+  ctx.witness.w_329_0
+
+def parallel_generatedRoot_45.w_329_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat37 :=
+  ctx.witness.w_329_1
+
+def parallel_generatedRoot_45.w_330_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat38 :=
+  ctx.witness.w_330_0
+
+def parallel_generatedRoot_45.w_330_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat38 :=
+  ctx.witness.w_330_1
+
+def parallel_generatedRoot_45.w_331_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat38 :=
+  ctx.witness.w_331_0
+
+def parallel_generatedRoot_45.w_331_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat38 :=
+  ctx.witness.w_331_1
+
+def parallel_generatedRoot_45.w_332_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat39 :=
+  ctx.witness.w_332_0
+
+def parallel_generatedRoot_45.w_332_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 128 → mxxMat39 :=
+  ctx.witness.w_332_1
+
+def parallel_generatedRoot_45.w_333_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat39 :=
+  ctx.witness.w_333_0
+
+def parallel_generatedRoot_45.w_333_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Fin 32 → mxxMat39 :=
+  ctx.witness.w_333_1
+
+def parallel_generatedRoot_45.w_334_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 1 :=
+  ctx.witness.w_334_0
+
+def parallel_generatedRoot_45.w_335_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_335_0
+
+def parallel_generatedRoot_45.w_336_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_334_0 ctx) (parallel_generatedRoot_45.w_335_0 ctx)
+
+def parallel_generatedRoot_45.w_337_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 1 :=
+  ctx.witness.w_337_0
+
+def parallel_generatedRoot_45.w_338_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_338_0
+
+def parallel_generatedRoot_45.w_339_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_337_0 ctx) (parallel_generatedRoot_45.w_338_0 ctx)
+
+def parallel_generatedRoot_45.w_340_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_336_0 ctx) (parallel_generatedRoot_45.w_339_0 ctx)
+
+def parallel_generatedRoot_45.w_341_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 1 :=
+  (MxxRuntime.matrixPolynomial [(1)] : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 1)
+
+def parallel_generatedRoot_45.w_342_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_342_0
+
+def parallel_generatedRoot_45.w_343_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_341_0 ctx) (parallel_generatedRoot_45.w_342_0 ctx)
+
+def parallel_generatedRoot_45.w_344_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_334_0 ctx) (parallel_generatedRoot_45.w_343_0 ctx)
+
+def parallel_generatedRoot_45.w_345_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_340_0 ctx) (parallel_generatedRoot_45.w_344_0 ctx)
+
+def parallel_generatedRoot_45.w_346_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_346_0
+
+def parallel_generatedRoot_45.w_347_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_345_0 ctx) (parallel_generatedRoot_45.w_346_0 ctx)
+
+def parallel_generatedRoot_45.w_348_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_348_0
+
+def parallel_generatedRoot_45.w_349_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_334_0 ctx) (parallel_generatedRoot_45.w_348_0 ctx)
+
+def parallel_generatedRoot_45.w_350_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_350_0
+
+def parallel_generatedRoot_45.w_351_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_337_0 ctx) (parallel_generatedRoot_45.w_350_0 ctx)
+
+def parallel_generatedRoot_45.w_352_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_349_0 ctx) (parallel_generatedRoot_45.w_351_0 ctx)
+
+def parallel_generatedRoot_45.w_353_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixMulScalarLeft (parallel_generatedRoot_45.w_337_0 ctx) (parallel_generatedRoot_45.w_343_0 ctx)
+
+def parallel_generatedRoot_45.w_354_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixSub (parallel_generatedRoot_45.w_352_0 ctx) (parallel_generatedRoot_45.w_353_0 ctx)
+
+def parallel_generatedRoot_45.w_355_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  ctx.witness.w_355_0
+
+def parallel_generatedRoot_45.w_356_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_354_0 ctx) (parallel_generatedRoot_45.w_355_0 ctx)
+
+def parallel_generatedRoot_45.w_357_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 1 :=
+  ctx.witness.w_357_0
+
+def parallel_generatedRoot_45.w_358_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 1 :=
+  ctx.witness.w_358_0
+
+def parallel_generatedRoot_45.w_359_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 2 :=
+  ctx.witness.w_359_0
+
+def parallel_generatedRoot_45.w_361_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 :=
+  MxxRuntime.matrixMul (parallel_generatedRoot_45.w_359_0 ctx) (parallel_generatedRoot_45.w_360_0 ctx)
+
+def parallel_generatedRoot_45.w_362_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 :=
+  ctx.witness.w_362_0
+
+def parallel_generatedRoot_45.w_363_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 :=
+  MxxRuntime.matrixAdd (parallel_generatedRoot_45.w_361_0 ctx) (parallel_generatedRoot_45.w_362_0 ctx)
+
+def parallel_generatedRoot_45.outs {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit) :=
+  (((parallel_generatedRoot_45.w_0_0 ctx), ((parallel_generatedRoot_45.w_1_0 ctx), ((parallel_generatedRoot_45.w_2_0 ctx), ((parallel_generatedRoot_45.w_3_0 ctx), ((parallel_generatedRoot_45.w_25_0 ctx), ((parallel_generatedRoot_45.w_35_0 ctx), ((parallel_generatedRoot_45.w_42_0 ctx), ((parallel_generatedRoot_45.w_42_1 ctx), ((parallel_generatedRoot_45.w_42_2 ctx), ((parallel_generatedRoot_45.w_42_3 ctx), ((parallel_generatedRoot_45.w_42_4 ctx), ((parallel_generatedRoot_45.w_42_5 ctx), ((parallel_generatedRoot_45.w_42_6 ctx), ((parallel_generatedRoot_45.w_44_0 ctx), ((parallel_generatedRoot_45.w_44_1 ctx), ((parallel_generatedRoot_45.w_45_0 ctx), ((parallel_generatedRoot_45.w_45_1 ctx), ((parallel_generatedRoot_45.w_46_0 ctx), ((parallel_generatedRoot_45.w_46_1 ctx), ((parallel_generatedRoot_45.w_47_0 ctx), ((parallel_generatedRoot_45.w_47_1 ctx), ((parallel_generatedRoot_45.w_48_0 ctx), ((parallel_generatedRoot_45.w_48_1 ctx), ((parallel_generatedRoot_45.w_49_0 ctx), ((parallel_generatedRoot_45.w_49_1 ctx), ((parallel_generatedRoot_45.w_50_0 ctx), ((parallel_generatedRoot_45.w_50_1 ctx), ((parallel_generatedRoot_45.w_51_0 ctx), ((parallel_generatedRoot_45.w_51_1 ctx), ((parallel_generatedRoot_45.w_52_0 ctx), ((parallel_generatedRoot_45.w_52_1 ctx), ((parallel_generatedRoot_45.w_53_0 ctx), ((parallel_generatedRoot_45.w_53_1 ctx), ((parallel_generatedRoot_45.w_54_0 ctx), ((parallel_generatedRoot_45.w_54_1 ctx), ((parallel_generatedRoot_45.w_55_0 ctx), ((parallel_generatedRoot_45.w_55_1 ctx), ((parallel_generatedRoot_45.w_56_0 ctx), ((parallel_generatedRoot_45.w_56_1 ctx), ((parallel_generatedRoot_45.w_57_0 ctx), ((parallel_generatedRoot_45.w_57_1 ctx), ((parallel_generatedRoot_45.w_58_0 ctx), ((parallel_generatedRoot_45.w_58_1 ctx), ((parallel_generatedRoot_45.w_59_0 ctx), ((parallel_generatedRoot_45.w_59_1 ctx), ((parallel_generatedRoot_45.w_60_0 ctx), ((parallel_generatedRoot_45.w_60_1 ctx), ((parallel_generatedRoot_45.w_61_0 ctx), ((parallel_generatedRoot_45.w_61_1 ctx), ((parallel_generatedRoot_45.w_62_0 ctx), ((parallel_generatedRoot_45.w_62_1 ctx), ((parallel_generatedRoot_45.w_63_0 ctx), ((parallel_generatedRoot_45.w_63_1 ctx), ((parallel_generatedRoot_45.w_64_0 ctx), ((parallel_generatedRoot_45.w_64_1 ctx), ((parallel_generatedRoot_45.w_65_0 ctx), ((parallel_generatedRoot_45.w_65_1 ctx), ((parallel_generatedRoot_45.w_66_0 ctx), ((parallel_generatedRoot_45.w_66_1 ctx), ((parallel_generatedRoot_45.w_67_0 ctx), ((parallel_generatedRoot_45.w_67_1 ctx), ((parallel_generatedRoot_45.w_68_0 ctx), ((parallel_generatedRoot_45.w_68_1 ctx), ((parallel_generatedRoot_45.w_69_0 ctx), ((parallel_generatedRoot_45.w_69_1 ctx), ((parallel_generatedRoot_45.w_70_0 ctx), ((parallel_generatedRoot_45.w_70_1 ctx), ((parallel_generatedRoot_45.w_71_0 ctx), ((parallel_generatedRoot_45.w_71_1 ctx), ((parallel_generatedRoot_45.w_72_0 ctx), ((parallel_generatedRoot_45.w_72_1 ctx), ((parallel_generatedRoot_45.w_73_0 ctx), ((parallel_generatedRoot_45.w_73_1 ctx), ((parallel_generatedRoot_45.w_74_0 ctx), ((parallel_generatedRoot_45.w_74_1 ctx), ((parallel_generatedRoot_45.w_75_0 ctx), ((parallel_generatedRoot_45.w_75_1 ctx), ((parallel_generatedRoot_45.w_76_0 ctx), ((parallel_generatedRoot_45.w_76_1 ctx), ((parallel_generatedRoot_45.w_77_0 ctx), ((parallel_generatedRoot_45.w_77_1 ctx), ((parallel_generatedRoot_45.w_78_0 ctx), ((parallel_generatedRoot_45.w_78_1 ctx), ((parallel_generatedRoot_45.w_97_0 ctx), ((parallel_generatedRoot_45.w_107_0 ctx), ((parallel_generatedRoot_45.w_108_0 ctx), ((parallel_generatedRoot_45.w_108_1 ctx), ((parallel_generatedRoot_45.w_109_0 ctx), ((parallel_generatedRoot_45.w_109_1 ctx), ((parallel_generatedRoot_45.w_110_0 ctx), ((parallel_generatedRoot_45.w_111_0 ctx), ((parallel_generatedRoot_45.w_112_0 ctx), ((parallel_generatedRoot_45.w_113_0 ctx), ((parallel_generatedRoot_45.w_132_0 ctx), ((parallel_generatedRoot_45.w_141_0 ctx), ((parallel_generatedRoot_45.w_148_0 ctx), ((parallel_generatedRoot_45.w_148_1 ctx), ((parallel_generatedRoot_45.w_148_2 ctx), ((parallel_generatedRoot_45.w_148_3 ctx), ((parallel_generatedRoot_45.w_148_4 ctx), ((parallel_generatedRoot_45.w_148_5 ctx), ((parallel_generatedRoot_45.w_148_6 ctx), ((parallel_generatedRoot_45.w_150_0 ctx), ((parallel_generatedRoot_45.w_150_1 ctx), ((parallel_generatedRoot_45.w_151_0 ctx), ((parallel_generatedRoot_45.w_151_1 ctx), ((parallel_generatedRoot_45.w_152_0 ctx), ((parallel_generatedRoot_45.w_152_1 ctx), ((parallel_generatedRoot_45.w_153_0 ctx), ((parallel_generatedRoot_45.w_153_1 ctx), ((parallel_generatedRoot_45.w_154_0 ctx), ((parallel_generatedRoot_45.w_154_1 ctx), ((parallel_generatedRoot_45.w_155_0 ctx), ((parallel_generatedRoot_45.w_155_1 ctx), ((parallel_generatedRoot_45.w_156_0 ctx), ((parallel_generatedRoot_45.w_156_1 ctx), ((parallel_generatedRoot_45.w_157_0 ctx), ((parallel_generatedRoot_45.w_157_1 ctx), ((parallel_generatedRoot_45.w_158_0 ctx), ((parallel_generatedRoot_45.w_158_1 ctx), ((parallel_generatedRoot_45.w_159_0 ctx), ((parallel_generatedRoot_45.w_159_1 ctx), ((parallel_generatedRoot_45.w_160_0 ctx), ((parallel_generatedRoot_45.w_160_1 ctx), ((parallel_generatedRoot_45.w_161_0 ctx), ((parallel_generatedRoot_45.w_161_1 ctx), ((parallel_generatedRoot_45.w_162_0 ctx), ((parallel_generatedRoot_45.w_162_1 ctx), ((parallel_generatedRoot_45.w_163_0 ctx), ((parallel_generatedRoot_45.w_163_1 ctx), ((parallel_generatedRoot_45.w_164_0 ctx), ((parallel_generatedRoot_45.w_164_1 ctx), ((parallel_generatedRoot_45.w_165_0 ctx), ((parallel_generatedRoot_45.w_165_1 ctx), ((parallel_generatedRoot_45.w_166_0 ctx), ((parallel_generatedRoot_45.w_166_1 ctx), ((parallel_generatedRoot_45.w_167_0 ctx), ((parallel_generatedRoot_45.w_167_1 ctx), ((parallel_generatedRoot_45.w_168_0 ctx), ((parallel_generatedRoot_45.w_168_1 ctx), ((parallel_generatedRoot_45.w_169_0 ctx), ((parallel_generatedRoot_45.w_169_1 ctx), ((parallel_generatedRoot_45.w_170_0 ctx), ((parallel_generatedRoot_45.w_170_1 ctx), ((parallel_generatedRoot_45.w_171_0 ctx), ((parallel_generatedRoot_45.w_171_1 ctx), ((parallel_generatedRoot_45.w_172_0 ctx), ((parallel_generatedRoot_45.w_172_1 ctx), ((parallel_generatedRoot_45.w_173_0 ctx), ((parallel_generatedRoot_45.w_173_1 ctx), ((parallel_generatedRoot_45.w_174_0 ctx), ((parallel_generatedRoot_45.w_174_1 ctx), ((parallel_generatedRoot_45.w_175_0 ctx), ((parallel_generatedRoot_45.w_175_1 ctx), ((parallel_generatedRoot_45.w_176_0 ctx), ((parallel_generatedRoot_45.w_176_1 ctx), ((parallel_generatedRoot_45.w_177_0 ctx), ((parallel_generatedRoot_45.w_177_1 ctx), ((parallel_generatedRoot_45.w_178_0 ctx), ((parallel_generatedRoot_45.w_178_1 ctx), ((parallel_generatedRoot_45.w_179_0 ctx), ((parallel_generatedRoot_45.w_179_1 ctx), ((parallel_generatedRoot_45.w_180_0 ctx), ((parallel_generatedRoot_45.w_180_1 ctx), ((parallel_generatedRoot_45.w_181_0 ctx), ((parallel_generatedRoot_45.w_181_1 ctx), ((parallel_generatedRoot_45.w_182_0 ctx), ((parallel_generatedRoot_45.w_182_1 ctx), ((parallel_generatedRoot_45.w_183_0 ctx), ((parallel_generatedRoot_45.w_183_1 ctx), ((parallel_generatedRoot_45.w_184_0 ctx), ((parallel_generatedRoot_45.w_184_1 ctx), ((parallel_generatedRoot_45.w_185_0 ctx), ((parallel_generatedRoot_45.w_185_1 ctx), ((parallel_generatedRoot_45.w_186_0 ctx), ((parallel_generatedRoot_45.w_186_1 ctx), ((parallel_generatedRoot_45.w_187_0 ctx), ((parallel_generatedRoot_45.w_187_1 ctx), ((parallel_generatedRoot_45.w_188_0 ctx), ((parallel_generatedRoot_45.w_188_1 ctx), ((parallel_generatedRoot_45.w_189_0 ctx), ((parallel_generatedRoot_45.w_189_1 ctx), ((parallel_generatedRoot_45.w_190_0 ctx), ((parallel_generatedRoot_45.w_190_1 ctx), ((parallel_generatedRoot_45.w_191_0 ctx), ((parallel_generatedRoot_45.w_191_1 ctx), ((parallel_generatedRoot_45.w_192_0 ctx), ((parallel_generatedRoot_45.w_192_1 ctx), ((parallel_generatedRoot_45.w_193_0 ctx), ((parallel_generatedRoot_45.w_193_1 ctx), ((parallel_generatedRoot_45.w_194_0 ctx), ((parallel_generatedRoot_45.w_194_1 ctx), ((parallel_generatedRoot_45.w_195_0 ctx), ((parallel_generatedRoot_45.w_195_1 ctx), ((parallel_generatedRoot_45.w_196_0 ctx), ((parallel_generatedRoot_45.w_196_1 ctx), ((parallel_generatedRoot_45.w_197_0 ctx), ((parallel_generatedRoot_45.w_197_1 ctx), ((parallel_generatedRoot_45.w_198_0 ctx), ((parallel_generatedRoot_45.w_198_1 ctx), ((parallel_generatedRoot_45.w_199_0 ctx), ((parallel_generatedRoot_45.w_199_1 ctx), ((parallel_generatedRoot_45.w_200_0 ctx), ()))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))), ((parallel_generatedRoot_45.w_200_1 ctx), ((parallel_generatedRoot_45.w_201_0 ctx), ((parallel_generatedRoot_45.w_201_1 ctx), ((parallel_generatedRoot_45.w_202_0 ctx), ((parallel_generatedRoot_45.w_202_1 ctx), ((parallel_generatedRoot_45.w_203_0 ctx), ((parallel_generatedRoot_45.w_203_1 ctx), ((parallel_generatedRoot_45.w_204_0 ctx), ((parallel_generatedRoot_45.w_204_1 ctx), ((parallel_generatedRoot_45.w_205_0 ctx), ((parallel_generatedRoot_45.w_205_1 ctx), ((parallel_generatedRoot_45.w_206_0 ctx), ((parallel_generatedRoot_45.w_206_1 ctx), ((parallel_generatedRoot_45.w_207_0 ctx), ((parallel_generatedRoot_45.w_207_1 ctx), ((parallel_generatedRoot_45.w_208_0 ctx), ((parallel_generatedRoot_45.w_208_1 ctx), ((parallel_generatedRoot_45.w_209_0 ctx), ((parallel_generatedRoot_45.w_209_1 ctx), ((parallel_generatedRoot_45.w_210_0 ctx), ((parallel_generatedRoot_45.w_210_1 ctx), ((parallel_generatedRoot_45.w_211_0 ctx), ((parallel_generatedRoot_45.w_211_1 ctx), ((parallel_generatedRoot_45.w_212_0 ctx), ((parallel_generatedRoot_45.w_212_1 ctx), ((parallel_generatedRoot_45.w_213_0 ctx), ((parallel_generatedRoot_45.w_213_1 ctx), ((parallel_generatedRoot_45.w_214_0 ctx), ((parallel_generatedRoot_45.w_214_1 ctx), ((parallel_generatedRoot_45.w_215_0 ctx), ((parallel_generatedRoot_45.w_215_1 ctx), ((parallel_generatedRoot_45.w_216_0 ctx), ((parallel_generatedRoot_45.w_216_1 ctx), ((parallel_generatedRoot_45.w_217_0 ctx), ((parallel_generatedRoot_45.w_217_1 ctx), ((parallel_generatedRoot_45.w_218_0 ctx), ((parallel_generatedRoot_45.w_218_1 ctx), ((parallel_generatedRoot_45.w_219_0 ctx), ((parallel_generatedRoot_45.w_219_1 ctx), ((parallel_generatedRoot_45.w_220_0 ctx), ((parallel_generatedRoot_45.w_220_1 ctx), ((parallel_generatedRoot_45.w_221_0 ctx), ((parallel_generatedRoot_45.w_221_1 ctx), ((parallel_generatedRoot_45.w_222_0 ctx), ((parallel_generatedRoot_45.w_223_0 ctx), ((parallel_generatedRoot_45.w_224_0 ctx), ((parallel_generatedRoot_45.w_225_0 ctx), ((parallel_generatedRoot_45.w_244_0 ctx), ((parallel_generatedRoot_45.w_253_0 ctx), ((parallel_generatedRoot_45.w_260_0 ctx), ((parallel_generatedRoot_45.w_260_1 ctx), ((parallel_generatedRoot_45.w_260_2 ctx), ((parallel_generatedRoot_45.w_260_3 ctx), ((parallel_generatedRoot_45.w_260_4 ctx), ((parallel_generatedRoot_45.w_260_5 ctx), ((parallel_generatedRoot_45.w_260_6 ctx), ((parallel_generatedRoot_45.w_262_0 ctx), ((parallel_generatedRoot_45.w_262_1 ctx), ((parallel_generatedRoot_45.w_263_0 ctx), ((parallel_generatedRoot_45.w_263_1 ctx), ((parallel_generatedRoot_45.w_264_0 ctx), ((parallel_generatedRoot_45.w_264_1 ctx), ((parallel_generatedRoot_45.w_265_0 ctx), ((parallel_generatedRoot_45.w_265_1 ctx), ((parallel_generatedRoot_45.w_266_0 ctx), ((parallel_generatedRoot_45.w_266_1 ctx), ((parallel_generatedRoot_45.w_267_0 ctx), ((parallel_generatedRoot_45.w_267_1 ctx), ((parallel_generatedRoot_45.w_268_0 ctx), ((parallel_generatedRoot_45.w_268_1 ctx), ((parallel_generatedRoot_45.w_269_0 ctx), ((parallel_generatedRoot_45.w_269_1 ctx), ((parallel_generatedRoot_45.w_270_0 ctx), ((parallel_generatedRoot_45.w_270_1 ctx), ((parallel_generatedRoot_45.w_271_0 ctx), ((parallel_generatedRoot_45.w_271_1 ctx), ((parallel_generatedRoot_45.w_272_0 ctx), ((parallel_generatedRoot_45.w_272_1 ctx), ((parallel_generatedRoot_45.w_273_0 ctx), ((parallel_generatedRoot_45.w_273_1 ctx), ((parallel_generatedRoot_45.w_274_0 ctx), ((parallel_generatedRoot_45.w_274_1 ctx), ((parallel_generatedRoot_45.w_275_0 ctx), ((parallel_generatedRoot_45.w_275_1 ctx), ((parallel_generatedRoot_45.w_276_0 ctx), ((parallel_generatedRoot_45.w_276_1 ctx), ((parallel_generatedRoot_45.w_277_0 ctx), ((parallel_generatedRoot_45.w_277_1 ctx), ((parallel_generatedRoot_45.w_278_0 ctx), ((parallel_generatedRoot_45.w_278_1 ctx), ((parallel_generatedRoot_45.w_279_0 ctx), ((parallel_generatedRoot_45.w_279_1 ctx), ((parallel_generatedRoot_45.w_280_0 ctx), ((parallel_generatedRoot_45.w_280_1 ctx), ((parallel_generatedRoot_45.w_281_0 ctx), ((parallel_generatedRoot_45.w_281_1 ctx), ((parallel_generatedRoot_45.w_282_0 ctx), ((parallel_generatedRoot_45.w_282_1 ctx), ((parallel_generatedRoot_45.w_283_0 ctx), ((parallel_generatedRoot_45.w_283_1 ctx), ((parallel_generatedRoot_45.w_284_0 ctx), ((parallel_generatedRoot_45.w_284_1 ctx), ((parallel_generatedRoot_45.w_285_0 ctx), ((parallel_generatedRoot_45.w_285_1 ctx), ((parallel_generatedRoot_45.w_286_0 ctx), ((parallel_generatedRoot_45.w_286_1 ctx), ((parallel_generatedRoot_45.w_287_0 ctx), ((parallel_generatedRoot_45.w_287_1 ctx), ((parallel_generatedRoot_45.w_288_0 ctx), ((parallel_generatedRoot_45.w_288_1 ctx), ((parallel_generatedRoot_45.w_289_0 ctx), ((parallel_generatedRoot_45.w_289_1 ctx), ((parallel_generatedRoot_45.w_290_0 ctx), ((parallel_generatedRoot_45.w_290_1 ctx), ((parallel_generatedRoot_45.w_291_0 ctx), ((parallel_generatedRoot_45.w_291_1 ctx), ((parallel_generatedRoot_45.w_292_0 ctx), ((parallel_generatedRoot_45.w_292_1 ctx), ((parallel_generatedRoot_45.w_293_0 ctx), ((parallel_generatedRoot_45.w_293_1 ctx), ((parallel_generatedRoot_45.w_294_0 ctx), ((parallel_generatedRoot_45.w_294_1 ctx), ((parallel_generatedRoot_45.w_295_0 ctx), ((parallel_generatedRoot_45.w_295_1 ctx), ((parallel_generatedRoot_45.w_296_0 ctx), ((parallel_generatedRoot_45.w_296_1 ctx), ((parallel_generatedRoot_45.w_297_0 ctx), ((parallel_generatedRoot_45.w_297_1 ctx), ((parallel_generatedRoot_45.w_298_0 ctx), ((parallel_generatedRoot_45.w_298_1 ctx), ((parallel_generatedRoot_45.w_299_0 ctx), ((parallel_generatedRoot_45.w_299_1 ctx), ((parallel_generatedRoot_45.w_300_0 ctx), ((parallel_generatedRoot_45.w_300_1 ctx), ((parallel_generatedRoot_45.w_301_0 ctx), ((parallel_generatedRoot_45.w_301_1 ctx), ((parallel_generatedRoot_45.w_302_0 ctx), ((parallel_generatedRoot_45.w_302_1 ctx), ((parallel_generatedRoot_45.w_303_0 ctx), ((parallel_generatedRoot_45.w_303_1 ctx), ((parallel_generatedRoot_45.w_304_0 ctx), ((parallel_generatedRoot_45.w_304_1 ctx), ((parallel_generatedRoot_45.w_305_0 ctx), ((parallel_generatedRoot_45.w_305_1 ctx), ((parallel_generatedRoot_45.w_306_0 ctx), ((parallel_generatedRoot_45.w_306_1 ctx), ((parallel_generatedRoot_45.w_307_0 ctx), ((parallel_generatedRoot_45.w_307_1 ctx), ((parallel_generatedRoot_45.w_308_0 ctx), ((parallel_generatedRoot_45.w_308_1 ctx), ((parallel_generatedRoot_45.w_309_0 ctx), ((parallel_generatedRoot_45.w_309_1 ctx), ((parallel_generatedRoot_45.w_310_0 ctx), ((parallel_generatedRoot_45.w_310_1 ctx), ((parallel_generatedRoot_45.w_311_0 ctx), ((parallel_generatedRoot_45.w_311_1 ctx), ((parallel_generatedRoot_45.w_312_0 ctx), ((parallel_generatedRoot_45.w_312_1 ctx), ((parallel_generatedRoot_45.w_313_0 ctx), ((parallel_generatedRoot_45.w_313_1 ctx), ((parallel_generatedRoot_45.w_314_0 ctx), ((parallel_generatedRoot_45.w_314_1 ctx), ((parallel_generatedRoot_45.w_315_0 ctx), ((parallel_generatedRoot_45.w_315_1 ctx), ((parallel_generatedRoot_45.w_316_0 ctx), ((parallel_generatedRoot_45.w_316_1 ctx), ((parallel_generatedRoot_45.w_317_0 ctx), ((parallel_generatedRoot_45.w_317_1 ctx), ((parallel_generatedRoot_45.w_318_0 ctx), ((parallel_generatedRoot_45.w_318_1 ctx), ((parallel_generatedRoot_45.w_319_0 ctx), ((parallel_generatedRoot_45.w_319_1 ctx), ((parallel_generatedRoot_45.w_320_0 ctx), ((parallel_generatedRoot_45.w_320_1 ctx), ((parallel_generatedRoot_45.w_321_0 ctx), ((parallel_generatedRoot_45.w_321_1 ctx), ((parallel_generatedRoot_45.w_322_0 ctx), ((parallel_generatedRoot_45.w_322_1 ctx), ((parallel_generatedRoot_45.w_323_0 ctx), ((parallel_generatedRoot_45.w_323_1 ctx), ((parallel_generatedRoot_45.w_324_0 ctx), ((parallel_generatedRoot_45.w_324_1 ctx), ((parallel_generatedRoot_45.w_325_0 ctx), ((parallel_generatedRoot_45.w_325_1 ctx), ((parallel_generatedRoot_45.w_326_0 ctx), ((parallel_generatedRoot_45.w_326_1 ctx), ((parallel_generatedRoot_45.w_327_0 ctx), ((parallel_generatedRoot_45.w_327_1 ctx), ((parallel_generatedRoot_45.w_328_0 ctx), ((parallel_generatedRoot_45.w_328_1 ctx), ((parallel_generatedRoot_45.w_329_0 ctx), ((parallel_generatedRoot_45.w_329_1 ctx), ((parallel_generatedRoot_45.w_330_0 ctx), ((parallel_generatedRoot_45.w_330_1 ctx), ((parallel_generatedRoot_45.w_331_0 ctx), ((parallel_generatedRoot_45.w_331_1 ctx), ((parallel_generatedRoot_45.w_332_0 ctx), ((parallel_generatedRoot_45.w_332_1 ctx), ((parallel_generatedRoot_45.w_333_0 ctx), ((parallel_generatedRoot_45.w_333_1 ctx), ((parallel_generatedRoot_45.w_347_0 ctx), ((parallel_generatedRoot_45.w_356_0 ctx), ((parallel_generatedRoot_45.w_363_0 ctx), ()))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+structure parallel_generatedRoot_45.Facts_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  h5_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_5_0 ctx)
+  h8_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_8_0 ctx)
+  h12_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_12_0 ctx)
+  h13_0 : MxxRuntime.gadgetMatrixRuns backend 1024 164 (parallel_generatedRoot_45.w_13_0 ctx)
+  h14_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_13_0 ctx) (parallel_generatedRoot_45.w_14_0 ctx)
+  h24_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_24_0 ctx)
+  h30_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_30_0 ctx)
+  h34_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_34_0 ctx)
+  t8 : (1025) = 1025
+  h42_6 : (∀ i : Fin 1025, parallel_parallel_generatedRoot_45_42 backend hashModel params i_0 i (((parallel_generatedRoot_45.w_36_0 ctx) i), (((parallel_generatedRoot_45.w_37_0 ctx) i), (((parallel_generatedRoot_45.w_38_0 ctx) i), (((parallel_generatedRoot_45.w_39_0 ctx) i), ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), (((parallel_generatedRoot_45.w_40_0 ctx) i), (((parallel_generatedRoot_45.w_41_0 ctx) i), ())))))))) (((parallel_generatedRoot_45.w_42_0 ctx) i), (((parallel_generatedRoot_45.w_42_1 ctx) i), (((parallel_generatedRoot_45.w_42_2 ctx) i), (((parallel_generatedRoot_45.w_42_3 ctx) i), (((parallel_generatedRoot_45.w_42_4 ctx) i), (((parallel_generatedRoot_45.w_42_5 ctx) i), (((parallel_generatedRoot_45.w_42_6 ctx) i), ()))))))))
+  t10 : (128) = 128
+  h44_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_44 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_44_0 ctx) i), (((parallel_generatedRoot_45.w_44_1 ctx) i), ())))
+  t12 : (128) = 128
+  h45_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_45 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_45_0 ctx) i), (((parallel_generatedRoot_45.w_45_1 ctx) i), ())))
+  t14 : (128) = 128
+  h46_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_46 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_46_0 ctx) i), (((parallel_generatedRoot_45.w_46_1 ctx) i), ())))
+  t16 : (128) = 128
+  h47_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_47 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_47_0 ctx) i), (((parallel_generatedRoot_45.w_47_1 ctx) i), ())))
+  t18 : (128) = 128
+  h48_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_48 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_48_0 ctx) i), (((parallel_generatedRoot_45.w_48_1 ctx) i), ())))
+  t20 : (128) = 128
+  h49_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_49 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_49_0 ctx) i), (((parallel_generatedRoot_45.w_49_1 ctx) i), ())))
+  t22 : (128) = 128
+  h50_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_50 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_50_0 ctx) i), (((parallel_generatedRoot_45.w_50_1 ctx) i), ())))
+  t24 : (128) = 128
+  h51_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_51 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_51_0 ctx) i), (((parallel_generatedRoot_45.w_51_1 ctx) i), ())))
+  t26 : (128) = 128
+  h52_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_52 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_52_0 ctx) i), (((parallel_generatedRoot_45.w_52_1 ctx) i), ())))
+  t28 : (128) = 128
+  h53_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_53 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_53_0 ctx) i), (((parallel_generatedRoot_45.w_53_1 ctx) i), ())))
+  t30 : (128) = 128
+  h54_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_54 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_54_0 ctx) i), (((parallel_generatedRoot_45.w_54_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_0 backend hashModel params i_0 (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_36_0 ctx) (parallel_generatedRoot_45.w_37_0 ctx) (parallel_generatedRoot_45.w_38_0 ctx) (parallel_generatedRoot_45.w_39_0 ctx) (parallel_generatedRoot_45.w_40_0 ctx) (parallel_generatedRoot_45.w_41_0 ctx) (parallel_generatedRoot_45.w_43_0 ctx) (parallel_generatedRoot_45.w_5_0 ctx) (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_8_0 ctx) (parallel_generatedRoot_45.w_12_0 ctx) (parallel_generatedRoot_45.w_13_0 ctx) (parallel_generatedRoot_45.w_14_0 ctx) (parallel_generatedRoot_45.w_24_0 ctx) (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_30_0 ctx) (parallel_generatedRoot_45.w_34_0 ctx) (parallel_generatedRoot_45.w_42_0 ctx) (parallel_generatedRoot_45.w_42_1 ctx) (parallel_generatedRoot_45.w_42_2 ctx) (parallel_generatedRoot_45.w_42_3 ctx) (parallel_generatedRoot_45.w_42_4 ctx) (parallel_generatedRoot_45.w_42_5 ctx) (parallel_generatedRoot_45.w_42_6 ctx) (parallel_generatedRoot_45.w_44_0 ctx) (parallel_generatedRoot_45.w_44_1 ctx) (parallel_generatedRoot_45.w_45_0 ctx) (parallel_generatedRoot_45.w_45_1 ctx) (parallel_generatedRoot_45.w_46_0 ctx) (parallel_generatedRoot_45.w_46_1 ctx) (parallel_generatedRoot_45.w_47_0 ctx) (parallel_generatedRoot_45.w_47_1 ctx) (parallel_generatedRoot_45.w_48_0 ctx) (parallel_generatedRoot_45.w_48_1 ctx) (parallel_generatedRoot_45.w_49_0 ctx) (parallel_generatedRoot_45.w_49_1 ctx) (parallel_generatedRoot_45.w_50_0 ctx) (parallel_generatedRoot_45.w_50_1 ctx) (parallel_generatedRoot_45.w_51_0 ctx) (parallel_generatedRoot_45.w_51_1 ctx) (parallel_generatedRoot_45.w_52_0 ctx) (parallel_generatedRoot_45.w_52_1 ctx) (parallel_generatedRoot_45.w_53_0 ctx) (parallel_generatedRoot_45.w_53_1 ctx) (parallel_generatedRoot_45.w_54_0 ctx) (parallel_generatedRoot_45.w_54_1 ctx)) :
+    parallel_generatedRoot_45.Facts_0 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t32 : (128) = 128
+  h55_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_55 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_55_0 ctx) i), (((parallel_generatedRoot_45.w_55_1 ctx) i), ())))
+  t34 : (128) = 128
+  h56_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_56 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_56_0 ctx) i), (((parallel_generatedRoot_45.w_56_1 ctx) i), ())))
+  t36 : (128) = 128
+  h57_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_57 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_57_0 ctx) i), (((parallel_generatedRoot_45.w_57_1 ctx) i), ())))
+  t38 : (128) = 128
+  h58_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_58 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_58_0 ctx) i), (((parallel_generatedRoot_45.w_58_1 ctx) i), ())))
+  t40 : (128) = 128
+  h59_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_59 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_59_0 ctx) i), (((parallel_generatedRoot_45.w_59_1 ctx) i), ())))
+  t42 : (128) = 128
+  h60_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_60 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_60_0 ctx) i), (((parallel_generatedRoot_45.w_60_1 ctx) i), ())))
+  t44 : (128) = 128
+  h61_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_61 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_61_0 ctx) i), (((parallel_generatedRoot_45.w_61_1 ctx) i), ())))
+  t46 : (128) = 128
+  h62_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_62 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_62_0 ctx) i), (((parallel_generatedRoot_45.w_62_1 ctx) i), ())))
+  t48 : (128) = 128
+  h63_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_63 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_63_0 ctx) i), (((parallel_generatedRoot_45.w_63_1 ctx) i), ())))
+  t50 : (128) = 128
+  h64_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_64 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_64_0 ctx) i), (((parallel_generatedRoot_45.w_64_1 ctx) i), ())))
+  t52 : (128) = 128
+  h65_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_65 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_65_0 ctx) i), (((parallel_generatedRoot_45.w_65_1 ctx) i), ())))
+  t54 : (128) = 128
+  h66_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_66 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_66_0 ctx) i), (((parallel_generatedRoot_45.w_66_1 ctx) i), ())))
+  t56 : (128) = 128
+  h67_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_67 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_67_0 ctx) i), (((parallel_generatedRoot_45.w_67_1 ctx) i), ())))
+  t58 : (128) = 128
+  h68_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_68 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_68_0 ctx) i), (((parallel_generatedRoot_45.w_68_1 ctx) i), ())))
+  t60 : (128) = 128
+  h69_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_69 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_69_0 ctx) i), (((parallel_generatedRoot_45.w_69_1 ctx) i), ())))
+  t62 : (128) = 128
+  h70_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_70 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_70_0 ctx) i), (((parallel_generatedRoot_45.w_70_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_1 backend hashModel params i_0 (parallel_generatedRoot_45.w_43_0 ctx) (parallel_generatedRoot_45.w_5_0 ctx) (parallel_generatedRoot_45.w_8_0 ctx) (parallel_generatedRoot_45.w_55_0 ctx) (parallel_generatedRoot_45.w_55_1 ctx) (parallel_generatedRoot_45.w_56_0 ctx) (parallel_generatedRoot_45.w_56_1 ctx) (parallel_generatedRoot_45.w_57_0 ctx) (parallel_generatedRoot_45.w_57_1 ctx) (parallel_generatedRoot_45.w_58_0 ctx) (parallel_generatedRoot_45.w_58_1 ctx) (parallel_generatedRoot_45.w_59_0 ctx) (parallel_generatedRoot_45.w_59_1 ctx) (parallel_generatedRoot_45.w_60_0 ctx) (parallel_generatedRoot_45.w_60_1 ctx) (parallel_generatedRoot_45.w_61_0 ctx) (parallel_generatedRoot_45.w_61_1 ctx) (parallel_generatedRoot_45.w_62_0 ctx) (parallel_generatedRoot_45.w_62_1 ctx) (parallel_generatedRoot_45.w_63_0 ctx) (parallel_generatedRoot_45.w_63_1 ctx) (parallel_generatedRoot_45.w_64_0 ctx) (parallel_generatedRoot_45.w_64_1 ctx) (parallel_generatedRoot_45.w_65_0 ctx) (parallel_generatedRoot_45.w_65_1 ctx) (parallel_generatedRoot_45.w_66_0 ctx) (parallel_generatedRoot_45.w_66_1 ctx) (parallel_generatedRoot_45.w_67_0 ctx) (parallel_generatedRoot_45.w_67_1 ctx) (parallel_generatedRoot_45.w_68_0 ctx) (parallel_generatedRoot_45.w_68_1 ctx) (parallel_generatedRoot_45.w_69_0 ctx) (parallel_generatedRoot_45.w_69_1 ctx) (parallel_generatedRoot_45.w_70_0 ctx) (parallel_generatedRoot_45.w_70_1 ctx)) :
+    parallel_generatedRoot_45.Facts_1 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_2 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t64 : (128) = 128
+  h71_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_71 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_71_0 ctx) i), (((parallel_generatedRoot_45.w_71_1 ctx) i), ())))
+  t66 : (128) = 128
+  h72_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_72 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_72_0 ctx) i), (((parallel_generatedRoot_45.w_72_1 ctx) i), ())))
+  t68 : (128) = 128
+  h73_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_73 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_73_0 ctx) i), (((parallel_generatedRoot_45.w_73_1 ctx) i), ())))
+  t70 : (128) = 128
+  h74_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_74 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_74_0 ctx) i), (((parallel_generatedRoot_45.w_74_1 ctx) i), ())))
+  t72 : (128) = 128
+  h75_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_75 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_75_0 ctx) i), (((parallel_generatedRoot_45.w_75_1 ctx) i), ())))
+  t74 : (128) = 128
+  h76_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_76 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_76_0 ctx) i), (((parallel_generatedRoot_45.w_76_1 ctx) i), ())))
+  t76 : (128) = 128
+  h77_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_77 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_77_0 ctx) i), (((parallel_generatedRoot_45.w_77_1 ctx) i), ())))
+  t78 : (128) = 128
+  h78_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_78 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_5_0 ctx), ((parallel_generatedRoot_45.w_43_0 ctx), ((parallel_generatedRoot_45.w_8_0 ctx), ()))) (((parallel_generatedRoot_45.w_78_0 ctx) i), (((parallel_generatedRoot_45.w_78_1 ctx) i), ())))
+  h80_0 : MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 105, 110, 112, 117, 116, 47, 87, 105, 114, 101, 73, 100, 40, 48, 41, 47, 48]) ([.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_80_0 ctx)
+  h82_0 : MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 105, 110, 112, 117, 116, 47, 87, 105, 114, 101, 73, 100, 40, 48, 41, 47, 48]) ([.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (2)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_82_0 ctx)
+  h85_0 : MxxRuntime.gadgetMatrixRuns backend 1024 28 (parallel_generatedRoot_45.w_85_0 ctx)
+  h86_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_85_0 ctx) (parallel_generatedRoot_45.w_86_0 ctx)
+  t84 : 0 ≤ ((Int.ofNat i_0))
+  t85 : ((Int.ofNat i_0)) < 16
+  h96_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_96_0 ctx)
+  h98_0 : MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 105, 110, 112, 117, 116, 47, 87, 105, 114, 101, 73, 100, 40, 48, 41, 47, 48]) ([.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_98_0 ctx)
+  h100_0 : MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 105, 110, 112, 117, 116, 47, 87, 105, 114, 101, 73, 100, 40, 48, 41, 47, 48]) ([.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_100_0 ctx)
+  h106_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_106_0 ctx)
+  t90 : (2) = 2
+  h108_1 : (∀ i : Fin 2, parallel_parallel_generatedRoot_45_108 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_4_0 ctx), ((parallel_generatedRoot_45.w_79_0 ctx), ((parallel_generatedRoot_45.w_7_0 ctx), ()))) (((parallel_generatedRoot_45.w_108_0 ctx) i), (((parallel_generatedRoot_45.w_108_1 ctx) i), ())))
+  t92 : (2) = 2
+  h109_1 : (∀ i : Fin 2, parallel_parallel_generatedRoot_45_109 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_4_0 ctx), ((parallel_generatedRoot_45.w_79_0 ctx), ((parallel_generatedRoot_45.w_7_0 ctx), ()))) (((parallel_generatedRoot_45.w_109_0 ctx) i), (((parallel_generatedRoot_45.w_109_1 ctx) i), ())))
+  h114_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_114_0 ctx)
+  h116_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx)
+
+theorem parallel_generatedRoot_45.facts_2 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_2 backend hashModel params i_0 (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_43_0 ctx) (parallel_generatedRoot_45.w_79_0 ctx) (parallel_generatedRoot_45.w_5_0 ctx) (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_8_0 ctx) (parallel_generatedRoot_45.w_71_0 ctx) (parallel_generatedRoot_45.w_71_1 ctx) (parallel_generatedRoot_45.w_72_0 ctx) (parallel_generatedRoot_45.w_72_1 ctx) (parallel_generatedRoot_45.w_73_0 ctx) (parallel_generatedRoot_45.w_73_1 ctx) (parallel_generatedRoot_45.w_74_0 ctx) (parallel_generatedRoot_45.w_74_1 ctx) (parallel_generatedRoot_45.w_75_0 ctx) (parallel_generatedRoot_45.w_75_1 ctx) (parallel_generatedRoot_45.w_76_0 ctx) (parallel_generatedRoot_45.w_76_1 ctx) (parallel_generatedRoot_45.w_77_0 ctx) (parallel_generatedRoot_45.w_77_1 ctx) (parallel_generatedRoot_45.w_78_0 ctx) (parallel_generatedRoot_45.w_78_1 ctx) (parallel_generatedRoot_45.w_80_0 ctx) (parallel_generatedRoot_45.w_82_0 ctx) (parallel_generatedRoot_45.w_85_0 ctx) (parallel_generatedRoot_45.w_86_0 ctx) (parallel_generatedRoot_45.w_96_0 ctx) (parallel_generatedRoot_45.w_98_0 ctx) (parallel_generatedRoot_45.w_100_0 ctx) (parallel_generatedRoot_45.w_106_0 ctx) (parallel_generatedRoot_45.w_108_0 ctx) (parallel_generatedRoot_45.w_108_1 ctx) (parallel_generatedRoot_45.w_109_0 ctx) (parallel_generatedRoot_45.w_109_1 ctx) (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx)) :
+    parallel_generatedRoot_45.Facts_2 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_3 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  h119_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_119_0 ctx)
+  h120_0 : MxxRuntime.gadgetMatrixRuns backend 1024 168 (parallel_generatedRoot_45.w_120_0 ctx)
+  h121_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_120_0 ctx) (parallel_generatedRoot_45.w_121_0 ctx)
+  h131_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_131_0 ctx)
+  h136_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_136_0 ctx)
+  h140_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_140_0 ctx)
+  t102 : (1025) = 1025
+  h148_6 : (∀ i : Fin 1025, parallel_parallel_generatedRoot_45_148 backend hashModel params i_0 i (((parallel_generatedRoot_45.w_142_0 ctx) i), (((parallel_generatedRoot_45.w_143_0 ctx) i), (((parallel_generatedRoot_45.w_144_0 ctx) i), (((parallel_generatedRoot_45.w_145_0 ctx) i), ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), (((parallel_generatedRoot_45.w_146_0 ctx) i), (((parallel_generatedRoot_45.w_147_0 ctx) i), ())))))))) (((parallel_generatedRoot_45.w_148_0 ctx) i), (((parallel_generatedRoot_45.w_148_1 ctx) i), (((parallel_generatedRoot_45.w_148_2 ctx) i), (((parallel_generatedRoot_45.w_148_3 ctx) i), (((parallel_generatedRoot_45.w_148_4 ctx) i), (((parallel_generatedRoot_45.w_148_5 ctx) i), (((parallel_generatedRoot_45.w_148_6 ctx) i), ()))))))))
+  t104 : (128) = 128
+  h150_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_150 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_150_0 ctx) i), (((parallel_generatedRoot_45.w_150_1 ctx) i), ())))
+  t106 : (32) = 32
+  h151_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_151 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_151_0 ctx) i), (((parallel_generatedRoot_45.w_151_1 ctx) i), ())))
+  t108 : (128) = 128
+  h152_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_152 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_152_0 ctx) i), (((parallel_generatedRoot_45.w_152_1 ctx) i), ())))
+  t110 : (32) = 32
+  h153_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_153 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_153_0 ctx) i), (((parallel_generatedRoot_45.w_153_1 ctx) i), ())))
+  t112 : (128) = 128
+  h154_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_154 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_154_0 ctx) i), (((parallel_generatedRoot_45.w_154_1 ctx) i), ())))
+  t114 : (32) = 32
+  h155_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_155 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_155_0 ctx) i), (((parallel_generatedRoot_45.w_155_1 ctx) i), ())))
+  t116 : (128) = 128
+  h156_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_156 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_156_0 ctx) i), (((parallel_generatedRoot_45.w_156_1 ctx) i), ())))
+  t118 : (32) = 32
+  h157_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_157 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_157_0 ctx) i), (((parallel_generatedRoot_45.w_157_1 ctx) i), ())))
+  t120 : (128) = 128
+  h158_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_158 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_158_0 ctx) i), (((parallel_generatedRoot_45.w_158_1 ctx) i), ())))
+  t122 : (32) = 32
+  h159_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_159 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_159_0 ctx) i), (((parallel_generatedRoot_45.w_159_1 ctx) i), ())))
+  t124 : (128) = 128
+  h160_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_160 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_160_0 ctx) i), (((parallel_generatedRoot_45.w_160_1 ctx) i), ())))
+  t126 : (32) = 32
+  h161_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_161 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_161_0 ctx) i), (((parallel_generatedRoot_45.w_161_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_3 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_3 backend hashModel params i_0 (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_142_0 ctx) (parallel_generatedRoot_45.w_143_0 ctx) (parallel_generatedRoot_45.w_144_0 ctx) (parallel_generatedRoot_45.w_145_0 ctx) (parallel_generatedRoot_45.w_146_0 ctx) (parallel_generatedRoot_45.w_147_0 ctx) (parallel_generatedRoot_45.w_149_0 ctx) (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_119_0 ctx) (parallel_generatedRoot_45.w_120_0 ctx) (parallel_generatedRoot_45.w_121_0 ctx) (parallel_generatedRoot_45.w_131_0 ctx) (parallel_generatedRoot_45.w_136_0 ctx) (parallel_generatedRoot_45.w_140_0 ctx) (parallel_generatedRoot_45.w_148_0 ctx) (parallel_generatedRoot_45.w_148_1 ctx) (parallel_generatedRoot_45.w_148_2 ctx) (parallel_generatedRoot_45.w_148_3 ctx) (parallel_generatedRoot_45.w_148_4 ctx) (parallel_generatedRoot_45.w_148_5 ctx) (parallel_generatedRoot_45.w_148_6 ctx) (parallel_generatedRoot_45.w_150_0 ctx) (parallel_generatedRoot_45.w_150_1 ctx) (parallel_generatedRoot_45.w_151_0 ctx) (parallel_generatedRoot_45.w_151_1 ctx) (parallel_generatedRoot_45.w_152_0 ctx) (parallel_generatedRoot_45.w_152_1 ctx) (parallel_generatedRoot_45.w_153_0 ctx) (parallel_generatedRoot_45.w_153_1 ctx) (parallel_generatedRoot_45.w_154_0 ctx) (parallel_generatedRoot_45.w_154_1 ctx) (parallel_generatedRoot_45.w_155_0 ctx) (parallel_generatedRoot_45.w_155_1 ctx) (parallel_generatedRoot_45.w_156_0 ctx) (parallel_generatedRoot_45.w_156_1 ctx) (parallel_generatedRoot_45.w_157_0 ctx) (parallel_generatedRoot_45.w_157_1 ctx) (parallel_generatedRoot_45.w_158_0 ctx) (parallel_generatedRoot_45.w_158_1 ctx) (parallel_generatedRoot_45.w_159_0 ctx) (parallel_generatedRoot_45.w_159_1 ctx) (parallel_generatedRoot_45.w_160_0 ctx) (parallel_generatedRoot_45.w_160_1 ctx) (parallel_generatedRoot_45.w_161_0 ctx) (parallel_generatedRoot_45.w_161_1 ctx)) :
+    parallel_generatedRoot_45.Facts_3 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_4 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t128 : (128) = 128
+  h162_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_162 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_162_0 ctx) i), (((parallel_generatedRoot_45.w_162_1 ctx) i), ())))
+  t130 : (32) = 32
+  h163_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_163 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_163_0 ctx) i), (((parallel_generatedRoot_45.w_163_1 ctx) i), ())))
+  t132 : (128) = 128
+  h164_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_164 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_164_0 ctx) i), (((parallel_generatedRoot_45.w_164_1 ctx) i), ())))
+  t134 : (32) = 32
+  h165_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_165 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_165_0 ctx) i), (((parallel_generatedRoot_45.w_165_1 ctx) i), ())))
+  t136 : (128) = 128
+  h166_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_166 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_166_0 ctx) i), (((parallel_generatedRoot_45.w_166_1 ctx) i), ())))
+  t138 : (32) = 32
+  h167_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_167 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_167_0 ctx) i), (((parallel_generatedRoot_45.w_167_1 ctx) i), ())))
+  t140 : (128) = 128
+  h168_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_168 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_168_0 ctx) i), (((parallel_generatedRoot_45.w_168_1 ctx) i), ())))
+  t142 : (32) = 32
+  h169_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_169 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_169_0 ctx) i), (((parallel_generatedRoot_45.w_169_1 ctx) i), ())))
+  t144 : (128) = 128
+  h170_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_170 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_170_0 ctx) i), (((parallel_generatedRoot_45.w_170_1 ctx) i), ())))
+  t146 : (32) = 32
+  h171_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_171 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_171_0 ctx) i), (((parallel_generatedRoot_45.w_171_1 ctx) i), ())))
+  t148 : (128) = 128
+  h172_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_172 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_172_0 ctx) i), (((parallel_generatedRoot_45.w_172_1 ctx) i), ())))
+  t150 : (32) = 32
+  h173_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_173 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_173_0 ctx) i), (((parallel_generatedRoot_45.w_173_1 ctx) i), ())))
+  t152 : (128) = 128
+  h174_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_174 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_174_0 ctx) i), (((parallel_generatedRoot_45.w_174_1 ctx) i), ())))
+  t154 : (32) = 32
+  h175_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_175 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_175_0 ctx) i), (((parallel_generatedRoot_45.w_175_1 ctx) i), ())))
+  t156 : (128) = 128
+  h176_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_176 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_176_0 ctx) i), (((parallel_generatedRoot_45.w_176_1 ctx) i), ())))
+  t158 : (32) = 32
+  h177_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_177 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_177_0 ctx) i), (((parallel_generatedRoot_45.w_177_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_4 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_4 backend hashModel params i_0 (parallel_generatedRoot_45.w_149_0 ctx) (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_162_0 ctx) (parallel_generatedRoot_45.w_162_1 ctx) (parallel_generatedRoot_45.w_163_0 ctx) (parallel_generatedRoot_45.w_163_1 ctx) (parallel_generatedRoot_45.w_164_0 ctx) (parallel_generatedRoot_45.w_164_1 ctx) (parallel_generatedRoot_45.w_165_0 ctx) (parallel_generatedRoot_45.w_165_1 ctx) (parallel_generatedRoot_45.w_166_0 ctx) (parallel_generatedRoot_45.w_166_1 ctx) (parallel_generatedRoot_45.w_167_0 ctx) (parallel_generatedRoot_45.w_167_1 ctx) (parallel_generatedRoot_45.w_168_0 ctx) (parallel_generatedRoot_45.w_168_1 ctx) (parallel_generatedRoot_45.w_169_0 ctx) (parallel_generatedRoot_45.w_169_1 ctx) (parallel_generatedRoot_45.w_170_0 ctx) (parallel_generatedRoot_45.w_170_1 ctx) (parallel_generatedRoot_45.w_171_0 ctx) (parallel_generatedRoot_45.w_171_1 ctx) (parallel_generatedRoot_45.w_172_0 ctx) (parallel_generatedRoot_45.w_172_1 ctx) (parallel_generatedRoot_45.w_173_0 ctx) (parallel_generatedRoot_45.w_173_1 ctx) (parallel_generatedRoot_45.w_174_0 ctx) (parallel_generatedRoot_45.w_174_1 ctx) (parallel_generatedRoot_45.w_175_0 ctx) (parallel_generatedRoot_45.w_175_1 ctx) (parallel_generatedRoot_45.w_176_0 ctx) (parallel_generatedRoot_45.w_176_1 ctx) (parallel_generatedRoot_45.w_177_0 ctx) (parallel_generatedRoot_45.w_177_1 ctx)) :
+    parallel_generatedRoot_45.Facts_4 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_5 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t160 : (128) = 128
+  h178_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_178 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_178_0 ctx) i), (((parallel_generatedRoot_45.w_178_1 ctx) i), ())))
+  t162 : (32) = 32
+  h179_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_179 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_179_0 ctx) i), (((parallel_generatedRoot_45.w_179_1 ctx) i), ())))
+  t164 : (128) = 128
+  h180_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_180 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_180_0 ctx) i), (((parallel_generatedRoot_45.w_180_1 ctx) i), ())))
+  t166 : (32) = 32
+  h181_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_181 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_181_0 ctx) i), (((parallel_generatedRoot_45.w_181_1 ctx) i), ())))
+  t168 : (128) = 128
+  h182_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_182 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_182_0 ctx) i), (((parallel_generatedRoot_45.w_182_1 ctx) i), ())))
+  t170 : (32) = 32
+  h183_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_183 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_183_0 ctx) i), (((parallel_generatedRoot_45.w_183_1 ctx) i), ())))
+  t172 : (128) = 128
+  h184_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_184 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_184_0 ctx) i), (((parallel_generatedRoot_45.w_184_1 ctx) i), ())))
+  t174 : (32) = 32
+  h185_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_185 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_185_0 ctx) i), (((parallel_generatedRoot_45.w_185_1 ctx) i), ())))
+  t176 : (128) = 128
+  h186_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_186 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_186_0 ctx) i), (((parallel_generatedRoot_45.w_186_1 ctx) i), ())))
+  t178 : (32) = 32
+  h187_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_187 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_187_0 ctx) i), (((parallel_generatedRoot_45.w_187_1 ctx) i), ())))
+  t180 : (128) = 128
+  h188_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_188 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_188_0 ctx) i), (((parallel_generatedRoot_45.w_188_1 ctx) i), ())))
+  t182 : (32) = 32
+  h189_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_189 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_189_0 ctx) i), (((parallel_generatedRoot_45.w_189_1 ctx) i), ())))
+  t184 : (128) = 128
+  h190_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_190 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_190_0 ctx) i), (((parallel_generatedRoot_45.w_190_1 ctx) i), ())))
+  t186 : (32) = 32
+  h191_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_191 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_191_0 ctx) i), (((parallel_generatedRoot_45.w_191_1 ctx) i), ())))
+  t188 : (128) = 128
+  h192_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_192 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_192_0 ctx) i), (((parallel_generatedRoot_45.w_192_1 ctx) i), ())))
+  t190 : (32) = 32
+  h193_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_193 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_193_0 ctx) i), (((parallel_generatedRoot_45.w_193_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_5 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_5 backend hashModel params i_0 (parallel_generatedRoot_45.w_149_0 ctx) (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_178_0 ctx) (parallel_generatedRoot_45.w_178_1 ctx) (parallel_generatedRoot_45.w_179_0 ctx) (parallel_generatedRoot_45.w_179_1 ctx) (parallel_generatedRoot_45.w_180_0 ctx) (parallel_generatedRoot_45.w_180_1 ctx) (parallel_generatedRoot_45.w_181_0 ctx) (parallel_generatedRoot_45.w_181_1 ctx) (parallel_generatedRoot_45.w_182_0 ctx) (parallel_generatedRoot_45.w_182_1 ctx) (parallel_generatedRoot_45.w_183_0 ctx) (parallel_generatedRoot_45.w_183_1 ctx) (parallel_generatedRoot_45.w_184_0 ctx) (parallel_generatedRoot_45.w_184_1 ctx) (parallel_generatedRoot_45.w_185_0 ctx) (parallel_generatedRoot_45.w_185_1 ctx) (parallel_generatedRoot_45.w_186_0 ctx) (parallel_generatedRoot_45.w_186_1 ctx) (parallel_generatedRoot_45.w_187_0 ctx) (parallel_generatedRoot_45.w_187_1 ctx) (parallel_generatedRoot_45.w_188_0 ctx) (parallel_generatedRoot_45.w_188_1 ctx) (parallel_generatedRoot_45.w_189_0 ctx) (parallel_generatedRoot_45.w_189_1 ctx) (parallel_generatedRoot_45.w_190_0 ctx) (parallel_generatedRoot_45.w_190_1 ctx) (parallel_generatedRoot_45.w_191_0 ctx) (parallel_generatedRoot_45.w_191_1 ctx) (parallel_generatedRoot_45.w_192_0 ctx) (parallel_generatedRoot_45.w_192_1 ctx) (parallel_generatedRoot_45.w_193_0 ctx) (parallel_generatedRoot_45.w_193_1 ctx)) :
+    parallel_generatedRoot_45.Facts_5 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_6 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t192 : (128) = 128
+  h194_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_194 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_194_0 ctx) i), (((parallel_generatedRoot_45.w_194_1 ctx) i), ())))
+  t194 : (32) = 32
+  h195_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_195 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_195_0 ctx) i), (((parallel_generatedRoot_45.w_195_1 ctx) i), ())))
+  t196 : (128) = 128
+  h196_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_196 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_196_0 ctx) i), (((parallel_generatedRoot_45.w_196_1 ctx) i), ())))
+  t198 : (32) = 32
+  h197_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_197 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_197_0 ctx) i), (((parallel_generatedRoot_45.w_197_1 ctx) i), ())))
+  t200 : (128) = 128
+  h198_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_198 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_198_0 ctx) i), (((parallel_generatedRoot_45.w_198_1 ctx) i), ())))
+  t202 : (32) = 32
+  h199_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_199 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_199_0 ctx) i), (((parallel_generatedRoot_45.w_199_1 ctx) i), ())))
+  t204 : (128) = 128
+  h200_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_200 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_200_0 ctx) i), (((parallel_generatedRoot_45.w_200_1 ctx) i), ())))
+  t206 : (32) = 32
+  h201_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_201 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_201_0 ctx) i), (((parallel_generatedRoot_45.w_201_1 ctx) i), ())))
+  t208 : (128) = 128
+  h202_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_202 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_202_0 ctx) i), (((parallel_generatedRoot_45.w_202_1 ctx) i), ())))
+  t210 : (32) = 32
+  h203_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_203 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_203_0 ctx) i), (((parallel_generatedRoot_45.w_203_1 ctx) i), ())))
+  t212 : (128) = 128
+  h204_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_204 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_204_0 ctx) i), (((parallel_generatedRoot_45.w_204_1 ctx) i), ())))
+  t214 : (32) = 32
+  h205_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_205 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_205_0 ctx) i), (((parallel_generatedRoot_45.w_205_1 ctx) i), ())))
+  t216 : (128) = 128
+  h206_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_206 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_206_0 ctx) i), (((parallel_generatedRoot_45.w_206_1 ctx) i), ())))
+  t218 : (32) = 32
+  h207_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_207 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_207_0 ctx) i), (((parallel_generatedRoot_45.w_207_1 ctx) i), ())))
+  t220 : (128) = 128
+  h208_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_208 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_208_0 ctx) i), (((parallel_generatedRoot_45.w_208_1 ctx) i), ())))
+  t222 : (32) = 32
+  h209_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_209 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_209_0 ctx) i), (((parallel_generatedRoot_45.w_209_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_6 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_6 backend hashModel params i_0 (parallel_generatedRoot_45.w_149_0 ctx) (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_194_0 ctx) (parallel_generatedRoot_45.w_194_1 ctx) (parallel_generatedRoot_45.w_195_0 ctx) (parallel_generatedRoot_45.w_195_1 ctx) (parallel_generatedRoot_45.w_196_0 ctx) (parallel_generatedRoot_45.w_196_1 ctx) (parallel_generatedRoot_45.w_197_0 ctx) (parallel_generatedRoot_45.w_197_1 ctx) (parallel_generatedRoot_45.w_198_0 ctx) (parallel_generatedRoot_45.w_198_1 ctx) (parallel_generatedRoot_45.w_199_0 ctx) (parallel_generatedRoot_45.w_199_1 ctx) (parallel_generatedRoot_45.w_200_0 ctx) (parallel_generatedRoot_45.w_200_1 ctx) (parallel_generatedRoot_45.w_201_0 ctx) (parallel_generatedRoot_45.w_201_1 ctx) (parallel_generatedRoot_45.w_202_0 ctx) (parallel_generatedRoot_45.w_202_1 ctx) (parallel_generatedRoot_45.w_203_0 ctx) (parallel_generatedRoot_45.w_203_1 ctx) (parallel_generatedRoot_45.w_204_0 ctx) (parallel_generatedRoot_45.w_204_1 ctx) (parallel_generatedRoot_45.w_205_0 ctx) (parallel_generatedRoot_45.w_205_1 ctx) (parallel_generatedRoot_45.w_206_0 ctx) (parallel_generatedRoot_45.w_206_1 ctx) (parallel_generatedRoot_45.w_207_0 ctx) (parallel_generatedRoot_45.w_207_1 ctx) (parallel_generatedRoot_45.w_208_0 ctx) (parallel_generatedRoot_45.w_208_1 ctx) (parallel_generatedRoot_45.w_209_0 ctx) (parallel_generatedRoot_45.w_209_1 ctx)) :
+    parallel_generatedRoot_45.Facts_6 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t224 : (128) = 128
+  h210_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_210 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_210_0 ctx) i), (((parallel_generatedRoot_45.w_210_1 ctx) i), ())))
+  t226 : (32) = 32
+  h211_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_211 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_211_0 ctx) i), (((parallel_generatedRoot_45.w_211_1 ctx) i), ())))
+  t228 : (128) = 128
+  h212_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_212 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_212_0 ctx) i), (((parallel_generatedRoot_45.w_212_1 ctx) i), ())))
+  t230 : (32) = 32
+  h213_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_213 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_213_0 ctx) i), (((parallel_generatedRoot_45.w_213_1 ctx) i), ())))
+  t232 : (128) = 128
+  h214_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_214 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_214_0 ctx) i), (((parallel_generatedRoot_45.w_214_1 ctx) i), ())))
+  t234 : (32) = 32
+  h215_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_215 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_215_0 ctx) i), (((parallel_generatedRoot_45.w_215_1 ctx) i), ())))
+  t236 : (128) = 128
+  h216_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_216 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_216_0 ctx) i), (((parallel_generatedRoot_45.w_216_1 ctx) i), ())))
+  t238 : (32) = 32
+  h217_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_217 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_217_0 ctx) i), (((parallel_generatedRoot_45.w_217_1 ctx) i), ())))
+  t240 : (128) = 128
+  h218_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_218 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_218_0 ctx) i), (((parallel_generatedRoot_45.w_218_1 ctx) i), ())))
+  t242 : (32) = 32
+  h219_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_219 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_219_0 ctx) i), (((parallel_generatedRoot_45.w_219_1 ctx) i), ())))
+  t244 : (128) = 128
+  h220_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_220 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_220_0 ctx) i), (((parallel_generatedRoot_45.w_220_1 ctx) i), ())))
+  t246 : (32) = 32
+  h221_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_221 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_114_0 ctx), ((parallel_generatedRoot_45.w_149_0 ctx), ((parallel_generatedRoot_45.w_116_0 ctx), ()))) (((parallel_generatedRoot_45.w_221_0 ctx) i), (((parallel_generatedRoot_45.w_221_1 ctx) i), ())))
+  h226_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_226_0 ctx)
+  h228_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx)
+  h231_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_231_0 ctx)
+  h232_0 : MxxRuntime.gadgetMatrixRuns backend 1024 168 (parallel_generatedRoot_45.w_232_0 ctx)
+  h233_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_232_0 ctx) (parallel_generatedRoot_45.w_233_0 ctx)
+  h243_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_243_0 ctx)
+  h248_0 : MxxRuntime.centeredRebaseRuns (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_248_0 ctx)
+  h252_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_252_0 ctx)
+
+theorem parallel_generatedRoot_45.facts_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_7 backend hashModel params i_0 (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_11_0 ctx) (parallel_generatedRoot_45.w_149_0 ctx) (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_29_0 ctx) (parallel_generatedRoot_45.w_114_0 ctx) (parallel_generatedRoot_45.w_116_0 ctx) (parallel_generatedRoot_45.w_210_0 ctx) (parallel_generatedRoot_45.w_210_1 ctx) (parallel_generatedRoot_45.w_211_0 ctx) (parallel_generatedRoot_45.w_211_1 ctx) (parallel_generatedRoot_45.w_212_0 ctx) (parallel_generatedRoot_45.w_212_1 ctx) (parallel_generatedRoot_45.w_213_0 ctx) (parallel_generatedRoot_45.w_213_1 ctx) (parallel_generatedRoot_45.w_214_0 ctx) (parallel_generatedRoot_45.w_214_1 ctx) (parallel_generatedRoot_45.w_215_0 ctx) (parallel_generatedRoot_45.w_215_1 ctx) (parallel_generatedRoot_45.w_216_0 ctx) (parallel_generatedRoot_45.w_216_1 ctx) (parallel_generatedRoot_45.w_217_0 ctx) (parallel_generatedRoot_45.w_217_1 ctx) (parallel_generatedRoot_45.w_218_0 ctx) (parallel_generatedRoot_45.w_218_1 ctx) (parallel_generatedRoot_45.w_219_0 ctx) (parallel_generatedRoot_45.w_219_1 ctx) (parallel_generatedRoot_45.w_220_0 ctx) (parallel_generatedRoot_45.w_220_1 ctx) (parallel_generatedRoot_45.w_221_0 ctx) (parallel_generatedRoot_45.w_221_1 ctx) (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_231_0 ctx) (parallel_generatedRoot_45.w_232_0 ctx) (parallel_generatedRoot_45.w_233_0 ctx) (parallel_generatedRoot_45.w_243_0 ctx) (parallel_generatedRoot_45.w_248_0 ctx) (parallel_generatedRoot_45.w_252_0 ctx)) :
+    parallel_generatedRoot_45.Facts_7 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_8 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t256 : (1025) = 1025
+  h260_6 : (∀ i : Fin 1025, parallel_parallel_generatedRoot_45_260 backend hashModel params i_0 i (((parallel_generatedRoot_45.w_254_0 ctx) i), (((parallel_generatedRoot_45.w_255_0 ctx) i), (((parallel_generatedRoot_45.w_256_0 ctx) i), (((parallel_generatedRoot_45.w_257_0 ctx) i), ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), (((parallel_generatedRoot_45.w_258_0 ctx) i), (((parallel_generatedRoot_45.w_259_0 ctx) i), ())))))))) (((parallel_generatedRoot_45.w_260_0 ctx) i), (((parallel_generatedRoot_45.w_260_1 ctx) i), (((parallel_generatedRoot_45.w_260_2 ctx) i), (((parallel_generatedRoot_45.w_260_3 ctx) i), (((parallel_generatedRoot_45.w_260_4 ctx) i), (((parallel_generatedRoot_45.w_260_5 ctx) i), (((parallel_generatedRoot_45.w_260_6 ctx) i), ()))))))))
+  t258 : (128) = 128
+  h262_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_262 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_262_0 ctx) i), (((parallel_generatedRoot_45.w_262_1 ctx) i), ())))
+  t260 : (32) = 32
+  h263_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_263 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_263_0 ctx) i), (((parallel_generatedRoot_45.w_263_1 ctx) i), ())))
+  t262 : (128) = 128
+  h264_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_264 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_264_0 ctx) i), (((parallel_generatedRoot_45.w_264_1 ctx) i), ())))
+  t264 : (32) = 32
+  h265_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_265 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_265_0 ctx) i), (((parallel_generatedRoot_45.w_265_1 ctx) i), ())))
+  t266 : (128) = 128
+  h266_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_266 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_266_0 ctx) i), (((parallel_generatedRoot_45.w_266_1 ctx) i), ())))
+  t268 : (32) = 32
+  h267_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_267 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_267_0 ctx) i), (((parallel_generatedRoot_45.w_267_1 ctx) i), ())))
+  t270 : (128) = 128
+  h268_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_268 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_268_0 ctx) i), (((parallel_generatedRoot_45.w_268_1 ctx) i), ())))
+  t272 : (32) = 32
+  h269_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_269 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_269_0 ctx) i), (((parallel_generatedRoot_45.w_269_1 ctx) i), ())))
+  t274 : (128) = 128
+  h270_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_270 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_270_0 ctx) i), (((parallel_generatedRoot_45.w_270_1 ctx) i), ())))
+  t276 : (32) = 32
+  h271_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_271 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_271_0 ctx) i), (((parallel_generatedRoot_45.w_271_1 ctx) i), ())))
+  t278 : (128) = 128
+  h272_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_272 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_272_0 ctx) i), (((parallel_generatedRoot_45.w_272_1 ctx) i), ())))
+  t280 : (32) = 32
+  h273_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_273 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_273_0 ctx) i), (((parallel_generatedRoot_45.w_273_1 ctx) i), ())))
+  t282 : (128) = 128
+  h274_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_274 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_274_0 ctx) i), (((parallel_generatedRoot_45.w_274_1 ctx) i), ())))
+  t284 : (32) = 32
+  h275_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_275 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_275_0 ctx) i), (((parallel_generatedRoot_45.w_275_1 ctx) i), ())))
+  t286 : (128) = 128
+  h276_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_276 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_276_0 ctx) i), (((parallel_generatedRoot_45.w_276_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_8 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_8 backend hashModel params i_0 (parallel_generatedRoot_45.w_254_0 ctx) (parallel_generatedRoot_45.w_255_0 ctx) (parallel_generatedRoot_45.w_256_0 ctx) (parallel_generatedRoot_45.w_257_0 ctx) (parallel_generatedRoot_45.w_258_0 ctx) (parallel_generatedRoot_45.w_259_0 ctx) (parallel_generatedRoot_45.w_261_0 ctx) (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_260_0 ctx) (parallel_generatedRoot_45.w_260_1 ctx) (parallel_generatedRoot_45.w_260_2 ctx) (parallel_generatedRoot_45.w_260_3 ctx) (parallel_generatedRoot_45.w_260_4 ctx) (parallel_generatedRoot_45.w_260_5 ctx) (parallel_generatedRoot_45.w_260_6 ctx) (parallel_generatedRoot_45.w_262_0 ctx) (parallel_generatedRoot_45.w_262_1 ctx) (parallel_generatedRoot_45.w_263_0 ctx) (parallel_generatedRoot_45.w_263_1 ctx) (parallel_generatedRoot_45.w_264_0 ctx) (parallel_generatedRoot_45.w_264_1 ctx) (parallel_generatedRoot_45.w_265_0 ctx) (parallel_generatedRoot_45.w_265_1 ctx) (parallel_generatedRoot_45.w_266_0 ctx) (parallel_generatedRoot_45.w_266_1 ctx) (parallel_generatedRoot_45.w_267_0 ctx) (parallel_generatedRoot_45.w_267_1 ctx) (parallel_generatedRoot_45.w_268_0 ctx) (parallel_generatedRoot_45.w_268_1 ctx) (parallel_generatedRoot_45.w_269_0 ctx) (parallel_generatedRoot_45.w_269_1 ctx) (parallel_generatedRoot_45.w_270_0 ctx) (parallel_generatedRoot_45.w_270_1 ctx) (parallel_generatedRoot_45.w_271_0 ctx) (parallel_generatedRoot_45.w_271_1 ctx) (parallel_generatedRoot_45.w_272_0 ctx) (parallel_generatedRoot_45.w_272_1 ctx) (parallel_generatedRoot_45.w_273_0 ctx) (parallel_generatedRoot_45.w_273_1 ctx) (parallel_generatedRoot_45.w_274_0 ctx) (parallel_generatedRoot_45.w_274_1 ctx) (parallel_generatedRoot_45.w_275_0 ctx) (parallel_generatedRoot_45.w_275_1 ctx) (parallel_generatedRoot_45.w_276_0 ctx) (parallel_generatedRoot_45.w_276_1 ctx)) :
+    parallel_generatedRoot_45.Facts_8 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_9 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t288 : (32) = 32
+  h277_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_277 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_277_0 ctx) i), (((parallel_generatedRoot_45.w_277_1 ctx) i), ())))
+  t290 : (128) = 128
+  h278_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_278 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_278_0 ctx) i), (((parallel_generatedRoot_45.w_278_1 ctx) i), ())))
+  t292 : (32) = 32
+  h279_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_279 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_279_0 ctx) i), (((parallel_generatedRoot_45.w_279_1 ctx) i), ())))
+  t294 : (128) = 128
+  h280_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_280 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_280_0 ctx) i), (((parallel_generatedRoot_45.w_280_1 ctx) i), ())))
+  t296 : (32) = 32
+  h281_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_281 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_281_0 ctx) i), (((parallel_generatedRoot_45.w_281_1 ctx) i), ())))
+  t298 : (128) = 128
+  h282_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_282 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_282_0 ctx) i), (((parallel_generatedRoot_45.w_282_1 ctx) i), ())))
+  t300 : (32) = 32
+  h283_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_283 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_283_0 ctx) i), (((parallel_generatedRoot_45.w_283_1 ctx) i), ())))
+  t302 : (128) = 128
+  h284_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_284 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_284_0 ctx) i), (((parallel_generatedRoot_45.w_284_1 ctx) i), ())))
+  t304 : (32) = 32
+  h285_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_285 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_285_0 ctx) i), (((parallel_generatedRoot_45.w_285_1 ctx) i), ())))
+  t306 : (128) = 128
+  h286_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_286 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_286_0 ctx) i), (((parallel_generatedRoot_45.w_286_1 ctx) i), ())))
+  t308 : (32) = 32
+  h287_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_287 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_287_0 ctx) i), (((parallel_generatedRoot_45.w_287_1 ctx) i), ())))
+  t310 : (128) = 128
+  h288_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_288 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_288_0 ctx) i), (((parallel_generatedRoot_45.w_288_1 ctx) i), ())))
+  t312 : (32) = 32
+  h289_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_289 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_289_0 ctx) i), (((parallel_generatedRoot_45.w_289_1 ctx) i), ())))
+  t314 : (128) = 128
+  h290_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_290 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_290_0 ctx) i), (((parallel_generatedRoot_45.w_290_1 ctx) i), ())))
+  t316 : (32) = 32
+  h291_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_291 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_291_0 ctx) i), (((parallel_generatedRoot_45.w_291_1 ctx) i), ())))
+  t318 : (128) = 128
+  h292_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_292 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_292_0 ctx) i), (((parallel_generatedRoot_45.w_292_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_9 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_9 backend hashModel params i_0 (parallel_generatedRoot_45.w_261_0 ctx) (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_277_0 ctx) (parallel_generatedRoot_45.w_277_1 ctx) (parallel_generatedRoot_45.w_278_0 ctx) (parallel_generatedRoot_45.w_278_1 ctx) (parallel_generatedRoot_45.w_279_0 ctx) (parallel_generatedRoot_45.w_279_1 ctx) (parallel_generatedRoot_45.w_280_0 ctx) (parallel_generatedRoot_45.w_280_1 ctx) (parallel_generatedRoot_45.w_281_0 ctx) (parallel_generatedRoot_45.w_281_1 ctx) (parallel_generatedRoot_45.w_282_0 ctx) (parallel_generatedRoot_45.w_282_1 ctx) (parallel_generatedRoot_45.w_283_0 ctx) (parallel_generatedRoot_45.w_283_1 ctx) (parallel_generatedRoot_45.w_284_0 ctx) (parallel_generatedRoot_45.w_284_1 ctx) (parallel_generatedRoot_45.w_285_0 ctx) (parallel_generatedRoot_45.w_285_1 ctx) (parallel_generatedRoot_45.w_286_0 ctx) (parallel_generatedRoot_45.w_286_1 ctx) (parallel_generatedRoot_45.w_287_0 ctx) (parallel_generatedRoot_45.w_287_1 ctx) (parallel_generatedRoot_45.w_288_0 ctx) (parallel_generatedRoot_45.w_288_1 ctx) (parallel_generatedRoot_45.w_289_0 ctx) (parallel_generatedRoot_45.w_289_1 ctx) (parallel_generatedRoot_45.w_290_0 ctx) (parallel_generatedRoot_45.w_290_1 ctx) (parallel_generatedRoot_45.w_291_0 ctx) (parallel_generatedRoot_45.w_291_1 ctx) (parallel_generatedRoot_45.w_292_0 ctx) (parallel_generatedRoot_45.w_292_1 ctx)) :
+    parallel_generatedRoot_45.Facts_9 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_10 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t320 : (32) = 32
+  h293_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_293 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_293_0 ctx) i), (((parallel_generatedRoot_45.w_293_1 ctx) i), ())))
+  t322 : (128) = 128
+  h294_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_294 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_294_0 ctx) i), (((parallel_generatedRoot_45.w_294_1 ctx) i), ())))
+  t324 : (32) = 32
+  h295_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_295 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_295_0 ctx) i), (((parallel_generatedRoot_45.w_295_1 ctx) i), ())))
+  t326 : (128) = 128
+  h296_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_296 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_296_0 ctx) i), (((parallel_generatedRoot_45.w_296_1 ctx) i), ())))
+  t328 : (32) = 32
+  h297_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_297 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_297_0 ctx) i), (((parallel_generatedRoot_45.w_297_1 ctx) i), ())))
+  t330 : (128) = 128
+  h298_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_298 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_298_0 ctx) i), (((parallel_generatedRoot_45.w_298_1 ctx) i), ())))
+  t332 : (32) = 32
+  h299_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_299 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_299_0 ctx) i), (((parallel_generatedRoot_45.w_299_1 ctx) i), ())))
+  t334 : (128) = 128
+  h300_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_300 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_300_0 ctx) i), (((parallel_generatedRoot_45.w_300_1 ctx) i), ())))
+  t336 : (32) = 32
+  h301_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_301 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_301_0 ctx) i), (((parallel_generatedRoot_45.w_301_1 ctx) i), ())))
+  t338 : (128) = 128
+  h302_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_302 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_302_0 ctx) i), (((parallel_generatedRoot_45.w_302_1 ctx) i), ())))
+  t340 : (32) = 32
+  h303_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_303 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_303_0 ctx) i), (((parallel_generatedRoot_45.w_303_1 ctx) i), ())))
+  t342 : (128) = 128
+  h304_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_304 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_304_0 ctx) i), (((parallel_generatedRoot_45.w_304_1 ctx) i), ())))
+  t344 : (32) = 32
+  h305_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_305 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_305_0 ctx) i), (((parallel_generatedRoot_45.w_305_1 ctx) i), ())))
+  t346 : (128) = 128
+  h306_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_306 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_306_0 ctx) i), (((parallel_generatedRoot_45.w_306_1 ctx) i), ())))
+  t348 : (32) = 32
+  h307_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_307 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_307_0 ctx) i), (((parallel_generatedRoot_45.w_307_1 ctx) i), ())))
+  t350 : (128) = 128
+  h308_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_308 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_308_0 ctx) i), (((parallel_generatedRoot_45.w_308_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_10 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_10 backend hashModel params i_0 (parallel_generatedRoot_45.w_261_0 ctx) (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_293_0 ctx) (parallel_generatedRoot_45.w_293_1 ctx) (parallel_generatedRoot_45.w_294_0 ctx) (parallel_generatedRoot_45.w_294_1 ctx) (parallel_generatedRoot_45.w_295_0 ctx) (parallel_generatedRoot_45.w_295_1 ctx) (parallel_generatedRoot_45.w_296_0 ctx) (parallel_generatedRoot_45.w_296_1 ctx) (parallel_generatedRoot_45.w_297_0 ctx) (parallel_generatedRoot_45.w_297_1 ctx) (parallel_generatedRoot_45.w_298_0 ctx) (parallel_generatedRoot_45.w_298_1 ctx) (parallel_generatedRoot_45.w_299_0 ctx) (parallel_generatedRoot_45.w_299_1 ctx) (parallel_generatedRoot_45.w_300_0 ctx) (parallel_generatedRoot_45.w_300_1 ctx) (parallel_generatedRoot_45.w_301_0 ctx) (parallel_generatedRoot_45.w_301_1 ctx) (parallel_generatedRoot_45.w_302_0 ctx) (parallel_generatedRoot_45.w_302_1 ctx) (parallel_generatedRoot_45.w_303_0 ctx) (parallel_generatedRoot_45.w_303_1 ctx) (parallel_generatedRoot_45.w_304_0 ctx) (parallel_generatedRoot_45.w_304_1 ctx) (parallel_generatedRoot_45.w_305_0 ctx) (parallel_generatedRoot_45.w_305_1 ctx) (parallel_generatedRoot_45.w_306_0 ctx) (parallel_generatedRoot_45.w_306_1 ctx) (parallel_generatedRoot_45.w_307_0 ctx) (parallel_generatedRoot_45.w_307_1 ctx) (parallel_generatedRoot_45.w_308_0 ctx) (parallel_generatedRoot_45.w_308_1 ctx)) :
+    parallel_generatedRoot_45.Facts_10 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_11 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t352 : (32) = 32
+  h309_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_309 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_309_0 ctx) i), (((parallel_generatedRoot_45.w_309_1 ctx) i), ())))
+  t354 : (128) = 128
+  h310_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_310 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_310_0 ctx) i), (((parallel_generatedRoot_45.w_310_1 ctx) i), ())))
+  t356 : (32) = 32
+  h311_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_311 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_311_0 ctx) i), (((parallel_generatedRoot_45.w_311_1 ctx) i), ())))
+  t358 : (128) = 128
+  h312_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_312 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_312_0 ctx) i), (((parallel_generatedRoot_45.w_312_1 ctx) i), ())))
+  t360 : (32) = 32
+  h313_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_313 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_313_0 ctx) i), (((parallel_generatedRoot_45.w_313_1 ctx) i), ())))
+  t362 : (128) = 128
+  h314_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_314 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_314_0 ctx) i), (((parallel_generatedRoot_45.w_314_1 ctx) i), ())))
+  t364 : (32) = 32
+  h315_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_315 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_315_0 ctx) i), (((parallel_generatedRoot_45.w_315_1 ctx) i), ())))
+  t366 : (128) = 128
+  h316_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_316 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_316_0 ctx) i), (((parallel_generatedRoot_45.w_316_1 ctx) i), ())))
+  t368 : (32) = 32
+  h317_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_317 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_317_0 ctx) i), (((parallel_generatedRoot_45.w_317_1 ctx) i), ())))
+  t370 : (128) = 128
+  h318_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_318 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_318_0 ctx) i), (((parallel_generatedRoot_45.w_318_1 ctx) i), ())))
+  t372 : (32) = 32
+  h319_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_319 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_319_0 ctx) i), (((parallel_generatedRoot_45.w_319_1 ctx) i), ())))
+  t374 : (128) = 128
+  h320_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_320 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_320_0 ctx) i), (((parallel_generatedRoot_45.w_320_1 ctx) i), ())))
+  t376 : (32) = 32
+  h321_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_321 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_321_0 ctx) i), (((parallel_generatedRoot_45.w_321_1 ctx) i), ())))
+  t378 : (128) = 128
+  h322_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_322 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_322_0 ctx) i), (((parallel_generatedRoot_45.w_322_1 ctx) i), ())))
+  t380 : (32) = 32
+  h323_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_323 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_323_0 ctx) i), (((parallel_generatedRoot_45.w_323_1 ctx) i), ())))
+  t382 : (128) = 128
+  h324_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_324 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_324_0 ctx) i), (((parallel_generatedRoot_45.w_324_1 ctx) i), ())))
+
+theorem parallel_generatedRoot_45.facts_11 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_11 backend hashModel params i_0 (parallel_generatedRoot_45.w_261_0 ctx) (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_309_0 ctx) (parallel_generatedRoot_45.w_309_1 ctx) (parallel_generatedRoot_45.w_310_0 ctx) (parallel_generatedRoot_45.w_310_1 ctx) (parallel_generatedRoot_45.w_311_0 ctx) (parallel_generatedRoot_45.w_311_1 ctx) (parallel_generatedRoot_45.w_312_0 ctx) (parallel_generatedRoot_45.w_312_1 ctx) (parallel_generatedRoot_45.w_313_0 ctx) (parallel_generatedRoot_45.w_313_1 ctx) (parallel_generatedRoot_45.w_314_0 ctx) (parallel_generatedRoot_45.w_314_1 ctx) (parallel_generatedRoot_45.w_315_0 ctx) (parallel_generatedRoot_45.w_315_1 ctx) (parallel_generatedRoot_45.w_316_0 ctx) (parallel_generatedRoot_45.w_316_1 ctx) (parallel_generatedRoot_45.w_317_0 ctx) (parallel_generatedRoot_45.w_317_1 ctx) (parallel_generatedRoot_45.w_318_0 ctx) (parallel_generatedRoot_45.w_318_1 ctx) (parallel_generatedRoot_45.w_319_0 ctx) (parallel_generatedRoot_45.w_319_1 ctx) (parallel_generatedRoot_45.w_320_0 ctx) (parallel_generatedRoot_45.w_320_1 ctx) (parallel_generatedRoot_45.w_321_0 ctx) (parallel_generatedRoot_45.w_321_1 ctx) (parallel_generatedRoot_45.w_322_0 ctx) (parallel_generatedRoot_45.w_322_1 ctx) (parallel_generatedRoot_45.w_323_0 ctx) (parallel_generatedRoot_45.w_323_1 ctx) (parallel_generatedRoot_45.w_324_0 ctx) (parallel_generatedRoot_45.w_324_1 ctx)) :
+    parallel_generatedRoot_45.Facts_11 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_12 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) : Prop where
+  t384 : (32) = 32
+  h325_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_325 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_325_0 ctx) i), (((parallel_generatedRoot_45.w_325_1 ctx) i), ())))
+  t386 : (128) = 128
+  h326_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_326 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_326_0 ctx) i), (((parallel_generatedRoot_45.w_326_1 ctx) i), ())))
+  t388 : (32) = 32
+  h327_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_327 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_327_0 ctx) i), (((parallel_generatedRoot_45.w_327_1 ctx) i), ())))
+  t390 : (128) = 128
+  h328_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_328 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_328_0 ctx) i), (((parallel_generatedRoot_45.w_328_1 ctx) i), ())))
+  t392 : (32) = 32
+  h329_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_329 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_329_0 ctx) i), (((parallel_generatedRoot_45.w_329_1 ctx) i), ())))
+  t394 : (128) = 128
+  h330_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_330 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_330_0 ctx) i), (((parallel_generatedRoot_45.w_330_1 ctx) i), ())))
+  t396 : (32) = 32
+  h331_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_331 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_331_0 ctx) i), (((parallel_generatedRoot_45.w_331_1 ctx) i), ())))
+  t398 : (128) = 128
+  h332_1 : (∀ i : Fin 128, parallel_parallel_generatedRoot_45_332 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_332_0 ctx) i), (((parallel_generatedRoot_45.w_332_1 ctx) i), ())))
+  t400 : (32) = 32
+  h333_1 : (∀ i : Fin 32, parallel_parallel_generatedRoot_45_333 backend hashModel params i_0 i ((parallel_generatedRoot_45.w_226_0 ctx), ((parallel_generatedRoot_45.w_261_0 ctx), ((parallel_generatedRoot_45.w_228_0 ctx), ()))) (((parallel_generatedRoot_45.w_333_0 ctx) i), (((parallel_generatedRoot_45.w_333_1 ctx) i), ())))
+  h334_0 : MxxRuntime.modulusReduceRuns (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_334_0 ctx)
+  t403 : 0 ≤ ((Int.ofNat i_0))
+  t404 : ((Int.ofNat i_0)) < 16
+  h335_0 : MxxRuntime.hashSample (hashModel) ([114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 111, 110, 101]) ([.decimal ((sel_4 ((Int.ofNat i_0)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_335_0 ctx)
+  h337_0 : MxxRuntime.modulusReduceRuns (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_337_0 ctx)
+  t407 : 0 ≤ ((Int.ofNat i_0))
+  t408 : ((Int.ofNat i_0)) < 16
+  h338_0 : MxxRuntime.hashSample (hashModel) ([114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 111, 110, 101]) ([.decimal ((sel_4 ((Int.ofNat i_0)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (2)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_338_0 ctx)
+  h342_0 : MxxRuntime.gadgetMatrixRuns backend 1024 28 (parallel_generatedRoot_45.w_342_0 ctx)
+  h346_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_346_0 ctx)
+  t412 : 0 ≤ ((Int.ofNat i_0))
+  t413 : ((Int.ofNat i_0)) < 16
+  h348_0 : MxxRuntime.hashSample (hashModel) ([114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 111, 110, 101]) ([.decimal ((sel_4 ((Int.ofNat i_0)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_348_0 ctx)
+  t415 : 0 ≤ ((Int.ofNat i_0))
+
+theorem parallel_generatedRoot_45.facts_12 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_12 backend hashModel params i_0 (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_79_0 ctx) (parallel_generatedRoot_45.w_261_0 ctx) (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_226_0 ctx) (parallel_generatedRoot_45.w_228_0 ctx) (parallel_generatedRoot_45.w_325_0 ctx) (parallel_generatedRoot_45.w_325_1 ctx) (parallel_generatedRoot_45.w_326_0 ctx) (parallel_generatedRoot_45.w_326_1 ctx) (parallel_generatedRoot_45.w_327_0 ctx) (parallel_generatedRoot_45.w_327_1 ctx) (parallel_generatedRoot_45.w_328_0 ctx) (parallel_generatedRoot_45.w_328_1 ctx) (parallel_generatedRoot_45.w_329_0 ctx) (parallel_generatedRoot_45.w_329_1 ctx) (parallel_generatedRoot_45.w_330_0 ctx) (parallel_generatedRoot_45.w_330_1 ctx) (parallel_generatedRoot_45.w_331_0 ctx) (parallel_generatedRoot_45.w_331_1 ctx) (parallel_generatedRoot_45.w_332_0 ctx) (parallel_generatedRoot_45.w_332_1 ctx) (parallel_generatedRoot_45.w_333_0 ctx) (parallel_generatedRoot_45.w_333_1 ctx) (parallel_generatedRoot_45.w_334_0 ctx) (parallel_generatedRoot_45.w_335_0 ctx) (parallel_generatedRoot_45.w_337_0 ctx) (parallel_generatedRoot_45.w_338_0 ctx) (parallel_generatedRoot_45.w_342_0 ctx) (parallel_generatedRoot_45.w_346_0 ctx) (parallel_generatedRoot_45.w_348_0 ctx)) :
+    parallel_generatedRoot_45.Facts_12 ctx :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts_13 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) (outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)) : Prop where
+  t416 : ((Int.ofNat i_0)) < 16
+  h350_0 : MxxRuntime.hashSample (hashModel) ([114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 111, 110, 101]) ([.decimal ((sel_4 ((Int.ofNat i_0)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) ((parallel_generatedRoot_45.w_79_0 ctx)) (parallel_generatedRoot_45.w_350_0 ctx)
+  h355_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_355_0 ctx)
+  h357_0 : MxxRuntime.modulusReduceRuns (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_357_0 ctx)
+  h358_0 : MxxRuntime.modulusReduceRuns (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_358_0 ctx)
+  h359_0 : MxxRuntime.concatColumns (parallel_generatedRoot_45.w_357_0 ctx) (parallel_generatedRoot_45.w_358_0 ctx) (parallel_generatedRoot_45.w_359_0 ctx)
+  h362_0 : MxxRuntime.gaussianSample ((4/1)) (26) (parallel_generatedRoot_45.w_362_0 ctx)
+  hout : outputs = parallel_generatedRoot_45.outs ctx
+
+theorem parallel_generatedRoot_45.facts_13 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} {ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0} {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.constraints_13 hashModel i_0 (parallel_generatedRoot_45.w_0_0 ctx) (parallel_generatedRoot_45.w_1_0 ctx) (parallel_generatedRoot_45.w_2_0 ctx) (parallel_generatedRoot_45.w_3_0 ctx) (parallel_generatedRoot_45.w_4_0 ctx) (parallel_generatedRoot_45.w_79_0 ctx) (parallel_generatedRoot_45.w_110_0 ctx) (parallel_generatedRoot_45.w_111_0 ctx) (parallel_generatedRoot_45.w_112_0 ctx) (parallel_generatedRoot_45.w_113_0 ctx) (parallel_generatedRoot_45.w_222_0 ctx) (parallel_generatedRoot_45.w_223_0 ctx) (parallel_generatedRoot_45.w_224_0 ctx) (parallel_generatedRoot_45.w_225_0 ctx) (parallel_generatedRoot_45.w_7_0 ctx) (parallel_generatedRoot_45.w_25_0 ctx) (parallel_generatedRoot_45.w_35_0 ctx) (parallel_generatedRoot_45.w_42_0 ctx) (parallel_generatedRoot_45.w_42_1 ctx) (parallel_generatedRoot_45.w_42_2 ctx) (parallel_generatedRoot_45.w_42_3 ctx) (parallel_generatedRoot_45.w_42_4 ctx) (parallel_generatedRoot_45.w_42_5 ctx) (parallel_generatedRoot_45.w_42_6 ctx) (parallel_generatedRoot_45.w_44_0 ctx) (parallel_generatedRoot_45.w_44_1 ctx) (parallel_generatedRoot_45.w_45_0 ctx) (parallel_generatedRoot_45.w_45_1 ctx) (parallel_generatedRoot_45.w_46_0 ctx) (parallel_generatedRoot_45.w_46_1 ctx) (parallel_generatedRoot_45.w_47_0 ctx) (parallel_generatedRoot_45.w_47_1 ctx) (parallel_generatedRoot_45.w_48_0 ctx) (parallel_generatedRoot_45.w_48_1 ctx) (parallel_generatedRoot_45.w_49_0 ctx) (parallel_generatedRoot_45.w_49_1 ctx) (parallel_generatedRoot_45.w_50_0 ctx) (parallel_generatedRoot_45.w_50_1 ctx) (parallel_generatedRoot_45.w_51_0 ctx) (parallel_generatedRoot_45.w_51_1 ctx) (parallel_generatedRoot_45.w_52_0 ctx) (parallel_generatedRoot_45.w_52_1 ctx) (parallel_generatedRoot_45.w_53_0 ctx) (parallel_generatedRoot_45.w_53_1 ctx) (parallel_generatedRoot_45.w_54_0 ctx) (parallel_generatedRoot_45.w_54_1 ctx) (parallel_generatedRoot_45.w_55_0 ctx) (parallel_generatedRoot_45.w_55_1 ctx) (parallel_generatedRoot_45.w_56_0 ctx) (parallel_generatedRoot_45.w_56_1 ctx) (parallel_generatedRoot_45.w_57_0 ctx) (parallel_generatedRoot_45.w_57_1 ctx) (parallel_generatedRoot_45.w_58_0 ctx) (parallel_generatedRoot_45.w_58_1 ctx) (parallel_generatedRoot_45.w_59_0 ctx) (parallel_generatedRoot_45.w_59_1 ctx) (parallel_generatedRoot_45.w_60_0 ctx) (parallel_generatedRoot_45.w_60_1 ctx) (parallel_generatedRoot_45.w_61_0 ctx) (parallel_generatedRoot_45.w_61_1 ctx) (parallel_generatedRoot_45.w_62_0 ctx) (parallel_generatedRoot_45.w_62_1 ctx) (parallel_generatedRoot_45.w_63_0 ctx) (parallel_generatedRoot_45.w_63_1 ctx) (parallel_generatedRoot_45.w_64_0 ctx) (parallel_generatedRoot_45.w_64_1 ctx) (parallel_generatedRoot_45.w_65_0 ctx) (parallel_generatedRoot_45.w_65_1 ctx) (parallel_generatedRoot_45.w_66_0 ctx) (parallel_generatedRoot_45.w_66_1 ctx) (parallel_generatedRoot_45.w_67_0 ctx) (parallel_generatedRoot_45.w_67_1 ctx) (parallel_generatedRoot_45.w_68_0 ctx) (parallel_generatedRoot_45.w_68_1 ctx) (parallel_generatedRoot_45.w_69_0 ctx) (parallel_generatedRoot_45.w_69_1 ctx) (parallel_generatedRoot_45.w_70_0 ctx) (parallel_generatedRoot_45.w_70_1 ctx) (parallel_generatedRoot_45.w_71_0 ctx) (parallel_generatedRoot_45.w_71_1 ctx) (parallel_generatedRoot_45.w_72_0 ctx) (parallel_generatedRoot_45.w_72_1 ctx) (parallel_generatedRoot_45.w_73_0 ctx) (parallel_generatedRoot_45.w_73_1 ctx) (parallel_generatedRoot_45.w_74_0 ctx) (parallel_generatedRoot_45.w_74_1 ctx) (parallel_generatedRoot_45.w_75_0 ctx) (parallel_generatedRoot_45.w_75_1 ctx) (parallel_generatedRoot_45.w_76_0 ctx) (parallel_generatedRoot_45.w_76_1 ctx) (parallel_generatedRoot_45.w_77_0 ctx) (parallel_generatedRoot_45.w_77_1 ctx) (parallel_generatedRoot_45.w_78_0 ctx) (parallel_generatedRoot_45.w_78_1 ctx) (parallel_generatedRoot_45.w_97_0 ctx) (parallel_generatedRoot_45.w_107_0 ctx) (parallel_generatedRoot_45.w_108_0 ctx) (parallel_generatedRoot_45.w_108_1 ctx) (parallel_generatedRoot_45.w_109_0 ctx) (parallel_generatedRoot_45.w_109_1 ctx) (parallel_generatedRoot_45.w_132_0 ctx) (parallel_generatedRoot_45.w_141_0 ctx) (parallel_generatedRoot_45.w_148_0 ctx) (parallel_generatedRoot_45.w_148_1 ctx) (parallel_generatedRoot_45.w_148_2 ctx) (parallel_generatedRoot_45.w_148_3 ctx) (parallel_generatedRoot_45.w_148_4 ctx) (parallel_generatedRoot_45.w_148_5 ctx) (parallel_generatedRoot_45.w_148_6 ctx) (parallel_generatedRoot_45.w_150_0 ctx) (parallel_generatedRoot_45.w_150_1 ctx) (parallel_generatedRoot_45.w_151_0 ctx) (parallel_generatedRoot_45.w_151_1 ctx) (parallel_generatedRoot_45.w_152_0 ctx) (parallel_generatedRoot_45.w_152_1 ctx) (parallel_generatedRoot_45.w_153_0 ctx) (parallel_generatedRoot_45.w_153_1 ctx) (parallel_generatedRoot_45.w_154_0 ctx) (parallel_generatedRoot_45.w_154_1 ctx) (parallel_generatedRoot_45.w_155_0 ctx) (parallel_generatedRoot_45.w_155_1 ctx) (parallel_generatedRoot_45.w_156_0 ctx) (parallel_generatedRoot_45.w_156_1 ctx) (parallel_generatedRoot_45.w_157_0 ctx) (parallel_generatedRoot_45.w_157_1 ctx) (parallel_generatedRoot_45.w_158_0 ctx) (parallel_generatedRoot_45.w_158_1 ctx) (parallel_generatedRoot_45.w_159_0 ctx) (parallel_generatedRoot_45.w_159_1 ctx) (parallel_generatedRoot_45.w_160_0 ctx) (parallel_generatedRoot_45.w_160_1 ctx) (parallel_generatedRoot_45.w_161_0 ctx) (parallel_generatedRoot_45.w_161_1 ctx) (parallel_generatedRoot_45.w_162_0 ctx) (parallel_generatedRoot_45.w_162_1 ctx) (parallel_generatedRoot_45.w_163_0 ctx) (parallel_generatedRoot_45.w_163_1 ctx) (parallel_generatedRoot_45.w_164_0 ctx) (parallel_generatedRoot_45.w_164_1 ctx) (parallel_generatedRoot_45.w_165_0 ctx) (parallel_generatedRoot_45.w_165_1 ctx) (parallel_generatedRoot_45.w_166_0 ctx) (parallel_generatedRoot_45.w_166_1 ctx) (parallel_generatedRoot_45.w_167_0 ctx) (parallel_generatedRoot_45.w_167_1 ctx) (parallel_generatedRoot_45.w_168_0 ctx) (parallel_generatedRoot_45.w_168_1 ctx) (parallel_generatedRoot_45.w_169_0 ctx) (parallel_generatedRoot_45.w_169_1 ctx) (parallel_generatedRoot_45.w_170_0 ctx) (parallel_generatedRoot_45.w_170_1 ctx) (parallel_generatedRoot_45.w_171_0 ctx) (parallel_generatedRoot_45.w_171_1 ctx) (parallel_generatedRoot_45.w_172_0 ctx) (parallel_generatedRoot_45.w_172_1 ctx) (parallel_generatedRoot_45.w_173_0 ctx) (parallel_generatedRoot_45.w_173_1 ctx) (parallel_generatedRoot_45.w_174_0 ctx) (parallel_generatedRoot_45.w_174_1 ctx) (parallel_generatedRoot_45.w_175_0 ctx) (parallel_generatedRoot_45.w_175_1 ctx) (parallel_generatedRoot_45.w_176_0 ctx) (parallel_generatedRoot_45.w_176_1 ctx) (parallel_generatedRoot_45.w_177_0 ctx) (parallel_generatedRoot_45.w_177_1 ctx) (parallel_generatedRoot_45.w_178_0 ctx) (parallel_generatedRoot_45.w_178_1 ctx) (parallel_generatedRoot_45.w_179_0 ctx) (parallel_generatedRoot_45.w_179_1 ctx) (parallel_generatedRoot_45.w_180_0 ctx) (parallel_generatedRoot_45.w_180_1 ctx) (parallel_generatedRoot_45.w_181_0 ctx) (parallel_generatedRoot_45.w_181_1 ctx) (parallel_generatedRoot_45.w_182_0 ctx) (parallel_generatedRoot_45.w_182_1 ctx) (parallel_generatedRoot_45.w_183_0 ctx) (parallel_generatedRoot_45.w_183_1 ctx) (parallel_generatedRoot_45.w_184_0 ctx) (parallel_generatedRoot_45.w_184_1 ctx) (parallel_generatedRoot_45.w_185_0 ctx) (parallel_generatedRoot_45.w_185_1 ctx) (parallel_generatedRoot_45.w_186_0 ctx) (parallel_generatedRoot_45.w_186_1 ctx) (parallel_generatedRoot_45.w_187_0 ctx) (parallel_generatedRoot_45.w_187_1 ctx) (parallel_generatedRoot_45.w_188_0 ctx) (parallel_generatedRoot_45.w_188_1 ctx) (parallel_generatedRoot_45.w_189_0 ctx) (parallel_generatedRoot_45.w_189_1 ctx) (parallel_generatedRoot_45.w_190_0 ctx) (parallel_generatedRoot_45.w_190_1 ctx) (parallel_generatedRoot_45.w_191_0 ctx) (parallel_generatedRoot_45.w_191_1 ctx) (parallel_generatedRoot_45.w_192_0 ctx) (parallel_generatedRoot_45.w_192_1 ctx) (parallel_generatedRoot_45.w_193_0 ctx) (parallel_generatedRoot_45.w_193_1 ctx) (parallel_generatedRoot_45.w_194_0 ctx) (parallel_generatedRoot_45.w_194_1 ctx) (parallel_generatedRoot_45.w_195_0 ctx) (parallel_generatedRoot_45.w_195_1 ctx) (parallel_generatedRoot_45.w_196_0 ctx) (parallel_generatedRoot_45.w_196_1 ctx) (parallel_generatedRoot_45.w_197_0 ctx) (parallel_generatedRoot_45.w_197_1 ctx) (parallel_generatedRoot_45.w_198_0 ctx) (parallel_generatedRoot_45.w_198_1 ctx) (parallel_generatedRoot_45.w_199_0 ctx) (parallel_generatedRoot_45.w_199_1 ctx) (parallel_generatedRoot_45.w_200_0 ctx) (parallel_generatedRoot_45.w_200_1 ctx) (parallel_generatedRoot_45.w_201_0 ctx) (parallel_generatedRoot_45.w_201_1 ctx) (parallel_generatedRoot_45.w_202_0 ctx) (parallel_generatedRoot_45.w_202_1 ctx) (parallel_generatedRoot_45.w_203_0 ctx) (parallel_generatedRoot_45.w_203_1 ctx) (parallel_generatedRoot_45.w_204_0 ctx) (parallel_generatedRoot_45.w_204_1 ctx) (parallel_generatedRoot_45.w_205_0 ctx) (parallel_generatedRoot_45.w_205_1 ctx) (parallel_generatedRoot_45.w_206_0 ctx) (parallel_generatedRoot_45.w_206_1 ctx) (parallel_generatedRoot_45.w_207_0 ctx) (parallel_generatedRoot_45.w_207_1 ctx) (parallel_generatedRoot_45.w_208_0 ctx) (parallel_generatedRoot_45.w_208_1 ctx) (parallel_generatedRoot_45.w_209_0 ctx) (parallel_generatedRoot_45.w_209_1 ctx) (parallel_generatedRoot_45.w_210_0 ctx) (parallel_generatedRoot_45.w_210_1 ctx) (parallel_generatedRoot_45.w_211_0 ctx) (parallel_generatedRoot_45.w_211_1 ctx) (parallel_generatedRoot_45.w_212_0 ctx) (parallel_generatedRoot_45.w_212_1 ctx) (parallel_generatedRoot_45.w_213_0 ctx) (parallel_generatedRoot_45.w_213_1 ctx) (parallel_generatedRoot_45.w_214_0 ctx) (parallel_generatedRoot_45.w_214_1 ctx) (parallel_generatedRoot_45.w_215_0 ctx) (parallel_generatedRoot_45.w_215_1 ctx) (parallel_generatedRoot_45.w_216_0 ctx) (parallel_generatedRoot_45.w_216_1 ctx) (parallel_generatedRoot_45.w_217_0 ctx) (parallel_generatedRoot_45.w_217_1 ctx) (parallel_generatedRoot_45.w_218_0 ctx) (parallel_generatedRoot_45.w_218_1 ctx) (parallel_generatedRoot_45.w_219_0 ctx) (parallel_generatedRoot_45.w_219_1 ctx) (parallel_generatedRoot_45.w_220_0 ctx) (parallel_generatedRoot_45.w_220_1 ctx) (parallel_generatedRoot_45.w_221_0 ctx) (parallel_generatedRoot_45.w_221_1 ctx) (parallel_generatedRoot_45.w_244_0 ctx) (parallel_generatedRoot_45.w_253_0 ctx) (parallel_generatedRoot_45.w_260_0 ctx) (parallel_generatedRoot_45.w_260_1 ctx) (parallel_generatedRoot_45.w_260_2 ctx) (parallel_generatedRoot_45.w_260_3 ctx) (parallel_generatedRoot_45.w_260_4 ctx) (parallel_generatedRoot_45.w_260_5 ctx) (parallel_generatedRoot_45.w_260_6 ctx) (parallel_generatedRoot_45.w_262_0 ctx) (parallel_generatedRoot_45.w_262_1 ctx) (parallel_generatedRoot_45.w_263_0 ctx) (parallel_generatedRoot_45.w_263_1 ctx) (parallel_generatedRoot_45.w_264_0 ctx) (parallel_generatedRoot_45.w_264_1 ctx) (parallel_generatedRoot_45.w_265_0 ctx) (parallel_generatedRoot_45.w_265_1 ctx) (parallel_generatedRoot_45.w_266_0 ctx) (parallel_generatedRoot_45.w_266_1 ctx) (parallel_generatedRoot_45.w_267_0 ctx) (parallel_generatedRoot_45.w_267_1 ctx) (parallel_generatedRoot_45.w_268_0 ctx) (parallel_generatedRoot_45.w_268_1 ctx) (parallel_generatedRoot_45.w_269_0 ctx) (parallel_generatedRoot_45.w_269_1 ctx) (parallel_generatedRoot_45.w_270_0 ctx) (parallel_generatedRoot_45.w_270_1 ctx) (parallel_generatedRoot_45.w_271_0 ctx) (parallel_generatedRoot_45.w_271_1 ctx) (parallel_generatedRoot_45.w_272_0 ctx) (parallel_generatedRoot_45.w_272_1 ctx) (parallel_generatedRoot_45.w_273_0 ctx) (parallel_generatedRoot_45.w_273_1 ctx) (parallel_generatedRoot_45.w_274_0 ctx) (parallel_generatedRoot_45.w_274_1 ctx) (parallel_generatedRoot_45.w_275_0 ctx) (parallel_generatedRoot_45.w_275_1 ctx) (parallel_generatedRoot_45.w_276_0 ctx) (parallel_generatedRoot_45.w_276_1 ctx) (parallel_generatedRoot_45.w_277_0 ctx) (parallel_generatedRoot_45.w_277_1 ctx) (parallel_generatedRoot_45.w_278_0 ctx) (parallel_generatedRoot_45.w_278_1 ctx) (parallel_generatedRoot_45.w_279_0 ctx) (parallel_generatedRoot_45.w_279_1 ctx) (parallel_generatedRoot_45.w_280_0 ctx) (parallel_generatedRoot_45.w_280_1 ctx) (parallel_generatedRoot_45.w_281_0 ctx) (parallel_generatedRoot_45.w_281_1 ctx) (parallel_generatedRoot_45.w_282_0 ctx) (parallel_generatedRoot_45.w_282_1 ctx) (parallel_generatedRoot_45.w_283_0 ctx) (parallel_generatedRoot_45.w_283_1 ctx) (parallel_generatedRoot_45.w_284_0 ctx) (parallel_generatedRoot_45.w_284_1 ctx) (parallel_generatedRoot_45.w_285_0 ctx) (parallel_generatedRoot_45.w_285_1 ctx) (parallel_generatedRoot_45.w_286_0 ctx) (parallel_generatedRoot_45.w_286_1 ctx) (parallel_generatedRoot_45.w_287_0 ctx) (parallel_generatedRoot_45.w_287_1 ctx) (parallel_generatedRoot_45.w_288_0 ctx) (parallel_generatedRoot_45.w_288_1 ctx) (parallel_generatedRoot_45.w_289_0 ctx) (parallel_generatedRoot_45.w_289_1 ctx) (parallel_generatedRoot_45.w_290_0 ctx) (parallel_generatedRoot_45.w_290_1 ctx) (parallel_generatedRoot_45.w_291_0 ctx) (parallel_generatedRoot_45.w_291_1 ctx) (parallel_generatedRoot_45.w_292_0 ctx) (parallel_generatedRoot_45.w_292_1 ctx) (parallel_generatedRoot_45.w_293_0 ctx) (parallel_generatedRoot_45.w_293_1 ctx) (parallel_generatedRoot_45.w_294_0 ctx) (parallel_generatedRoot_45.w_294_1 ctx) (parallel_generatedRoot_45.w_295_0 ctx) (parallel_generatedRoot_45.w_295_1 ctx) (parallel_generatedRoot_45.w_296_0 ctx) (parallel_generatedRoot_45.w_296_1 ctx) (parallel_generatedRoot_45.w_297_0 ctx) (parallel_generatedRoot_45.w_297_1 ctx) (parallel_generatedRoot_45.w_298_0 ctx) (parallel_generatedRoot_45.w_298_1 ctx) (parallel_generatedRoot_45.w_299_0 ctx) (parallel_generatedRoot_45.w_299_1 ctx) (parallel_generatedRoot_45.w_300_0 ctx) (parallel_generatedRoot_45.w_300_1 ctx) (parallel_generatedRoot_45.w_301_0 ctx) (parallel_generatedRoot_45.w_301_1 ctx) (parallel_generatedRoot_45.w_302_0 ctx) (parallel_generatedRoot_45.w_302_1 ctx) (parallel_generatedRoot_45.w_303_0 ctx) (parallel_generatedRoot_45.w_303_1 ctx) (parallel_generatedRoot_45.w_304_0 ctx) (parallel_generatedRoot_45.w_304_1 ctx) (parallel_generatedRoot_45.w_305_0 ctx) (parallel_generatedRoot_45.w_305_1 ctx) (parallel_generatedRoot_45.w_306_0 ctx) (parallel_generatedRoot_45.w_306_1 ctx) (parallel_generatedRoot_45.w_307_0 ctx) (parallel_generatedRoot_45.w_307_1 ctx) (parallel_generatedRoot_45.w_308_0 ctx) (parallel_generatedRoot_45.w_308_1 ctx) (parallel_generatedRoot_45.w_309_0 ctx) (parallel_generatedRoot_45.w_309_1 ctx) (parallel_generatedRoot_45.w_310_0 ctx) (parallel_generatedRoot_45.w_310_1 ctx) (parallel_generatedRoot_45.w_311_0 ctx) (parallel_generatedRoot_45.w_311_1 ctx) (parallel_generatedRoot_45.w_312_0 ctx) (parallel_generatedRoot_45.w_312_1 ctx) (parallel_generatedRoot_45.w_313_0 ctx) (parallel_generatedRoot_45.w_313_1 ctx) (parallel_generatedRoot_45.w_314_0 ctx) (parallel_generatedRoot_45.w_314_1 ctx) (parallel_generatedRoot_45.w_315_0 ctx) (parallel_generatedRoot_45.w_315_1 ctx) (parallel_generatedRoot_45.w_316_0 ctx) (parallel_generatedRoot_45.w_316_1 ctx) (parallel_generatedRoot_45.w_317_0 ctx) (parallel_generatedRoot_45.w_317_1 ctx) (parallel_generatedRoot_45.w_318_0 ctx) (parallel_generatedRoot_45.w_318_1 ctx) (parallel_generatedRoot_45.w_319_0 ctx) (parallel_generatedRoot_45.w_319_1 ctx) (parallel_generatedRoot_45.w_320_0 ctx) (parallel_generatedRoot_45.w_320_1 ctx) (parallel_generatedRoot_45.w_321_0 ctx) (parallel_generatedRoot_45.w_321_1 ctx) (parallel_generatedRoot_45.w_322_0 ctx) (parallel_generatedRoot_45.w_322_1 ctx) (parallel_generatedRoot_45.w_323_0 ctx) (parallel_generatedRoot_45.w_323_1 ctx) (parallel_generatedRoot_45.w_324_0 ctx) (parallel_generatedRoot_45.w_324_1 ctx) (parallel_generatedRoot_45.w_325_0 ctx) (parallel_generatedRoot_45.w_325_1 ctx) (parallel_generatedRoot_45.w_326_0 ctx) (parallel_generatedRoot_45.w_326_1 ctx) (parallel_generatedRoot_45.w_327_0 ctx) (parallel_generatedRoot_45.w_327_1 ctx) (parallel_generatedRoot_45.w_328_0 ctx) (parallel_generatedRoot_45.w_328_1 ctx) (parallel_generatedRoot_45.w_329_0 ctx) (parallel_generatedRoot_45.w_329_1 ctx) (parallel_generatedRoot_45.w_330_0 ctx) (parallel_generatedRoot_45.w_330_1 ctx) (parallel_generatedRoot_45.w_331_0 ctx) (parallel_generatedRoot_45.w_331_1 ctx) (parallel_generatedRoot_45.w_332_0 ctx) (parallel_generatedRoot_45.w_332_1 ctx) (parallel_generatedRoot_45.w_333_0 ctx) (parallel_generatedRoot_45.w_333_1 ctx) (parallel_generatedRoot_45.w_347_0 ctx) (parallel_generatedRoot_45.w_350_0 ctx) (parallel_generatedRoot_45.w_355_0 ctx) (parallel_generatedRoot_45.w_356_0 ctx) (parallel_generatedRoot_45.w_357_0 ctx) (parallel_generatedRoot_45.w_358_0 ctx) (parallel_generatedRoot_45.w_359_0 ctx) (parallel_generatedRoot_45.w_362_0 ctx) (parallel_generatedRoot_45.w_363_0 ctx) outputs) :
+    parallel_generatedRoot_45.Facts_13 ctx outputs :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2⟩
+
+structure parallel_generatedRoot_45.Facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) (outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)) : Prop where
+  c0 : parallel_generatedRoot_45.Facts_0 ctx
+  c1 : parallel_generatedRoot_45.Facts_1 ctx
+  c2 : parallel_generatedRoot_45.Facts_2 ctx
+  c3 : parallel_generatedRoot_45.Facts_3 ctx
+  c4 : parallel_generatedRoot_45.Facts_4 ctx
+  c5 : parallel_generatedRoot_45.Facts_5 ctx
+  c6 : parallel_generatedRoot_45.Facts_6 ctx
+  c7 : parallel_generatedRoot_45.Facts_7 ctx
+  c8 : parallel_generatedRoot_45.Facts_8 ctx
+  c9 : parallel_generatedRoot_45.Facts_9 ctx
+  c10 : parallel_generatedRoot_45.Facts_10 ctx
+  c11 : parallel_generatedRoot_45.Facts_11 ctx
+  c12 : parallel_generatedRoot_45.Facts_12 ctx
+  c13 : parallel_generatedRoot_45.Facts_13 ctx outputs
+
+theorem parallel_generatedRoot_45.facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {i_0 : Nat} (ctx : parallel_generatedRoot_45.Ctx backend hashModel params i_0) {outputs : (mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat2) × (Fin 1025 → mxxMat5) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × mxxMat34 × mxxMat34 × (Fin 2 → mxxMat34) × (Fin 2 → mxxMat34) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × (((m0 : Fin 2) → Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24)) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × Unit) × ((Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat4) × (Fin 1025 → mxxMat41) × (Fin 128 → mxxMat3) × (Fin 128 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 32 → mxxMat3) × (Fin 128 → mxxMat0) × (Fin 128 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 32 → mxxMat0) × (Fin 128 → mxxMat40) × (Fin 128 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 32 → mxxMat40) × (Fin 128 → mxxMat8) × (Fin 128 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 32 → mxxMat8) × (Fin 128 → mxxMat9) × (Fin 128 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 32 → mxxMat9) × (Fin 128 → mxxMat10) × (Fin 128 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 32 → mxxMat10) × (Fin 128 → mxxMat11) × (Fin 128 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 32 → mxxMat11) × (Fin 128 → mxxMat12) × (Fin 128 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 32 → mxxMat12) × (Fin 128 → mxxMat13) × (Fin 128 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 32 → mxxMat13) × (Fin 128 → mxxMat14) × (Fin 128 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 32 → mxxMat14) × (Fin 128 → mxxMat15) × (Fin 128 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 32 → mxxMat15) × (Fin 128 → mxxMat16) × (Fin 128 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 32 → mxxMat16) × (Fin 128 → mxxMat7) × (Fin 128 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 32 → mxxMat7) × (Fin 128 → mxxMat17) × (Fin 128 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 32 → mxxMat17) × (Fin 128 → mxxMat19) × (Fin 128 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 32 → mxxMat19) × (Fin 128 → mxxMat20) × (Fin 128 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 32 → mxxMat20) × (Fin 128 → mxxMat21) × (Fin 128 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 32 → mxxMat21) × (Fin 128 → mxxMat22) × (Fin 128 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 32 → mxxMat22) × (Fin 128 → mxxMat23) × (Fin 128 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 32 → mxxMat23) × (Fin 128 → mxxMat24) × (Fin 128 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 32 → mxxMat24) × (Fin 128 → mxxMat25) × (Fin 128 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 32 → mxxMat25) × (Fin 128 → mxxMat26) × (Fin 128 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 32 → mxxMat26) × (Fin 128 → mxxMat27) × (Fin 128 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 32 → mxxMat27) × (Fin 128 → mxxMat18) × (Fin 128 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 32 → mxxMat18) × (Fin 128 → mxxMat28) × (Fin 128 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 32 → mxxMat28) × (Fin 128 → mxxMat30) × (Fin 128 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 32 → mxxMat30) × (Fin 128 → mxxMat31) × (Fin 128 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 32 → mxxMat31) × (Fin 128 → mxxMat32) × (Fin 128 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 32 → mxxMat32) × (Fin 128 → mxxMat33) × (Fin 128 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 32 → mxxMat33) × (Fin 128 → mxxMat34) × (Fin 128 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 32 → mxxMat34) × (Fin 128 → mxxMat29) × (Fin 128 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 32 → mxxMat29) × (Fin 128 → mxxMat35) × (Fin 128 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 32 → mxxMat35) × (Fin 128 → mxxMat36) × (Fin 128 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 32 → mxxMat36) × (Fin 128 → mxxMat37) × (Fin 128 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 32 → mxxMat37) × (Fin 128 → mxxMat38) × (Fin 128 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 32 → mxxMat38) × (Fin 128 → mxxMat39) × (Fin 128 → mxxMat39) × (Fin 32 → mxxMat39) × (Fin 32 → mxxMat39) × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 × Mxx.Primitives.ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 60 × Unit)}
+    (h : parallel_generatedRoot_45.body backend hashModel params i_0 ctx.inputs outputs ctx.witness) :
+    parallel_generatedRoot_45.Facts ctx outputs :=
+  have t0 := h
+  have r0 := parallel_generatedRoot_45.facts_0 (ctx := ctx) (outputs := outputs) t0.1
+  have t1 := t0.2
+  have r1 := parallel_generatedRoot_45.facts_1 (ctx := ctx) (outputs := outputs) t1.1
+  have t2 := t1.2
+  have r2 := parallel_generatedRoot_45.facts_2 (ctx := ctx) (outputs := outputs) t2.1
+  have t3 := t2.2
+  have r3 := parallel_generatedRoot_45.facts_3 (ctx := ctx) (outputs := outputs) t3.1
+  have t4 := t3.2
+  have r4 := parallel_generatedRoot_45.facts_4 (ctx := ctx) (outputs := outputs) t4.1
+  have t5 := t4.2
+  have r5 := parallel_generatedRoot_45.facts_5 (ctx := ctx) (outputs := outputs) t5.1
+  have t6 := t5.2
+  have r6 := parallel_generatedRoot_45.facts_6 (ctx := ctx) (outputs := outputs) t6.1
+  have t7 := t6.2
+  have r7 := parallel_generatedRoot_45.facts_7 (ctx := ctx) (outputs := outputs) t7.1
+  have t8 := t7.2
+  have r8 := parallel_generatedRoot_45.facts_8 (ctx := ctx) (outputs := outputs) t8.1
+  have t9 := t8.2
+  have r9 := parallel_generatedRoot_45.facts_9 (ctx := ctx) (outputs := outputs) t9.1
+  have t10 := t9.2
+  have r10 := parallel_generatedRoot_45.facts_10 (ctx := ctx) (outputs := outputs) t10.1
+  have t11 := t10.2
+  have r11 := parallel_generatedRoot_45.facts_11 (ctx := ctx) (outputs := outputs) t11.1
+  have t12 := t11.2
+  have r12 := parallel_generatedRoot_45.facts_12 (ctx := ctx) (outputs := outputs) t12.1
+  have t13 := t12.2
+  have r13 := parallel_generatedRoot_45.facts_13 (ctx := ctx) (outputs := outputs) t13
+  ⟨r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13⟩
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Ctx (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) where
+  inputs : (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × mxxMat1 × mxxMat1 × (Fin 16 → Int) × (Fin 16 → Int) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → Int) × (Fin 16 → Fin 1025 → Int) × (Fin 16 → ByteArray) × (Fin 16 → ByteArray) × (Fin 16 → Int) × (Fin 16 → Int) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Int) × (Fin 16 → Int) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → Int) × (Fin 16 → Fin 1025 → Int) × (Fin 16 → ByteArray) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Int) × (Fin 16 → Int) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → Int) × (Fin 16 → Fin 1025 → Int) × (Fin 16 → ByteArray) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 2 60)) × Unit
+  witness : generatedRoot.Witness
+
+def generatedRoot.w_0_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.inputs.1
+
+def generatedRoot.w_1_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.inputs.2.1
+
+def generatedRoot.w_2_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.inputs.2.2.1
+
+def generatedRoot.w_3_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.inputs.2.2.2.1
+
+def generatedRoot.w_4_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : mxxMat1 :=
+  ctx.inputs.2.2.2.2.1
+
+def generatedRoot.w_5_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : mxxMat1 :=
+  ctx.inputs.2.2.2.2.2.1
+
+def generatedRoot.w_6_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.1
+
+def generatedRoot.w_7_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_8_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_9_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_10_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_11_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_12_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_13_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_14_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_15_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_16_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_17_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_18_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_19_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_20_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_21_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_22_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_23_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_24_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_25_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_26_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_27_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_28_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_29_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_30_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_31_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_32_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_33_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_34_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_35_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_36_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_37_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_38_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_39_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_40_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_41_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_42_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → Int :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_43_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → ByteArray :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_44_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 2 60) :=
+  ctx.inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+
+def generatedRoot.w_45_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.witness.w_45_0
+
+def generatedRoot.w_45_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.witness.w_45_1
+
+def generatedRoot.w_45_2 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.witness.w_45_2
+
+def generatedRoot.w_45_3 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.witness.w_45_3
+
+def generatedRoot.w_45_4 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.witness.w_45_4
+
+def generatedRoot.w_45_5 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat0 :=
+  ctx.witness.w_45_5
+
+def generatedRoot.w_45_6 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.witness.w_45_6
+
+def generatedRoot.w_45_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.witness.w_45_7
+
+def generatedRoot.w_45_8 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.witness.w_45_8
+
+def generatedRoot.w_45_9 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.witness.w_45_9
+
+def generatedRoot.w_45_10 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.witness.w_45_10
+
+def generatedRoot.w_45_11 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat2 :=
+  ctx.witness.w_45_11
+
+def generatedRoot.w_45_12 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat5 :=
+  ctx.witness.w_45_12
+
+def generatedRoot.w_45_13 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat0 :=
+  ctx.witness.w_45_13
+
+def generatedRoot.w_45_14 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat0 :=
+  ctx.witness.w_45_14
+
+def generatedRoot.w_45_15 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_15
+
+def generatedRoot.w_45_16 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_16
+
+def generatedRoot.w_45_17 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat8 :=
+  ctx.witness.w_45_17
+
+def generatedRoot.w_45_18 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat8 :=
+  ctx.witness.w_45_18
+
+def generatedRoot.w_45_19 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat9 :=
+  ctx.witness.w_45_19
+
+def generatedRoot.w_45_20 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat9 :=
+  ctx.witness.w_45_20
+
+def generatedRoot.w_45_21 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat10 :=
+  ctx.witness.w_45_21
+
+def generatedRoot.w_45_22 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat10 :=
+  ctx.witness.w_45_22
+
+def generatedRoot.w_45_23 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat11 :=
+  ctx.witness.w_45_23
+
+def generatedRoot.w_45_24 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat11 :=
+  ctx.witness.w_45_24
+
+def generatedRoot.w_45_25 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat12 :=
+  ctx.witness.w_45_25
+
+def generatedRoot.w_45_26 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat12 :=
+  ctx.witness.w_45_26
+
+def generatedRoot.w_45_27 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat13 :=
+  ctx.witness.w_45_27
+
+def generatedRoot.w_45_28 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat13 :=
+  ctx.witness.w_45_28
+
+def generatedRoot.w_45_29 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat14 :=
+  ctx.witness.w_45_29
+
+def generatedRoot.w_45_30 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat14 :=
+  ctx.witness.w_45_30
+
+def generatedRoot.w_45_31 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat15 :=
+  ctx.witness.w_45_31
+
+def generatedRoot.w_45_32 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat15 :=
+  ctx.witness.w_45_32
+
+def generatedRoot.w_45_33 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat16 :=
+  ctx.witness.w_45_33
+
+def generatedRoot.w_45_34 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat16 :=
+  ctx.witness.w_45_34
+
+def generatedRoot.w_45_35 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat17 :=
+  ctx.witness.w_45_35
+
+def generatedRoot.w_45_36 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat17 :=
+  ctx.witness.w_45_36
+
+def generatedRoot.w_45_37 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat18 :=
+  ctx.witness.w_45_37
+
+def generatedRoot.w_45_38 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat18 :=
+  ctx.witness.w_45_38
+
+def generatedRoot.w_45_39 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat19 :=
+  ctx.witness.w_45_39
+
+def generatedRoot.w_45_40 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat19 :=
+  ctx.witness.w_45_40
+
+def generatedRoot.w_45_41 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat20 :=
+  ctx.witness.w_45_41
+
+def generatedRoot.w_45_42 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat20 :=
+  ctx.witness.w_45_42
+
+def generatedRoot.w_45_43 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat21 :=
+  ctx.witness.w_45_43
+
+def generatedRoot.w_45_44 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat21 :=
+  ctx.witness.w_45_44
+
+def generatedRoot.w_45_45 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat22 :=
+  ctx.witness.w_45_45
+
+def generatedRoot.w_45_46 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat22 :=
+  ctx.witness.w_45_46
+
+def generatedRoot.w_45_47 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat23 :=
+  ctx.witness.w_45_47
+
+def generatedRoot.w_45_48 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat23 :=
+  ctx.witness.w_45_48
+
+def generatedRoot.w_45_49 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat24 :=
+  ctx.witness.w_45_49
+
+def generatedRoot.w_45_50 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat24 :=
+  ctx.witness.w_45_50
+
+def generatedRoot.w_45_51 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat25 :=
+  ctx.witness.w_45_51
+
+def generatedRoot.w_45_52 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat25 :=
+  ctx.witness.w_45_52
+
+def generatedRoot.w_45_53 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat26 :=
+  ctx.witness.w_45_53
+
+def generatedRoot.w_45_54 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat26 :=
+  ctx.witness.w_45_54
+
+def generatedRoot.w_45_55 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat27 :=
+  ctx.witness.w_45_55
+
+def generatedRoot.w_45_56 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat27 :=
+  ctx.witness.w_45_56
+
+def generatedRoot.w_45_57 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat28 :=
+  ctx.witness.w_45_57
+
+def generatedRoot.w_45_58 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat28 :=
+  ctx.witness.w_45_58
+
+def generatedRoot.w_45_59 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat29 :=
+  ctx.witness.w_45_59
+
+def generatedRoot.w_45_60 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat29 :=
+  ctx.witness.w_45_60
+
+def generatedRoot.w_45_61 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat30 :=
+  ctx.witness.w_45_61
+
+def generatedRoot.w_45_62 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat30 :=
+  ctx.witness.w_45_62
+
+def generatedRoot.w_45_63 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat31 :=
+  ctx.witness.w_45_63
+
+def generatedRoot.w_45_64 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat31 :=
+  ctx.witness.w_45_64
+
+def generatedRoot.w_45_65 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat32 :=
+  ctx.witness.w_45_65
+
+def generatedRoot.w_45_66 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat32 :=
+  ctx.witness.w_45_66
+
+def generatedRoot.w_45_67 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat33 :=
+  ctx.witness.w_45_67
+
+def generatedRoot.w_45_68 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat33 :=
+  ctx.witness.w_45_68
+
+def generatedRoot.w_45_69 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat34 :=
+  ctx.witness.w_45_69
+
+def generatedRoot.w_45_70 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat34 :=
+  ctx.witness.w_45_70
+
+def generatedRoot.w_45_71 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat35 :=
+  ctx.witness.w_45_71
+
+def generatedRoot.w_45_72 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat35 :=
+  ctx.witness.w_45_72
+
+def generatedRoot.w_45_73 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat36 :=
+  ctx.witness.w_45_73
+
+def generatedRoot.w_45_74 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat36 :=
+  ctx.witness.w_45_74
+
+def generatedRoot.w_45_75 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat37 :=
+  ctx.witness.w_45_75
+
+def generatedRoot.w_45_76 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat37 :=
+  ctx.witness.w_45_76
+
+def generatedRoot.w_45_77 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat38 :=
+  ctx.witness.w_45_77
+
+def generatedRoot.w_45_78 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat38 :=
+  ctx.witness.w_45_78
+
+def generatedRoot.w_45_79 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat39 :=
+  ctx.witness.w_45_79
+
+def generatedRoot.w_45_80 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat39 :=
+  ctx.witness.w_45_80
+
+def generatedRoot.w_45_81 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat40 :=
+  ctx.witness.w_45_81
+
+def generatedRoot.w_45_82 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat40 :=
+  ctx.witness.w_45_82
+
+def generatedRoot.w_45_83 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat34 :=
+  ctx.witness.w_45_83
+
+def generatedRoot.w_45_84 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat34 :=
+  ctx.witness.w_45_84
+
+def generatedRoot.w_45_85 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 2 → mxxMat34 :=
+  ctx.witness.w_45_85
+
+def generatedRoot.w_45_86 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 2 → mxxMat34 :=
+  ctx.witness.w_45_86
+
+def generatedRoot.w_45_87 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24)) :=
+  ctx.witness.w_45_87
+
+def generatedRoot.w_45_88 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24)) :=
+  ctx.witness.w_45_88
+
+def generatedRoot.w_45_89 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_89
+
+def generatedRoot.w_45_90 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_90
+
+def generatedRoot.w_45_91 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_91
+
+def generatedRoot.w_45_92 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_92
+
+def generatedRoot.w_45_93 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_93
+
+def generatedRoot.w_45_94 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_94
+
+def generatedRoot.w_45_95 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_95
+
+def generatedRoot.w_45_96 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_96
+
+def generatedRoot.w_45_97 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_97
+
+def generatedRoot.w_45_98 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_98
+
+def generatedRoot.w_45_99 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_99
+
+def generatedRoot.w_45_100 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_100
+
+def generatedRoot.w_45_101 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat41 :=
+  ctx.witness.w_45_101
+
+def generatedRoot.w_45_102 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat3 :=
+  ctx.witness.w_45_102
+
+def generatedRoot.w_45_103 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat3 :=
+  ctx.witness.w_45_103
+
+def generatedRoot.w_45_104 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat3 :=
+  ctx.witness.w_45_104
+
+def generatedRoot.w_45_105 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat3 :=
+  ctx.witness.w_45_105
+
+def generatedRoot.w_45_106 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat0 :=
+  ctx.witness.w_45_106
+
+def generatedRoot.w_45_107 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat0 :=
+  ctx.witness.w_45_107
+
+def generatedRoot.w_45_108 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat0 :=
+  ctx.witness.w_45_108
+
+def generatedRoot.w_45_109 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat0 :=
+  ctx.witness.w_45_109
+
+def generatedRoot.w_45_110 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat40 :=
+  ctx.witness.w_45_110
+
+def generatedRoot.w_45_111 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat40 :=
+  ctx.witness.w_45_111
+
+def generatedRoot.w_45_112 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat40 :=
+  ctx.witness.w_45_112
+
+def generatedRoot.w_45_113 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat40 :=
+  ctx.witness.w_45_113
+
+def generatedRoot.w_45_114 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat8 :=
+  ctx.witness.w_45_114
+
+def generatedRoot.w_45_115 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat8 :=
+  ctx.witness.w_45_115
+
+def generatedRoot.w_45_116 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat8 :=
+  ctx.witness.w_45_116
+
+def generatedRoot.w_45_117 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat8 :=
+  ctx.witness.w_45_117
+
+def generatedRoot.w_45_118 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat9 :=
+  ctx.witness.w_45_118
+
+def generatedRoot.w_45_119 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat9 :=
+  ctx.witness.w_45_119
+
+def generatedRoot.w_45_120 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat9 :=
+  ctx.witness.w_45_120
+
+def generatedRoot.w_45_121 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat9 :=
+  ctx.witness.w_45_121
+
+def generatedRoot.w_45_122 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat10 :=
+  ctx.witness.w_45_122
+
+def generatedRoot.w_45_123 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat10 :=
+  ctx.witness.w_45_123
+
+def generatedRoot.w_45_124 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat10 :=
+  ctx.witness.w_45_124
+
+def generatedRoot.w_45_125 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat10 :=
+  ctx.witness.w_45_125
+
+def generatedRoot.w_45_126 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat11 :=
+  ctx.witness.w_45_126
+
+def generatedRoot.w_45_127 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat11 :=
+  ctx.witness.w_45_127
+
+def generatedRoot.w_45_128 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat11 :=
+  ctx.witness.w_45_128
+
+def generatedRoot.w_45_129 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat11 :=
+  ctx.witness.w_45_129
+
+def generatedRoot.w_45_130 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat12 :=
+  ctx.witness.w_45_130
+
+def generatedRoot.w_45_131 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat12 :=
+  ctx.witness.w_45_131
+
+def generatedRoot.w_45_132 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat12 :=
+  ctx.witness.w_45_132
+
+def generatedRoot.w_45_133 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat12 :=
+  ctx.witness.w_45_133
+
+def generatedRoot.w_45_134 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat13 :=
+  ctx.witness.w_45_134
+
+def generatedRoot.w_45_135 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat13 :=
+  ctx.witness.w_45_135
+
+def generatedRoot.w_45_136 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat13 :=
+  ctx.witness.w_45_136
+
+def generatedRoot.w_45_137 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat13 :=
+  ctx.witness.w_45_137
+
+def generatedRoot.w_45_138 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat14 :=
+  ctx.witness.w_45_138
+
+def generatedRoot.w_45_139 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat14 :=
+  ctx.witness.w_45_139
+
+def generatedRoot.w_45_140 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat14 :=
+  ctx.witness.w_45_140
+
+def generatedRoot.w_45_141 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat14 :=
+  ctx.witness.w_45_141
+
+def generatedRoot.w_45_142 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat15 :=
+  ctx.witness.w_45_142
+
+def generatedRoot.w_45_143 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat15 :=
+  ctx.witness.w_45_143
+
+def generatedRoot.w_45_144 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat15 :=
+  ctx.witness.w_45_144
+
+def generatedRoot.w_45_145 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat15 :=
+  ctx.witness.w_45_145
+
+def generatedRoot.w_45_146 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat16 :=
+  ctx.witness.w_45_146
+
+def generatedRoot.w_45_147 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat16 :=
+  ctx.witness.w_45_147
+
+def generatedRoot.w_45_148 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat16 :=
+  ctx.witness.w_45_148
+
+def generatedRoot.w_45_149 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat16 :=
+  ctx.witness.w_45_149
+
+def generatedRoot.w_45_150 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_150
+
+def generatedRoot.w_45_151 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_151
+
+def generatedRoot.w_45_152 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat7 :=
+  ctx.witness.w_45_152
+
+def generatedRoot.w_45_153 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat7 :=
+  ctx.witness.w_45_153
+
+def generatedRoot.w_45_154 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat17 :=
+  ctx.witness.w_45_154
+
+def generatedRoot.w_45_155 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat17 :=
+  ctx.witness.w_45_155
+
+def generatedRoot.w_45_156 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat17 :=
+  ctx.witness.w_45_156
+
+def generatedRoot.w_45_157 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat17 :=
+  ctx.witness.w_45_157
+
+def generatedRoot.w_45_158 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat19 :=
+  ctx.witness.w_45_158
+
+def generatedRoot.w_45_159 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat19 :=
+  ctx.witness.w_45_159
+
+def generatedRoot.w_45_160 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat19 :=
+  ctx.witness.w_45_160
+
+def generatedRoot.w_45_161 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat19 :=
+  ctx.witness.w_45_161
+
+def generatedRoot.w_45_162 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat20 :=
+  ctx.witness.w_45_162
+
+def generatedRoot.w_45_163 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat20 :=
+  ctx.witness.w_45_163
+
+def generatedRoot.w_45_164 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat20 :=
+  ctx.witness.w_45_164
+
+def generatedRoot.w_45_165 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat20 :=
+  ctx.witness.w_45_165
+
+def generatedRoot.w_45_166 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat21 :=
+  ctx.witness.w_45_166
+
+def generatedRoot.w_45_167 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat21 :=
+  ctx.witness.w_45_167
+
+def generatedRoot.w_45_168 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat21 :=
+  ctx.witness.w_45_168
+
+def generatedRoot.w_45_169 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat21 :=
+  ctx.witness.w_45_169
+
+def generatedRoot.w_45_170 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat22 :=
+  ctx.witness.w_45_170
+
+def generatedRoot.w_45_171 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat22 :=
+  ctx.witness.w_45_171
+
+def generatedRoot.w_45_172 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat22 :=
+  ctx.witness.w_45_172
+
+def generatedRoot.w_45_173 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat22 :=
+  ctx.witness.w_45_173
+
+def generatedRoot.w_45_174 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat23 :=
+  ctx.witness.w_45_174
+
+def generatedRoot.w_45_175 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat23 :=
+  ctx.witness.w_45_175
+
+def generatedRoot.w_45_176 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat23 :=
+  ctx.witness.w_45_176
+
+def generatedRoot.w_45_177 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat23 :=
+  ctx.witness.w_45_177
+
+def generatedRoot.w_45_178 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat24 :=
+  ctx.witness.w_45_178
+
+def generatedRoot.w_45_179 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat24 :=
+  ctx.witness.w_45_179
+
+def generatedRoot.w_45_180 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat24 :=
+  ctx.witness.w_45_180
+
+def generatedRoot.w_45_181 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat24 :=
+  ctx.witness.w_45_181
+
+def generatedRoot.w_45_182 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat25 :=
+  ctx.witness.w_45_182
+
+def generatedRoot.w_45_183 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat25 :=
+  ctx.witness.w_45_183
+
+def generatedRoot.w_45_184 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat25 :=
+  ctx.witness.w_45_184
+
+def generatedRoot.w_45_185 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat25 :=
+  ctx.witness.w_45_185
+
+def generatedRoot.w_45_186 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat26 :=
+  ctx.witness.w_45_186
+
+def generatedRoot.w_45_187 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat26 :=
+  ctx.witness.w_45_187
+
+def generatedRoot.w_45_188 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat26 :=
+  ctx.witness.w_45_188
+
+def generatedRoot.w_45_189 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat26 :=
+  ctx.witness.w_45_189
+
+def generatedRoot.w_45_190 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat27 :=
+  ctx.witness.w_45_190
+
+def generatedRoot.w_45_191 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat27 :=
+  ctx.witness.w_45_191
+
+def generatedRoot.w_45_192 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat27 :=
+  ctx.witness.w_45_192
+
+def generatedRoot.w_45_193 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat27 :=
+  ctx.witness.w_45_193
+
+def generatedRoot.w_45_194 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat18 :=
+  ctx.witness.w_45_194
+
+def generatedRoot.w_45_195 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat18 :=
+  ctx.witness.w_45_195
+
+def generatedRoot.w_45_196 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat18 :=
+  ctx.witness.w_45_196
+
+def generatedRoot.w_45_197 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat18 :=
+  ctx.witness.w_45_197
+
+def generatedRoot.w_45_198 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat28 :=
+  ctx.witness.w_45_198
+
+def generatedRoot.w_45_199 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat28 :=
+  ctx.witness.w_45_199
+
+def generatedRoot.w_45_200 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat28 :=
+  ctx.witness.w_45_200
+
+def generatedRoot.w_45_201 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat28 :=
+  ctx.witness.w_45_201
+
+def generatedRoot.w_45_202 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat30 :=
+  ctx.witness.w_45_202
+
+def generatedRoot.w_45_203 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat30 :=
+  ctx.witness.w_45_203
+
+def generatedRoot.w_45_204 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat30 :=
+  ctx.witness.w_45_204
+
+def generatedRoot.w_45_205 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat30 :=
+  ctx.witness.w_45_205
+
+def generatedRoot.w_45_206 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat31 :=
+  ctx.witness.w_45_206
+
+def generatedRoot.w_45_207 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat31 :=
+  ctx.witness.w_45_207
+
+def generatedRoot.w_45_208 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat31 :=
+  ctx.witness.w_45_208
+
+def generatedRoot.w_45_209 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat31 :=
+  ctx.witness.w_45_209
+
+def generatedRoot.w_45_210 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat32 :=
+  ctx.witness.w_45_210
+
+def generatedRoot.w_45_211 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat32 :=
+  ctx.witness.w_45_211
+
+def generatedRoot.w_45_212 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat32 :=
+  ctx.witness.w_45_212
+
+def generatedRoot.w_45_213 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat32 :=
+  ctx.witness.w_45_213
+
+def generatedRoot.w_45_214 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat33 :=
+  ctx.witness.w_45_214
+
+def generatedRoot.w_45_215 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat33 :=
+  ctx.witness.w_45_215
+
+def generatedRoot.w_45_216 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat33 :=
+  ctx.witness.w_45_216
+
+def generatedRoot.w_45_217 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat33 :=
+  ctx.witness.w_45_217
+
+def generatedRoot.w_45_218 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat34 :=
+  ctx.witness.w_45_218
+
+def generatedRoot.w_45_219 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat34 :=
+  ctx.witness.w_45_219
+
+def generatedRoot.w_45_220 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat34 :=
+  ctx.witness.w_45_220
+
+def generatedRoot.w_45_221 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat34 :=
+  ctx.witness.w_45_221
+
+def generatedRoot.w_45_222 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat29 :=
+  ctx.witness.w_45_222
+
+def generatedRoot.w_45_223 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat29 :=
+  ctx.witness.w_45_223
+
+def generatedRoot.w_45_224 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat29 :=
+  ctx.witness.w_45_224
+
+def generatedRoot.w_45_225 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat29 :=
+  ctx.witness.w_45_225
+
+def generatedRoot.w_45_226 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat35 :=
+  ctx.witness.w_45_226
+
+def generatedRoot.w_45_227 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat35 :=
+  ctx.witness.w_45_227
+
+def generatedRoot.w_45_228 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat35 :=
+  ctx.witness.w_45_228
+
+def generatedRoot.w_45_229 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat35 :=
+  ctx.witness.w_45_229
+
+def generatedRoot.w_45_230 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat36 :=
+  ctx.witness.w_45_230
+
+def generatedRoot.w_45_231 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat36 :=
+  ctx.witness.w_45_231
+
+def generatedRoot.w_45_232 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat36 :=
+  ctx.witness.w_45_232
+
+def generatedRoot.w_45_233 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat36 :=
+  ctx.witness.w_45_233
+
+def generatedRoot.w_45_234 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat37 :=
+  ctx.witness.w_45_234
+
+def generatedRoot.w_45_235 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat37 :=
+  ctx.witness.w_45_235
+
+def generatedRoot.w_45_236 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat37 :=
+  ctx.witness.w_45_236
+
+def generatedRoot.w_45_237 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat37 :=
+  ctx.witness.w_45_237
+
+def generatedRoot.w_45_238 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat38 :=
+  ctx.witness.w_45_238
+
+def generatedRoot.w_45_239 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat38 :=
+  ctx.witness.w_45_239
+
+def generatedRoot.w_45_240 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat38 :=
+  ctx.witness.w_45_240
+
+def generatedRoot.w_45_241 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat38 :=
+  ctx.witness.w_45_241
+
+def generatedRoot.w_45_242 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat39 :=
+  ctx.witness.w_45_242
+
+def generatedRoot.w_45_243 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat39 :=
+  ctx.witness.w_45_243
+
+def generatedRoot.w_45_244 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat39 :=
+  ctx.witness.w_45_244
+
+def generatedRoot.w_45_245 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat39 :=
+  ctx.witness.w_45_245
+
+def generatedRoot.w_45_246 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_246
+
+def generatedRoot.w_45_247 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_247
+
+def generatedRoot.w_45_248 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_248
+
+def generatedRoot.w_45_249 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_249
+
+def generatedRoot.w_45_250 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_250
+
+def generatedRoot.w_45_251 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → mxxMat3 :=
+  ctx.witness.w_45_251
+
+def generatedRoot.w_45_252 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_252
+
+def generatedRoot.w_45_253 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_253
+
+def generatedRoot.w_45_254 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_254
+
+def generatedRoot.w_45_255 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_255
+
+def generatedRoot.w_45_256 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_256
+
+def generatedRoot.w_45_257 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat4 :=
+  ctx.witness.w_45_257
+
+def generatedRoot.w_45_258 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 1025 → mxxMat41 :=
+  ctx.witness.w_45_258
+
+def generatedRoot.w_45_259 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat3 :=
+  ctx.witness.w_45_259
+
+def generatedRoot.w_45_260 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat3 :=
+  ctx.witness.w_45_260
+
+def generatedRoot.w_45_261 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat3 :=
+  ctx.witness.w_45_261
+
+def generatedRoot.w_45_262 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat3 :=
+  ctx.witness.w_45_262
+
+def generatedRoot.w_45_263 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat0 :=
+  ctx.witness.w_45_263
+
+def generatedRoot.w_45_264 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat0 :=
+  ctx.witness.w_45_264
+
+def generatedRoot.w_45_265 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat0 :=
+  ctx.witness.w_45_265
+
+def generatedRoot.w_45_266 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat0 :=
+  ctx.witness.w_45_266
+
+def generatedRoot.w_45_267 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat40 :=
+  ctx.witness.w_45_267
+
+def generatedRoot.w_45_268 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat40 :=
+  ctx.witness.w_45_268
+
+def generatedRoot.w_45_269 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat40 :=
+  ctx.witness.w_45_269
+
+def generatedRoot.w_45_270 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat40 :=
+  ctx.witness.w_45_270
+
+def generatedRoot.w_45_271 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat8 :=
+  ctx.witness.w_45_271
+
+def generatedRoot.w_45_272 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat8 :=
+  ctx.witness.w_45_272
+
+def generatedRoot.w_45_273 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat8 :=
+  ctx.witness.w_45_273
+
+def generatedRoot.w_45_274 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat8 :=
+  ctx.witness.w_45_274
+
+def generatedRoot.w_45_275 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat9 :=
+  ctx.witness.w_45_275
+
+def generatedRoot.w_45_276 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat9 :=
+  ctx.witness.w_45_276
+
+def generatedRoot.w_45_277 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat9 :=
+  ctx.witness.w_45_277
+
+def generatedRoot.w_45_278 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat9 :=
+  ctx.witness.w_45_278
+
+def generatedRoot.w_45_279 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat10 :=
+  ctx.witness.w_45_279
+
+def generatedRoot.w_45_280 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat10 :=
+  ctx.witness.w_45_280
+
+def generatedRoot.w_45_281 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat10 :=
+  ctx.witness.w_45_281
+
+def generatedRoot.w_45_282 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat10 :=
+  ctx.witness.w_45_282
+
+def generatedRoot.w_45_283 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat11 :=
+  ctx.witness.w_45_283
+
+def generatedRoot.w_45_284 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat11 :=
+  ctx.witness.w_45_284
+
+def generatedRoot.w_45_285 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat11 :=
+  ctx.witness.w_45_285
+
+def generatedRoot.w_45_286 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat11 :=
+  ctx.witness.w_45_286
+
+def generatedRoot.w_45_287 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat12 :=
+  ctx.witness.w_45_287
+
+def generatedRoot.w_45_288 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat12 :=
+  ctx.witness.w_45_288
+
+def generatedRoot.w_45_289 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat12 :=
+  ctx.witness.w_45_289
+
+def generatedRoot.w_45_290 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat12 :=
+  ctx.witness.w_45_290
+
+def generatedRoot.w_45_291 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat13 :=
+  ctx.witness.w_45_291
+
+def generatedRoot.w_45_292 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat13 :=
+  ctx.witness.w_45_292
+
+def generatedRoot.w_45_293 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat13 :=
+  ctx.witness.w_45_293
+
+def generatedRoot.w_45_294 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat13 :=
+  ctx.witness.w_45_294
+
+def generatedRoot.w_45_295 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat14 :=
+  ctx.witness.w_45_295
+
+def generatedRoot.w_45_296 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat14 :=
+  ctx.witness.w_45_296
+
+def generatedRoot.w_45_297 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat14 :=
+  ctx.witness.w_45_297
+
+def generatedRoot.w_45_298 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat14 :=
+  ctx.witness.w_45_298
+
+def generatedRoot.w_45_299 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat15 :=
+  ctx.witness.w_45_299
+
+def generatedRoot.w_45_300 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat15 :=
+  ctx.witness.w_45_300
+
+def generatedRoot.w_45_301 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat15 :=
+  ctx.witness.w_45_301
+
+def generatedRoot.w_45_302 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat15 :=
+  ctx.witness.w_45_302
+
+def generatedRoot.w_45_303 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat16 :=
+  ctx.witness.w_45_303
+
+def generatedRoot.w_45_304 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat16 :=
+  ctx.witness.w_45_304
+
+def generatedRoot.w_45_305 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat16 :=
+  ctx.witness.w_45_305
+
+def generatedRoot.w_45_306 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat16 :=
+  ctx.witness.w_45_306
+
+def generatedRoot.w_45_307 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_307
+
+def generatedRoot.w_45_308 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat7 :=
+  ctx.witness.w_45_308
+
+def generatedRoot.w_45_309 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat7 :=
+  ctx.witness.w_45_309
+
+def generatedRoot.w_45_310 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat7 :=
+  ctx.witness.w_45_310
+
+def generatedRoot.w_45_311 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat17 :=
+  ctx.witness.w_45_311
+
+def generatedRoot.w_45_312 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat17 :=
+  ctx.witness.w_45_312
+
+def generatedRoot.w_45_313 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat17 :=
+  ctx.witness.w_45_313
+
+def generatedRoot.w_45_314 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat17 :=
+  ctx.witness.w_45_314
+
+def generatedRoot.w_45_315 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat19 :=
+  ctx.witness.w_45_315
+
+def generatedRoot.w_45_316 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat19 :=
+  ctx.witness.w_45_316
+
+def generatedRoot.w_45_317 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat19 :=
+  ctx.witness.w_45_317
+
+def generatedRoot.w_45_318 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat19 :=
+  ctx.witness.w_45_318
+
+def generatedRoot.w_45_319 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat20 :=
+  ctx.witness.w_45_319
+
+def generatedRoot.w_45_320 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat20 :=
+  ctx.witness.w_45_320
+
+def generatedRoot.w_45_321 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat20 :=
+  ctx.witness.w_45_321
+
+def generatedRoot.w_45_322 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat20 :=
+  ctx.witness.w_45_322
+
+def generatedRoot.w_45_323 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat21 :=
+  ctx.witness.w_45_323
+
+def generatedRoot.w_45_324 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat21 :=
+  ctx.witness.w_45_324
+
+def generatedRoot.w_45_325 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat21 :=
+  ctx.witness.w_45_325
+
+def generatedRoot.w_45_326 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat21 :=
+  ctx.witness.w_45_326
+
+def generatedRoot.w_45_327 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat22 :=
+  ctx.witness.w_45_327
+
+def generatedRoot.w_45_328 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat22 :=
+  ctx.witness.w_45_328
+
+def generatedRoot.w_45_329 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat22 :=
+  ctx.witness.w_45_329
+
+def generatedRoot.w_45_330 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat22 :=
+  ctx.witness.w_45_330
+
+def generatedRoot.w_45_331 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat23 :=
+  ctx.witness.w_45_331
+
+def generatedRoot.w_45_332 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat23 :=
+  ctx.witness.w_45_332
+
+def generatedRoot.w_45_333 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat23 :=
+  ctx.witness.w_45_333
+
+def generatedRoot.w_45_334 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat23 :=
+  ctx.witness.w_45_334
+
+def generatedRoot.w_45_335 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat24 :=
+  ctx.witness.w_45_335
+
+def generatedRoot.w_45_336 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat24 :=
+  ctx.witness.w_45_336
+
+def generatedRoot.w_45_337 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat24 :=
+  ctx.witness.w_45_337
+
+def generatedRoot.w_45_338 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat24 :=
+  ctx.witness.w_45_338
+
+def generatedRoot.w_45_339 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat25 :=
+  ctx.witness.w_45_339
+
+def generatedRoot.w_45_340 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat25 :=
+  ctx.witness.w_45_340
+
+def generatedRoot.w_45_341 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat25 :=
+  ctx.witness.w_45_341
+
+def generatedRoot.w_45_342 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat25 :=
+  ctx.witness.w_45_342
+
+def generatedRoot.w_45_343 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat26 :=
+  ctx.witness.w_45_343
+
+def generatedRoot.w_45_344 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat26 :=
+  ctx.witness.w_45_344
+
+def generatedRoot.w_45_345 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat26 :=
+  ctx.witness.w_45_345
+
+def generatedRoot.w_45_346 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat26 :=
+  ctx.witness.w_45_346
+
+def generatedRoot.w_45_347 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat27 :=
+  ctx.witness.w_45_347
+
+def generatedRoot.w_45_348 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat27 :=
+  ctx.witness.w_45_348
+
+def generatedRoot.w_45_349 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat27 :=
+  ctx.witness.w_45_349
+
+def generatedRoot.w_45_350 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat27 :=
+  ctx.witness.w_45_350
+
+def generatedRoot.w_45_351 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat18 :=
+  ctx.witness.w_45_351
+
+def generatedRoot.w_45_352 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat18 :=
+  ctx.witness.w_45_352
+
+def generatedRoot.w_45_353 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat18 :=
+  ctx.witness.w_45_353
+
+def generatedRoot.w_45_354 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat18 :=
+  ctx.witness.w_45_354
+
+def generatedRoot.w_45_355 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat28 :=
+  ctx.witness.w_45_355
+
+def generatedRoot.w_45_356 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat28 :=
+  ctx.witness.w_45_356
+
+def generatedRoot.w_45_357 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat28 :=
+  ctx.witness.w_45_357
+
+def generatedRoot.w_45_358 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat28 :=
+  ctx.witness.w_45_358
+
+def generatedRoot.w_45_359 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat30 :=
+  ctx.witness.w_45_359
+
+def generatedRoot.w_45_360 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat30 :=
+  ctx.witness.w_45_360
+
+def generatedRoot.w_45_361 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat30 :=
+  ctx.witness.w_45_361
+
+def generatedRoot.w_45_362 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat30 :=
+  ctx.witness.w_45_362
+
+def generatedRoot.w_45_363 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat31 :=
+  ctx.witness.w_45_363
+
+def generatedRoot.w_45_364 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat31 :=
+  ctx.witness.w_45_364
+
+def generatedRoot.w_45_365 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat31 :=
+  ctx.witness.w_45_365
+
+def generatedRoot.w_45_366 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat31 :=
+  ctx.witness.w_45_366
+
+def generatedRoot.w_45_367 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat32 :=
+  ctx.witness.w_45_367
+
+def generatedRoot.w_45_368 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat32 :=
+  ctx.witness.w_45_368
+
+def generatedRoot.w_45_369 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat32 :=
+  ctx.witness.w_45_369
+
+def generatedRoot.w_45_370 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat32 :=
+  ctx.witness.w_45_370
+
+def generatedRoot.w_45_371 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat33 :=
+  ctx.witness.w_45_371
+
+def generatedRoot.w_45_372 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat33 :=
+  ctx.witness.w_45_372
+
+def generatedRoot.w_45_373 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat33 :=
+  ctx.witness.w_45_373
+
+def generatedRoot.w_45_374 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat33 :=
+  ctx.witness.w_45_374
+
+def generatedRoot.w_45_375 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat34 :=
+  ctx.witness.w_45_375
+
+def generatedRoot.w_45_376 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat34 :=
+  ctx.witness.w_45_376
+
+def generatedRoot.w_45_377 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat34 :=
+  ctx.witness.w_45_377
+
+def generatedRoot.w_45_378 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat34 :=
+  ctx.witness.w_45_378
+
+def generatedRoot.w_45_379 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat29 :=
+  ctx.witness.w_45_379
+
+def generatedRoot.w_45_380 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat29 :=
+  ctx.witness.w_45_380
+
+def generatedRoot.w_45_381 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat29 :=
+  ctx.witness.w_45_381
+
+def generatedRoot.w_45_382 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat29 :=
+  ctx.witness.w_45_382
+
+def generatedRoot.w_45_383 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat35 :=
+  ctx.witness.w_45_383
+
+def generatedRoot.w_45_384 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat35 :=
+  ctx.witness.w_45_384
+
+def generatedRoot.w_45_385 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat35 :=
+  ctx.witness.w_45_385
+
+def generatedRoot.w_45_386 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat35 :=
+  ctx.witness.w_45_386
+
+def generatedRoot.w_45_387 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat36 :=
+  ctx.witness.w_45_387
+
+def generatedRoot.w_45_388 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat36 :=
+  ctx.witness.w_45_388
+
+def generatedRoot.w_45_389 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat36 :=
+  ctx.witness.w_45_389
+
+def generatedRoot.w_45_390 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat36 :=
+  ctx.witness.w_45_390
+
+def generatedRoot.w_45_391 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat37 :=
+  ctx.witness.w_45_391
+
+def generatedRoot.w_45_392 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat37 :=
+  ctx.witness.w_45_392
+
+def generatedRoot.w_45_393 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat37 :=
+  ctx.witness.w_45_393
+
+def generatedRoot.w_45_394 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat37 :=
+  ctx.witness.w_45_394
+
+def generatedRoot.w_45_395 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat38 :=
+  ctx.witness.w_45_395
+
+def generatedRoot.w_45_396 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat38 :=
+  ctx.witness.w_45_396
+
+def generatedRoot.w_45_397 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat38 :=
+  ctx.witness.w_45_397
+
+def generatedRoot.w_45_398 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat38 :=
+  ctx.witness.w_45_398
+
+def generatedRoot.w_45_399 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat39 :=
+  ctx.witness.w_45_399
+
+def generatedRoot.w_45_400 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 128 → mxxMat39 :=
+  ctx.witness.w_45_400
+
+def generatedRoot.w_45_401 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat39 :=
+  ctx.witness.w_45_401
+
+def generatedRoot.w_45_402 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : Fin 16 → Fin 32 → mxxMat39 :=
+  ctx.witness.w_45_402
+
+def generatedRoot.w_45_403 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28) :=
+  ctx.witness.w_45_403
+
+def generatedRoot.w_45_404 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28) :=
+  ctx.witness.w_45_404
+
+def generatedRoot.w_45_405 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60) :=
+  ctx.witness.w_45_405
+
+def generatedRoot.outs {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) : ((Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat5) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → mxxMat34) × (Fin 16 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × Unit) × ((Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60)) × Unit) :=
+  (((generatedRoot.w_45_0 ctx), ((generatedRoot.w_45_1 ctx), ((generatedRoot.w_45_2 ctx), ((generatedRoot.w_45_3 ctx), ((generatedRoot.w_45_4 ctx), ((generatedRoot.w_45_5 ctx), ((generatedRoot.w_45_6 ctx), ((generatedRoot.w_45_7 ctx), ((generatedRoot.w_45_8 ctx), ((generatedRoot.w_45_9 ctx), ((generatedRoot.w_45_10 ctx), ((generatedRoot.w_45_11 ctx), ((generatedRoot.w_45_12 ctx), ((generatedRoot.w_45_13 ctx), ((generatedRoot.w_45_14 ctx), ((generatedRoot.w_45_15 ctx), ((generatedRoot.w_45_16 ctx), ((generatedRoot.w_45_17 ctx), ((generatedRoot.w_45_18 ctx), ((generatedRoot.w_45_19 ctx), ((generatedRoot.w_45_20 ctx), ((generatedRoot.w_45_21 ctx), ((generatedRoot.w_45_22 ctx), ((generatedRoot.w_45_23 ctx), ((generatedRoot.w_45_24 ctx), ((generatedRoot.w_45_25 ctx), ((generatedRoot.w_45_26 ctx), ((generatedRoot.w_45_27 ctx), ((generatedRoot.w_45_28 ctx), ((generatedRoot.w_45_29 ctx), ((generatedRoot.w_45_30 ctx), ((generatedRoot.w_45_31 ctx), ((generatedRoot.w_45_32 ctx), ((generatedRoot.w_45_33 ctx), ((generatedRoot.w_45_34 ctx), ((generatedRoot.w_45_35 ctx), ((generatedRoot.w_45_36 ctx), ((generatedRoot.w_45_37 ctx), ((generatedRoot.w_45_38 ctx), ((generatedRoot.w_45_39 ctx), ((generatedRoot.w_45_40 ctx), ((generatedRoot.w_45_41 ctx), ((generatedRoot.w_45_42 ctx), ((generatedRoot.w_45_43 ctx), ((generatedRoot.w_45_44 ctx), ((generatedRoot.w_45_45 ctx), ((generatedRoot.w_45_46 ctx), ((generatedRoot.w_45_47 ctx), ((generatedRoot.w_45_48 ctx), ((generatedRoot.w_45_49 ctx), ((generatedRoot.w_45_50 ctx), ((generatedRoot.w_45_51 ctx), ((generatedRoot.w_45_52 ctx), ((generatedRoot.w_45_53 ctx), ((generatedRoot.w_45_54 ctx), ((generatedRoot.w_45_55 ctx), ((generatedRoot.w_45_56 ctx), ((generatedRoot.w_45_57 ctx), ((generatedRoot.w_45_58 ctx), ((generatedRoot.w_45_59 ctx), ((generatedRoot.w_45_60 ctx), ((generatedRoot.w_45_61 ctx), ((generatedRoot.w_45_62 ctx), ((generatedRoot.w_45_63 ctx), ((generatedRoot.w_45_64 ctx), ((generatedRoot.w_45_65 ctx), ((generatedRoot.w_45_66 ctx), ((generatedRoot.w_45_67 ctx), ((generatedRoot.w_45_68 ctx), ((generatedRoot.w_45_69 ctx), ((generatedRoot.w_45_70 ctx), ((generatedRoot.w_45_71 ctx), ((generatedRoot.w_45_72 ctx), ((generatedRoot.w_45_73 ctx), ((generatedRoot.w_45_74 ctx), ((generatedRoot.w_45_75 ctx), ((generatedRoot.w_45_76 ctx), ((generatedRoot.w_45_77 ctx), ((generatedRoot.w_45_78 ctx), ((generatedRoot.w_45_79 ctx), ((generatedRoot.w_45_80 ctx), ((generatedRoot.w_45_81 ctx), ((generatedRoot.w_45_82 ctx), ((generatedRoot.w_45_83 ctx), ((generatedRoot.w_45_84 ctx), ((generatedRoot.w_45_85 ctx), ((generatedRoot.w_45_86 ctx), ((generatedRoot.w_45_87 ctx), ((generatedRoot.w_45_88 ctx), ((generatedRoot.w_45_89 ctx), ((generatedRoot.w_45_90 ctx), ((generatedRoot.w_45_91 ctx), ((generatedRoot.w_45_92 ctx), ((generatedRoot.w_45_93 ctx), ((generatedRoot.w_45_94 ctx), ((generatedRoot.w_45_95 ctx), ((generatedRoot.w_45_96 ctx), ((generatedRoot.w_45_97 ctx), ((generatedRoot.w_45_98 ctx), ((generatedRoot.w_45_99 ctx), ((generatedRoot.w_45_100 ctx), ((generatedRoot.w_45_101 ctx), ((generatedRoot.w_45_102 ctx), ((generatedRoot.w_45_103 ctx), ((generatedRoot.w_45_104 ctx), ((generatedRoot.w_45_105 ctx), ((generatedRoot.w_45_106 ctx), ((generatedRoot.w_45_107 ctx), ((generatedRoot.w_45_108 ctx), ((generatedRoot.w_45_109 ctx), ((generatedRoot.w_45_110 ctx), ((generatedRoot.w_45_111 ctx), ((generatedRoot.w_45_112 ctx), ((generatedRoot.w_45_113 ctx), ((generatedRoot.w_45_114 ctx), ((generatedRoot.w_45_115 ctx), ((generatedRoot.w_45_116 ctx), ((generatedRoot.w_45_117 ctx), ((generatedRoot.w_45_118 ctx), ((generatedRoot.w_45_119 ctx), ((generatedRoot.w_45_120 ctx), ((generatedRoot.w_45_121 ctx), ((generatedRoot.w_45_122 ctx), ((generatedRoot.w_45_123 ctx), ((generatedRoot.w_45_124 ctx), ((generatedRoot.w_45_125 ctx), ((generatedRoot.w_45_126 ctx), ((generatedRoot.w_45_127 ctx), ((generatedRoot.w_45_128 ctx), ((generatedRoot.w_45_129 ctx), ((generatedRoot.w_45_130 ctx), ((generatedRoot.w_45_131 ctx), ((generatedRoot.w_45_132 ctx), ((generatedRoot.w_45_133 ctx), ((generatedRoot.w_45_134 ctx), ((generatedRoot.w_45_135 ctx), ((generatedRoot.w_45_136 ctx), ((generatedRoot.w_45_137 ctx), ((generatedRoot.w_45_138 ctx), ((generatedRoot.w_45_139 ctx), ((generatedRoot.w_45_140 ctx), ((generatedRoot.w_45_141 ctx), ((generatedRoot.w_45_142 ctx), ((generatedRoot.w_45_143 ctx), ((generatedRoot.w_45_144 ctx), ((generatedRoot.w_45_145 ctx), ((generatedRoot.w_45_146 ctx), ((generatedRoot.w_45_147 ctx), ((generatedRoot.w_45_148 ctx), ((generatedRoot.w_45_149 ctx), ((generatedRoot.w_45_150 ctx), ((generatedRoot.w_45_151 ctx), ((generatedRoot.w_45_152 ctx), ((generatedRoot.w_45_153 ctx), ((generatedRoot.w_45_154 ctx), ((generatedRoot.w_45_155 ctx), ((generatedRoot.w_45_156 ctx), ((generatedRoot.w_45_157 ctx), ((generatedRoot.w_45_158 ctx), ((generatedRoot.w_45_159 ctx), ((generatedRoot.w_45_160 ctx), ((generatedRoot.w_45_161 ctx), ((generatedRoot.w_45_162 ctx), ((generatedRoot.w_45_163 ctx), ((generatedRoot.w_45_164 ctx), ((generatedRoot.w_45_165 ctx), ((generatedRoot.w_45_166 ctx), ((generatedRoot.w_45_167 ctx), ((generatedRoot.w_45_168 ctx), ((generatedRoot.w_45_169 ctx), ((generatedRoot.w_45_170 ctx), ((generatedRoot.w_45_171 ctx), ((generatedRoot.w_45_172 ctx), ((generatedRoot.w_45_173 ctx), ((generatedRoot.w_45_174 ctx), ((generatedRoot.w_45_175 ctx), ((generatedRoot.w_45_176 ctx), ((generatedRoot.w_45_177 ctx), ((generatedRoot.w_45_178 ctx), ((generatedRoot.w_45_179 ctx), ((generatedRoot.w_45_180 ctx), ((generatedRoot.w_45_181 ctx), ((generatedRoot.w_45_182 ctx), ((generatedRoot.w_45_183 ctx), ((generatedRoot.w_45_184 ctx), ((generatedRoot.w_45_185 ctx), ((generatedRoot.w_45_186 ctx), ((generatedRoot.w_45_187 ctx), ((generatedRoot.w_45_188 ctx), ((generatedRoot.w_45_189 ctx), ((generatedRoot.w_45_190 ctx), ((generatedRoot.w_45_191 ctx), ((generatedRoot.w_45_192 ctx), ((generatedRoot.w_45_193 ctx), ((generatedRoot.w_45_194 ctx), ((generatedRoot.w_45_195 ctx), ((generatedRoot.w_45_196 ctx), ((generatedRoot.w_45_197 ctx), ((generatedRoot.w_45_198 ctx), ((generatedRoot.w_45_199 ctx), ((generatedRoot.w_45_200 ctx), ((generatedRoot.w_45_201 ctx), ((generatedRoot.w_45_202 ctx), ()))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))), ((generatedRoot.w_45_203 ctx), ((generatedRoot.w_45_204 ctx), ((generatedRoot.w_45_205 ctx), ((generatedRoot.w_45_206 ctx), ((generatedRoot.w_45_207 ctx), ((generatedRoot.w_45_208 ctx), ((generatedRoot.w_45_209 ctx), ((generatedRoot.w_45_210 ctx), ((generatedRoot.w_45_211 ctx), ((generatedRoot.w_45_212 ctx), ((generatedRoot.w_45_213 ctx), ((generatedRoot.w_45_214 ctx), ((generatedRoot.w_45_215 ctx), ((generatedRoot.w_45_216 ctx), ((generatedRoot.w_45_217 ctx), ((generatedRoot.w_45_218 ctx), ((generatedRoot.w_45_219 ctx), ((generatedRoot.w_45_220 ctx), ((generatedRoot.w_45_221 ctx), ((generatedRoot.w_45_222 ctx), ((generatedRoot.w_45_223 ctx), ((generatedRoot.w_45_224 ctx), ((generatedRoot.w_45_225 ctx), ((generatedRoot.w_45_226 ctx), ((generatedRoot.w_45_227 ctx), ((generatedRoot.w_45_228 ctx), ((generatedRoot.w_45_229 ctx), ((generatedRoot.w_45_230 ctx), ((generatedRoot.w_45_231 ctx), ((generatedRoot.w_45_232 ctx), ((generatedRoot.w_45_233 ctx), ((generatedRoot.w_45_234 ctx), ((generatedRoot.w_45_235 ctx), ((generatedRoot.w_45_236 ctx), ((generatedRoot.w_45_237 ctx), ((generatedRoot.w_45_238 ctx), ((generatedRoot.w_45_239 ctx), ((generatedRoot.w_45_240 ctx), ((generatedRoot.w_45_241 ctx), ((generatedRoot.w_45_242 ctx), ((generatedRoot.w_45_243 ctx), ((generatedRoot.w_45_244 ctx), ((generatedRoot.w_45_245 ctx), ((generatedRoot.w_45_246 ctx), ((generatedRoot.w_45_247 ctx), ((generatedRoot.w_45_248 ctx), ((generatedRoot.w_45_249 ctx), ((generatedRoot.w_45_250 ctx), ((generatedRoot.w_45_251 ctx), ((generatedRoot.w_45_252 ctx), ((generatedRoot.w_45_253 ctx), ((generatedRoot.w_45_254 ctx), ((generatedRoot.w_45_255 ctx), ((generatedRoot.w_45_256 ctx), ((generatedRoot.w_45_257 ctx), ((generatedRoot.w_45_258 ctx), ((generatedRoot.w_45_259 ctx), ((generatedRoot.w_45_260 ctx), ((generatedRoot.w_45_261 ctx), ((generatedRoot.w_45_262 ctx), ((generatedRoot.w_45_263 ctx), ((generatedRoot.w_45_264 ctx), ((generatedRoot.w_45_265 ctx), ((generatedRoot.w_45_266 ctx), ((generatedRoot.w_45_267 ctx), ((generatedRoot.w_45_268 ctx), ((generatedRoot.w_45_269 ctx), ((generatedRoot.w_45_270 ctx), ((generatedRoot.w_45_271 ctx), ((generatedRoot.w_45_272 ctx), ((generatedRoot.w_45_273 ctx), ((generatedRoot.w_45_274 ctx), ((generatedRoot.w_45_275 ctx), ((generatedRoot.w_45_276 ctx), ((generatedRoot.w_45_277 ctx), ((generatedRoot.w_45_278 ctx), ((generatedRoot.w_45_279 ctx), ((generatedRoot.w_45_280 ctx), ((generatedRoot.w_45_281 ctx), ((generatedRoot.w_45_282 ctx), ((generatedRoot.w_45_283 ctx), ((generatedRoot.w_45_284 ctx), ((generatedRoot.w_45_285 ctx), ((generatedRoot.w_45_286 ctx), ((generatedRoot.w_45_287 ctx), ((generatedRoot.w_45_288 ctx), ((generatedRoot.w_45_289 ctx), ((generatedRoot.w_45_290 ctx), ((generatedRoot.w_45_291 ctx), ((generatedRoot.w_45_292 ctx), ((generatedRoot.w_45_293 ctx), ((generatedRoot.w_45_294 ctx), ((generatedRoot.w_45_295 ctx), ((generatedRoot.w_45_296 ctx), ((generatedRoot.w_45_297 ctx), ((generatedRoot.w_45_298 ctx), ((generatedRoot.w_45_299 ctx), ((generatedRoot.w_45_300 ctx), ((generatedRoot.w_45_301 ctx), ((generatedRoot.w_45_302 ctx), ((generatedRoot.w_45_303 ctx), ((generatedRoot.w_45_304 ctx), ((generatedRoot.w_45_305 ctx), ((generatedRoot.w_45_306 ctx), ((generatedRoot.w_45_307 ctx), ((generatedRoot.w_45_308 ctx), ((generatedRoot.w_45_309 ctx), ((generatedRoot.w_45_310 ctx), ((generatedRoot.w_45_311 ctx), ((generatedRoot.w_45_312 ctx), ((generatedRoot.w_45_313 ctx), ((generatedRoot.w_45_314 ctx), ((generatedRoot.w_45_315 ctx), ((generatedRoot.w_45_316 ctx), ((generatedRoot.w_45_317 ctx), ((generatedRoot.w_45_318 ctx), ((generatedRoot.w_45_319 ctx), ((generatedRoot.w_45_320 ctx), ((generatedRoot.w_45_321 ctx), ((generatedRoot.w_45_322 ctx), ((generatedRoot.w_45_323 ctx), ((generatedRoot.w_45_324 ctx), ((generatedRoot.w_45_325 ctx), ((generatedRoot.w_45_326 ctx), ((generatedRoot.w_45_327 ctx), ((generatedRoot.w_45_328 ctx), ((generatedRoot.w_45_329 ctx), ((generatedRoot.w_45_330 ctx), ((generatedRoot.w_45_331 ctx), ((generatedRoot.w_45_332 ctx), ((generatedRoot.w_45_333 ctx), ((generatedRoot.w_45_334 ctx), ((generatedRoot.w_45_335 ctx), ((generatedRoot.w_45_336 ctx), ((generatedRoot.w_45_337 ctx), ((generatedRoot.w_45_338 ctx), ((generatedRoot.w_45_339 ctx), ((generatedRoot.w_45_340 ctx), ((generatedRoot.w_45_341 ctx), ((generatedRoot.w_45_342 ctx), ((generatedRoot.w_45_343 ctx), ((generatedRoot.w_45_344 ctx), ((generatedRoot.w_45_345 ctx), ((generatedRoot.w_45_346 ctx), ((generatedRoot.w_45_347 ctx), ((generatedRoot.w_45_348 ctx), ((generatedRoot.w_45_349 ctx), ((generatedRoot.w_45_350 ctx), ((generatedRoot.w_45_351 ctx), ((generatedRoot.w_45_352 ctx), ((generatedRoot.w_45_353 ctx), ((generatedRoot.w_45_354 ctx), ((generatedRoot.w_45_355 ctx), ((generatedRoot.w_45_356 ctx), ((generatedRoot.w_45_357 ctx), ((generatedRoot.w_45_358 ctx), ((generatedRoot.w_45_359 ctx), ((generatedRoot.w_45_360 ctx), ((generatedRoot.w_45_361 ctx), ((generatedRoot.w_45_362 ctx), ((generatedRoot.w_45_363 ctx), ((generatedRoot.w_45_364 ctx), ((generatedRoot.w_45_365 ctx), ((generatedRoot.w_45_366 ctx), ((generatedRoot.w_45_367 ctx), ((generatedRoot.w_45_368 ctx), ((generatedRoot.w_45_369 ctx), ((generatedRoot.w_45_370 ctx), ((generatedRoot.w_45_371 ctx), ((generatedRoot.w_45_372 ctx), ((generatedRoot.w_45_373 ctx), ((generatedRoot.w_45_374 ctx), ((generatedRoot.w_45_375 ctx), ((generatedRoot.w_45_376 ctx), ((generatedRoot.w_45_377 ctx), ((generatedRoot.w_45_378 ctx), ((generatedRoot.w_45_379 ctx), ((generatedRoot.w_45_380 ctx), ((generatedRoot.w_45_381 ctx), ((generatedRoot.w_45_382 ctx), ((generatedRoot.w_45_383 ctx), ((generatedRoot.w_45_384 ctx), ((generatedRoot.w_45_385 ctx), ((generatedRoot.w_45_386 ctx), ((generatedRoot.w_45_387 ctx), ((generatedRoot.w_45_388 ctx), ((generatedRoot.w_45_389 ctx), ((generatedRoot.w_45_390 ctx), ((generatedRoot.w_45_391 ctx), ((generatedRoot.w_45_392 ctx), ((generatedRoot.w_45_393 ctx), ((generatedRoot.w_45_394 ctx), ((generatedRoot.w_45_395 ctx), ((generatedRoot.w_45_396 ctx), ((generatedRoot.w_45_397 ctx), ((generatedRoot.w_45_398 ctx), ((generatedRoot.w_45_399 ctx), ((generatedRoot.w_45_400 ctx), ((generatedRoot.w_45_401 ctx), ((generatedRoot.w_45_402 ctx), ((generatedRoot.w_45_403 ctx), ((generatedRoot.w_45_404 ctx), ((generatedRoot.w_45_405 ctx), ()))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+structure generatedRoot.Facts_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) (outputs : ((Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat5) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → mxxMat34) × (Fin 16 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × Unit) × ((Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60)) × Unit)) : Prop where
+  t0 : (16) = 16
+  h45_405 : (∀ i : Fin 16, parallel_generatedRoot_45 backend hashModel params i (((generatedRoot.w_0_0 ctx) i), (((generatedRoot.w_1_0 ctx) i), (((generatedRoot.w_2_0 ctx) i), (((generatedRoot.w_3_0 ctx) i), ((generatedRoot.w_4_0 ctx), ((generatedRoot.w_5_0 ctx), (((generatedRoot.w_6_0 ctx) i), (((generatedRoot.w_7_0 ctx) i), (((generatedRoot.w_8_0 ctx) i), (((generatedRoot.w_9_0 ctx) i), (((generatedRoot.w_10_0 ctx) i), (((generatedRoot.w_11_0 ctx) i), (((generatedRoot.w_12_0 ctx) i), (((generatedRoot.w_13_0 ctx) i), (((generatedRoot.w_14_0 ctx) i), (((generatedRoot.w_15_0 ctx) i), (((generatedRoot.w_16_0 ctx) i), (((generatedRoot.w_17_0 ctx) i), (((generatedRoot.w_18_0 ctx) i), (((generatedRoot.w_19_0 ctx) i), (((generatedRoot.w_20_0 ctx) i), (((generatedRoot.w_21_0 ctx) i), (((generatedRoot.w_22_0 ctx) i), (((generatedRoot.w_23_0 ctx) i), (((generatedRoot.w_24_0 ctx) i), (((generatedRoot.w_25_0 ctx) i), (((generatedRoot.w_26_0 ctx) i), (((generatedRoot.w_27_0 ctx) i), (((generatedRoot.w_28_0 ctx) i), (((generatedRoot.w_29_0 ctx) i), (((generatedRoot.w_30_0 ctx) i), (((generatedRoot.w_31_0 ctx) i), (((generatedRoot.w_32_0 ctx) i), (((generatedRoot.w_33_0 ctx) i), (((generatedRoot.w_34_0 ctx) i), (((generatedRoot.w_35_0 ctx) i), (((generatedRoot.w_36_0 ctx) i), (((generatedRoot.w_37_0 ctx) i), (((generatedRoot.w_38_0 ctx) i), (((generatedRoot.w_39_0 ctx) i), (((generatedRoot.w_40_0 ctx) i), (((generatedRoot.w_41_0 ctx) i), (((generatedRoot.w_42_0 ctx) i), (((generatedRoot.w_43_0 ctx) i), (((generatedRoot.w_44_0 ctx) i), ()))))))))))))))))))))))))))))))))))))))))))))) ((((generatedRoot.w_45_0 ctx) i), (((generatedRoot.w_45_1 ctx) i), (((generatedRoot.w_45_2 ctx) i), (((generatedRoot.w_45_3 ctx) i), (((generatedRoot.w_45_4 ctx) i), (((generatedRoot.w_45_5 ctx) i), (((generatedRoot.w_45_6 ctx) i), (((generatedRoot.w_45_7 ctx) i), (((generatedRoot.w_45_8 ctx) i), (((generatedRoot.w_45_9 ctx) i), (((generatedRoot.w_45_10 ctx) i), (((generatedRoot.w_45_11 ctx) i), (((generatedRoot.w_45_12 ctx) i), (((generatedRoot.w_45_13 ctx) i), (((generatedRoot.w_45_14 ctx) i), (((generatedRoot.w_45_15 ctx) i), (((generatedRoot.w_45_16 ctx) i), (((generatedRoot.w_45_17 ctx) i), (((generatedRoot.w_45_18 ctx) i), (((generatedRoot.w_45_19 ctx) i), (((generatedRoot.w_45_20 ctx) i), (((generatedRoot.w_45_21 ctx) i), (((generatedRoot.w_45_22 ctx) i), (((generatedRoot.w_45_23 ctx) i), (((generatedRoot.w_45_24 ctx) i), (((generatedRoot.w_45_25 ctx) i), (((generatedRoot.w_45_26 ctx) i), (((generatedRoot.w_45_27 ctx) i), (((generatedRoot.w_45_28 ctx) i), (((generatedRoot.w_45_29 ctx) i), (((generatedRoot.w_45_30 ctx) i), (((generatedRoot.w_45_31 ctx) i), (((generatedRoot.w_45_32 ctx) i), (((generatedRoot.w_45_33 ctx) i), (((generatedRoot.w_45_34 ctx) i), (((generatedRoot.w_45_35 ctx) i), (((generatedRoot.w_45_36 ctx) i), (((generatedRoot.w_45_37 ctx) i), (((generatedRoot.w_45_38 ctx) i), (((generatedRoot.w_45_39 ctx) i), (((generatedRoot.w_45_40 ctx) i), (((generatedRoot.w_45_41 ctx) i), (((generatedRoot.w_45_42 ctx) i), (((generatedRoot.w_45_43 ctx) i), (((generatedRoot.w_45_44 ctx) i), (((generatedRoot.w_45_45 ctx) i), (((generatedRoot.w_45_46 ctx) i), (((generatedRoot.w_45_47 ctx) i), (((generatedRoot.w_45_48 ctx) i), (((generatedRoot.w_45_49 ctx) i), (((generatedRoot.w_45_50 ctx) i), (((generatedRoot.w_45_51 ctx) i), (((generatedRoot.w_45_52 ctx) i), (((generatedRoot.w_45_53 ctx) i), (((generatedRoot.w_45_54 ctx) i), (((generatedRoot.w_45_55 ctx) i), (((generatedRoot.w_45_56 ctx) i), (((generatedRoot.w_45_57 ctx) i), (((generatedRoot.w_45_58 ctx) i), (((generatedRoot.w_45_59 ctx) i), (((generatedRoot.w_45_60 ctx) i), (((generatedRoot.w_45_61 ctx) i), (((generatedRoot.w_45_62 ctx) i), (((generatedRoot.w_45_63 ctx) i), (((generatedRoot.w_45_64 ctx) i), (((generatedRoot.w_45_65 ctx) i), (((generatedRoot.w_45_66 ctx) i), (((generatedRoot.w_45_67 ctx) i), (((generatedRoot.w_45_68 ctx) i), (((generatedRoot.w_45_69 ctx) i), (((generatedRoot.w_45_70 ctx) i), (((generatedRoot.w_45_71 ctx) i), (((generatedRoot.w_45_72 ctx) i), (((generatedRoot.w_45_73 ctx) i), (((generatedRoot.w_45_74 ctx) i), (((generatedRoot.w_45_75 ctx) i), (((generatedRoot.w_45_76 ctx) i), (((generatedRoot.w_45_77 ctx) i), (((generatedRoot.w_45_78 ctx) i), (((generatedRoot.w_45_79 ctx) i), (((generatedRoot.w_45_80 ctx) i), (((generatedRoot.w_45_81 ctx) i), (((generatedRoot.w_45_82 ctx) i), (((generatedRoot.w_45_83 ctx) i), (((generatedRoot.w_45_84 ctx) i), (((generatedRoot.w_45_85 ctx) i), (((generatedRoot.w_45_86 ctx) i), (((generatedRoot.w_45_87 ctx) i), (((generatedRoot.w_45_88 ctx) i), (((generatedRoot.w_45_89 ctx) i), (((generatedRoot.w_45_90 ctx) i), (((generatedRoot.w_45_91 ctx) i), (((generatedRoot.w_45_92 ctx) i), (((generatedRoot.w_45_93 ctx) i), (((generatedRoot.w_45_94 ctx) i), (((generatedRoot.w_45_95 ctx) i), (((generatedRoot.w_45_96 ctx) i), (((generatedRoot.w_45_97 ctx) i), (((generatedRoot.w_45_98 ctx) i), (((generatedRoot.w_45_99 ctx) i), (((generatedRoot.w_45_100 ctx) i), (((generatedRoot.w_45_101 ctx) i), (((generatedRoot.w_45_102 ctx) i), (((generatedRoot.w_45_103 ctx) i), (((generatedRoot.w_45_104 ctx) i), (((generatedRoot.w_45_105 ctx) i), (((generatedRoot.w_45_106 ctx) i), (((generatedRoot.w_45_107 ctx) i), (((generatedRoot.w_45_108 ctx) i), (((generatedRoot.w_45_109 ctx) i), (((generatedRoot.w_45_110 ctx) i), (((generatedRoot.w_45_111 ctx) i), (((generatedRoot.w_45_112 ctx) i), (((generatedRoot.w_45_113 ctx) i), (((generatedRoot.w_45_114 ctx) i), (((generatedRoot.w_45_115 ctx) i), (((generatedRoot.w_45_116 ctx) i), (((generatedRoot.w_45_117 ctx) i), (((generatedRoot.w_45_118 ctx) i), (((generatedRoot.w_45_119 ctx) i), (((generatedRoot.w_45_120 ctx) i), (((generatedRoot.w_45_121 ctx) i), (((generatedRoot.w_45_122 ctx) i), (((generatedRoot.w_45_123 ctx) i), (((generatedRoot.w_45_124 ctx) i), (((generatedRoot.w_45_125 ctx) i), (((generatedRoot.w_45_126 ctx) i), (((generatedRoot.w_45_127 ctx) i), (((generatedRoot.w_45_128 ctx) i), (((generatedRoot.w_45_129 ctx) i), (((generatedRoot.w_45_130 ctx) i), (((generatedRoot.w_45_131 ctx) i), (((generatedRoot.w_45_132 ctx) i), (((generatedRoot.w_45_133 ctx) i), (((generatedRoot.w_45_134 ctx) i), (((generatedRoot.w_45_135 ctx) i), (((generatedRoot.w_45_136 ctx) i), (((generatedRoot.w_45_137 ctx) i), (((generatedRoot.w_45_138 ctx) i), (((generatedRoot.w_45_139 ctx) i), (((generatedRoot.w_45_140 ctx) i), (((generatedRoot.w_45_141 ctx) i), (((generatedRoot.w_45_142 ctx) i), (((generatedRoot.w_45_143 ctx) i), (((generatedRoot.w_45_144 ctx) i), (((generatedRoot.w_45_145 ctx) i), (((generatedRoot.w_45_146 ctx) i), (((generatedRoot.w_45_147 ctx) i), (((generatedRoot.w_45_148 ctx) i), (((generatedRoot.w_45_149 ctx) i), (((generatedRoot.w_45_150 ctx) i), (((generatedRoot.w_45_151 ctx) i), (((generatedRoot.w_45_152 ctx) i), (((generatedRoot.w_45_153 ctx) i), (((generatedRoot.w_45_154 ctx) i), (((generatedRoot.w_45_155 ctx) i), (((generatedRoot.w_45_156 ctx) i), (((generatedRoot.w_45_157 ctx) i), (((generatedRoot.w_45_158 ctx) i), (((generatedRoot.w_45_159 ctx) i), (((generatedRoot.w_45_160 ctx) i), (((generatedRoot.w_45_161 ctx) i), (((generatedRoot.w_45_162 ctx) i), (((generatedRoot.w_45_163 ctx) i), (((generatedRoot.w_45_164 ctx) i), (((generatedRoot.w_45_165 ctx) i), (((generatedRoot.w_45_166 ctx) i), (((generatedRoot.w_45_167 ctx) i), (((generatedRoot.w_45_168 ctx) i), (((generatedRoot.w_45_169 ctx) i), (((generatedRoot.w_45_170 ctx) i), (((generatedRoot.w_45_171 ctx) i), (((generatedRoot.w_45_172 ctx) i), (((generatedRoot.w_45_173 ctx) i), (((generatedRoot.w_45_174 ctx) i), (((generatedRoot.w_45_175 ctx) i), (((generatedRoot.w_45_176 ctx) i), (((generatedRoot.w_45_177 ctx) i), (((generatedRoot.w_45_178 ctx) i), (((generatedRoot.w_45_179 ctx) i), (((generatedRoot.w_45_180 ctx) i), (((generatedRoot.w_45_181 ctx) i), (((generatedRoot.w_45_182 ctx) i), (((generatedRoot.w_45_183 ctx) i), (((generatedRoot.w_45_184 ctx) i), (((generatedRoot.w_45_185 ctx) i), (((generatedRoot.w_45_186 ctx) i), (((generatedRoot.w_45_187 ctx) i), (((generatedRoot.w_45_188 ctx) i), (((generatedRoot.w_45_189 ctx) i), (((generatedRoot.w_45_190 ctx) i), (((generatedRoot.w_45_191 ctx) i), (((generatedRoot.w_45_192 ctx) i), (((generatedRoot.w_45_193 ctx) i), (((generatedRoot.w_45_194 ctx) i), (((generatedRoot.w_45_195 ctx) i), (((generatedRoot.w_45_196 ctx) i), (((generatedRoot.w_45_197 ctx) i), (((generatedRoot.w_45_198 ctx) i), (((generatedRoot.w_45_199 ctx) i), (((generatedRoot.w_45_200 ctx) i), (((generatedRoot.w_45_201 ctx) i), (((generatedRoot.w_45_202 ctx) i), ()))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))), (((generatedRoot.w_45_203 ctx) i), (((generatedRoot.w_45_204 ctx) i), (((generatedRoot.w_45_205 ctx) i), (((generatedRoot.w_45_206 ctx) i), (((generatedRoot.w_45_207 ctx) i), (((generatedRoot.w_45_208 ctx) i), (((generatedRoot.w_45_209 ctx) i), (((generatedRoot.w_45_210 ctx) i), (((generatedRoot.w_45_211 ctx) i), (((generatedRoot.w_45_212 ctx) i), (((generatedRoot.w_45_213 ctx) i), (((generatedRoot.w_45_214 ctx) i), (((generatedRoot.w_45_215 ctx) i), (((generatedRoot.w_45_216 ctx) i), (((generatedRoot.w_45_217 ctx) i), (((generatedRoot.w_45_218 ctx) i), (((generatedRoot.w_45_219 ctx) i), (((generatedRoot.w_45_220 ctx) i), (((generatedRoot.w_45_221 ctx) i), (((generatedRoot.w_45_222 ctx) i), (((generatedRoot.w_45_223 ctx) i), (((generatedRoot.w_45_224 ctx) i), (((generatedRoot.w_45_225 ctx) i), (((generatedRoot.w_45_226 ctx) i), (((generatedRoot.w_45_227 ctx) i), (((generatedRoot.w_45_228 ctx) i), (((generatedRoot.w_45_229 ctx) i), (((generatedRoot.w_45_230 ctx) i), (((generatedRoot.w_45_231 ctx) i), (((generatedRoot.w_45_232 ctx) i), (((generatedRoot.w_45_233 ctx) i), (((generatedRoot.w_45_234 ctx) i), (((generatedRoot.w_45_235 ctx) i), (((generatedRoot.w_45_236 ctx) i), (((generatedRoot.w_45_237 ctx) i), (((generatedRoot.w_45_238 ctx) i), (((generatedRoot.w_45_239 ctx) i), (((generatedRoot.w_45_240 ctx) i), (((generatedRoot.w_45_241 ctx) i), (((generatedRoot.w_45_242 ctx) i), (((generatedRoot.w_45_243 ctx) i), (((generatedRoot.w_45_244 ctx) i), (((generatedRoot.w_45_245 ctx) i), (((generatedRoot.w_45_246 ctx) i), (((generatedRoot.w_45_247 ctx) i), (((generatedRoot.w_45_248 ctx) i), (((generatedRoot.w_45_249 ctx) i), (((generatedRoot.w_45_250 ctx) i), (((generatedRoot.w_45_251 ctx) i), (((generatedRoot.w_45_252 ctx) i), (((generatedRoot.w_45_253 ctx) i), (((generatedRoot.w_45_254 ctx) i), (((generatedRoot.w_45_255 ctx) i), (((generatedRoot.w_45_256 ctx) i), (((generatedRoot.w_45_257 ctx) i), (((generatedRoot.w_45_258 ctx) i), (((generatedRoot.w_45_259 ctx) i), (((generatedRoot.w_45_260 ctx) i), (((generatedRoot.w_45_261 ctx) i), (((generatedRoot.w_45_262 ctx) i), (((generatedRoot.w_45_263 ctx) i), (((generatedRoot.w_45_264 ctx) i), (((generatedRoot.w_45_265 ctx) i), (((generatedRoot.w_45_266 ctx) i), (((generatedRoot.w_45_267 ctx) i), (((generatedRoot.w_45_268 ctx) i), (((generatedRoot.w_45_269 ctx) i), (((generatedRoot.w_45_270 ctx) i), (((generatedRoot.w_45_271 ctx) i), (((generatedRoot.w_45_272 ctx) i), (((generatedRoot.w_45_273 ctx) i), (((generatedRoot.w_45_274 ctx) i), (((generatedRoot.w_45_275 ctx) i), (((generatedRoot.w_45_276 ctx) i), (((generatedRoot.w_45_277 ctx) i), (((generatedRoot.w_45_278 ctx) i), (((generatedRoot.w_45_279 ctx) i), (((generatedRoot.w_45_280 ctx) i), (((generatedRoot.w_45_281 ctx) i), (((generatedRoot.w_45_282 ctx) i), (((generatedRoot.w_45_283 ctx) i), (((generatedRoot.w_45_284 ctx) i), (((generatedRoot.w_45_285 ctx) i), (((generatedRoot.w_45_286 ctx) i), (((generatedRoot.w_45_287 ctx) i), (((generatedRoot.w_45_288 ctx) i), (((generatedRoot.w_45_289 ctx) i), (((generatedRoot.w_45_290 ctx) i), (((generatedRoot.w_45_291 ctx) i), (((generatedRoot.w_45_292 ctx) i), (((generatedRoot.w_45_293 ctx) i), (((generatedRoot.w_45_294 ctx) i), (((generatedRoot.w_45_295 ctx) i), (((generatedRoot.w_45_296 ctx) i), (((generatedRoot.w_45_297 ctx) i), (((generatedRoot.w_45_298 ctx) i), (((generatedRoot.w_45_299 ctx) i), (((generatedRoot.w_45_300 ctx) i), (((generatedRoot.w_45_301 ctx) i), (((generatedRoot.w_45_302 ctx) i), (((generatedRoot.w_45_303 ctx) i), (((generatedRoot.w_45_304 ctx) i), (((generatedRoot.w_45_305 ctx) i), (((generatedRoot.w_45_306 ctx) i), (((generatedRoot.w_45_307 ctx) i), (((generatedRoot.w_45_308 ctx) i), (((generatedRoot.w_45_309 ctx) i), (((generatedRoot.w_45_310 ctx) i), (((generatedRoot.w_45_311 ctx) i), (((generatedRoot.w_45_312 ctx) i), (((generatedRoot.w_45_313 ctx) i), (((generatedRoot.w_45_314 ctx) i), (((generatedRoot.w_45_315 ctx) i), (((generatedRoot.w_45_316 ctx) i), (((generatedRoot.w_45_317 ctx) i), (((generatedRoot.w_45_318 ctx) i), (((generatedRoot.w_45_319 ctx) i), (((generatedRoot.w_45_320 ctx) i), (((generatedRoot.w_45_321 ctx) i), (((generatedRoot.w_45_322 ctx) i), (((generatedRoot.w_45_323 ctx) i), (((generatedRoot.w_45_324 ctx) i), (((generatedRoot.w_45_325 ctx) i), (((generatedRoot.w_45_326 ctx) i), (((generatedRoot.w_45_327 ctx) i), (((generatedRoot.w_45_328 ctx) i), (((generatedRoot.w_45_329 ctx) i), (((generatedRoot.w_45_330 ctx) i), (((generatedRoot.w_45_331 ctx) i), (((generatedRoot.w_45_332 ctx) i), (((generatedRoot.w_45_333 ctx) i), (((generatedRoot.w_45_334 ctx) i), (((generatedRoot.w_45_335 ctx) i), (((generatedRoot.w_45_336 ctx) i), (((generatedRoot.w_45_337 ctx) i), (((generatedRoot.w_45_338 ctx) i), (((generatedRoot.w_45_339 ctx) i), (((generatedRoot.w_45_340 ctx) i), (((generatedRoot.w_45_341 ctx) i), (((generatedRoot.w_45_342 ctx) i), (((generatedRoot.w_45_343 ctx) i), (((generatedRoot.w_45_344 ctx) i), (((generatedRoot.w_45_345 ctx) i), (((generatedRoot.w_45_346 ctx) i), (((generatedRoot.w_45_347 ctx) i), (((generatedRoot.w_45_348 ctx) i), (((generatedRoot.w_45_349 ctx) i), (((generatedRoot.w_45_350 ctx) i), (((generatedRoot.w_45_351 ctx) i), (((generatedRoot.w_45_352 ctx) i), (((generatedRoot.w_45_353 ctx) i), (((generatedRoot.w_45_354 ctx) i), (((generatedRoot.w_45_355 ctx) i), (((generatedRoot.w_45_356 ctx) i), (((generatedRoot.w_45_357 ctx) i), (((generatedRoot.w_45_358 ctx) i), (((generatedRoot.w_45_359 ctx) i), (((generatedRoot.w_45_360 ctx) i), (((generatedRoot.w_45_361 ctx) i), (((generatedRoot.w_45_362 ctx) i), (((generatedRoot.w_45_363 ctx) i), (((generatedRoot.w_45_364 ctx) i), (((generatedRoot.w_45_365 ctx) i), (((generatedRoot.w_45_366 ctx) i), (((generatedRoot.w_45_367 ctx) i), (((generatedRoot.w_45_368 ctx) i), (((generatedRoot.w_45_369 ctx) i), (((generatedRoot.w_45_370 ctx) i), (((generatedRoot.w_45_371 ctx) i), (((generatedRoot.w_45_372 ctx) i), (((generatedRoot.w_45_373 ctx) i), (((generatedRoot.w_45_374 ctx) i), (((generatedRoot.w_45_375 ctx) i), (((generatedRoot.w_45_376 ctx) i), (((generatedRoot.w_45_377 ctx) i), (((generatedRoot.w_45_378 ctx) i), (((generatedRoot.w_45_379 ctx) i), (((generatedRoot.w_45_380 ctx) i), (((generatedRoot.w_45_381 ctx) i), (((generatedRoot.w_45_382 ctx) i), (((generatedRoot.w_45_383 ctx) i), (((generatedRoot.w_45_384 ctx) i), (((generatedRoot.w_45_385 ctx) i), (((generatedRoot.w_45_386 ctx) i), (((generatedRoot.w_45_387 ctx) i), (((generatedRoot.w_45_388 ctx) i), (((generatedRoot.w_45_389 ctx) i), (((generatedRoot.w_45_390 ctx) i), (((generatedRoot.w_45_391 ctx) i), (((generatedRoot.w_45_392 ctx) i), (((generatedRoot.w_45_393 ctx) i), (((generatedRoot.w_45_394 ctx) i), (((generatedRoot.w_45_395 ctx) i), (((generatedRoot.w_45_396 ctx) i), (((generatedRoot.w_45_397 ctx) i), (((generatedRoot.w_45_398 ctx) i), (((generatedRoot.w_45_399 ctx) i), (((generatedRoot.w_45_400 ctx) i), (((generatedRoot.w_45_401 ctx) i), (((generatedRoot.w_45_402 ctx) i), (((generatedRoot.w_45_403 ctx) i), (((generatedRoot.w_45_404 ctx) i), (((generatedRoot.w_45_405 ctx) i), ())))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+  hout : outputs = generatedRoot.outs ctx
+
+theorem generatedRoot.facts_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {ctx : generatedRoot.Ctx backend hashModel params} {outputs : ((Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat5) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → mxxMat34) × (Fin 16 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × Unit) × ((Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60)) × Unit)}
+    (h : generatedRoot.constraints_0 backend hashModel params (generatedRoot.w_0_0 ctx) (generatedRoot.w_1_0 ctx) (generatedRoot.w_2_0 ctx) (generatedRoot.w_3_0 ctx) (generatedRoot.w_4_0 ctx) (generatedRoot.w_5_0 ctx) (generatedRoot.w_6_0 ctx) (generatedRoot.w_7_0 ctx) (generatedRoot.w_8_0 ctx) (generatedRoot.w_9_0 ctx) (generatedRoot.w_10_0 ctx) (generatedRoot.w_11_0 ctx) (generatedRoot.w_12_0 ctx) (generatedRoot.w_13_0 ctx) (generatedRoot.w_14_0 ctx) (generatedRoot.w_15_0 ctx) (generatedRoot.w_16_0 ctx) (generatedRoot.w_17_0 ctx) (generatedRoot.w_18_0 ctx) (generatedRoot.w_19_0 ctx) (generatedRoot.w_20_0 ctx) (generatedRoot.w_21_0 ctx) (generatedRoot.w_22_0 ctx) (generatedRoot.w_23_0 ctx) (generatedRoot.w_24_0 ctx) (generatedRoot.w_25_0 ctx) (generatedRoot.w_26_0 ctx) (generatedRoot.w_27_0 ctx) (generatedRoot.w_28_0 ctx) (generatedRoot.w_29_0 ctx) (generatedRoot.w_30_0 ctx) (generatedRoot.w_31_0 ctx) (generatedRoot.w_32_0 ctx) (generatedRoot.w_33_0 ctx) (generatedRoot.w_34_0 ctx) (generatedRoot.w_35_0 ctx) (generatedRoot.w_36_0 ctx) (generatedRoot.w_37_0 ctx) (generatedRoot.w_38_0 ctx) (generatedRoot.w_39_0 ctx) (generatedRoot.w_40_0 ctx) (generatedRoot.w_41_0 ctx) (generatedRoot.w_42_0 ctx) (generatedRoot.w_43_0 ctx) (generatedRoot.w_44_0 ctx) (generatedRoot.w_45_0 ctx) (generatedRoot.w_45_1 ctx) (generatedRoot.w_45_2 ctx) (generatedRoot.w_45_3 ctx) (generatedRoot.w_45_4 ctx) (generatedRoot.w_45_5 ctx) (generatedRoot.w_45_6 ctx) (generatedRoot.w_45_7 ctx) (generatedRoot.w_45_8 ctx) (generatedRoot.w_45_9 ctx) (generatedRoot.w_45_10 ctx) (generatedRoot.w_45_11 ctx) (generatedRoot.w_45_12 ctx) (generatedRoot.w_45_13 ctx) (generatedRoot.w_45_14 ctx) (generatedRoot.w_45_15 ctx) (generatedRoot.w_45_16 ctx) (generatedRoot.w_45_17 ctx) (generatedRoot.w_45_18 ctx) (generatedRoot.w_45_19 ctx) (generatedRoot.w_45_20 ctx) (generatedRoot.w_45_21 ctx) (generatedRoot.w_45_22 ctx) (generatedRoot.w_45_23 ctx) (generatedRoot.w_45_24 ctx) (generatedRoot.w_45_25 ctx) (generatedRoot.w_45_26 ctx) (generatedRoot.w_45_27 ctx) (generatedRoot.w_45_28 ctx) (generatedRoot.w_45_29 ctx) (generatedRoot.w_45_30 ctx) (generatedRoot.w_45_31 ctx) (generatedRoot.w_45_32 ctx) (generatedRoot.w_45_33 ctx) (generatedRoot.w_45_34 ctx) (generatedRoot.w_45_35 ctx) (generatedRoot.w_45_36 ctx) (generatedRoot.w_45_37 ctx) (generatedRoot.w_45_38 ctx) (generatedRoot.w_45_39 ctx) (generatedRoot.w_45_40 ctx) (generatedRoot.w_45_41 ctx) (generatedRoot.w_45_42 ctx) (generatedRoot.w_45_43 ctx) (generatedRoot.w_45_44 ctx) (generatedRoot.w_45_45 ctx) (generatedRoot.w_45_46 ctx) (generatedRoot.w_45_47 ctx) (generatedRoot.w_45_48 ctx) (generatedRoot.w_45_49 ctx) (generatedRoot.w_45_50 ctx) (generatedRoot.w_45_51 ctx) (generatedRoot.w_45_52 ctx) (generatedRoot.w_45_53 ctx) (generatedRoot.w_45_54 ctx) (generatedRoot.w_45_55 ctx) (generatedRoot.w_45_56 ctx) (generatedRoot.w_45_57 ctx) (generatedRoot.w_45_58 ctx) (generatedRoot.w_45_59 ctx) (generatedRoot.w_45_60 ctx) (generatedRoot.w_45_61 ctx) (generatedRoot.w_45_62 ctx) (generatedRoot.w_45_63 ctx) (generatedRoot.w_45_64 ctx) (generatedRoot.w_45_65 ctx) (generatedRoot.w_45_66 ctx) (generatedRoot.w_45_67 ctx) (generatedRoot.w_45_68 ctx) (generatedRoot.w_45_69 ctx) (generatedRoot.w_45_70 ctx) (generatedRoot.w_45_71 ctx) (generatedRoot.w_45_72 ctx) (generatedRoot.w_45_73 ctx) (generatedRoot.w_45_74 ctx) (generatedRoot.w_45_75 ctx) (generatedRoot.w_45_76 ctx) (generatedRoot.w_45_77 ctx) (generatedRoot.w_45_78 ctx) (generatedRoot.w_45_79 ctx) (generatedRoot.w_45_80 ctx) (generatedRoot.w_45_81 ctx) (generatedRoot.w_45_82 ctx) (generatedRoot.w_45_83 ctx) (generatedRoot.w_45_84 ctx) (generatedRoot.w_45_85 ctx) (generatedRoot.w_45_86 ctx) (generatedRoot.w_45_87 ctx) (generatedRoot.w_45_88 ctx) (generatedRoot.w_45_89 ctx) (generatedRoot.w_45_90 ctx) (generatedRoot.w_45_91 ctx) (generatedRoot.w_45_92 ctx) (generatedRoot.w_45_93 ctx) (generatedRoot.w_45_94 ctx) (generatedRoot.w_45_95 ctx) (generatedRoot.w_45_96 ctx) (generatedRoot.w_45_97 ctx) (generatedRoot.w_45_98 ctx) (generatedRoot.w_45_99 ctx) (generatedRoot.w_45_100 ctx) (generatedRoot.w_45_101 ctx) (generatedRoot.w_45_102 ctx) (generatedRoot.w_45_103 ctx) (generatedRoot.w_45_104 ctx) (generatedRoot.w_45_105 ctx) (generatedRoot.w_45_106 ctx) (generatedRoot.w_45_107 ctx) (generatedRoot.w_45_108 ctx) (generatedRoot.w_45_109 ctx) (generatedRoot.w_45_110 ctx) (generatedRoot.w_45_111 ctx) (generatedRoot.w_45_112 ctx) (generatedRoot.w_45_113 ctx) (generatedRoot.w_45_114 ctx) (generatedRoot.w_45_115 ctx) (generatedRoot.w_45_116 ctx) (generatedRoot.w_45_117 ctx) (generatedRoot.w_45_118 ctx) (generatedRoot.w_45_119 ctx) (generatedRoot.w_45_120 ctx) (generatedRoot.w_45_121 ctx) (generatedRoot.w_45_122 ctx) (generatedRoot.w_45_123 ctx) (generatedRoot.w_45_124 ctx) (generatedRoot.w_45_125 ctx) (generatedRoot.w_45_126 ctx) (generatedRoot.w_45_127 ctx) (generatedRoot.w_45_128 ctx) (generatedRoot.w_45_129 ctx) (generatedRoot.w_45_130 ctx) (generatedRoot.w_45_131 ctx) (generatedRoot.w_45_132 ctx) (generatedRoot.w_45_133 ctx) (generatedRoot.w_45_134 ctx) (generatedRoot.w_45_135 ctx) (generatedRoot.w_45_136 ctx) (generatedRoot.w_45_137 ctx) (generatedRoot.w_45_138 ctx) (generatedRoot.w_45_139 ctx) (generatedRoot.w_45_140 ctx) (generatedRoot.w_45_141 ctx) (generatedRoot.w_45_142 ctx) (generatedRoot.w_45_143 ctx) (generatedRoot.w_45_144 ctx) (generatedRoot.w_45_145 ctx) (generatedRoot.w_45_146 ctx) (generatedRoot.w_45_147 ctx) (generatedRoot.w_45_148 ctx) (generatedRoot.w_45_149 ctx) (generatedRoot.w_45_150 ctx) (generatedRoot.w_45_151 ctx) (generatedRoot.w_45_152 ctx) (generatedRoot.w_45_153 ctx) (generatedRoot.w_45_154 ctx) (generatedRoot.w_45_155 ctx) (generatedRoot.w_45_156 ctx) (generatedRoot.w_45_157 ctx) (generatedRoot.w_45_158 ctx) (generatedRoot.w_45_159 ctx) (generatedRoot.w_45_160 ctx) (generatedRoot.w_45_161 ctx) (generatedRoot.w_45_162 ctx) (generatedRoot.w_45_163 ctx) (generatedRoot.w_45_164 ctx) (generatedRoot.w_45_165 ctx) (generatedRoot.w_45_166 ctx) (generatedRoot.w_45_167 ctx) (generatedRoot.w_45_168 ctx) (generatedRoot.w_45_169 ctx) (generatedRoot.w_45_170 ctx) (generatedRoot.w_45_171 ctx) (generatedRoot.w_45_172 ctx) (generatedRoot.w_45_173 ctx) (generatedRoot.w_45_174 ctx) (generatedRoot.w_45_175 ctx) (generatedRoot.w_45_176 ctx) (generatedRoot.w_45_177 ctx) (generatedRoot.w_45_178 ctx) (generatedRoot.w_45_179 ctx) (generatedRoot.w_45_180 ctx) (generatedRoot.w_45_181 ctx) (generatedRoot.w_45_182 ctx) (generatedRoot.w_45_183 ctx) (generatedRoot.w_45_184 ctx) (generatedRoot.w_45_185 ctx) (generatedRoot.w_45_186 ctx) (generatedRoot.w_45_187 ctx) (generatedRoot.w_45_188 ctx) (generatedRoot.w_45_189 ctx) (generatedRoot.w_45_190 ctx) (generatedRoot.w_45_191 ctx) (generatedRoot.w_45_192 ctx) (generatedRoot.w_45_193 ctx) (generatedRoot.w_45_194 ctx) (generatedRoot.w_45_195 ctx) (generatedRoot.w_45_196 ctx) (generatedRoot.w_45_197 ctx) (generatedRoot.w_45_198 ctx) (generatedRoot.w_45_199 ctx) (generatedRoot.w_45_200 ctx) (generatedRoot.w_45_201 ctx) (generatedRoot.w_45_202 ctx) (generatedRoot.w_45_203 ctx) (generatedRoot.w_45_204 ctx) (generatedRoot.w_45_205 ctx) (generatedRoot.w_45_206 ctx) (generatedRoot.w_45_207 ctx) (generatedRoot.w_45_208 ctx) (generatedRoot.w_45_209 ctx) (generatedRoot.w_45_210 ctx) (generatedRoot.w_45_211 ctx) (generatedRoot.w_45_212 ctx) (generatedRoot.w_45_213 ctx) (generatedRoot.w_45_214 ctx) (generatedRoot.w_45_215 ctx) (generatedRoot.w_45_216 ctx) (generatedRoot.w_45_217 ctx) (generatedRoot.w_45_218 ctx) (generatedRoot.w_45_219 ctx) (generatedRoot.w_45_220 ctx) (generatedRoot.w_45_221 ctx) (generatedRoot.w_45_222 ctx) (generatedRoot.w_45_223 ctx) (generatedRoot.w_45_224 ctx) (generatedRoot.w_45_225 ctx) (generatedRoot.w_45_226 ctx) (generatedRoot.w_45_227 ctx) (generatedRoot.w_45_228 ctx) (generatedRoot.w_45_229 ctx) (generatedRoot.w_45_230 ctx) (generatedRoot.w_45_231 ctx) (generatedRoot.w_45_232 ctx) (generatedRoot.w_45_233 ctx) (generatedRoot.w_45_234 ctx) (generatedRoot.w_45_235 ctx) (generatedRoot.w_45_236 ctx) (generatedRoot.w_45_237 ctx) (generatedRoot.w_45_238 ctx) (generatedRoot.w_45_239 ctx) (generatedRoot.w_45_240 ctx) (generatedRoot.w_45_241 ctx) (generatedRoot.w_45_242 ctx) (generatedRoot.w_45_243 ctx) (generatedRoot.w_45_244 ctx) (generatedRoot.w_45_245 ctx) (generatedRoot.w_45_246 ctx) (generatedRoot.w_45_247 ctx) (generatedRoot.w_45_248 ctx) (generatedRoot.w_45_249 ctx) (generatedRoot.w_45_250 ctx) (generatedRoot.w_45_251 ctx) (generatedRoot.w_45_252 ctx) (generatedRoot.w_45_253 ctx) (generatedRoot.w_45_254 ctx) (generatedRoot.w_45_255 ctx) (generatedRoot.w_45_256 ctx) (generatedRoot.w_45_257 ctx) (generatedRoot.w_45_258 ctx) (generatedRoot.w_45_259 ctx) (generatedRoot.w_45_260 ctx) (generatedRoot.w_45_261 ctx) (generatedRoot.w_45_262 ctx) (generatedRoot.w_45_263 ctx) (generatedRoot.w_45_264 ctx) (generatedRoot.w_45_265 ctx) (generatedRoot.w_45_266 ctx) (generatedRoot.w_45_267 ctx) (generatedRoot.w_45_268 ctx) (generatedRoot.w_45_269 ctx) (generatedRoot.w_45_270 ctx) (generatedRoot.w_45_271 ctx) (generatedRoot.w_45_272 ctx) (generatedRoot.w_45_273 ctx) (generatedRoot.w_45_274 ctx) (generatedRoot.w_45_275 ctx) (generatedRoot.w_45_276 ctx) (generatedRoot.w_45_277 ctx) (generatedRoot.w_45_278 ctx) (generatedRoot.w_45_279 ctx) (generatedRoot.w_45_280 ctx) (generatedRoot.w_45_281 ctx) (generatedRoot.w_45_282 ctx) (generatedRoot.w_45_283 ctx) (generatedRoot.w_45_284 ctx) (generatedRoot.w_45_285 ctx) (generatedRoot.w_45_286 ctx) (generatedRoot.w_45_287 ctx) (generatedRoot.w_45_288 ctx) (generatedRoot.w_45_289 ctx) (generatedRoot.w_45_290 ctx) (generatedRoot.w_45_291 ctx) (generatedRoot.w_45_292 ctx) (generatedRoot.w_45_293 ctx) (generatedRoot.w_45_294 ctx) (generatedRoot.w_45_295 ctx) (generatedRoot.w_45_296 ctx) (generatedRoot.w_45_297 ctx) (generatedRoot.w_45_298 ctx) (generatedRoot.w_45_299 ctx) (generatedRoot.w_45_300 ctx) (generatedRoot.w_45_301 ctx) (generatedRoot.w_45_302 ctx) (generatedRoot.w_45_303 ctx) (generatedRoot.w_45_304 ctx) (generatedRoot.w_45_305 ctx) (generatedRoot.w_45_306 ctx) (generatedRoot.w_45_307 ctx) (generatedRoot.w_45_308 ctx) (generatedRoot.w_45_309 ctx) (generatedRoot.w_45_310 ctx) (generatedRoot.w_45_311 ctx) (generatedRoot.w_45_312 ctx) (generatedRoot.w_45_313 ctx) (generatedRoot.w_45_314 ctx) (generatedRoot.w_45_315 ctx) (generatedRoot.w_45_316 ctx) (generatedRoot.w_45_317 ctx) (generatedRoot.w_45_318 ctx) (generatedRoot.w_45_319 ctx) (generatedRoot.w_45_320 ctx) (generatedRoot.w_45_321 ctx) (generatedRoot.w_45_322 ctx) (generatedRoot.w_45_323 ctx) (generatedRoot.w_45_324 ctx) (generatedRoot.w_45_325 ctx) (generatedRoot.w_45_326 ctx) (generatedRoot.w_45_327 ctx) (generatedRoot.w_45_328 ctx) (generatedRoot.w_45_329 ctx) (generatedRoot.w_45_330 ctx) (generatedRoot.w_45_331 ctx) (generatedRoot.w_45_332 ctx) (generatedRoot.w_45_333 ctx) (generatedRoot.w_45_334 ctx) (generatedRoot.w_45_335 ctx) (generatedRoot.w_45_336 ctx) (generatedRoot.w_45_337 ctx) (generatedRoot.w_45_338 ctx) (generatedRoot.w_45_339 ctx) (generatedRoot.w_45_340 ctx) (generatedRoot.w_45_341 ctx) (generatedRoot.w_45_342 ctx) (generatedRoot.w_45_343 ctx) (generatedRoot.w_45_344 ctx) (generatedRoot.w_45_345 ctx) (generatedRoot.w_45_346 ctx) (generatedRoot.w_45_347 ctx) (generatedRoot.w_45_348 ctx) (generatedRoot.w_45_349 ctx) (generatedRoot.w_45_350 ctx) (generatedRoot.w_45_351 ctx) (generatedRoot.w_45_352 ctx) (generatedRoot.w_45_353 ctx) (generatedRoot.w_45_354 ctx) (generatedRoot.w_45_355 ctx) (generatedRoot.w_45_356 ctx) (generatedRoot.w_45_357 ctx) (generatedRoot.w_45_358 ctx) (generatedRoot.w_45_359 ctx) (generatedRoot.w_45_360 ctx) (generatedRoot.w_45_361 ctx) (generatedRoot.w_45_362 ctx) (generatedRoot.w_45_363 ctx) (generatedRoot.w_45_364 ctx) (generatedRoot.w_45_365 ctx) (generatedRoot.w_45_366 ctx) (generatedRoot.w_45_367 ctx) (generatedRoot.w_45_368 ctx) (generatedRoot.w_45_369 ctx) (generatedRoot.w_45_370 ctx) (generatedRoot.w_45_371 ctx) (generatedRoot.w_45_372 ctx) (generatedRoot.w_45_373 ctx) (generatedRoot.w_45_374 ctx) (generatedRoot.w_45_375 ctx) (generatedRoot.w_45_376 ctx) (generatedRoot.w_45_377 ctx) (generatedRoot.w_45_378 ctx) (generatedRoot.w_45_379 ctx) (generatedRoot.w_45_380 ctx) (generatedRoot.w_45_381 ctx) (generatedRoot.w_45_382 ctx) (generatedRoot.w_45_383 ctx) (generatedRoot.w_45_384 ctx) (generatedRoot.w_45_385 ctx) (generatedRoot.w_45_386 ctx) (generatedRoot.w_45_387 ctx) (generatedRoot.w_45_388 ctx) (generatedRoot.w_45_389 ctx) (generatedRoot.w_45_390 ctx) (generatedRoot.w_45_391 ctx) (generatedRoot.w_45_392 ctx) (generatedRoot.w_45_393 ctx) (generatedRoot.w_45_394 ctx) (generatedRoot.w_45_395 ctx) (generatedRoot.w_45_396 ctx) (generatedRoot.w_45_397 ctx) (generatedRoot.w_45_398 ctx) (generatedRoot.w_45_399 ctx) (generatedRoot.w_45_400 ctx) (generatedRoot.w_45_401 ctx) (generatedRoot.w_45_402 ctx) (generatedRoot.w_45_403 ctx) (generatedRoot.w_45_404 ctx) (generatedRoot.w_45_405 ctx) outputs) :
+    generatedRoot.Facts_0 ctx outputs :=
+  ⟨h.1, h.2.1, h.2.2⟩
+
+structure generatedRoot.Facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) (outputs : ((Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat5) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → mxxMat34) × (Fin 16 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × Unit) × ((Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60)) × Unit)) : Prop where
+  c0 : generatedRoot.Facts_0 ctx outputs
+
+theorem generatedRoot.facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} (ctx : generatedRoot.Ctx backend hashModel params) {outputs : ((Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat5) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → mxxMat34) × (Fin 16 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × Unit) × ((Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60)) × Unit)}
+    (h : generatedRoot.body backend hashModel params ctx.inputs outputs ctx.witness) :
+    generatedRoot.Facts ctx outputs :=
+  have t0 := h
+  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
+  ⟨r0⟩
+
+theorem generatedRoot.h45_405_at {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params} {ctx : generatedRoot.Ctx backend hashModel params} {outputs : ((Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → mxxMat0) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat2) × (Fin 16 → Fin 1025 → mxxMat5) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → mxxMat34) × (Fin 16 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (Fin 16 → Fin 2 → mxxMat34) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (((m0 : Fin 16) → ((m1 : Fin 2) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 24))) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × Unit) × ((Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → mxxMat3) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat4) × (Fin 16 → Fin 1025 → mxxMat41) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 32 → mxxMat3) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 32 → mxxMat0) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 32 → mxxMat40) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 32 → mxxMat8) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 32 → mxxMat9) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 32 → mxxMat10) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 32 → mxxMat11) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 32 → mxxMat12) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 32 → mxxMat13) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 32 → mxxMat14) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 32 → mxxMat15) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 32 → mxxMat16) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 32 → mxxMat7) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 32 → mxxMat17) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 32 → mxxMat19) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 32 → mxxMat20) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 32 → mxxMat21) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 32 → mxxMat22) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 32 → mxxMat23) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 32 → mxxMat24) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 32 → mxxMat25) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 32 → mxxMat26) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 32 → mxxMat27) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 32 → mxxMat18) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 32 → mxxMat28) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 32 → mxxMat30) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 32 → mxxMat31) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 32 → mxxMat32) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 32 → mxxMat33) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 32 → mxxMat34) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 32 → mxxMat29) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 32 → mxxMat35) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 32 → mxxMat36) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 32 → mxxMat37) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 32 → mxxMat38) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 128 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (Fin 16 → Fin 32 → mxxMat39) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 28)) × (((m0 : Fin 16) → Mxx.Primitives.ExactMatrix ((1099510054913) * (1099507695617) * (1099504549889) * (1099502714881) * (1099500617729) * (1099499569153) * ((MxxIR.selectInt ((Int.ofNat m0.val)) [(1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099498258433), (1099489607681), (1099489607681)]))).toNat 131072 1 60)) × Unit)}
+    (F : generatedRoot.Facts ctx outputs) (i : Fin 16) :
+    ∃ w : parallel_generatedRoot_45.Witness, parallel_generatedRoot_45.Facts (⟨(((generatedRoot.w_0_0 ctx) i), (((generatedRoot.w_1_0 ctx) i), (((generatedRoot.w_2_0 ctx) i), (((generatedRoot.w_3_0 ctx) i), ((generatedRoot.w_4_0 ctx), ((generatedRoot.w_5_0 ctx), (((generatedRoot.w_6_0 ctx) i), (((generatedRoot.w_7_0 ctx) i), (((generatedRoot.w_8_0 ctx) i), (((generatedRoot.w_9_0 ctx) i), (((generatedRoot.w_10_0 ctx) i), (((generatedRoot.w_11_0 ctx) i), (((generatedRoot.w_12_0 ctx) i), (((generatedRoot.w_13_0 ctx) i), (((generatedRoot.w_14_0 ctx) i), (((generatedRoot.w_15_0 ctx) i), (((generatedRoot.w_16_0 ctx) i), (((generatedRoot.w_17_0 ctx) i), (((generatedRoot.w_18_0 ctx) i), (((generatedRoot.w_19_0 ctx) i), (((generatedRoot.w_20_0 ctx) i), (((generatedRoot.w_21_0 ctx) i), (((generatedRoot.w_22_0 ctx) i), (((generatedRoot.w_23_0 ctx) i), (((generatedRoot.w_24_0 ctx) i), (((generatedRoot.w_25_0 ctx) i), (((generatedRoot.w_26_0 ctx) i), (((generatedRoot.w_27_0 ctx) i), (((generatedRoot.w_28_0 ctx) i), (((generatedRoot.w_29_0 ctx) i), (((generatedRoot.w_30_0 ctx) i), (((generatedRoot.w_31_0 ctx) i), (((generatedRoot.w_32_0 ctx) i), (((generatedRoot.w_33_0 ctx) i), (((generatedRoot.w_34_0 ctx) i), (((generatedRoot.w_35_0 ctx) i), (((generatedRoot.w_36_0 ctx) i), (((generatedRoot.w_37_0 ctx) i), (((generatedRoot.w_38_0 ctx) i), (((generatedRoot.w_39_0 ctx) i), (((generatedRoot.w_40_0 ctx) i), (((generatedRoot.w_41_0 ctx) i), (((generatedRoot.w_42_0 ctx) i), (((generatedRoot.w_43_0 ctx) i), (((generatedRoot.w_44_0 ctx) i), ()))))))))))))))))))))))))))))))))))))))))))))), w⟩ : parallel_generatedRoot_45.Ctx backend hashModel params i) ((((generatedRoot.w_45_0 ctx) i), (((generatedRoot.w_45_1 ctx) i), (((generatedRoot.w_45_2 ctx) i), (((generatedRoot.w_45_3 ctx) i), (((generatedRoot.w_45_4 ctx) i), (((generatedRoot.w_45_5 ctx) i), (((generatedRoot.w_45_6 ctx) i), (((generatedRoot.w_45_7 ctx) i), (((generatedRoot.w_45_8 ctx) i), (((generatedRoot.w_45_9 ctx) i), (((generatedRoot.w_45_10 ctx) i), (((generatedRoot.w_45_11 ctx) i), (((generatedRoot.w_45_12 ctx) i), (((generatedRoot.w_45_13 ctx) i), (((generatedRoot.w_45_14 ctx) i), (((generatedRoot.w_45_15 ctx) i), (((generatedRoot.w_45_16 ctx) i), (((generatedRoot.w_45_17 ctx) i), (((generatedRoot.w_45_18 ctx) i), (((generatedRoot.w_45_19 ctx) i), (((generatedRoot.w_45_20 ctx) i), (((generatedRoot.w_45_21 ctx) i), (((generatedRoot.w_45_22 ctx) i), (((generatedRoot.w_45_23 ctx) i), (((generatedRoot.w_45_24 ctx) i), (((generatedRoot.w_45_25 ctx) i), (((generatedRoot.w_45_26 ctx) i), (((generatedRoot.w_45_27 ctx) i), (((generatedRoot.w_45_28 ctx) i), (((generatedRoot.w_45_29 ctx) i), (((generatedRoot.w_45_30 ctx) i), (((generatedRoot.w_45_31 ctx) i), (((generatedRoot.w_45_32 ctx) i), (((generatedRoot.w_45_33 ctx) i), (((generatedRoot.w_45_34 ctx) i), (((generatedRoot.w_45_35 ctx) i), (((generatedRoot.w_45_36 ctx) i), (((generatedRoot.w_45_37 ctx) i), (((generatedRoot.w_45_38 ctx) i), (((generatedRoot.w_45_39 ctx) i), (((generatedRoot.w_45_40 ctx) i), (((generatedRoot.w_45_41 ctx) i), (((generatedRoot.w_45_42 ctx) i), (((generatedRoot.w_45_43 ctx) i), (((generatedRoot.w_45_44 ctx) i), (((generatedRoot.w_45_45 ctx) i), (((generatedRoot.w_45_46 ctx) i), (((generatedRoot.w_45_47 ctx) i), (((generatedRoot.w_45_48 ctx) i), (((generatedRoot.w_45_49 ctx) i), (((generatedRoot.w_45_50 ctx) i), (((generatedRoot.w_45_51 ctx) i), (((generatedRoot.w_45_52 ctx) i), (((generatedRoot.w_45_53 ctx) i), (((generatedRoot.w_45_54 ctx) i), (((generatedRoot.w_45_55 ctx) i), (((generatedRoot.w_45_56 ctx) i), (((generatedRoot.w_45_57 ctx) i), (((generatedRoot.w_45_58 ctx) i), (((generatedRoot.w_45_59 ctx) i), (((generatedRoot.w_45_60 ctx) i), (((generatedRoot.w_45_61 ctx) i), (((generatedRoot.w_45_62 ctx) i), (((generatedRoot.w_45_63 ctx) i), (((generatedRoot.w_45_64 ctx) i), (((generatedRoot.w_45_65 ctx) i), (((generatedRoot.w_45_66 ctx) i), (((generatedRoot.w_45_67 ctx) i), (((generatedRoot.w_45_68 ctx) i), (((generatedRoot.w_45_69 ctx) i), (((generatedRoot.w_45_70 ctx) i), (((generatedRoot.w_45_71 ctx) i), (((generatedRoot.w_45_72 ctx) i), (((generatedRoot.w_45_73 ctx) i), (((generatedRoot.w_45_74 ctx) i), (((generatedRoot.w_45_75 ctx) i), (((generatedRoot.w_45_76 ctx) i), (((generatedRoot.w_45_77 ctx) i), (((generatedRoot.w_45_78 ctx) i), (((generatedRoot.w_45_79 ctx) i), (((generatedRoot.w_45_80 ctx) i), (((generatedRoot.w_45_81 ctx) i), (((generatedRoot.w_45_82 ctx) i), (((generatedRoot.w_45_83 ctx) i), (((generatedRoot.w_45_84 ctx) i), (((generatedRoot.w_45_85 ctx) i), (((generatedRoot.w_45_86 ctx) i), (((generatedRoot.w_45_87 ctx) i), (((generatedRoot.w_45_88 ctx) i), (((generatedRoot.w_45_89 ctx) i), (((generatedRoot.w_45_90 ctx) i), (((generatedRoot.w_45_91 ctx) i), (((generatedRoot.w_45_92 ctx) i), (((generatedRoot.w_45_93 ctx) i), (((generatedRoot.w_45_94 ctx) i), (((generatedRoot.w_45_95 ctx) i), (((generatedRoot.w_45_96 ctx) i), (((generatedRoot.w_45_97 ctx) i), (((generatedRoot.w_45_98 ctx) i), (((generatedRoot.w_45_99 ctx) i), (((generatedRoot.w_45_100 ctx) i), (((generatedRoot.w_45_101 ctx) i), (((generatedRoot.w_45_102 ctx) i), (((generatedRoot.w_45_103 ctx) i), (((generatedRoot.w_45_104 ctx) i), (((generatedRoot.w_45_105 ctx) i), (((generatedRoot.w_45_106 ctx) i), (((generatedRoot.w_45_107 ctx) i), (((generatedRoot.w_45_108 ctx) i), (((generatedRoot.w_45_109 ctx) i), (((generatedRoot.w_45_110 ctx) i), (((generatedRoot.w_45_111 ctx) i), (((generatedRoot.w_45_112 ctx) i), (((generatedRoot.w_45_113 ctx) i), (((generatedRoot.w_45_114 ctx) i), (((generatedRoot.w_45_115 ctx) i), (((generatedRoot.w_45_116 ctx) i), (((generatedRoot.w_45_117 ctx) i), (((generatedRoot.w_45_118 ctx) i), (((generatedRoot.w_45_119 ctx) i), (((generatedRoot.w_45_120 ctx) i), (((generatedRoot.w_45_121 ctx) i), (((generatedRoot.w_45_122 ctx) i), (((generatedRoot.w_45_123 ctx) i), (((generatedRoot.w_45_124 ctx) i), (((generatedRoot.w_45_125 ctx) i), (((generatedRoot.w_45_126 ctx) i), (((generatedRoot.w_45_127 ctx) i), (((generatedRoot.w_45_128 ctx) i), (((generatedRoot.w_45_129 ctx) i), (((generatedRoot.w_45_130 ctx) i), (((generatedRoot.w_45_131 ctx) i), (((generatedRoot.w_45_132 ctx) i), (((generatedRoot.w_45_133 ctx) i), (((generatedRoot.w_45_134 ctx) i), (((generatedRoot.w_45_135 ctx) i), (((generatedRoot.w_45_136 ctx) i), (((generatedRoot.w_45_137 ctx) i), (((generatedRoot.w_45_138 ctx) i), (((generatedRoot.w_45_139 ctx) i), (((generatedRoot.w_45_140 ctx) i), (((generatedRoot.w_45_141 ctx) i), (((generatedRoot.w_45_142 ctx) i), (((generatedRoot.w_45_143 ctx) i), (((generatedRoot.w_45_144 ctx) i), (((generatedRoot.w_45_145 ctx) i), (((generatedRoot.w_45_146 ctx) i), (((generatedRoot.w_45_147 ctx) i), (((generatedRoot.w_45_148 ctx) i), (((generatedRoot.w_45_149 ctx) i), (((generatedRoot.w_45_150 ctx) i), (((generatedRoot.w_45_151 ctx) i), (((generatedRoot.w_45_152 ctx) i), (((generatedRoot.w_45_153 ctx) i), (((generatedRoot.w_45_154 ctx) i), (((generatedRoot.w_45_155 ctx) i), (((generatedRoot.w_45_156 ctx) i), (((generatedRoot.w_45_157 ctx) i), (((generatedRoot.w_45_158 ctx) i), (((generatedRoot.w_45_159 ctx) i), (((generatedRoot.w_45_160 ctx) i), (((generatedRoot.w_45_161 ctx) i), (((generatedRoot.w_45_162 ctx) i), (((generatedRoot.w_45_163 ctx) i), (((generatedRoot.w_45_164 ctx) i), (((generatedRoot.w_45_165 ctx) i), (((generatedRoot.w_45_166 ctx) i), (((generatedRoot.w_45_167 ctx) i), (((generatedRoot.w_45_168 ctx) i), (((generatedRoot.w_45_169 ctx) i), (((generatedRoot.w_45_170 ctx) i), (((generatedRoot.w_45_171 ctx) i), (((generatedRoot.w_45_172 ctx) i), (((generatedRoot.w_45_173 ctx) i), (((generatedRoot.w_45_174 ctx) i), (((generatedRoot.w_45_175 ctx) i), (((generatedRoot.w_45_176 ctx) i), (((generatedRoot.w_45_177 ctx) i), (((generatedRoot.w_45_178 ctx) i), (((generatedRoot.w_45_179 ctx) i), (((generatedRoot.w_45_180 ctx) i), (((generatedRoot.w_45_181 ctx) i), (((generatedRoot.w_45_182 ctx) i), (((generatedRoot.w_45_183 ctx) i), (((generatedRoot.w_45_184 ctx) i), (((generatedRoot.w_45_185 ctx) i), (((generatedRoot.w_45_186 ctx) i), (((generatedRoot.w_45_187 ctx) i), (((generatedRoot.w_45_188 ctx) i), (((generatedRoot.w_45_189 ctx) i), (((generatedRoot.w_45_190 ctx) i), (((generatedRoot.w_45_191 ctx) i), (((generatedRoot.w_45_192 ctx) i), (((generatedRoot.w_45_193 ctx) i), (((generatedRoot.w_45_194 ctx) i), (((generatedRoot.w_45_195 ctx) i), (((generatedRoot.w_45_196 ctx) i), (((generatedRoot.w_45_197 ctx) i), (((generatedRoot.w_45_198 ctx) i), (((generatedRoot.w_45_199 ctx) i), (((generatedRoot.w_45_200 ctx) i), (((generatedRoot.w_45_201 ctx) i), (((generatedRoot.w_45_202 ctx) i), ()))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))), (((generatedRoot.w_45_203 ctx) i), (((generatedRoot.w_45_204 ctx) i), (((generatedRoot.w_45_205 ctx) i), (((generatedRoot.w_45_206 ctx) i), (((generatedRoot.w_45_207 ctx) i), (((generatedRoot.w_45_208 ctx) i), (((generatedRoot.w_45_209 ctx) i), (((generatedRoot.w_45_210 ctx) i), (((generatedRoot.w_45_211 ctx) i), (((generatedRoot.w_45_212 ctx) i), (((generatedRoot.w_45_213 ctx) i), (((generatedRoot.w_45_214 ctx) i), (((generatedRoot.w_45_215 ctx) i), (((generatedRoot.w_45_216 ctx) i), (((generatedRoot.w_45_217 ctx) i), (((generatedRoot.w_45_218 ctx) i), (((generatedRoot.w_45_219 ctx) i), (((generatedRoot.w_45_220 ctx) i), (((generatedRoot.w_45_221 ctx) i), (((generatedRoot.w_45_222 ctx) i), (((generatedRoot.w_45_223 ctx) i), (((generatedRoot.w_45_224 ctx) i), (((generatedRoot.w_45_225 ctx) i), (((generatedRoot.w_45_226 ctx) i), (((generatedRoot.w_45_227 ctx) i), (((generatedRoot.w_45_228 ctx) i), (((generatedRoot.w_45_229 ctx) i), (((generatedRoot.w_45_230 ctx) i), (((generatedRoot.w_45_231 ctx) i), (((generatedRoot.w_45_232 ctx) i), (((generatedRoot.w_45_233 ctx) i), (((generatedRoot.w_45_234 ctx) i), (((generatedRoot.w_45_235 ctx) i), (((generatedRoot.w_45_236 ctx) i), (((generatedRoot.w_45_237 ctx) i), (((generatedRoot.w_45_238 ctx) i), (((generatedRoot.w_45_239 ctx) i), (((generatedRoot.w_45_240 ctx) i), (((generatedRoot.w_45_241 ctx) i), (((generatedRoot.w_45_242 ctx) i), (((generatedRoot.w_45_243 ctx) i), (((generatedRoot.w_45_244 ctx) i), (((generatedRoot.w_45_245 ctx) i), (((generatedRoot.w_45_246 ctx) i), (((generatedRoot.w_45_247 ctx) i), (((generatedRoot.w_45_248 ctx) i), (((generatedRoot.w_45_249 ctx) i), (((generatedRoot.w_45_250 ctx) i), (((generatedRoot.w_45_251 ctx) i), (((generatedRoot.w_45_252 ctx) i), (((generatedRoot.w_45_253 ctx) i), (((generatedRoot.w_45_254 ctx) i), (((generatedRoot.w_45_255 ctx) i), (((generatedRoot.w_45_256 ctx) i), (((generatedRoot.w_45_257 ctx) i), (((generatedRoot.w_45_258 ctx) i), (((generatedRoot.w_45_259 ctx) i), (((generatedRoot.w_45_260 ctx) i), (((generatedRoot.w_45_261 ctx) i), (((generatedRoot.w_45_262 ctx) i), (((generatedRoot.w_45_263 ctx) i), (((generatedRoot.w_45_264 ctx) i), (((generatedRoot.w_45_265 ctx) i), (((generatedRoot.w_45_266 ctx) i), (((generatedRoot.w_45_267 ctx) i), (((generatedRoot.w_45_268 ctx) i), (((generatedRoot.w_45_269 ctx) i), (((generatedRoot.w_45_270 ctx) i), (((generatedRoot.w_45_271 ctx) i), (((generatedRoot.w_45_272 ctx) i), (((generatedRoot.w_45_273 ctx) i), (((generatedRoot.w_45_274 ctx) i), (((generatedRoot.w_45_275 ctx) i), (((generatedRoot.w_45_276 ctx) i), (((generatedRoot.w_45_277 ctx) i), (((generatedRoot.w_45_278 ctx) i), (((generatedRoot.w_45_279 ctx) i), (((generatedRoot.w_45_280 ctx) i), (((generatedRoot.w_45_281 ctx) i), (((generatedRoot.w_45_282 ctx) i), (((generatedRoot.w_45_283 ctx) i), (((generatedRoot.w_45_284 ctx) i), (((generatedRoot.w_45_285 ctx) i), (((generatedRoot.w_45_286 ctx) i), (((generatedRoot.w_45_287 ctx) i), (((generatedRoot.w_45_288 ctx) i), (((generatedRoot.w_45_289 ctx) i), (((generatedRoot.w_45_290 ctx) i), (((generatedRoot.w_45_291 ctx) i), (((generatedRoot.w_45_292 ctx) i), (((generatedRoot.w_45_293 ctx) i), (((generatedRoot.w_45_294 ctx) i), (((generatedRoot.w_45_295 ctx) i), (((generatedRoot.w_45_296 ctx) i), (((generatedRoot.w_45_297 ctx) i), (((generatedRoot.w_45_298 ctx) i), (((generatedRoot.w_45_299 ctx) i), (((generatedRoot.w_45_300 ctx) i), (((generatedRoot.w_45_301 ctx) i), (((generatedRoot.w_45_302 ctx) i), (((generatedRoot.w_45_303 ctx) i), (((generatedRoot.w_45_304 ctx) i), (((generatedRoot.w_45_305 ctx) i), (((generatedRoot.w_45_306 ctx) i), (((generatedRoot.w_45_307 ctx) i), (((generatedRoot.w_45_308 ctx) i), (((generatedRoot.w_45_309 ctx) i), (((generatedRoot.w_45_310 ctx) i), (((generatedRoot.w_45_311 ctx) i), (((generatedRoot.w_45_312 ctx) i), (((generatedRoot.w_45_313 ctx) i), (((generatedRoot.w_45_314 ctx) i), (((generatedRoot.w_45_315 ctx) i), (((generatedRoot.w_45_316 ctx) i), (((generatedRoot.w_45_317 ctx) i), (((generatedRoot.w_45_318 ctx) i), (((generatedRoot.w_45_319 ctx) i), (((generatedRoot.w_45_320 ctx) i), (((generatedRoot.w_45_321 ctx) i), (((generatedRoot.w_45_322 ctx) i), (((generatedRoot.w_45_323 ctx) i), (((generatedRoot.w_45_324 ctx) i), (((generatedRoot.w_45_325 ctx) i), (((generatedRoot.w_45_326 ctx) i), (((generatedRoot.w_45_327 ctx) i), (((generatedRoot.w_45_328 ctx) i), (((generatedRoot.w_45_329 ctx) i), (((generatedRoot.w_45_330 ctx) i), (((generatedRoot.w_45_331 ctx) i), (((generatedRoot.w_45_332 ctx) i), (((generatedRoot.w_45_333 ctx) i), (((generatedRoot.w_45_334 ctx) i), (((generatedRoot.w_45_335 ctx) i), (((generatedRoot.w_45_336 ctx) i), (((generatedRoot.w_45_337 ctx) i), (((generatedRoot.w_45_338 ctx) i), (((generatedRoot.w_45_339 ctx) i), (((generatedRoot.w_45_340 ctx) i), (((generatedRoot.w_45_341 ctx) i), (((generatedRoot.w_45_342 ctx) i), (((generatedRoot.w_45_343 ctx) i), (((generatedRoot.w_45_344 ctx) i), (((generatedRoot.w_45_345 ctx) i), (((generatedRoot.w_45_346 ctx) i), (((generatedRoot.w_45_347 ctx) i), (((generatedRoot.w_45_348 ctx) i), (((generatedRoot.w_45_349 ctx) i), (((generatedRoot.w_45_350 ctx) i), (((generatedRoot.w_45_351 ctx) i), (((generatedRoot.w_45_352 ctx) i), (((generatedRoot.w_45_353 ctx) i), (((generatedRoot.w_45_354 ctx) i), (((generatedRoot.w_45_355 ctx) i), (((generatedRoot.w_45_356 ctx) i), (((generatedRoot.w_45_357 ctx) i), (((generatedRoot.w_45_358 ctx) i), (((generatedRoot.w_45_359 ctx) i), (((generatedRoot.w_45_360 ctx) i), (((generatedRoot.w_45_361 ctx) i), (((generatedRoot.w_45_362 ctx) i), (((generatedRoot.w_45_363 ctx) i), (((generatedRoot.w_45_364 ctx) i), (((generatedRoot.w_45_365 ctx) i), (((generatedRoot.w_45_366 ctx) i), (((generatedRoot.w_45_367 ctx) i), (((generatedRoot.w_45_368 ctx) i), (((generatedRoot.w_45_369 ctx) i), (((generatedRoot.w_45_370 ctx) i), (((generatedRoot.w_45_371 ctx) i), (((generatedRoot.w_45_372 ctx) i), (((generatedRoot.w_45_373 ctx) i), (((generatedRoot.w_45_374 ctx) i), (((generatedRoot.w_45_375 ctx) i), (((generatedRoot.w_45_376 ctx) i), (((generatedRoot.w_45_377 ctx) i), (((generatedRoot.w_45_378 ctx) i), (((generatedRoot.w_45_379 ctx) i), (((generatedRoot.w_45_380 ctx) i), (((generatedRoot.w_45_381 ctx) i), (((generatedRoot.w_45_382 ctx) i), (((generatedRoot.w_45_383 ctx) i), (((generatedRoot.w_45_384 ctx) i), (((generatedRoot.w_45_385 ctx) i), (((generatedRoot.w_45_386 ctx) i), (((generatedRoot.w_45_387 ctx) i), (((generatedRoot.w_45_388 ctx) i), (((generatedRoot.w_45_389 ctx) i), (((generatedRoot.w_45_390 ctx) i), (((generatedRoot.w_45_391 ctx) i), (((generatedRoot.w_45_392 ctx) i), (((generatedRoot.w_45_393 ctx) i), (((generatedRoot.w_45_394 ctx) i), (((generatedRoot.w_45_395 ctx) i), (((generatedRoot.w_45_396 ctx) i), (((generatedRoot.w_45_397 ctx) i), (((generatedRoot.w_45_398 ctx) i), (((generatedRoot.w_45_399 ctx) i), (((generatedRoot.w_45_400 ctx) i), (((generatedRoot.w_45_401 ctx) i), (((generatedRoot.w_45_402 ctx) i), (((generatedRoot.w_45_403 ctx) i), (((generatedRoot.w_45_404 ctx) i), (((generatedRoot.w_45_405 ctx) i), ())))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) :=
+  let ⟨w, h⟩ := F.c0.h45_405 i
+  ⟨w, parallel_generatedRoot_45.facts _ h⟩
+
+end Stage_encrypt
+
+end

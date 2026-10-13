@@ -7,10 +7,23 @@ correctness proof gives the average-case claim with failure probability zero.
 
 This script writes, in the average-case parameter directory:
 - `worst/`: the worst-case export, renamed (`Stage_x` → `W_Stage_x`, `Ideal` → `W_Ideal`,
-  `Requirement_0` → `W_Requirement_0`), with `W_Claim.lean` holding its `Runs` over the
-  average-case claim's `ExternalInputs` and `Execution`;
-- `bridge/`: per stage, `Stage_x.D.bridge : Stage_x.D … tape path … → W_Stage_x.D …` for every
-  relation `D`, and `BridgeRuns.lean` with `GeneratedClaim.runs_bridge`.
+  `Requirement_0` → `W_Requirement_0`, and the facts modules `<module>_Facts` alike), with
+  `W_Claim.lean` holding its `Runs` over the average-case claim's `ExternalInputs` and
+  `Execution`;
+- `bridge/`: per relation module (not per facts module), `Stage_x.D.bridge : Stage_x.D … tape
+  path … → W_Stage_x.D …` for every relation `D` whose signature takes a tape, and
+  `BridgeRuns.lean` with `GeneratedClaim.runs_bridge`;
+and deletes the `.lean` files of `worst/` and `bridge/` it no longer writes, and sets the roots
+of the `RefreshTopGenerated`, `RefreshTopWorst` and `RefreshTopBridge` libraries in
+`lakefile.toml`.
+
+The bridge reads each relation as a proposition: `let` lines are kept by definitional unfolding;
+`∃` binders (record witnesses `∃ witness : D.Witness`, scalar chains `∃ (x : T),`, gathered
+values `∃ x_gathered : T,`) are opened and closed again; conjunctions are split at the top level;
+a parallel or gather loop `∀ i : Fin n, …` maps its body; a sequential loop
+`MxxIR.IterRuns (fun i current next => child …) …` maps its step by `iterRuns_mono`; a call of
+a relation (or constraint fragment) taking a tape uses its bridge; a tape sampler uses its
+`ExponentSampling` lemma; every other atom is the same proposition on both sides.
 
 Usage: `python3 gen_bridge.py <average directory> <worst directory>`.
 """
@@ -23,8 +36,19 @@ ROOTS = re.compile(r'\b(Stage_\w+|Ideal|Requirement_0)\b')
 os.makedirs(f'{avg}/worst', exist_ok=True)
 os.makedirs(f'{avg}/bridge', exist_ok=True)
 
+
+def is_relation(name):
+    return bool(ROOTS.fullmatch(name)) and not name.endswith('_Facts')
+
+
 modules = sorted(f[:-5] for f in os.listdir(f'{avg}/generated')
-                 if f.endswith('.lean') and ROOTS.fullmatch(f[:-5]))
+                 if f.endswith('.lean') and is_relation(f[:-5]))
+written = {'worst': set(), 'bridge': set()}
+
+
+def write(sub, name, text):
+    open(f'{avg}/{sub}/{name}.lean', 'w').write(text)
+    written[sub].add(name)
 
 
 def renamed(text):
@@ -32,17 +56,17 @@ def renamed(text):
 
 
 for m in modules:
-    open(f'{avg}/worst/W_{m}.lean', 'w').write(renamed(open(f'{worst}/generated/{m}.lean').read()))
+    write('worst', f'W_{m}', renamed(open(f'{worst}/generated/{m}.lean').read()))
 # The worst-case export's facts modules (`<module>_Facts`, exported with
 # `MXX_EXPONENT_LUT_REFRESH_TOP_LEAN_FACTS=1`), renamed alike: the modular proof reads them.
 for f in sorted(os.listdir(f'{worst}/generated')):
-    if f.endswith('_Facts.lean') and ROOTS.fullmatch(f[:-len('_Facts.lean')]):
-        open(f'{avg}/worst/W_{f}', 'w').write(renamed(open(f'{worst}/generated/{f}').read()))
+    if f.endswith('_Facts.lean') and is_relation(f[:-len('_Facts.lean')]):
+        write('worst', f'W_{f[:-5]}', renamed(open(f'{worst}/generated/{f}').read()))
 
 claim = open(f'{worst}/generated/Claim.lean').read()
 imports = ''.join(f'import W_{m}\n' for m in modules)
 body = claim[claim.index('def stage_0_params'):claim.index('/-- Every execution')]
-open(f'{avg}/worst/W_Claim.lean', 'w').write(f'''import Claim
+write('worst', 'W_Claim', f'''import Claim
 {imports}
 /-! The worst-case relation of the graph (written by `generator/gen_bridge.py`): the worst-case
 export's `Runs` over the average-case claim's inputs and executions. -/
@@ -92,13 +116,68 @@ def blocks(text):
     return out
 
 
-def sub_name(atom):
-    m = re.search(r'(?:^|[(\s])((?:parallel|sequential)_\w+) (?:backend )?(?:hashModel )?tape ', atom)
-    assert m, atom
-    return m.group(1)
+OPEN, CLOSE = '([{⟨', ')]}⟩'
 
 
-for m in modules:
+def depths(s):
+    """The bracket depth before each character of `s`."""
+    out, d = [], 0
+    for ch in s:
+        if ch in CLOSE:
+            d -= 1
+        out.append(d)
+        if ch in OPEN:
+            d += 1
+    return out
+
+
+def strip_parens(e):
+    """`e` without enclosing parentheses that span all of it."""
+    e = e.strip()
+    while e.startswith('(') and e.endswith(')'):
+        d = depths(e)
+        if any(d[k] == 0 for k in range(1, len(e) - 1)):
+            break
+        e = e[1:-1].strip()
+    return e
+
+
+def split_conj(e):
+    """The top-level conjuncts of `e`; a conjunct opening an unparenthesized binder ends the list."""
+    out, start, d = [], 0, depths(e)
+    k = 0
+    while k < len(e):
+        if e[k] == '∧' and d[k] == 0:
+            out.append(e[start:k].strip())
+            start = k + 1
+            if re.match(r'\s*[∃∀]', e[start:]):
+                break
+        k += 1
+    out.append(e[start:].strip())
+    return out
+
+
+def binder(e):
+    """Split `∃ x : T, rest` / `∃ (x : T), rest` / `∀ i : T, rest` into `(x, T, rest)`."""
+    s = e[1:].lstrip()
+    d = depths(s)
+    comma = next(k for k, ch in enumerate(s) if ch == ',' and d[k] == 0)
+    b = strip_parens(s[:comma])
+    name, ty = b.split(' : ', 1)
+    assert re.fullmatch(r'\w+', name.strip()), e[:200]
+    return name.strip(), ty.strip(), s[comma + 1:].strip()
+
+
+def expression(lines):
+    """The proposition of a relation body without its `let` lines."""
+    kept = [l.strip() for l in lines if not l.strip().startswith('let ')]
+    return ' '.join(kept)
+
+
+TAPE = re.compile(r'\btape\b')
+
+
+def gen_module(m):
     text = open(f'{avg}/generated/{m}.lean').read()
     B = blocks(text)
     out = [f'''import {m}
@@ -124,21 +203,65 @@ theorem {m}.iterRuns_mono {{State : Type}} {{f g : Nat → State → State → P
         counter[0] += 1
         return f'{p}{counter[0]}'
 
-    def atom_term(atom, h):
-        if 'tape' not in atom:
+    def bridged(name):
+        """Whether relation `name` takes a tape (and so has a bridge)."""
+        return name in B and 'MxxRuntime.SampleTape' in B[name][1]
+
+    def term(e, h):
+        """A proof of the worst-case form of proposition `e` from `h : e`."""
+        e = strip_parens(e)
+        if not TAPE.search(e):
             return h
-        if 'MxxRuntime.gaussianSampleAt tape' in atom:
+        if e.startswith('∀'):
+            v, _, rest = binder(e)
+            return f'(fun {v} ↦ {term(rest, f"({h} {v})")})'
+        if e.startswith('∃'):
+            xs, wits, rest = [], [], e
+            while rest.startswith('∃'):
+                x, ty, rest = binder(rest)
+                if ty.endswith('.Witness') and ty in B:
+                    x = fresh('wit')
+                    fields = [l.split(' : ')[0].strip() for l in B[ty][2]]
+                    wits.append('⟨' + ', '.join(f'{x}.{f}' for f in fields) + '⟩')
+                else:
+                    wits.append(x)
+                xs.append(x)
+                rest = strip_parens(rest)
+            parts = split_conj(rest)
+            hs = [fresh('h') for _ in parts]
+            terms = [term(p, hp) for p, hp in zip(parts, hs)]
+            return f'(by obtain ⟨{", ".join(xs + hs)}⟩ := {h}; exact ⟨{", ".join(wits + terms)}⟩)'
+        parts = split_conj(e)
+        if len(parts) > 1:
+            hs = [fresh('h') for _ in parts]
+            terms = [term(p, hp) for p, hp in zip(parts, hs)]
+            return f'(by obtain ⟨{", ".join(hs)}⟩ := {h}; exact ⟨{", ".join(terms)}⟩)'
+        if e.startswith('MxxRuntime.gaussianSampleAt tape'):
             return f'(MxxExponentLut.gaussianSampleAt_sample (by decide) {h})'
-        if 'MxxRuntime.uniformIntervalSampleAt tape' in atom:
+        if e.startswith('MxxRuntime.uniformIntervalSampleAt tape'):
             return f'(MxxExponentLut.uniformIntervalSampleAt_sample (by decide) {h})'
-        if atom.startswith('(∀ i : Fin'):
-            return f'(fun i ↦ {m}.{sub_name(atom)}.bridge ({h} i))'
-        if atom.startswith('MxxIR.IterRuns'):
-            return f'({m}.iterRuns_mono {h} (fun _ _ _ hs ↦ {m}.{sub_name(atom)}.bridge hs))'
-        raise ValueError(atom)
+        if e.startswith('MxxRuntime.trapdoorSampleAt '):
+            return f'(MxxRuntime.trapdoorSampleAt_sample {h})'
+        if e.startswith('MxxIR.IterRuns (fun'):
+            s = e[len('MxxIR.IterRuns '):]
+            d = depths(s)
+            end = next(k for k in range(1, len(s)) if d[k] == 0)
+            step = s[1:end]
+            step = step[step.index('=>') + 2:]
+            hs = fresh('hs')
+            return f'({m}.iterRuns_mono {h} (fun _ _ _ {hs} ↦ {term(step, hs)}))'
+        head = e.split(' ', 1)[0]
+        if head.startswith(f'{m}.'):
+            head = head[len(m) + 1:]
+        if head in B and B[head][0] == 'abbrev' and head.endswith('.body'):
+            return term(expression(B[head][2]), h)
+        if bridged(head):
+            return f'({m}.{head}.bridge {h})'
+        raise ValueError(f'{m}: no bridge for atom {e[:300]}')
 
     def signature(name, header, kind):
         """The arguments of `name` on the average-case and worst-case sides, and the binders."""
+        assert header.endswith(': Prop :='), header[:200]
         args = top_args(header[len(f'{kind} {name} '):-len(': Prop :=')])
         avg_args, w_args, binders = [], [], []
         for k, a in enumerate(args):
@@ -160,59 +283,25 @@ theorem {m}.iterRuns_mono {{State : Type}} {{f g : Nat → State → State → P
                 binders.append(n)
         return avg_args, w_args, binders
 
-    def theorem(name, kind, header, script):
+    for name, (kind, header, lines) in B.items():
+        if not header.endswith(': Prop :=') or not bridged(name):
+            continue
+        if kind == 'abbrev' and name.endswith('.body'):
+            continue  # unfolded at its witness
+        assert kind == 'def' or re.search(r'\.constraints_\d+$', name), (m, name)
+        counter[0] = 0
         avg_args, w_args, binders = signature(name, header, kind)
-        return f'''
+        script = [] if kind == 'abbrev' else [f'  delta W_{m}.{name}']
+        script.append(f'  exact {term(expression(lines), "h")}')
+        out.append(f'''
 theorem {m}.{name}.bridge {{{' '.join(binders)}}}
     (h : {m}.{name} {' '.join(avg_args)}) : W_{m}.{name} {' '.join(w_args)} := by
-''' + '\n'.join(script) + '\n'
+''' + '\n'.join(script) + '\n')
+    write('bridge', f'Bridge_{m}', '\n'.join(out))
 
-    def constraint(name, h):
-        """The bridge of constraint abbrev call `h` of `name`."""
-        return f'({m}.{name}.bridge {h})' if 'tape' in B[name][1] else h
 
-    for name, (kind, header, lines) in B.items():
-        if not header.endswith(': Prop :='):
-            continue
-        counter[0] = 0
-        if kind == 'abbrev' and re.search(r'\.constraints_\d+$', name):
-            if 'tape' not in header:
-                continue
-            atoms = [l.strip() for l in lines]
-            for a in atoms[:-1]:
-                assert a.endswith(' ∧'), a
-            atoms = [a[:-2] if a.endswith(' ∧') else a for a in atoms]
-            hs = [fresh('a') for _ in atoms]
-            terms = []
-            for a, ha in zip(atoms, hs):
-                c = re.match(r'(\w+)\.(constraints_\d+) ', a)
-                terms.append(constraint(f'{c.group(1)}.{c.group(2)}', ha) if c else atom_term(a, ha))
-            out.append(theorem(name, kind, header, [f'  obtain ⟨{", ".join(hs)}⟩ := h',
-                                                     f'  exact ⟨{", ".join(terms)}⟩']))
-            continue
-        if kind != 'def':
-            continue
-        script = [f'  delta W_{m}.{name}']
-        body = '\n'.join(lines)
-        last = lines[-1].strip()
-        cc = re.match(r'(\w+)\.(constraints_\d+) ', last)
-        if lines[0].strip().startswith('∃ witness'):
-            fields = [l.split(' : ')[0].strip() for l in B[f'{name}.Witness'][2]]
-            bl = B[f'{name}.body'][2][-1].strip()
-            cc = re.match(r'(\w+)\.(constraints_\d+) ', bl)
-            witness = '⟨' + ', '.join(f'wit.{f}' for f in fields) + '⟩'
-            script += ['  obtain ⟨wit, hb⟩ := h',
-                       f'  exact ⟨{witness}, {constraint(f"{cc.group(1)}.{cc.group(2)}", "hb")}⟩']
-        else:
-            assert cc, (name, last)
-            xs = [fresh('x') for _ in range(len(re.findall(r'^\s*∃ \(', body, re.M)))]
-            if xs:
-                script += [f'  obtain ⟨{", ".join(xs + ["hb"])}⟩ := h',
-                           f'  exact ⟨{", ".join(xs + [constraint(f"{cc.group(1)}.{cc.group(2)}", "hb")])}⟩']
-            else:
-                script.append(f'  exact {constraint(f"{cc.group(1)}.{cc.group(2)}", "h")}')
-        out.append(theorem(name, kind, header, script))
-    open(f'{avg}/bridge/Bridge_{m}.lean', 'w').write('\n'.join(out))
+for m in modules:
+    gen_module(m)
 
 # The bridge of `Runs`.
 cl = open(f'{avg}/generated/Claim.lean').read()
@@ -225,7 +314,7 @@ for k, c in enumerate(conj):
     r = re.match(r'(\w+)\.generatedRoot ', c)
     terms.append(f'{r.group(1)}.generatedRoot.bridge {h}' if r else h)
 imports = ''.join(f'import Bridge_{m}\n' for m in modules)
-open(f'{avg}/bridge/BridgeRuns.lean', 'w').write(f'''{imports}import W_Claim
+write('bridge', 'BridgeRuns', f'''{imports}import W_Claim
 
 /-! Every average-case run is a worst-case run (written by `generator/gen_bridge.py`). -/
 
@@ -241,3 +330,20 @@ theorem GeneratedClaim.runs_bridge {{hashModel : MxxRuntime.HashModel}}
   obtain ⟨{", ".join(hs)}⟩ := h
   exact ⟨{", ".join(terms)}⟩
 ''')
+
+# Stale outputs of earlier exports.
+for sub in ('worst', 'bridge'):
+    for f in sorted(os.listdir(f'{avg}/{sub}')):
+        if f.endswith('.lean') and f[:-5] not in written[sub]:
+            os.remove(f'{avg}/{sub}/{f}')
+
+# The library roots.
+generated = sorted(f[:-5] for f in os.listdir(f'{avg}/generated') if f.endswith('.lean'))
+roots = {'RefreshTopGenerated': generated, 'RefreshTopWorst': sorted(written['worst']),
+         'RefreshTopBridge': sorted(written['bridge'])}
+lake = open(f'{avg}/lakefile.toml').read()
+for lib, names in roots.items():
+    lake, n = re.subn(rf'(name = "{lib}"\n(?:(?!\[\[).*\n)*?roots = )\[[^\]]*\]',
+                      lambda mm: mm.group(1) + '[' + ', '.join(f'"{x}"' for x in names) + ']', lake)
+    assert n == 1, lib
+open(f'{avg}/lakefile.toml', 'w').write(lake)

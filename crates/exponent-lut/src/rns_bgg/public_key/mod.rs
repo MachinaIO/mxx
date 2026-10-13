@@ -130,6 +130,10 @@ pub struct PublicKeyLowering<'a> {
     /// preimage `K` of the summed key, and the public `B` it is a preimage
     /// under.
     pub(crate) unmask: Option<(String, Preimage, Mat)>,
+    /// The values of the Program's integer data (`None` when bound by shape
+    /// only, see [`super::RnsPreprocessBuild::bind_rhs_inputs`]). A child
+    /// Program's data are exported (`data/<id>`) for online evaluation.
+    pub(crate) data_values: Option<crate::program::ProgramData>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Dynamic: the public action of every root-scope `MulPrivate` and
     /// `Lut` site, its output key and a LUT's product keys `T_k`, which

@@ -39,8 +39,8 @@ use crate::{
 pub use dynamic::{compact_expansion_bound, expand_compact_entry};
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, decode_output, decode_public_output, decode_top_refresh, refresh_error,
-    top_refresh_error, verify_output,
+    RnsOnlineEvalBuild, TOP_REFRESH_TERMS_INPUT, decode_output, decode_public_output,
+    decode_top_refresh, refresh_error, top_refresh_error, verify_output,
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
@@ -752,19 +752,6 @@ impl RnsBggParameters {
             .centered_rebase(&self.ring(ring_level)?))
     }
 
-    /// The constant `1 x n` row of `weights` in the ring of `level`.
-    pub(crate) fn weight_row(&self, level: usize, weights: &[BigUint]) -> Result<Mat, RnsBggError> {
-        let ring = self.ring(level)?;
-        let entries = weights
-            .iter()
-            .map(|weight| ring.polynomial([IntExpr::constant(weight.clone())]))
-            .collect::<Vec<_>>();
-        Ok(match entries.len() {
-            1 => entries.into_iter().next().expect("one weight"),
-            _ => Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, entries),
-        })
-    }
-
     /// The largest `l1` norm of [`Self::gadget_inverse`] over `weights`: the
     /// balanced digits of each weight, as the runtime decomposes it (see
     /// [`Self::gadget_inverse_norms`]).
@@ -846,7 +833,11 @@ impl RnsBggParameters {
         level: usize,
         w: &BigUint,
     ) -> Result<SmallMatrix, RnsBggError> {
-        self.gadget_inverse(level, level, self.weight_row(level, std::slice::from_ref(w))?)
+        self.gadget_inverse(
+            level,
+            level,
+            self.ring(level)?.polynomial([IntExpr::constant(w.clone())]),
+        )
     }
 
     /// The carrier of output `wire` of `program`, whose lowered value is at
@@ -1417,22 +1408,31 @@ pub enum InputKeySource {
 }
 
 impl InputKeySource {
-    /// The key of input `wire`, or of its member `member`.
+    /// The key of input `wire`, or of its member `member`. A Static member
+    /// may be a runtime index (a data entry, see [`crate::program::Operand::Selected`]);
+    /// a Dynamic setup's member keys are tagged by index expressions, so
+    /// their member is known when the graph is built.
     pub fn key(
         &self,
         parameters: &RnsBggParameters,
         hash_key: mxx_dsl::Bytes,
         wire: WireId,
-        member: Option<IntExpr>,
+        member: Option<mxx_dsl::Int>,
     ) -> Result<RnsBggPublicKey, RnsBggError> {
         match self {
             Self::Static { level, knowledge } => {
                 public_key::sampled_key(parameters, *level, hash_key, wire, *knowledge, member)
             }
-            Self::Dynamic { setup, coordinate } => Ok(RnsBggPublicKey::new(
-                wire,
-                setup.input_key(parameters, hash_key, *coordinate, member)?,
-            )),
+            Self::Dynamic { setup, coordinate } => {
+                let member =
+                    member.map(|member| member.expression()).transpose().map_err(|_| {
+                        RnsBggError::Binding("a Dynamic input member is not selected at run time")
+                    })?;
+                Ok(RnsBggPublicKey::new(
+                    wire,
+                    setup.input_key(parameters, hash_key, *coordinate, member)?,
+                ))
+            }
         }
     }
 }
@@ -1468,6 +1468,11 @@ pub(crate) struct RnsBggArtifactBinding {
     /// family's ciphertexts, and its manifest.
     ciphertext_prelude:
         Option<(mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::Manifest)>,
+    /// The entries of every integer data family of a decoder's or refresh's
+    /// child Program that preprocessing exported, by artifact name (`None`
+    /// for a family bound by shape only). Online evaluation binds each one as
+    /// a resident graph input, which a protocol links to that artifact.
+    child_data: BTreeMap<String, Option<Vec<usize>>>,
     /// Preprocessing only: how the Program's outputs are consumed, and the
     /// resolved carrier of each declared output.
     output_use: RnsOutputUse,
@@ -1499,6 +1504,7 @@ impl RnsBggArtifactBinding {
             dynamic_setup: None,
             dynamic_binding: None,
             data: None,
+            child_data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             output_carriers: Vec::new(),
         };
@@ -1517,6 +1523,20 @@ impl RnsBggArtifactBinding {
     /// The logical level of each Program input.
     pub(crate) fn input_levels(&self) -> &BTreeMap<WireId, usize> {
         &self.input_levels
+    }
+
+    /// Records the entries of the exported child data families, by artifact
+    /// name.
+    pub(crate) fn with_child_data(mut self, data: BTreeMap<String, Option<Vec<usize>>>) -> Self {
+        self.child_data = data;
+        self
+    }
+
+    /// The entries of the exported child data family `name`: `None` when no
+    /// such family was exported, `Some(None)` for a family bound by shape
+    /// only.
+    pub(crate) fn child_data(&self, name: &str) -> Option<Option<&[usize]>> {
+        self.child_data.get(name).map(Option::as_deref)
     }
 
     /// Records the Dynamic setup of the stage and, for preprocessing, the
@@ -1704,24 +1724,61 @@ pub(crate) struct RnsBggDecoder<'a, E: ExponentLUTProgramLowering> {
 /// Program, whose finalized carrier at `level` has payload `v r G_level`, is
 /// right-multiplied by `G_level^-1(w)` for its halved weight `w = 2^-1 P^digit
 /// mod q_level` and then by `X^coefficient`. Returns that action and that
-/// monomial; both are graph values chosen per member, built without
-/// loop-dependent constants.
+/// monomial; both are graph values chosen per member. The weight is the
+/// constant `2^-1 P^digit` of the member's digit expression (one
+/// power-of-base constant scaled by `2^-1 mod q_level`), so the member body
+/// does not grow with the digit count.
 pub(crate) fn smudge_member_action(
     parameters: &RnsBggParameters,
     declaration: &DecoderDeclaration,
     member: IntExpr,
     level: usize,
 ) -> Result<(SmallMatrix, mxx_dsl::Int), RnsBggError> {
-    let weights = parameters.halved_weights(level, &declaration.member_weights())?;
-    let (coefficient, index) = declaration.member_placement(member);
-    let row = parameters.weight_row(level, &weights)?;
-    let weight = if weights.len() == 1 { row } else { row_entry(&row, index) };
+    let half = parameters.halved_weights(level, &[BigUint::one()])?.remove(0);
+    let (coefficient, digit) = declaration.member_placement(member);
+    let ring = parameters.ring(level)?;
+    let weight = ring.polynomial([IntExpr::constant(half)]) *
+        ring.constant(
+            (1, 1),
+            mxx_ir_core::node::ConstantMatrix::PowerOfBase {
+                base: IntExpr::constant(declaration.digit_base()),
+                exponent: digit,
+            },
+        );
     Ok((parameters.gadget_inverse(level, level, weight)?, mxx_dsl::Int::evaluate(coefficient)))
 }
 
 /// `X^coefficient * entry * action` for one carrier entry.
 pub(crate) fn act_on_entry(entry: Mat, action: &SmallMatrix, coefficient: &mxx_dsl::Int) -> Mat {
     action.clone().right_multiply(entry).multiply_monomial(coefficient.clone())
+}
+
+/// A carrier entry `E` in column `column` of a row of `columns` blocks:
+/// `e_column ⊗ E`, the unit row of the column tensored with the entry (see
+/// the row `Sum` of [`crate::program::ExponentLutProgramBuilder::sum_columns`]).
+pub(crate) fn place_in_column(entry: Mat, columns: usize, column: &IntExpr) -> Mat {
+    let ring = Ring::from_ref(entry.matrix_type().ring.clone());
+    ring.constant(
+        (1, columns),
+        mxx_ir_core::node::ConstantMatrix::UnitRow { index: column.clone() },
+    )
+    .tensor(entry)
+}
+
+/// The members per column of a row `Sum` of `columns` columns over a family
+/// of `count` members.
+pub(crate) fn row_sum_block(
+    count: &IntExpr,
+    columns: usize,
+) -> Result<usize, crate::program::ProgramLowerError<RnsBggError>> {
+    count
+        .evaluate(&mxx_ir_core::ParamEnv::default())
+        .ok()
+        .and_then(|count| count.to_usize())
+        .map(|count| count / columns)
+        .ok_or(crate::program::ProgramLowerError::Backend(RnsBggError::Parameters(
+            "a row Sum needs a constant member count",
+        )))
 }
 
 fn map_row(row: RnsBggRow, mut operation: impl FnMut(Mat) -> Mat) -> RnsBggRow {
@@ -1885,20 +1942,12 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
     use rayon::prelude::*;
     let (coefficient_name, exponent_name) =
         (format!("{name}.coefficient"), format!("{name}.exponent"));
-    let context = mxx_dsl::DslContext::new("plaintext");
-    Ok(match value {
+    let shape = match value {
         InputBinding::Scalar(value) => {
             let (coefficient, exponent) = plaintext_monomial(value)?;
-            runtime.insert(coefficient_name.clone(), RuntimeValue::Int(coefficient));
-            runtime.insert(exponent_name.clone(), RuntimeValue::Int(BigInt::from(exponent)));
-            let input = |name: String| {
-                context.input::<mxx_dsl::Int>(name, mxx_dsl::IntType).map_err(|e| e.to_string())
-            };
-            InputBinding::Scalar(signed_monomial(
-                ring,
-                input(coefficient_name)?,
-                input(exponent_name)?,
-            ))
+            runtime.insert(coefficient_name, RuntimeValue::Int(coefficient));
+            runtime.insert(exponent_name, RuntimeValue::Int(BigInt::from(exponent)));
+            InputBinding::Scalar(())
         }
         InputBinding::Family(values) => {
             let (coefficients, exponents): (Vec<_>, Vec<_>) = values
@@ -1908,13 +1957,42 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
                 .into_iter()
                 .map(|(coefficient, exponent)| (coefficient, BigInt::from(exponent)))
                 .unzip();
-            runtime.insert(coefficient_name.clone(), RuntimeValue::integer_values(coefficients));
-            runtime.insert(exponent_name.clone(), RuntimeValue::integer_values(exponents));
-            InputBinding::Family(PlaintextFamily {
-                coefficients: context.int_family_input(coefficient_name, values.len()),
-                exponents: context.int_family_input(exponent_name, values.len()),
-            })
+            runtime.insert(coefficient_name, RuntimeValue::integer_values(coefficients));
+            runtime.insert(exponent_name, RuntimeValue::integer_values(exponents));
+            InputBinding::Family(values.len())
         }
+    };
+    plaintext_handles(ring, name, shape)
+}
+
+/// The graph inputs of the plaintext binding `name` of `shape` (a scalar, or
+/// a family of `count` members) that [`plaintext_inputs`] binds, without
+/// values: a graph that binds its plaintexts by shape only is the graph of
+/// any plaintexts of that shape, which can be validated and exported but not
+/// executed.
+pub(crate) fn plaintext_handles(
+    ring: &Ring,
+    name: &str,
+    shape: InputBinding<(), usize>,
+) -> Result<InputBinding<Mat, PlaintextFamily>, String> {
+    let (coefficient_name, exponent_name) =
+        (format!("{name}.coefficient"), format!("{name}.exponent"));
+    let context = mxx_dsl::DslContext::new("plaintext");
+    Ok(match shape {
+        InputBinding::Scalar(()) => {
+            let input = |name: String| {
+                context.input::<mxx_dsl::Int>(name, mxx_dsl::IntType).map_err(|e| e.to_string())
+            };
+            InputBinding::Scalar(signed_monomial(
+                ring,
+                input(coefficient_name)?,
+                input(exponent_name)?,
+            ))
+        }
+        InputBinding::Family(count) => InputBinding::Family(PlaintextFamily {
+            coefficients: context.int_family_input(coefficient_name, count),
+            exponents: context.int_family_input(exponent_name, count),
+        }),
     })
 }
 
@@ -1930,6 +2008,20 @@ pub fn plaintext_input_prefix(namespace: Option<&[u8; 32]>, role: &str) -> Strin
     digest.update(namespace.copied().unwrap_or([0; 32]));
     let digest: [u8; 32] = digest.finalize().into();
     format!("rns-bgg/plaintext/{}", decoder_commitment_hex(digest)[..32].to_owned())
+}
+
+/// The graph input name of the integer data family `family` of a Program
+/// lowered under the hash namespace `namespace`: the Program's own name
+/// ([`crate::program::ProgramData::input_name`]) without a namespace, else
+/// that name under the namespace's plaintext prefix, so the data of Programs
+/// lowered next to each other (a decoder's or refresh's children) are distinct
+/// inputs.
+pub fn data_input_name(namespace: Option<&[u8; 32]>, family: crate::program::DataId) -> String {
+    let name = crate::program::ProgramData::input_name(family);
+    match namespace {
+        None => name,
+        Some(_) => format!("{}/{name}", plaintext_input_prefix(namespace, "data")),
+    }
 }
 
 pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {

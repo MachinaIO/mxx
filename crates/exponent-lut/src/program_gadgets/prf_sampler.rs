@@ -29,11 +29,12 @@ use crate::{
     api::PlaintextInputs,
     program::{
         ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange, InputBinding, LutId,
-        LutOutputRepresentation, LutTable, Operand, ProgramValidationError, RhsId, WireId,
+        LutOutputRepresentation, LutTable, Operand, ProgramData, ProgramValidationError, RhsId,
+        WireId,
     },
     program_gadgets::{
-        pbc::{PbcGeneratedKeyLayout, PbcPublicLayout},
-        prf::{PrfError, PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
+        pbc::PbcGeneratedKeyLayout,
+        prf::{PrfError, PrfKeys, PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
     },
 };
 use mxx_backends::poly::Poly;
@@ -118,12 +119,12 @@ pub struct PrfSampler {
 }
 
 impl PrfSampler {
-    /// Add the PRF of the members `layouts` (see [`SparseLwrPrf::build`])
-    /// and its samples of `distribution` to `builder`.
+    /// Add the PRF of `keys` (see [`SparseLwrPrf::build`]) and its samples
+    /// of `distribution` to `builder`.
     pub fn build(
         builder: &mut ExponentLutProgramBuilder,
         profile: SparseLwrPrfProfile,
-        layouts: Vec<PbcPublicLayout>,
+        keys: PrfKeys,
         distribution: PrfDistribution,
     ) -> Result<Self, PrfSamplerError> {
         profile.validate()?;
@@ -141,7 +142,7 @@ impl PrfSampler {
         let prf = SparseLwrPrf::build(
             builder,
             profile,
-            layouts,
+            keys,
             LutOutputRepresentation::Exponent(readout_layout),
         )?;
         // Odd `e = 2 j + 1` reads bin `j`; even exponents are never read.
@@ -161,9 +162,7 @@ impl PrfSampler {
             PrfDistribution::Cbd { .. } => (Vec::new(), None),
             PrfDistribution::Binary { .. } => {
                 let mut state = prf.initial_input();
-                let offset_rhs = prf.layouts()[0]
-                    .cells
-                    .iter()
+                let offset_rhs = (0..prf.bucket_count())
                     .map(|_| {
                         let rhs = builder.rhs_input()?;
                         state =
@@ -196,33 +195,33 @@ impl PrfSampler {
 
     /// The uniform binary polynomial `sum_o b_o X^o` over `Z_(q_min)` of the
     /// first `count` coefficients (the ring dimension by default), one PRF
-    /// member and key layout per coefficient (see [`Self::polynomial`]).
+    /// member and key per coefficient (see [`Self::polynomial`]).
     pub fn binary_polynomial(
         builder: &mut ExponentLutProgramBuilder,
         profile: SparseLwrPrfProfile,
-        layouts: Vec<PbcPublicLayout>,
+        keys: PrfKeys,
         count: Option<usize>,
         q_min: u64,
     ) -> Result<(Self, WireId), PrfSamplerError> {
-        Self::polynomial(builder, profile, layouts, count, PrfDistribution::Binary { q_min })
+        Self::polynomial(builder, profile, keys, count, PrfDistribution::Binary { q_min })
     }
 
     /// The centered binomial polynomial `sum_o e_o X^o` with `e_o` from
     /// `CBD_eta`, of the first `count` coefficients (the ring dimension by
-    /// default), one PRF member and key layout per coefficient (see
+    /// default), one PRF member and key per coefficient (see
     /// [`Self::polynomial`]).
     pub fn cbd_polynomial(
         builder: &mut ExponentLutProgramBuilder,
         profile: SparseLwrPrfProfile,
-        layouts: Vec<PbcPublicLayout>,
+        keys: PrfKeys,
         count: Option<usize>,
         eta: u32,
     ) -> Result<(Self, WireId), PrfSamplerError> {
-        Self::polynomial(builder, profile, layouts, count, PrfDistribution::Cbd { eta })
+        Self::polynomial(builder, profile, keys, count, PrfDistribution::Cbd { eta })
     }
 
     /// The sampler of `count` members (the profile's ring dimension by
-    /// default, at most it; `layouts` holds one layout per member) and the
+    /// default, at most it; `keys` holds one key per member) and the
     /// coefficient wire `sum_o s_o X^o` of its samples: member `o` is placed
     /// at `X^o` and the members are summed. The wire's coefficient bound is
     /// the sum of the members' bounds, although each coefficient holds one
@@ -230,16 +229,20 @@ impl PrfSampler {
     fn polynomial(
         builder: &mut ExponentLutProgramBuilder,
         profile: SparseLwrPrfProfile,
-        layouts: Vec<PbcPublicLayout>,
+        keys: PrfKeys,
         count: Option<usize>,
         distribution: PrfDistribution,
     ) -> Result<(Self, WireId), PrfSamplerError> {
         let ring_dimension = profile.ring_dimension()?;
         let count = count.unwrap_or(ring_dimension);
-        if count == 0 || count > ring_dimension || layouts.len() != count {
+        let members = match &keys {
+            PrfKeys::Layout(_) => 1,
+            PrfKeys::Shape(shape) => shape.members(),
+        };
+        if count == 0 || count > ring_dimension || members != count {
             return Err(PrfSamplerError::InvalidDistribution);
         }
-        let sampler = Self::build(builder, profile, layouts, distribution)?;
+        let sampler = Self::build(builder, profile, keys, distribution)?;
         let polynomial = match sampler.output {
             PrfOutput::Scalar(sample) => sample,
             PrfOutput::Family(family) => {
@@ -307,20 +310,21 @@ impl PrfSampler {
         Ok(if z < n_prime { value } else { -value })
     }
 
-    /// The RHS plaintexts: the PRF selectors of `keys` (see
-    /// [`SparseLwrPrf::selector_plaintexts`]) and one for every offset RHS.
-    pub fn rhs_plaintexts<P: Poly>(
+    /// The RHS plaintexts and the Program data (coordinate tables) of `keys`: the PRF's (see
+    /// [`SparseLwrPrf::key_inputs`]) and one plaintext for every offset RHS.
+    #[allow(clippy::type_complexity)]
+    pub fn key_inputs<P: Poly>(
         &self,
         parameters: &P::Params,
         keys: &[PbcGeneratedKeyLayout],
-    ) -> Result<PlaintextInputs<RhsId, P>, PrfSamplerError> {
-        let mut plaintexts = self.prf.selector_plaintexts(parameters, keys)?;
+    ) -> Result<(PlaintextInputs<RhsId, P>, ProgramData), PrfSamplerError> {
+        let (mut plaintexts, tables) = self.prf.key_inputs(parameters, keys)?;
         plaintexts.extend(
             self.offset_rhs
                 .iter()
                 .map(|rhs| (*rhs, InputBinding::Scalar(P::const_one(parameters)))),
         );
-        Ok(plaintexts)
+        Ok((plaintexts, tables))
     }
 
     /// The LHS plaintexts of the PRF on the public vector `a` (see
@@ -361,7 +365,8 @@ mod tests {
     }
 
     fn key(support: &[usize], seed_base: u8) -> PbcGeneratedKeyLayout {
-        let parameters = PbcParameters::paper_evaluation(10, 4);
+        let parameters =
+            PbcParameters { bucket_width_limit: Some(8), ..PbcParameters::paper_evaluation(10, 4) };
         (seed_base..seed_base.saturating_add(32))
             .find_map(|seed| {
                 generate_key_layout(&parameters, PbcRootSeed([seed; 32]), support).ok()
@@ -389,12 +394,9 @@ mod tests {
         distribution: PrfDistribution,
     ) -> Result<(ExponentLutProgram, PrfSampler), PrfSamplerError> {
         let mut builder = ExponentLutProgramBuilder::new();
-        let sampler = PrfSampler::build(
-            &mut builder,
-            profile,
-            keys.iter().map(|key| key.public_layout.clone()).collect(),
-            distribution,
-        )?;
+        let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+        let sampler =
+            PrfSampler::build(&mut builder, profile, PrfKeys::new(&layouts)?, distribution)?;
         let outputs = match sampler.output() {
             PrfOutput::Scalar(wire) => vec![Operand::Scalar(wire)],
             PrfOutput::Family(family) => (0..keys.len())
@@ -465,7 +467,7 @@ mod tests {
             for (level, rhs) in sampler.offset_rhs().iter().enumerate() {
                 assert_eq!(workload.rhs_level(*rhs).unwrap(), level);
             }
-            let plaintexts = sampler.rhs_plaintexts::<DCRTPoly>(&parameters, &keys).unwrap();
+            let (plaintexts, _) = sampler.key_inputs::<DCRTPoly>(&parameters, &keys).unwrap();
             let one = DCRTPoly::const_one(&parameters);
             for rhs in sampler.offset_rhs() {
                 assert!(matches!(&plaintexts[rhs], InputBinding::Scalar(value) if *value == one));
@@ -615,11 +617,16 @@ mod tests {
         let keys = crate::decoder::decoding::fixture::keys(members);
         let (program, sampler) = if packed {
             let mut builder = ExponentLutProgramBuilder::new();
-            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect();
+            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
             let count = (members != profile.ring_dimension().unwrap()).then_some(members);
-            let (sampler, polynomial) =
-                PrfSampler::polynomial(&mut builder, profile, layouts, count, distribution)
-                    .unwrap();
+            let (sampler, polynomial) = PrfSampler::polynomial(
+                &mut builder,
+                profile,
+                PrfKeys::new(&layouts).unwrap(),
+                count,
+                distribution,
+            )
+            .unwrap();
             (builder.finish(vec![Operand::Scalar(polynomial)]).unwrap(), sampler)
         } else {
             sampler_on(profile, &keys, distribution).unwrap()
@@ -656,14 +663,14 @@ mod tests {
         let payload = RnsEncryptBuild::new(&parameters, context)
             .sample_payload_secret(&mut execution, &mut store, |_| Ok(()))
             .unwrap();
-        let rhs = sampler.rhs_plaintexts::<DCRTPoly>(&level, &keys).unwrap();
+        let (rhs, tables) = sampler.key_inputs::<DCRTPoly>(&level, &keys).unwrap();
         let (preprocess, online_eval) = crate::api::preprocess(
             &program,
             &ParamEnv::default(),
             &rhs,
             Some(&payload),
             &hash_key,
-            RnsPreprocessBuild::new(&parameters, context),
+            RnsPreprocessBuild::new(&parameters, context).with_data(tables.clone()),
             &mut execution,
             &mut store,
             |_, outputs| Ok(outputs),
@@ -697,7 +704,7 @@ mod tests {
             &online_eval,
             &encrypted,
             &hash_key,
-            RnsOnlineEvalBuild::new(&parameters, context),
+            RnsOnlineEvalBuild::new(&parameters, context).with_data(tables),
             &mut execution,
             &mut store,
             |_, outputs| Ok(outputs),
@@ -837,12 +844,12 @@ mod tests {
     #[test]
     fn polynomial_count_is_at_most_the_ring_dimension_and_matches_the_layouts() {
         let keys = keys(2);
-        let layouts = || keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+        let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
         let build = |count| {
             PrfSampler::cbd_polynomial(
                 &mut ExponentLutProgramBuilder::new(),
                 profile(),
-                layouts(),
+                PrfKeys::new(&layouts).unwrap(),
                 count,
                 1,
             )

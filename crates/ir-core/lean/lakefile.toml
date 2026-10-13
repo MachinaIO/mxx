@@ -39,6 +39,7 @@ name = "MxxRuntime"
 leanOptions = { relaxedAutoImplicit = false }
 roots = [
   "MxxRuntime",
+  "RuntimeAllCoefficients",
   "RuntimeGaussian",
   "RuntimeHash",
   "RuntimeHeuristics",

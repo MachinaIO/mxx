@@ -54,7 +54,13 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   a root-scope private product may read the RHS member at a data entry (`Operand::Selected`),
   and a lookup may take its table from data (`LutTable::from_data`). One graph then serves every
   value of the data; preprocessing binds the data's commitment, and online evaluation checks it.
-  The noise simulator treats a selected member as member 0.
+  The noise simulator treats a selected RHS member as member 0.
+  A data family declared with a bound (every entry below it) may also select wire members
+  wherever a member read is valid (the key of a Dynamic input member is tagged by a static
+  index, so a selection reads Static input families and evaluated families): a multi-member PRF
+  reads its input vector at each key cell's coordinate this way. The noise simulator treats such a member as unknown.
+  The data of a decoder's or refresh's child Program are bound to its preprocessing builder,
+  exported by preprocessing, and read by online evaluation from that export.
 
 ## LUTs on public payloads
 

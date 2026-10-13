@@ -346,6 +346,18 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
     type WireFamily = (WireId, usize, FamilyRange);
     type RhsFamily = (RhsId, FamilyRange);
 
+    /// Every member of a family has the family's level, so a selected member
+    /// reads the same workload as a member read, whatever the data.
+    fn wire_selected(
+        &mut self,
+        _evaluator: &mut WorkloadCollector<'a>,
+        family: &Self::WireFamily,
+        _data: crate::program::DataId,
+        _position: &IntExpr,
+    ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {
+        Ok((family.0, family.1))
+    }
+
     fn wire_at(
         &mut self,
         _evaluator: &mut WorkloadCollector<'a>,
@@ -402,6 +414,7 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
         &mut self,
         evaluator: &mut WorkloadCollector<'a>,
         family: &Self::WireFamily,
+        _: usize,
     ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {
         let output = evaluator.site().map_err(ProgramLowerError::Backend)?.output;
         evaluator.levels.insert(output, family.1);

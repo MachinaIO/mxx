@@ -543,7 +543,7 @@ pub trait PreprocessBuild<P: Poly> {
 
     /// Bind the Program, its RHS plaintexts, and the payload secret. A scheme
     /// whose RHS values are chosen only at encryption receives no RHS and no
-    /// secret here.
+    /// secret here. A Program's integer data are the builder's.
     fn bind_inputs(
         &mut self,
         program: &ExponentLutProgram,

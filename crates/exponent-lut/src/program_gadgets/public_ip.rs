@@ -321,6 +321,16 @@ mod tests {
         type WireFamily = usize;
         type RhsFamily = ();
 
+        fn wire_selected(
+            &mut self,
+            _evaluator: &mut Depth,
+            family: &usize,
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<DepthError>> {
+            Ok(*family)
+        }
+
         fn wire_at(
             &mut self,
             _evaluator: &mut Depth,
@@ -357,6 +367,7 @@ mod tests {
             &mut self,
             _: &mut Depth,
             _: &usize,
+            _: usize,
         ) -> Result<usize, ProgramLowerError<DepthError>> {
             Err(ProgramLowerError::Backend(DepthError))
         }

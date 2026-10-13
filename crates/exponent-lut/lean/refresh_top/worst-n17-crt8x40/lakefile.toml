@@ -1,0 +1,30 @@
+name = "MxxExponentLutRefreshTopWorstN17Crt8x40"
+version = "0.1.0"
+defaultTargets = ["RefreshTopGenerated"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = "../.."
+
+# Modules written by `refresh_top_round_trip` (`tests/refresh_top.rs`) in export-only mode with
+#   MXX_EXPONENT_LUT_REFRESH_TOP_{LEAN_FACTS=1, EXPORT_ONLY=1, RING_DIMENSION=131072, CRT_BITS=40,
+#   BASE_BITS=10, PRIMES=8, SLOTS=8, EXTENSION_PRIMES=48, DIGITS=42, ERROR_SIGMA=4,
+#   LWR_DIMENSION=1024, SUPPORT_WEIGHT=31, INPUT_MODULUS=256, OUTPUT_MODULUS=32, NOISE_MODEL=worst}
+# (accepted under the average-case noise model with failure exponent 100, STATISTICAL_BITS=100
+# and SECURITY_BITS=100 hold).
+[[lean_lib]]
+name = "RefreshTopGenerated"
+srcDir = "generated"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Backend", "Claim", "Ideal", "Ideal_Facts", "Requirement_0", "Requirement_0_Facts", "Stage_decode", "Stage_decode_Facts", "Stage_encrypt", "Stage_encrypt_Facts", "Stage_mask", "Stage_mask_Facts", "Stage_online_eval", "Stage_online_eval_Facts", "Stage_payload", "Stage_payload_Facts", "Stage_preprocess", "Stage_preprocess_Facts"]
+
+# The proof of the generated claim (written by `generator/run.sh` from the export; the
+# parameter-independent modules are copies of `generic/`).
+[[lean_lib]]
+name = "RefreshTopProof"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["GenBridge_Enc", "GenBridge_Lut", "GenBridge_LutKey", "GenBridge_Prf", "GenDecode", "GenEnc", "GenFinal", "GenFinalFresh", "GenFinalLink", "GenFinalValues", "GenIface", "GenInstKeys", "GenInstLemmas", "GenInstSource", "GenKey", "GenKeyChain", "GenLabel", "GenLoop", "GenLut", "GenPbc", "GenRel", "GenRelLut", "GenReq", "GenSmudge", "Gen_Correct", "Gen_Final_Certs", "Gen_Final_Inst", "Gen_InstCerts", "Gen_Inst_Cx", "Gen_Inst_KeyEq", "Gen_Inst_KeyEq_FreshKeys", "Gen_Inst_KeyEq_MaskKeys", "Gen_Inst_Keys", "Gen_Inst_Stage_encrypt", "Gen_Inst_Stage_online_eval", "Gen_Inst_Stage_online_eval_KeyChain", "Gen_Inst_Stage_online_eval_Keys", "Gen_Inst_Stage_preprocess", "Gen_Inst_Stage_preprocess_Keys", "Gen_Online_Fresh", "Gen_Online_Smudge", "Gen_Online_Values", "Gen_Part", "Gen_Part_Ctx", "Gen_Requirement", "Gen_Stage_Links", "Gen_Stage_decode_Scopes", "Gen_Stage_encrypt_Scopes", "Gen_Stage_online_eval_Scopes", "Gen_Stage_preprocess_Scopes", "Gen_Summands", "Gen_Summands_FreshSummand", "Gen_Summands_HintSummand", "Gen_Summands_KeysSummand", "Gen_Summands_MaskSummand", "Gen_Summands_Pre", "Gen_Summands_PreSummand", "Gen_Summands_PreimageSummand", "Gen_Summands_SmudgeSummand", "Gen_Wiring", "ModularGlue", "RefreshTopCertificate", "TopCrtGeneric", "TopDecodeLoops"]

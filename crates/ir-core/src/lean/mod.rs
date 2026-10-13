@@ -255,6 +255,18 @@ pub struct ExportOptions {
     pub sampling_tape: bool,
     /// Also render the facts declarations of every record scope ([`LeanArtifact::facts_source`],
     /// see `facts.rs`): wire constants, per-fragment fact records and their extraction theorems.
+    ///
+    /// The facts records are then the interface to a scope's relations, and the fragments
+    /// `S.constraints_k` are independent: the scope's relation is the right-nested conjunction
+    /// `S.constraints_0 … ∧ … ∧ S.constraints_m …` of fragments that each take only the wires
+    /// their own relations name (the same conjuncts, grouped by fragment). Without facts, each
+    /// fragment ends in the call of the next one and so takes every wire a later fragment
+    /// names, which makes the fragment headers quadratic in the scope size.
+    ///
+    /// With facts, the matrix types of the module's relations also name each concrete modulus by
+    /// the abbreviation `modulus_<k> : Nat` instead of its literal (a reducible definition, so the
+    /// relations are unchanged); the root boundary types ([`LeanArtifact::root`]) keep the
+    /// literals.
     pub facts: bool,
 }
 
@@ -345,46 +357,54 @@ const LONG_LITERAL_DIGITS: usize = 64;
 /// The matrix type constructor whose concrete instances [`abbreviate_long_literals`] names.
 const EXACT_MATRIX: &str = "Mxx.Primitives.ExactMatrix ";
 
-/// `source` with repeated constants after byte `at` replaced by local notations declared at
-/// `at`, in order of first use: every decimal literal of at least [`LONG_LITERAL_DIGITS`] digits
-/// by `mxxNat<k>`, then every matrix type `Mxx.Primitives.ExactMatrix q n r c` whose four
-/// arguments are single tokens by `mxxMat<k>`. Moduli recur in every matrix type and matrix types
-/// in every binder, so naming them keeps a module linear in its size; a notation expands to the
-/// same term, so the elaborated terms are unchanged.
-fn abbreviate_long_literals(source: &str, at: usize) -> String {
+/// `source` with repeated constants after byte `at` replaced by local notations, in order of
+/// first use: every decimal literal of at least [`LONG_LITERAL_DIGITS`] digits after `at` by
+/// `mxxNat<k>`, declared at `at`, then every matrix type `Mxx.Primitives.ExactMatrix q n r c`
+/// after `types_at` (at least `at`, at a line start) whose four arguments are single tokens by
+/// `mxxMat<k>`, declared at `types_at`, so that a type's arguments (the `modulus_<k>`
+/// abbreviations of a module's tables) are declared before it. Moduli recur in every matrix type
+/// and matrix types in every binder, so naming them keeps a module linear in its size; a notation
+/// expands to the same term, so the elaborated terms are unchanged.
+fn abbreviate_long_literals<'a>(source: &'a str, at: usize, types_at: usize) -> String {
     let (head, body) = source.split_at(at);
+    let (tables, body) = body.split_at(types_at - at);
     let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
-    // The long literals.
-    let bytes = body.as_bytes();
+    // The long literals, named in both parts with one numbering.
     let mut literals = Vec::<&str>::new();
     let mut lookup = BTreeMap::<&str, usize>::new();
-    let mut named = String::with_capacity(body.len());
-    let (mut position, mut copied) = (0, 0);
-    while position < bytes.len() {
-        if !bytes[position].is_ascii_digit() {
-            position += 1;
-            continue;
+    let mut name_literals = |text: &'a str| {
+        let bytes = text.as_bytes();
+        let mut named = String::with_capacity(text.len());
+        let (mut position, mut copied) = (0, 0);
+        while position < bytes.len() {
+            if !bytes[position].is_ascii_digit() {
+                position += 1;
+                continue;
+            }
+            let start = position;
+            while position < bytes.len() && bytes[position].is_ascii_digit() {
+                position += 1;
+            }
+            if position - start < LONG_LITERAL_DIGITS ||
+                (start > 0 && word(bytes[start - 1])) ||
+                (position < bytes.len() && word(bytes[position]))
+            {
+                continue;
+            }
+            let literal = &text[start..position];
+            let index = *lookup.entry(literal).or_insert_with(|| {
+                literals.push(literal);
+                literals.len() - 1
+            });
+            named.push_str(&text[copied..start]);
+            named.push_str(&format!("mxxNat{index}"));
+            copied = position;
         }
-        let start = position;
-        while position < bytes.len() && bytes[position].is_ascii_digit() {
-            position += 1;
-        }
-        if position - start < LONG_LITERAL_DIGITS ||
-            (start > 0 && word(bytes[start - 1])) ||
-            (position < bytes.len() && word(bytes[position]))
-        {
-            continue;
-        }
-        let literal = &body[start..position];
-        let index = *lookup.entry(literal).or_insert_with(|| {
-            literals.push(literal);
-            literals.len() - 1
-        });
-        named.push_str(&body[copied..start]);
-        named.push_str(&format!("mxxNat{index}"));
-        copied = position;
-    }
-    named.push_str(&body[copied..]);
+        named.push_str(&text[copied..]);
+        named
+    };
+    let named_tables = name_literals(tables);
+    let named = name_literals(body);
     // The concrete matrix types.
     let mut types = Vec::<String>::new();
     let mut type_lookup = BTreeMap::<String, usize>::new();
@@ -427,19 +447,28 @@ fn abbreviate_long_literals(source: &str, at: usize) -> String {
         }
     }
     rewritten.push_str(rest);
-    let declarations = literals
+    // A block of declarations is followed by a blank line.
+    let block = |declarations: String| {
+        if declarations.is_empty() { declarations } else { declarations + "\n" }
+    };
+    let literal_declarations = literals
         .iter()
         .enumerate()
         .map(|(index, literal)| format!("local notation \"mxxNat{index}\" => {literal}\n"))
-        .chain(
-            types
-                .iter()
-                .enumerate()
-                .map(|(index, ty)| format!("local notation \"mxxMat{index}\" => {ty}\n")),
-        )
         .collect::<String>();
-    let separator = if declarations.is_empty() { "" } else { "\n" };
-    format!("{head}{declarations}{separator}{rewritten}")
+    let type_declarations = types
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| format!("local notation \"mxxMat{index}\" => {ty}\n"))
+        .collect::<String>();
+    if named_tables.is_empty() {
+        let declarations = block(literal_declarations + &type_declarations);
+        format!("{head}{declarations}{rewritten}")
+    } else {
+        let (literal_declarations, type_declarations) =
+            (block(literal_declarations), block(type_declarations));
+        format!("{head}{literal_declarations}{named_tables}{type_declarations}{rewritten}")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -888,10 +917,19 @@ struct Emitter<'a> {
     layouts: BTreeMap<(num_bigint::BigInt, usize), BackendLayout>,
     /// Top-level definitions of the packed constant tables, inserted before the first scope.
     tables: String,
+    /// Whether a relation uses `MxxRuntime.allCoefficients`, whose module the source then imports
+    /// besides the runtime import.
+    all_coefficients: bool,
     selection_tables: Rc<RefCell<Vec<Vec<String>>>>,
     /// A merged graph (see `LexicalEnv::instance_tables`).
     instance_tables: bool,
     modulus_tables: Rc<RefCell<Vec<String>>>,
+    /// With facts, the concrete moduli of the matrix types in the module's relations, each the
+    /// abbreviation `modulus_<k> : Nat` (in first-use order), so that a type names its modulus
+    /// instead of repeating its literal. The boundary types of the claim keep the literals
+    /// (`abbreviate_moduli` is off), since the claim compares them across modules.
+    moduli: RefCell<Vec<String>>,
+    abbreviate_moduli: Cell<bool>,
     source_map: SourceMap,
     scopes: BTreeMap<FrozenGraphScopeId, String>,
     params: BTreeSet<String>,
@@ -944,8 +982,11 @@ impl<'a> Emitter<'a> {
             source: String::new(),
             layouts: BTreeMap::new(),
             tables: String::new(),
+            all_coefficients: false,
             selection_tables: Rc::default(),
             modulus_tables: Rc::default(),
+            moduli: RefCell::default(),
+            abbreviate_moduli: Cell::new(options.facts),
             instance_tables: graph.root_scope().nodes().iter().any(|node| {
                 matches!(node.kind(), NodeKind::ParallelLoop(_)) &&
                     node.output_types().iter().any(member_dependent)
@@ -1030,8 +1071,21 @@ impl<'a> Emitter<'a> {
                 "/-- The modulus of a ring selected by the instance index. -/\nabbrev mod_{index} (i : Int) : Nat := ({modulus}).toNat\n\n"
             ));
         }
+        for (index, modulus) in self.moduli.borrow().iter().enumerate() {
+            tables.push_str(&format!(
+                "/-- The modulus of a matrix type. -/\nabbrev modulus_{index} : Nat := {modulus}\n\n"
+            ));
+        }
+        self.abbreviate_moduli.set(false);
         self.source.insert_str(tables_at, &tables);
-        self.source = abbreviate_long_literals(&self.source, tables_at);
+        // The literals are named from the tables on and the matrix types after them, so the
+        // imports keep their offsets.
+        self.source = abbreviate_long_literals(&self.source, tables_at, tables_at + tables.len());
+        if self.all_coefficients {
+            let imports_end =
+                format!("import MxxIR\nimport {}\n", self.options.runtime_import).len();
+            self.source.insert_str(imports_end, "import RuntimeAllCoefficients\n");
+        }
         self.source.push_str("\nend ");
         self.source.push_str(&self.options.namespace);
         self.source.push('\n');
@@ -1168,12 +1222,12 @@ impl<'a> Emitter<'a> {
             module_name: self.options.module_name.clone(),
             facts_source: self.options.facts.then(|| {
                 let header = format!(
-                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\nnoncomputable section\n\nnamespace {}\n\n",
+                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\n-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a\n-- projection against its field type expands it at the ring dimension.\nattribute [local irreducible] Mxx.Primitives.negacyclicModulus\n\nnoncomputable section\n\nnamespace {}\n\n",
                     self.options.module_name, self.options.namespace
                 );
                 let source =
                     format!("{header}{}end {}\n\nend\n", self.facts, self.options.namespace);
-                abbreviate_long_literals(&source, header.len())
+                abbreviate_long_literals(&source, header.len(), header.len())
             }),
             source: self.source,
             source_map: self.source_map,
@@ -1426,23 +1480,39 @@ impl<'a> Emitter<'a> {
         // Keep both the existential telescope and each conjunction fragment small
         // during elaboration. Reducible suffix calls preserve the exact right-associated
         // And proposition and original witness order by definitional equality.
-        let mut constraint_call = conclusion;
+        let mut constraint_call = conclusion.clone();
         let mut constraint_definition = String::new();
         // Include the output equation in the final fragment even for a closed pure scope.
         let fragment_count = relations.len().max(1).div_ceil(32);
         let mut fragment_calls = vec![String::new(); fragment_count];
+        // Independent fragments (with facts): each fragment holds its own relations (the last
+        // also the output equation) and the scope is their conjunction.
+        let independent = self.options.facts;
         for part in (0..fragment_count).rev() {
             let start = (part * 32).min(relations.len());
             let end = ((part + 1) * 32).min(relations.len());
-            let body = if start == end {
-                constraint_call
+            let tail = if !independent {
+                Some(constraint_call.clone())
+            } else if part + 1 == fragment_count {
+                Some(conclusion.clone())
             } else {
-                format!("{} ∧ {}", relations[start..end].join(" ∧ "), constraint_call)
+                None
+            };
+            let body = match (start == end, tail) {
+                (true, Some(tail)) => tail,
+                (_, None) => relations[start..end].join(" ∧ "),
+                (false, Some(tail)) => format!("{} ∧ {tail}", relations[start..end].join(" ∧ ")),
             };
             let (definition, call) = self.scope_constraints(scope_id, &body, &output_ty, part);
             fragment_calls[part] = call.clone();
             constraint_definition.push_str(&definition);
             constraint_call = call;
+        }
+        if independent {
+            constraint_call = fragment_calls.join(
+                " ∧
+    ",
+            );
         }
         self.source.push_str(&format!("{}{constraint_call}\n\n", "  ".repeat(self.indent)));
         let loop_binders =
@@ -1559,6 +1629,7 @@ impl<'a> Emitter<'a> {
                         output_type: &output_ty,
                         wires,
                         fragments,
+                        independent,
                         output_tuple: output.clone(),
                         loops: std::mem::take(&mut self.current_loops),
                     },
@@ -1647,7 +1718,10 @@ impl<'a> Emitter<'a> {
                 .filter(|(name, _)| referenced.contains(name.as_str()))
                 .cloned(),
         );
-        constraint_arguments.push(("outputs".to_owned(), output_ty.to_owned()));
+        // An independent fragment without the output equation does not name the outputs.
+        if !self.options.facts || referenced.contains("outputs") {
+            constraint_arguments.push(("outputs".to_owned(), output_ty.to_owned()));
+        }
         let constraint_name = format!("{}.constraints_{part}", self.scopes[scope_id]);
         let constraint_header = constraint_arguments
             .iter()
@@ -1819,6 +1893,13 @@ impl<'a> Emitter<'a> {
                             "({} [{coefficients}] : {ty})",
                             self.options.primitives.matrix_polynomial
                         )
+                    }
+                    ConstantMatrix::AllCoefficients { value } => {
+                        // One value stands for all `ring_dimension` coefficients, so the term
+                        // does not grow with the ring dimension.
+                        append_expression_guards(value, env, relations);
+                        self.all_coefficients = true;
+                        format!("(MxxRuntime.allCoefficients ({}) : {ty})", env.expr(value))
                     }
                     _ => {
                         return self.unsupported(
@@ -3478,10 +3559,19 @@ impl<'a> Emitter<'a> {
     }
 
     fn matrix_type(&self, matrix: &crate::types::ConcreteMatrixType, prefix: &str) -> String {
+        let mut modulus = matrix.ring.modulus().to_string();
+        if self.abbreviate_moduli.get() {
+            let mut moduli = self.moduli.borrow_mut();
+            let index = moduli.iter().position(|known| *known == modulus).unwrap_or_else(|| {
+                moduli.push(modulus);
+                moduli.len() - 1
+            });
+            modulus = format!("modulus_{index}");
+        }
         format!(
             "{} {} {} {} {}",
             prefix,
-            matrix.ring.modulus(),
+            modulus,
             matrix.ring.ring_dimension(),
             matrix.rows,
             matrix.columns
@@ -3490,7 +3580,7 @@ impl<'a> Emitter<'a> {
 }
 
 /// Render a hash tag prefix and its typed components as `MxxRuntime` terms, recording the guards
-/// of every compile-time component.
+/// of every compile-time component and the `[0, 2^64)` range of every runtime `u64Le` operand.
 fn hash_tag_terms(
     tag_prefix: &[u8],
     tag_components: &[crate::node::HashTagComponent],
@@ -3518,6 +3608,12 @@ fn hash_tag_terms(
                 format!(".{constructor} ({})", env.expr(expression))
             }
             HashTagComponent::Operand(index) => format!(".integer {}", wire_name(args[*index])),
+            HashTagComponent::OperandU64Le(index) => {
+                let wire = wire_name(args[*index]);
+                relations.push(format!("0 ≤ {wire}"));
+                relations.push(format!("{wire} < 2 ^ 64"));
+                format!(".u64Le {wire}")
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -3712,6 +3808,30 @@ mod tests {
     };
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
+
+    /// Literals are named from `at` on and declared there; matrix types are named after the
+    /// tables and declared after them, so a type naming a table abbreviation follows it.
+    #[test]
+    fn abbreviated_matrix_types_follow_the_tables_they_name() {
+        let literal = "1".repeat(LONG_LITERAL_DIGITS);
+        let head = "import MxxIR\n\n";
+        let tables = format!("abbrev modulus_0 : Nat := {literal}\n\n");
+        let body = format!(
+            "def x : Mxx.Primitives.ExactMatrix modulus_0 8 1 1 := y\n\
+             def z : Mxx.Primitives.ExactMatrix modulus_0 8 1 1 := {literal}\n"
+        );
+        let source = format!("{head}{tables}{body}");
+        let abbreviated = abbreviate_long_literals(&source, head.len(), head.len() + tables.len());
+        assert_eq!(
+            abbreviated,
+            format!(
+                "{head}local notation \"mxxNat0\" => {literal}\n\n\
+                 abbrev modulus_0 : Nat := mxxNat0\n\n\
+                 local notation \"mxxMat0\" => Mxx.Primitives.ExactMatrix modulus_0 8 1 1\n\n\
+                 def x : mxxMat0 := y\ndef z : mxxMat0 := mxxNat0\n"
+            )
+        );
+    }
 
     #[test]
     fn ring_property_exports_resolved_crt_value() {
@@ -3998,6 +4118,44 @@ mod tests {
         assert_eq!(artifact.root.relation, "Generated.generatedRoot");
         assert_eq!(artifact.root.parameter_type, "Generated.Params");
         assert_eq!(artifact.root.parameters["unit"].root_value.as_deref(), Some("()"));
+    }
+
+    #[test]
+    fn export_with_facts_abbreviates_the_moduli_of_relation_types() {
+        let ty = WireType::Matrix(MatrixType {
+            ring: crate::ring::test_ring(17 * 97, 2),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        });
+        let input = NodeHandle::new(
+            NodeKind::Input { name: "x".into(), wire_type: ty.clone(), artifact: None },
+            vec![],
+            vec![ty.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let sum = NodeHandle::new(NodeKind::MatrixNegate, vec![input], vec![ty]).output(0).unwrap();
+        let (graph, _) = Graph::freeze(
+            "moduli",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: sum, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let plain = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(plain.source.contains("ExactMatrix 1649 2 1 1"));
+        assert!(!plain.source.contains("modulus_0"));
+        let facts =
+            export(&validated, &ExportOptions { facts: true, ..ExportOptions::default() }).unwrap();
+        assert!(facts.source.contains("abbrev modulus_0 : Nat := 1649\n"));
+        assert!(facts.source.contains("ExactMatrix modulus_0 2 1 1"));
+        assert!(!facts.source.contains("ExactMatrix 1649"));
+        // The claim compares boundary types across modules, so they keep the literal.
+        assert_eq!(facts.root.output_type, plain.root.output_type);
+        assert!(facts.root.output_type.contains("ExactMatrix 1649 2 1 1"));
     }
 
     #[test]
@@ -4904,6 +5062,55 @@ mod tests {
         assert!(artifact.source.contains("def generatedRoot (hashModel : MxxRuntime.HashModel)"));
         assert!(artifact.source.contains("scope_plain hashModel params"));
         assert!(artifact.source.contains("hashSample (hashModel)"));
+    }
+
+    #[test]
+    fn export_renders_runtime_u64_le_operand_with_its_range_guard() {
+        let key_type = WireType::Bytes { length: 32.into() };
+        let key = NodeHandle::new(
+            NodeKind::Input { name: "key".into(), wire_type: key_type.clone(), artifact: None },
+            vec![],
+            vec![key_type],
+        )
+        .output(0)
+        .unwrap();
+        let row = scalar_input("row");
+        let matrix =
+            MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
+        let sampled = NodeHandle::new(
+            NodeKind::HashSample {
+                matrix_type: matrix.clone(),
+                variant: crate::node::HashVariant::Plain,
+                tag_prefix: vec![],
+                tag_components: vec![
+                    crate::node::HashTagComponent::U64Le(258.into()),
+                    crate::node::HashTagComponent::OperandU64Le(1),
+                ],
+                base: None,
+                digit_count: None,
+            },
+            vec![key, row],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "hash-u64-le-operand",
+            vec![],
+            BTreeMap::from([(
+                "sampled".into(),
+                GraphOutput { value: sampled, availability: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let source = export(&validated, &ExportOptions::default()).unwrap().source;
+        let wire = "w_1_0";
+        assert!(source.contains(&format!("[.u64Le (258), .u64Le {wire}]")), "{source}");
+        assert!(source.contains(&format!("0 ≤ {wire} ∧\n  {wire} < 2 ^ 64 ∧")), "{source}");
     }
 
     #[test]

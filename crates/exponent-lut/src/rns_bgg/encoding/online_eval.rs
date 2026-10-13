@@ -88,7 +88,56 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_namespace: None,
             pending_refresh: None,
             refresh_matrix_key: None,
+            runtime: BTreeMap::new(),
         }
+    }
+
+    /// Bind every integer data family of the child Program `program` to the
+    /// entries preprocessing exported under `name("data/<id>")` (recorded in
+    /// its binding `preprocess`), as a resident graph input of the same name:
+    /// a protocol links the input to that artifact. The coordinate tables of
+    /// `prf` must be those of its committed key set. A family preprocessing
+    /// bound by shape only is bound with its declared count and no value.
+    /// Returns the data inputs, which the child's lowering reads.
+    fn bind_child_data(
+        &mut self,
+        program: &ExponentLutProgram,
+        preprocess: &RnsBggArtifactBinding,
+        prf: &crate::program_gadgets::prf::SparseLwrPrf,
+        name: impl Fn(&str) -> String,
+    ) -> Result<BTreeMap<crate::program::DataId, Family<Int>>, ApiError> {
+        let mut bound = crate::program::ProgramData::new();
+        let mut shape_only = false;
+        let mut inputs = BTreeMap::new();
+        for (id, declaration) in program.data_families() {
+            let name = name(&format!("data/{id:?}"));
+            let entries = preprocess
+                .child_data(&name)
+                .ok_or_else(|| ApiError::compatibility("preprocessing exported no such data"))?;
+            match entries {
+                Some(entries) => {
+                    self.runtime.insert(
+                        name.clone(),
+                        RuntimeValue::integer_values(
+                            entries.iter().map(|entry| BigInt::from(*entry)).collect(),
+                        ),
+                    );
+                    bound = bound.with(*id, entries.to_vec());
+                }
+                None => shape_only = true,
+            }
+            inputs.insert(*id, mxx_dsl::int_family_input(name, declaration.count()));
+        }
+        // Data bound by shape only have no entries to check.
+        if !shape_only {
+            bound.validate(program).map_err(|_| {
+                ApiError::compatibility("the exported data do not match the Program")
+            })?;
+            prf.check_tables(&bound).map_err(|_| {
+                ApiError::compatibility("the exported data are not those of the key set")
+            })?;
+        }
+        Ok(inputs)
     }
 
     /// Sample a top refresh's `A'` from the stage key `hash_key` derived
@@ -188,6 +237,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let key = declaration.artifact_key();
         self.bind_child(
             declaration.smudge().program(),
+            declaration.smudge().prf(),
             commitment,
             Some(declaration.clone()),
             decoder_artifact_name(&key, "smudge"),
@@ -299,6 +349,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         match decoder {
             None => self.bind_child(
                 program,
+                prf,
                 spec,
                 None,
                 crate::rns_bgg::refresh::refresh_artifact_name(
@@ -314,6 +365,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 let key = decoder.artifact_key();
                 self.bind_child(
                     program,
+                    prf,
                     spec,
                     Some(decoder.clone()),
                     decoder_artifact_name(&key, "smudge"),
@@ -338,11 +390,15 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// under `name("input-<wire>.<port>")` and its RHS material under
     /// `name(role)`; a `decoder_smudge` child transforms its smudge members;
     /// `label`, the PRF's public input family with its label values and
-    /// exponent layout, replaces that family's encrypted public payload.
+    /// exponent layout, replaces that family's encrypted public payload;
+    /// the integer data of `prepared` (the coordinate tables of `prf`, the
+    /// child's PRF) are bound from the entries preprocessing exported under
+    /// `name("data/<id>")`.
     #[allow(clippy::too_many_arguments)]
     fn bind_child(
         &mut self,
         prepared: &ExponentLutProgram,
+        prf: &crate::program_gadgets::prf::SparseLwrPrf,
         commitment: [u8; 32],
         decoder_smudge: Option<DecoderDeclaration>,
         prefix: String,
@@ -419,6 +475,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 &encryption_production,
                 &hash_key,
                 dynamic.as_ref(),
+                label.as_ref(),
                 |role| name(&role),
             )?;
         } else {
@@ -486,6 +543,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     .map_err(|error| ApiError::input(error.to_string()))?;
             }
         }
+        let data = self.bind_child_data(prepared, preprocess_binding, prf, name)?;
+        self.families.data = data.clone();
         for (rhs, binding) in import_rhs_bindings(
             self.parameters,
             prepared,
@@ -513,7 +572,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_key,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
-            data: BTreeMap::new(),
+            data,
             output_use: RnsOutputUse::default(),
             dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
                 setup,
@@ -594,6 +653,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         })?;
         let child_manifests =
             smudge.evaluator.as_ref().map(|child| child.manifests.clone()).unwrap_or_default();
+        self.runtime.append(&mut smudge.runtime);
         let evaluator = self
             .evaluator
             .as_mut()
@@ -628,9 +688,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // `crate::decoder::decoding`); removing it centers the smudge.
         let modulus: BigUint = self.parameters.level(level)?.modulus().as_ref().clone();
         let half = IntExpr::constant((modulus + 1u8) / 2u8);
-        let dimension = self.parameters.level(level)?.ring_dimension() as usize;
         let decoded = crate::decoder::unmask::unmask(hint, preimage, encoding) -
-            ring.polynomial(std::iter::repeat_n(half, dimension));
+            ring.all_coefficients((1, 1), half);
         let plaintext = self.parameters.decoder_plaintext_ring(declaration, &evaluator.program)?;
         Ok(decoded.modulus_switch(&plaintext))
     }
@@ -640,7 +699,9 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// public key is derived from the hash key here, or where a family
     /// member is read. A Static input is stored at its logical level under
     /// its wire; a Dynamic one at the setup ring under its setup coordinate.
-    /// `name` maps a role to its artifact name.
+    /// `label`, a public input family with its label values and exponent
+    /// layout, replaces that family's encrypted public payload (see
+    /// [`Self::bind_refresh_child`]). `name` maps a role to its artifact name.
     fn bind_encrypted_inputs(
         &mut self,
         program: &ExponentLutProgram,
@@ -648,6 +709,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         encryption: &ProductionId,
         hash_key: &Bytes,
         dynamic: Option<&(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+        label: Option<&(WireId, Vec<usize>, ExpLayout)>,
         name: impl Fn(String) -> String,
     ) -> Result<(), ApiError> {
         for (wire, declaration) in program.inputs() {
@@ -717,7 +779,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                         hash_key: hash_key.clone(),
                         rows: family_of_fields(&element, count.clone(), &fields)
                             .map_err(ApiError::scheme)?,
-                        payloads: public.then(|| port(2, 1)),
+                        payloads: match label {
+                            Some((label_wire, values, layout)) if label_wire == wire => {
+                                Some(label_payloads(&ring, values, *layout, count)?)
+                            }
+                            _ => public.then(|| port(2, 1)),
+                        },
                     })
                 }
             };
@@ -744,8 +811,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
 
     /// Apply the top-refresh part `declaration` as [`Self::apply_refresh`]
     /// does, with its bound mask child `mask`: the graph output `refresh` is
-    /// the part's residue `y_j mod q` of its output prime `q`, a `1 x w_0`
-    /// row in the ring of `q` (see [`crate::refresh::top`]).
+    /// the CRT term of the part's residue `y_j mod q` of its output prime
+    /// `q`, a `1 x w_0` row in the ring of the product `P` of the refreshed
+    /// primes (the residue itself when `P = q`); the terms of every chain sum
+    /// to `y_j mod P` (see [`crate::refresh::top`]).
     pub fn apply_top_refresh(
         &mut self,
         target_index: usize,
@@ -833,7 +902,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         outputs: &[RnsBggEncoding],
     ) -> Result<(Mat, HashKeyInputs), RnsBggError> {
         use crate::rns_bgg::refresh::{
-            hash_key_input_name, refresh_artifact_name, refresh_column, refresh_combination,
+            hash_key_input_name, refresh_artifact_name, refresh_combination,
         };
         let target = outputs
             .get(target_index)
@@ -856,12 +925,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let level = evaluator.workload.level(target.wire())?;
         let ring = self.parameters.ring(level)?;
         let (fresh_outputs, mut manifests) = lower(&mut fresh)?;
-        // The fresh carriers' component-1 rows, moved down once to the
+        // The fresh carrier row's component-1 row, moved down once to the
         // decoding ring and never finalized for decryption.
-        let fresh_rows = fresh_outputs
+        let fresh_row = fresh_outputs
             .into_iter()
-            .map(|encoding| mod_down_encoding(encoding.row, &ring).1)
-            .collect::<Vec<_>>();
+            .next()
+            .map(|encoding| (mod_down_encoding(encoding.row, &ring).1, declaration.columns()))
+            .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
         let spec = *declaration.spec();
         let columns = self.parameters.level(level)?.modulus_digits();
         let encryption = evaluator.encryption.clone();
@@ -921,41 +991,40 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // The halved smudge weights leave `2^-1` in every coefficient (see
         // `crate::decoder::decoding`); removing it centers the smudge.
         let modulus: BigUint = self.parameters.level(level)?.modulus().as_ref().clone();
-        let dimension = self.parameters.level(level)?.ring_dimension() as usize;
-        let half = ring
-            .polynomial(std::iter::repeat_n(IntExpr::constant((modulus + 1u8) / 2u8), dimension));
+        // The columns concatenate one scalar constant, keeping the graph's
+        // node numbering, which the Lean proofs of the export name.
+        let half = ring.all_coefficients((1, 1), IntExpr::constant((modulus + 1u8) / 2u8));
+        let half = match output_columns {
+            1 => half,
+            columns => Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![half; columns]),
+        };
         let mut unmasked = Vec::with_capacity(declaration.primes());
-        for (position, prime) in declaration.decoded_primes().into_iter().enumerate() {
+        // Every decoded prime's row is decoded at once: its smudge child sums
+        // each column's members into its column, and the preimage has one
+        // column per decoded column.
+        let decoders = declaration.decoded_primes().into_iter().zip(declaration.decoders());
+        for ((prime, decoder), child) in decoders.zip(&mut smudges) {
             let actions =
                 self.parameters.refresh_actions(level, prime, a_prime.clone(), declaration)?;
             let decoded =
-                refresh_combination(one.clone(), target_row.clone(), &fresh_rows, &actions);
-            let mut row = Vec::with_capacity(output_columns);
-            for column in 0..output_columns {
-                let decoder = declaration
-                    .decoder(prime, column)
-                    .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
-                let (smudge, child_manifests) =
-                    lower(&mut smudges[position * output_columns + column])?;
-                manifests.extend(child_manifests);
-                let smudge = smudge
-                    .into_iter()
-                    .next()
-                    .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
-                let encoding = refresh_column(decoded.clone(), column) +
-                    checked_modulus_convert(smudge.row.1, &ring)?;
-                let preimage = ring.preimage_artifact_input(
-                    preprocess.clone(),
-                    decoder_artifact_name(&decoder.artifact_key(), "unmask-preimage"),
-                    (hint_columns, 1),
-                    BigInt::from(bound.clone()),
-                    ArtifactAvailability::Transferred,
-                );
-                row.push(
-                    crate::decoder::unmask::unmask(hint.clone(), preimage, encoding) - half.clone(),
-                );
-            }
-            unmasked.push(Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, row));
+                refresh_combination(one.clone(), target_row.clone(), fresh_row.clone(), &actions)?;
+            let (smudge, child_manifests) = lower(child)?;
+            manifests.extend(child_manifests);
+            let smudge = smudge
+                .into_iter()
+                .next()
+                .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
+            let encoding = decoded + checked_modulus_convert(smudge.row.1, &ring)?;
+            let preimage = ring.preimage_artifact_input(
+                preprocess.clone(),
+                decoder_artifact_name(&decoder.artifact_key(), "unmask-preimage"),
+                (hint_columns, output_columns),
+                BigInt::from(bound.clone()),
+                ArtifactAvailability::Transferred,
+            );
+            unmasked.push(
+                crate::decoder::unmask::unmask(hint.clone(), preimage, encoding) - half.clone(),
+            );
         }
         let refreshed = match declaration.top() {
             // `crt_recompose` rounds every `Q_i y + M + N` to `y mod q_i` and
@@ -965,15 +1034,19 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 Mat::crt_recompose(unmasked, primes, coefficients, &ring)
             }
             // A top-refresh part rounds `Q_q y + M + N` to its residue
-            // `y mod q`; the chains' residues are recombined modulo `Q_0`.
-            Some(part) => unmasked
-                .into_iter()
-                .next()
-                .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?
-                .modulus_switch(&Ring::from_crt_moduli(
-                    vec![IntExpr::from(part.output_modulus())],
-                    self.parameters.level(level)?.ring_dimension(),
-                )),
+            // `y mod q` and outputs its CRT term modulo the product `P` of
+            // the refreshed primes; the chains' terms sum to `y mod P`.
+            Some(part) => crate::rns_bgg::refresh::top_residue_term(
+                part,
+                unmasked
+                    .into_iter()
+                    .next()
+                    .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?
+                    .modulus_switch(&Ring::from_crt_moduli(
+                        vec![IntExpr::from(part.output_modulus())],
+                        self.parameters.level(level)?.ring_dimension(),
+                    )),
+            )?,
         };
         let evaluator = self
             .evaluator
@@ -990,6 +1063,9 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .collect::<Vec<_>>();
         if let Some((namespace, key)) = &self.refresh_matrix_key {
             hash_keys.push((hash_key_input_name(Some(namespace)), key.clone()));
+        }
+        for child in mask.iter_mut().chain(std::iter::once(&mut fresh)).chain(&mut smudges) {
+            self.runtime.append(&mut child.runtime);
         }
         Ok((refreshed, hash_keys))
     }
@@ -1091,7 +1167,17 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 "RNS-BGG preprocess binding has other Program data than the online evaluation",
             ));
         }
-        let data = crate::program::data_inputs(program);
+        // The data are graph inputs whose values this builder was given.
+        let data = crate::program::data_inputs(program, |family| {
+            crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family)
+        });
+        for family in program.data_families().keys() {
+            let values = self.data.values(*family).expect("validated program data");
+            self.runtime.insert(
+                crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), *family),
+                RuntimeValue::integer_values(values.iter().map(|value| (*value).into()).collect()),
+            );
+        }
         self.families.data = data.clone();
         if !preprocess_binding.sources().is_empty() {
             return Err(ApiError::compatibility(
@@ -1151,6 +1237,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             &encryption_production,
             &hash_key,
             dynamic.as_ref(),
+            None,
             |role| role,
         )?;
         for (rhs, binding) in import_rhs_bindings(
@@ -1264,22 +1351,10 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             .map_err(ApiError::scheme)?;
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
-        let mut runtime = BTreeMap::new();
+        let mut runtime = super::declared_runtime_inputs(&graph, std::mem::take(&mut self.runtime));
         for (name, key) in hash_keys {
             if super::graph_declares_input(&graph, &name) {
                 runtime.insert(name, RuntimeValue::Bytes(key.as_slice().into()));
-            }
-        }
-        for (family, _) in evaluator.program.data_families() {
-            let name = crate::program::ProgramData::input_name(*family);
-            if super::graph_declares_input(&graph, &name) {
-                let values = self.data.values(*family).expect("validated program data");
-                runtime.insert(
-                    name,
-                    RuntimeValue::integer_values(
-                        values.iter().map(|value| (*value).into()).collect(),
-                    ),
-                );
             }
         }
         Ok(StageGraph::new(graph, runtime, evaluator.manifests.clone()))

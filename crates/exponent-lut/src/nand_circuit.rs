@@ -461,6 +461,21 @@ mod tests {
         type WireFamily = ();
         type RhsFamily = ();
 
+        fn wire_selected(
+            &mut self,
+            _evaluator: &mut LogicalEvaluator,
+            family: &Self::WireFamily,
+            data: crate::program::DataId,
+            position: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: format!(
+                    "NAND test has no wire families (family={family:?}, data={data:?}, \
+                     position={position:?})"
+                ),
+            })
+        }
+
         fn wire_at(
             &mut self,
             _evaluator: &mut LogicalEvaluator,
@@ -520,6 +535,7 @@ mod tests {
             &mut self,
             evaluator: &mut LogicalEvaluator,
             family: &Self::WireFamily,
+            _: usize,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {
             let site = evaluator.site.as_ref();
             Err(ProgramLowerError::UnsupportedStructure {

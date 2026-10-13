@@ -71,6 +71,8 @@ pub trait ProgramLoweringContext: ExponentLUTProgramLowering {
     fn replace_site(&mut self, site: Option<LoweringSite>) -> Option<LoweringSite>;
 }
 
+/// The values bound to a Program's inputs and RHS inputs while it is lowered.
+/// Its integer data are the family execution's ([`FamilyExecution::wire_selected`]).
 pub struct Environment<W, R, WF, RF> {
     pub(crate) wires: BTreeMap<WireId, InputBinding<W, WF>>,
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<R, RF>>,
@@ -121,6 +123,16 @@ where
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>>;
+    /// The member of `family` whose index is entry `position` of the bounded integer data
+    /// family `data` ([`Operand::Selected`]): the member is a runtime value, so an execution
+    /// that needs the member statically treats it as unknown.
+    fn wire_selected(
+        &mut self,
+        evaluator: &mut E,
+        family: &Self::WireFamily,
+        data: DataId,
+        position: &IntExpr,
+    ) -> Result<E::Wire, ProgramLowerError<E::Error>>;
     fn rhs_at(
         &mut self,
         family: &Self::RhsFamily,
@@ -140,10 +152,13 @@ where
         range: &FamilyRange,
         body: impl FnOnce(&mut Self, &mut E, IntExpr) -> Result<E::Wire, ProgramLowerError<E::Error>>,
     ) -> Result<Self::WireFamily, ProgramLowerError<E::Error>>;
+    /// The sum of the members of `family`, or with `columns > 1` the row of
+    /// its block sums ([`super::Step::Sum`]).
     fn sum(
         &mut self,
         evaluator: &mut E,
         family: &Self::WireFamily,
+        columns: usize,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>>;
 }
 
@@ -320,7 +335,7 @@ where
                         })?;
                     LoweredValue::Family(family)
                 }
-                Step::Sum { family, .. } => {
+                Step::Sum { family, columns, .. } => {
                     let InputBinding::Family(family) = environment
                         .wires
                         .get(family)
@@ -331,8 +346,9 @@ where
                             ProgramValidationError::ExpectedFamilyWire(*family),
                         ));
                     };
-                    let value =
-                        with_site(evaluator, site, |evaluator| families.sum(evaluator, &family))?;
+                    let value = with_site(evaluator, site, |evaluator| {
+                        families.sum(evaluator, &family, *columns)
+                    })?;
                     LoweredValue::Scalar(value)
                 }
             };
@@ -471,11 +487,18 @@ where
             }
             None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedWire(*family))),
         },
-        Operand::Selected { .. } => {
-            Err(ProgramLowerError::Program(ProgramValidationError::InvalidStructure(
-                "only a private product's RHS is selected at run time".into(),
-            )))
-        }
+        Operand::Selected { family, data, position } => match environment.wires.get(family) {
+            Some(InputBinding::Family(value)) => families.wire_selected(
+                evaluator,
+                value,
+                *data,
+                &substitute_indices(position, indices)?,
+            ),
+            Some(InputBinding::Scalar(_)) => {
+                Err(ProgramLowerError::Program(ProgramValidationError::ExpectedFamilyWire(*family)))
+            }
+            None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedWire(*family))),
+        },
     }
 }
 
@@ -649,10 +672,31 @@ mod tests {
         }
     }
 
-    struct MockFamilies;
+    /// The family adapter of the mock, with the Program data its selections read.
+    #[derive(Default)]
+    struct MockFamilies(crate::program::ProgramData);
     impl FamilyExecution<MockEvaluator> for MockFamilies {
         type WireFamily = Vec<i32>;
         type RhsFamily = Vec<i32>;
+
+        fn wire_selected(
+            &mut self,
+            evaluator: &mut MockEvaluator,
+            family: &Self::WireFamily,
+            data: DataId,
+            position: &IntExpr,
+        ) -> Result<i32, ProgramLowerError<MockError>> {
+            let position = position
+                .evaluate(&ParamEnv::default())
+                .map_err(|_| ProgramValidationError::MemberOutOfBounds)?;
+            let position = position.to_usize().ok_or(ProgramValidationError::MemberOutOfBounds)?;
+            let member = self
+                .0
+                .values(data)
+                .and_then(|values| values.get(position).copied())
+                .ok_or(ProgramValidationError::MissingBinding)?;
+            self.wire_at(evaluator, family, &IntExpr::constant(member))
+        }
 
         fn wire_at(
             &mut self,
@@ -708,6 +752,7 @@ mod tests {
             &mut self,
             evaluator: &mut MockEvaluator,
             family: &Self::WireFamily,
+            _: usize,
         ) -> Result<i32, ProgramLowerError<MockError>> {
             family.iter().skip(1).try_fold(family[0], |state, value| {
                 evaluator.add(&state, value).map_err(ProgramLowerError::Backend)
@@ -746,7 +791,7 @@ mod tests {
         environment.bind_wire(input, InputBinding::Family(vec![1, 2, 3, 4])).unwrap();
         environment.bind_rhs(rhs, InputBinding::Family(vec![4, 5, 6, 7])).unwrap();
         let mut evaluator = MockEvaluator::default();
-        let mut families = MockFamilies;
+        let mut families = MockFamilies::default();
         let outputs =
             lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
         assert_eq!(outputs, vec![10]);
@@ -780,7 +825,7 @@ mod tests {
         environment.bind_wire(input, InputBinding::Scalar(3)).unwrap();
         environment.bind_rhs(rhs, InputBinding::Scalar(5)).unwrap();
         let mut evaluator = MockEvaluator::default();
-        let mut families = MockFamilies;
+        let mut families = MockFamilies::default();
         let outputs =
             lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
 
@@ -788,6 +833,46 @@ mod tests {
         assert_eq!(evaluator.luts, [vec![0, 1, 1, 0]]);
         assert_eq!(outputs, vec![17]);
         assert!(evaluator.site.is_none());
+    }
+
+    /// A wire selection reads the member its bound data name; a declared data
+    /// family must be bound.
+    #[test]
+    fn lower_program_reads_wire_selections_through_the_bound_data() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input =
+            builder.input_family(IntExpr::constant(4), AttributeKnowledge::PrivatePayload).unwrap();
+        let data = builder.data_family(2, Some(4)).unwrap();
+        let output = builder
+            .add(
+                Operand::Selected { family: input, data, position: IntExpr::constant(0) },
+                Operand::Selected { family: input, data, position: IntExpr::constant(1) },
+            )
+            .unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+
+        let environment = || {
+            let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>>::new();
+            environment.bind_wire(input, InputBinding::Family(vec![10, 20, 30, 40])).unwrap();
+            environment
+        };
+        let outputs = lower_program(
+            &program,
+            &mut MockEvaluator::default(),
+            &mut MockFamilies(crate::program::ProgramData::new().with(data, vec![3, 1])),
+            &mut environment(),
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![60]);
+        assert!(matches!(
+            lower_program(
+                &program,
+                &mut MockEvaluator::default(),
+                &mut MockFamilies::default(),
+                &mut environment()
+            ),
+            Err(ProgramLowerError::Program(ProgramValidationError::MissingBinding))
+        ));
     }
 
     #[test]
@@ -818,7 +903,7 @@ mod tests {
         environment.bind_wire(first_input, InputBinding::Scalar(0)).unwrap();
         environment.bind_wire(second_input, InputBinding::Scalar(1)).unwrap();
         let mut evaluator = MockEvaluator::default();
-        let mut families = MockFamilies;
+        let mut families = MockFamilies::default();
         let outputs =
             lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
 

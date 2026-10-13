@@ -153,7 +153,8 @@ returns the matching per-leaf `ArtifactBinding`s for a `ProtocolStage`.
 | `ring.identity(size)` | The `size x size` identity. |
 | `ring.gadget(rows, base, digit_count)` | The gadget matrix `G = I_rows ⊗ (1, b, ..., b^(k-1))`. |
 | `ring.polynomial([c_0, c_1, ...])` | The scalar polynomial `c_0 + c_1 X + ...` (compile expressions, for example `ring.modulus().floor_div(2)`). |
-| `ring.constant(shape, ConstantMatrix::...)` | Any constant: `Zero`, `Identity`, `UnitRow { index }`, `UnitColumn { index }`, `Gadget { base, small }`, `PowerOfBase { base, exponent }`, `Rotation { exponent }`, or `Polynomial { coefficients }`. |
+| `ring.all_coefficients(shape, value)` | The matrix whose every entry is the polynomial with all `N` coefficients equal to `value`; its graph and Lean export do not grow with `N`. |
+| `ring.constant(shape, ConstantMatrix::...)` | Any constant: `Zero`, `Identity`, `UnitRow { index }`, `UnitColumn { index }`, `Gadget { base, small }`, `PowerOfBase { base, exponent }`, `Rotation { exponent }`, `Polynomial { coefficients }`, or `AllCoefficients { value }`. |
 | `ring.from_coefficients(&values)` | The scalar polynomial whose coefficients are a runtime `Family<Int>` of length `N`, reduced modulo `Q`. |
 | `ring.from_evaluations(&values)` | The scalar polynomial with the given NTT evaluation slots, in the backend's native order. |
 | `ring.pack_polynomial_coefficients(bits, coefficient_bits)` | The scalar polynomial whose coefficients are given as bits, coefficient by coefficient, least significant bit first. |

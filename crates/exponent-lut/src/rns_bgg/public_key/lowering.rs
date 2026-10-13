@@ -14,14 +14,15 @@ pub enum PreprocessWireFamily {
 }
 
 impl PreprocessWireFamily {
-    /// Read one member: an input member's key is sampled from the hash key.
+    /// Read member `index`, a static index or a runtime data entry: an
+    /// input member's key is sampled from the hash key.
     fn member(
         &self,
         parameters: &RnsBggParameters,
-        index: IntExpr,
+        index: Int,
     ) -> Result<RnsBggPublicKey, RnsBggError> {
         match self {
-            Self::Stored(family) => Ok(family.at(Int::evaluate(index))),
+            Self::Stored(family) => Ok(family.at(index)),
             Self::Input { wire, key, hash_key, .. } => {
                 key.key(parameters, hash_key.clone(), *wire, Some(index))
             }
@@ -44,6 +45,21 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
     type WireFamily = PreprocessWireFamily;
     type RhsFamily = Family<RhsRef<Int>>;
 
+    /// The member at the data entry: a stored member is read there, and an
+    /// input member's key is sampled under the entry, a runtime hash
+    /// argument hashing as the static index encryption sampled it under.
+    fn wire_selected(
+        &mut self,
+        _evaluator: &mut PublicKeyLowering<'a>,
+        family: &Self::WireFamily,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
+        use crate::program::ProgramLowerError;
+        let member = self.selected_member(data, position).map_err(ProgramLowerError::Backend)?;
+        family.member(self.parameters, member).map_err(ProgramLowerError::Backend)
+    }
+
     fn wire_at(
         &mut self,
         _evaluator: &mut PublicKeyLowering<'a>,
@@ -51,7 +67,7 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         index: &IntExpr,
     ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
         family
-            .member(self.parameters, index.clone())
+            .member(self.parameters, Int::evaluate(index.clone()))
             .map_err(crate::program::ProgramLowerError::Backend)
     }
 
@@ -102,13 +118,29 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         &mut self,
         evaluator: &mut PublicKeyLowering<'a>,
         family: &Self::WireFamily,
+        columns: usize,
     ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
         use crate::program::ProgramLowerError;
         let parameters = self.parameters;
-        crate::program::graph_sum(evaluator, family.count(), |index| {
+        let member = |index: Int| {
             let index = index.expression().map_err(ProgramLowerError::Dsl)?;
-            family.member(parameters, index).map_err(ProgramLowerError::Backend)
-        })
+            family.member(parameters, Int::evaluate(index)).map_err(ProgramLowerError::Backend)
+        };
+        if columns == 1 {
+            return crate::program::graph_sum(evaluator, family.count(), member);
+        }
+        let per_column = super::row_sum_block(&family.count(), columns)?;
+        crate::program::graph_column_sums(
+            evaluator,
+            (columns, per_column),
+            member,
+            |sum, column| {
+                RnsBggPublicKey::new(
+                    sum.wire,
+                    map_matrix(sum.matrix, |entry| super::place_in_column(entry, columns, column)),
+                )
+            },
+        )
     }
 }
 
@@ -135,6 +167,7 @@ impl<'a> PublicKeyLowering<'a> {
             rhs_material: BTreeMap::new(),
             lut_material: BTreeMap::new(),
             unmask: None,
+            data_values: None,
             current_site: None,
             public_actions: BTreeMap::new(),
             parallel_bodies: Vec::new(),
@@ -627,10 +660,6 @@ impl<'a> PublicKeyLowering<'a> {
             .program
             .wire_knowledge(wire)
             .map_err(|_| RnsBggError::Binding("wire knowledge"))?;
-        let member =
-            member.as_ref().map(Int::expression).transpose().map_err(|_| {
-                RnsBggError::Binding("input member index is not an index expression")
-            })?;
         self.input_key_source(wire, knowledge)?.key(
             self.parameters,
             self.hash_key.clone(),
@@ -1213,7 +1242,7 @@ mod test {
         let public_outputs = lower_program(
             &program,
             &mut public,
-            &mut GraphFamilyExecution,
+            &mut GraphFamilyExecution::default(),
             &mut public_environment,
         )
         .unwrap();
@@ -1252,7 +1281,7 @@ mod test {
         let online_eval_outputs = lower_program(
             &program,
             &mut online_eval,
-            &mut GraphFamilyExecution,
+            &mut GraphFamilyExecution::default(),
             &mut online_eval_environment,
         )
         .unwrap();

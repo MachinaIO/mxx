@@ -54,7 +54,7 @@ use mxx_exponent_lut::{
             PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, clear_pbc_inner_product,
             generate_key_layout,
         },
-        prf::SparseLwrPrfProfile,
+        prf::{PrfKeyShape, SparseLwrPrfProfile},
     },
     refresh::RefreshDeclaration,
     rns_bgg::{
@@ -95,7 +95,8 @@ fn identity_source() -> (ExponentLutProgram, WireId) {
 
 /// `count` random weight-one PRF keys over the LWR coordinates, in two buckets.
 fn keys(count: usize) -> Vec<PbcGeneratedKeyLayout> {
-    let parameters = PbcParameters::custom(LWR_DIMENSION, 1, 2, 2, 64, None);
+    // Every coordinate lies in both buckets, so each bucket has `nu` real cells and a dummy.
+    let parameters = PbcParameters::custom(LWR_DIMENSION, 1, 2, 2, 64, Some(LWR_DIMENSION + 1));
     (0..count)
         .map(|_| {
             let support = vec![rand::random::<u32>() as usize % LWR_DIMENSION];
@@ -108,10 +109,10 @@ fn keys(count: usize) -> Vec<PbcGeneratedKeyLayout> {
         .collect()
 }
 
-fn layouts(
-    keys: &[PbcGeneratedKeyLayout],
-) -> Vec<mxx_exponent_lut::program_gadgets::pbc::PbcPublicLayout> {
-    keys.iter().map(|key| key.public_layout.clone()).collect()
+/// The key shape of `keys`.
+fn shape(keys: &[PbcGeneratedKeyLayout]) -> PrfKeyShape {
+    let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+    PrfKeyShape::new(&layouts).expect("PRF key shape")
 }
 
 /// The accepted refresh: its declaration, keys, children chains and noise.
@@ -148,7 +149,7 @@ fn search(
     .expect("source noise bindings");
     for digits in 1..32 {
         let fresh_keys = keys(columns * n);
-        let smudge_keys = (0..primes * columns).map(|_| keys(n * digits)).collect::<Vec<_>>();
+        let smudge_keys = (0..primes).map(|_| keys(columns * n * digits)).collect::<Vec<_>>();
         let declaration = RefreshDeclaration::new(
             source,
             input,
@@ -157,8 +158,8 @@ fn search(
             primes,
             columns,
             digits,
-            layouts(&fresh_keys),
-            smudge_keys.iter().map(|keys| layouts(keys)).collect(),
+            shape(&fresh_keys),
+            smudge_keys.iter().map(|keys| shape(keys)).collect(),
             b"refresh-round-trip".to_vec(),
         )
         .expect("refresh declaration");
@@ -273,17 +274,19 @@ fn refresh_round_trip() {
     let payload = RnsEncryptBuild::new(&parameters, context)
         .sample_payload_secret(&mut runtime, &mut store, |_| Ok(()))
         .expect("payload secret");
-    let mut fresh_preprocess =
-        RnsPreprocessBuild::new(&fresh, context).with_hash_namespace(fresh_namespace);
+    let (fresh_rhs, fresh_tables) = declaration
+        .fresh()
+        .sampler()
+        .key_inputs::<DCRTPoly>(&fresh_level, &fresh_keys)
+        .expect("fresh selectors and tables");
+    let mut fresh_preprocess = RnsPreprocessBuild::new(&fresh, context)
+        .with_hash_namespace(fresh_namespace)
+        .with_data(fresh_tables);
     fresh_preprocess
         .bind_rhs_inputs(
             fresh_program,
             &env,
-            &declaration
-                .fresh()
-                .sampler()
-                .rhs_plaintexts::<DCRTPoly>(&fresh_level, &fresh_keys)
-                .expect("fresh selectors"),
+            Some(&fresh_rhs),
             Some(&payload.at_level(&fresh, 0).expect("fresh payload")),
             &hash_key,
         )
@@ -293,17 +296,19 @@ fn refresh_round_trip() {
         .iter()
         .zip(&smudge_keys)
         .map(|(decoder, keys)| {
+            let (rhs, tables) = decoder
+                .smudge()
+                .prf()
+                .key_inputs::<DCRTPoly>(&smudge_level, keys)
+                .expect("smudge selectors and tables");
             let mut child = RnsPreprocessBuild::new(&smudge, context)
-                .with_hash_namespace(*decoder.commitment());
+                .with_hash_namespace(*decoder.commitment())
+                .with_data(tables);
             child
                 .bind_rhs_inputs(
                     decoder.smudge().program(),
                     &env,
-                    &decoder
-                        .smudge()
-                        .prf()
-                        .selector_plaintexts::<DCRTPoly>(&smudge_level, keys)
-                        .expect("smudge selectors"),
+                    Some(&rhs),
                     Some(&payload.at_level(&smudge, 0).expect("smudge payload")),
                     &hash_key,
                 )
@@ -354,7 +359,7 @@ fn refresh_round_trip() {
             .bind_lhs_inputs(
                 &program.encryption_inputs(),
                 &env,
-                lhs,
+                Some(lhs),
                 &payload.at_level(chain, 0).expect("child payload"),
                 Some(&mask.at_level(chain, 0).expect("child mask")),
                 &hash_key,

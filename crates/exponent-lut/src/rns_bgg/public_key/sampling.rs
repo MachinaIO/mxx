@@ -46,13 +46,16 @@ pub(in crate::rns_bgg) fn lut_public_matrix(
     Ok(matrix_from_hash(&ring, key, tag, columns))
 }
 
-/// The member enters the tag as an index expression in every stage, so a
-/// member read by a loop index and one read by a table of indices share it.
-fn input_hash_tag(wire: WireId, level: usize, member: Option<IntExpr>) -> mxx_dsl::HashTag {
+/// The member enters the tag as a `u64` component in every stage: a member
+/// index known when the graph is built (a constant or a loop-index
+/// expression) is static, and a runtime one (a table entry) is a hash
+/// argument hashing the same bytes, so every reader of a member derives the
+/// key encryption sampled for it.
+fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::HashTag {
     let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/input/{wire:?}/{level}").into_bytes());
     if let Some(member) = member {
         tag.push("member");
-        tag.push(member);
+        tag.push_u64_le(member);
     }
     tag
 }
@@ -219,7 +222,7 @@ pub(crate) fn sampled_key(
     hash_key: Bytes,
     wire: WireId,
     knowledge: AttributeKnowledge,
-    member: Option<IntExpr>,
+    member: Option<Int>,
 ) -> Result<RnsBggPublicKey, RnsBggError> {
     let ring = parameters.ring(level)?;
     let columns = parameters.key_component_columns(level, knowledge)?;

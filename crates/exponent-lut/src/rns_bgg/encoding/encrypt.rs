@@ -157,21 +157,24 @@ impl<'a> RnsEncryptBuild<'a> {
         Ok(())
     }
 
-    /// Bind public LHS plaintexts and secrets for a decoder smudge child.
-    /// This application-facing method keeps the generic stage trait out of
-    /// decoder child setup code. Dynamic children take no mask.
+    /// Bind public LHS plaintexts `lhs` and secrets for a decoder smudge or
+    /// refresh child. This application-facing method keeps the generic stage
+    /// trait out of child setup code. Dynamic children take no mask.
+    ///
+    /// `None` binds the plaintexts by the inputs' declared shapes only (see
+    /// [`super::super::RnsPreprocessBuild::bind_rhs_inputs`]): the graph is
+    /// the one of any plaintexts of those shapes, which can be validated and
+    /// exported but not executed.
     pub fn bind_lhs_inputs<P: Poly>(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
         parameters: &mxx_ir_core::ParamEnv,
-        lhs: &PlaintextInputs<WireId, P>,
+        lhs: Option<&PlaintextInputs<WireId, P>>,
         payload: &RnsBggPayloadSecret,
         mask: Option<&RnsBggMaskSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        <Self as EncryptBuild<P>>::bind_inputs(
-            self, inputs, parameters, lhs, payload, mask, hash_key,
-        )
+        self.bind_encryption_inputs(inputs, parameters, lhs, payload, mask, hash_key)
     }
 
     fn bind_preprocess_artifacts_inner(
@@ -714,19 +717,16 @@ impl<'a> RnsEncryptBuild<'a> {
     }
 }
 
-impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
-    type PayloadSecret = RnsBggPayloadSecret;
-    type MaskSecret = RnsBggMaskSecret;
-    type PreprocessDescriptor = RnsBggPreprocessEncryptDescriptor;
-    type Descriptor = RnsBggEncryptionDescriptor;
-
-    fn bind_inputs(
+impl RnsEncryptBuild<'_> {
+    /// Bind the encryption inputs: the plaintexts `lhs`, or, for `None`,
+    /// their declared shapes only (see [`Self::bind_lhs_inputs`]).
+    fn bind_encryption_inputs<P: Poly>(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
         parameters: &mxx_ir_core::ParamEnv,
-        lhs: &PlaintextInputs<WireId, P>,
-        payload: &Self::PayloadSecret,
-        mask: Option<&Self::MaskSecret>,
+        lhs: Option<&PlaintextInputs<WireId, P>>,
+        payload: &RnsBggPayloadSecret,
+        mask: Option<&RnsBggMaskSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         let mask = stage_mask(self.parameters, payload, mask)?;
@@ -737,39 +737,51 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         {
             return Err(ApiError::input("Dynamic encryption inputs are not the setup's"));
         }
-        if lhs.len() != inputs.inputs().len() ||
-            lhs.keys().any(|wire| !inputs.inputs().contains_key(wire))
+        if let Some(lhs) = lhs &&
+            (lhs.len() != inputs.inputs().len() ||
+                lhs.keys().any(|wire| !inputs.inputs().contains_key(wire)))
         {
             return Err(ApiError::input("encryption inputs do not exactly match Program inputs"));
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
         let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "input");
         for (wire, declaration) in inputs.inputs() {
-            let value = lhs.get(wire).ok_or_else(|| ApiError::input("missing encryption input"))?;
-            match (declaration.shape(), value) {
-                (InputBinding::Scalar(()), InputBinding::Scalar(_)) => {}
-                (InputBinding::Family(count), InputBinding::Family(values)) => {
-                    let expected = count
-                        .evaluate(parameters)
-                        .ok()
-                        .and_then(|value| value.to_usize())
-                        .ok_or_else(|| {
-                            ApiError::input("encryption input family count is not concrete")
-                        })?;
-                    if values.len() != expected {
-                        return Err(ApiError::input(
-                            "encryption input family count does not match Program",
-                        ));
+            let concrete =
+                |count: &IntExpr| {
+                    count.evaluate(parameters).ok().and_then(|value| value.to_usize()).ok_or_else(
+                        || ApiError::input("encryption input family count is not concrete"),
+                    )
+                };
+            let name = format!("{prefix}/input/{wire:?}");
+            let plaintext = match lhs {
+                Some(lhs) => {
+                    let value =
+                        lhs.get(wire).ok_or_else(|| ApiError::input("missing encryption input"))?;
+                    match (declaration.shape(), value) {
+                        (InputBinding::Scalar(()), InputBinding::Scalar(_)) => {}
+                        (InputBinding::Family(count), InputBinding::Family(values)) => {
+                            if values.len() != concrete(count)? {
+                                return Err(ApiError::input(
+                                    "encryption input family count does not match Program",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(ApiError::input(
+                                "encryption input shape does not match Program",
+                            ));
+                        }
                     }
+                    super::plaintext_inputs(&ring, &name, value, &mut self.runtime)
                 }
-                _ => return Err(ApiError::input("encryption input shape does not match Program")),
+                None => {
+                    let shape = match declaration.shape() {
+                        InputBinding::Scalar(()) => InputBinding::Scalar(()),
+                        InputBinding::Family(count) => InputBinding::Family(concrete(count)?),
+                    };
+                    super::plaintext_handles(&ring, &name, shape)
+                }
             }
-            let plaintext = super::plaintext_inputs(
-                &ring,
-                &format!("{prefix}/input/{wire:?}"),
-                value,
-                &mut self.runtime,
-            )
             .map_err(ApiError::input)?;
             self.plaintexts.insert(*wire, plaintext);
         }
@@ -794,6 +806,25 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             None => hash_key.to_vec(),
         };
         Ok(())
+    }
+}
+
+impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
+    type PayloadSecret = RnsBggPayloadSecret;
+    type MaskSecret = RnsBggMaskSecret;
+    type PreprocessDescriptor = RnsBggPreprocessEncryptDescriptor;
+    type Descriptor = RnsBggEncryptionDescriptor;
+
+    fn bind_inputs(
+        &mut self,
+        inputs: &crate::program::EncryptionInputs,
+        parameters: &mxx_ir_core::ParamEnv,
+        lhs: &PlaintextInputs<WireId, P>,
+        payload: &Self::PayloadSecret,
+        mask: Option<&Self::MaskSecret>,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        self.bind_encryption_inputs(inputs, parameters, Some(lhs), payload, mask, hash_key)
     }
 
     fn bind_artifacts(
@@ -993,7 +1024,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                     .plaintexts
                     .get(wire)
                     .ok_or_else(|| ApiError::input("missing encryption plaintext"))?;
-                let encode = |member: Option<IntExpr>, plaintext: Mat| {
+                let encode = |member: Option<Int>, plaintext: Mat| {
                     let key = super::public_key::sampled_key(
                         self.parameters,
                         level,
@@ -1025,7 +1056,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                     (InputBinding::Family(plaintexts), true) => {
                         let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
                             let plaintext = plaintexts.member(&plaintext_ring, index.clone());
-                            let encoding = encode(Some(index.expression()?), plaintext)
+                            let encoding = encode(Some(index.clone()), plaintext)
                                 .map_err(|_| DslError::Schema)?;
                             let payload = encoding.public_payload.ok_or(DslError::Schema)?;
                             Ok((encoding.row.0, encoding.row.1, payload))
@@ -1036,7 +1067,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                     (InputBinding::Family(plaintexts), false) => {
                         let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
                             let plaintext = plaintexts.member(&plaintext_ring, index.clone());
-                            encode(Some(index.expression()?), plaintext)
+                            encode(Some(index.clone()), plaintext)
                                 .map(|encoding| encoding.row)
                                 .map_err(|_| DslError::Schema)
                         })

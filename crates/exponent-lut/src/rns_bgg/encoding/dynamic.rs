@@ -1887,7 +1887,7 @@ mod test {
             let mut builder = ExponentLutProgramBuilder::new();
             let representation = LutOutputRepresentation::Exponent(layout);
             let (table, data) = if data_backed {
-                let family = builder.data_family(values.len()).unwrap();
+                let family = builder.data_family(values.len(), None).unwrap();
                 (
                     LutTable::from_data(4, layout, 4, family, 0, representation).unwrap(),
                     crate::program::ProgramData::new().with(family, values.clone()),

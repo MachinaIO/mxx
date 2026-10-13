@@ -2567,7 +2567,11 @@ fn artifact_wire_type(artifact: &ArtifactType) -> ConcreteWireType {
         ArtifactType::TypedBlob { type_name, schema_hash } => {
             ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
         }
-        ArtifactType::Family(members) => {
+        ArtifactType::IndexedFamily { element, count } => ConcreteWireType::IndexedFamily {
+            element: Box::new(artifact_wire_type(element)),
+            count: *count,
+        },
+        ArtifactType::DependentFamily(members) => {
             let members = members.iter().map(artifact_wire_type).collect::<Vec<_>>();
             match members.first() {
                 Some(first) if members.iter().all(|member| member == first) => {

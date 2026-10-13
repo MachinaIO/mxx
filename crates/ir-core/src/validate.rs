@@ -2206,6 +2206,10 @@ fn validate_constant(
             }
             Ok(())
         }
+        ConstantMatrix::AllCoefficients { value } => {
+            value.evaluate(env)?;
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -2323,7 +2327,7 @@ fn validate_hash_key_and_tag(
                     return node_error(scope, node.id, "little-endian hash tag must fit in u64");
                 }
             }
-            HashTagComponent::Operand(index) => {
+            HashTagComponent::Operand(index) | HashTagComponent::OperandU64Le(index) => {
                 require_scalar(scope, values, node, *index, is_integer, "integer")?;
             }
         }
@@ -2897,6 +2901,42 @@ mod tests {
         let different = make_graph(crate::ring::test_ring(17 * 193, 8));
         let error = crate::ring::test_validate(&different, &ParamEnv::default()).unwrap_err();
         assert!(node_message(error).contains("cannot change their ordered CRT basis"));
+    }
+
+    #[test]
+    fn hash_u64_le_operand_must_be_an_integer_scalar() {
+        let key_type = WireType::Bytes { length: IntExpr::constant(32) };
+        let key = value(
+            NodeKind::Input { name: "key".to_owned(), wire_type: key_type.clone(), artifact: None },
+            Vec::new(),
+            vec![key_type],
+        );
+        let row = value(
+            NodeKind::Input { name: "row".to_owned(), wire_type: WireType::Int, artifact: None },
+            Vec::new(),
+            vec![WireType::Int],
+        );
+        let sample = |operand: usize| {
+            let matrix_type = matrix_type(17, 1, 1);
+            value(
+                NodeKind::HashSample {
+                    matrix_type: matrix_type.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: Vec::new(),
+                    tag_components: vec![crate::node::HashTagComponent::OperandU64Le(operand)],
+                    base: None,
+                    digit_count: None,
+                },
+                vec![key.clone(), row.clone()],
+                vec![WireType::Matrix(matrix_type)],
+            )
+        };
+        crate::ring::test_validate(&graph("u64-le-integer", sample(1)), &ParamEnv::default())
+            .unwrap();
+        let error =
+            crate::ring::test_validate(&graph("u64-le-key", sample(0)), &ParamEnv::default())
+                .unwrap_err();
+        assert!(node_message(error).contains("integer"));
     }
 
     #[test]

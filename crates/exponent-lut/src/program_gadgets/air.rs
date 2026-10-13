@@ -657,6 +657,15 @@ mod tests {
         ) -> Result<Monomial, ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no families")))
         }
+        fn wire_selected(
+            &mut self,
+            _: &mut Clear,
+            _: &(),
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<Monomial, ProgramLowerError<ClearError>> {
+            Err(ProgramLowerError::Backend(ClearError("the AIR step has no families")))
+        }
         fn rhs_at(&mut self, _: &(), _: &IntExpr) -> Result<(), ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no RHS")))
         }
@@ -684,6 +693,7 @@ mod tests {
             &mut self,
             _: &mut Clear,
             _: &(),
+            _: usize,
         ) -> Result<Monomial, ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no sums")))
         }

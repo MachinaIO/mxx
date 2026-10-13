@@ -1,7 +1,9 @@
 //! Immutable Exponent-LUT programs and their structural execution model.
 //!
 //! This module deliberately contains no scheme-specific carrier types.  A
-//! program describes scalar operations, indexed bodies, and literal LUTs;
+//! program describes scalar operations, indexed bodies, literal LUTs, and the
+//! shapes of integer data families supplied at run time, whose entries name
+//! family members or hold LUT values;
 //! The internal program walker supplies the only execution path and delegates
 //! each scalar operation to a scheme evaluator.
 
@@ -25,7 +27,7 @@ use thiserror::Error;
 
 pub use builder::ExponentLutProgramBuilder;
 pub use graph::{GraphFamilyExecution, RhsRef, family_of_fields};
-pub(crate) use graph::{GraphParallelLowering, graph_parallel, graph_sum};
+pub(crate) use graph::{GraphParallelLowering, graph_column_sums, graph_parallel, graph_sum};
 pub(crate) use lowering::lower_program;
 pub use lowering::{
     Environment, FamilyExecution, LoweringSite, ProgramLowerError, ProgramLoweringContext,
@@ -196,8 +198,10 @@ pub enum Operand<I> {
         index: IntExpr,
     },
     /// The member of `family` selected at run time: its index is entry `position` of the
-    /// Program's integer data family `data` ([`ExponentLutProgramBuilder::data_family`]). Only
-    /// the RHS of a private product is selected this way.
+    /// Program's integer data family `data` ([`ExponentLutProgramBuilder::data_family`]). The
+    /// RHS of a private product may be selected this way, and so may a wire operand wherever a
+    /// member read is valid (not a root output), from a family of data bounded by the wire
+    /// family's member count; the read member is unknown until the data are bound.
     Selected {
         family: I,
         data: DataId,
@@ -619,10 +623,26 @@ pub(crate) enum Step {
         body: Box<Body>,
         output: WireId,
     },
+    /// The sum of the members of `family`; with `columns = w > 1`, the `1 x
+    /// w` row of the block sums of a family of `w b` members: column `j`
+    /// sums the `b` members from `j b`, placed in column `j` (each carrier
+    /// entry `E` of a column sum becomes `e_j ⊗ E`, `e_j` the unit row of
+    /// column `j`). Folding `w` sums into one row keeps a lowered graph
+    /// independent of `w`.
     Sum {
         family: WireId,
         output: WireId,
+        #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
+        columns: usize,
     },
+}
+
+const fn one_column() -> usize {
+    1
+}
+
+fn is_one_column(columns: &usize) -> bool {
+    *columns == 1
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -673,6 +693,38 @@ pub enum ProgramValidationError {
     InvalidStructure(String),
 }
 
+/// The declaration of an integer data family ([`ExponentLutProgramBuilder::data_family`]):
+/// `count` entries, each below `bound` when the family is bounded. A bounded family may select
+/// wire members ([`Operand::Selected`]); the noise model and the export read the bound as the
+/// range of every entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataFamily {
+    count: usize,
+    bound: Option<usize>,
+}
+
+impl DataFamily {
+    /// The number of entries.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+    /// The exclusive upper bound of every entry, when the family is bounded.
+    pub fn bound(&self) -> Option<usize> {
+        self.bound
+    }
+}
+
+/// The canonical encoding of a declaration: the count of an unbounded family, which keeps the
+/// identity of a Program without bounded families, else the pair of the count and the bound.
+impl Serialize for DataFamily {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.bound {
+            None => self.count.serialize(serializer),
+            Some(bound) => (self.count, bound).serialize(serializer),
+        }
+    }
+}
+
 /// The run-time values of a Program's integer data families
 /// ([`ExponentLutProgramBuilder::data_family`]). A preprocessing and the online evaluation that
 /// consumes it must be given the same data; the preprocessing records its
@@ -710,13 +762,25 @@ impl ProgramData {
     }
 
     /// Checks the data against `program`: one value per member of each declared family, every
-    /// selected RHS member below its family's count, and every LUT value below its output width.
+    /// entry of a bounded family below its bound, every selected RHS member below its family's
+    /// count, and every LUT value below its output width.
     pub fn validate(&self, program: &ExponentLutProgram) -> Result<(), ProgramValidationError> {
         let invalid = |reason: &str| ProgramValidationError::InvalidStructure(reason.into());
         if self.0.keys().ne(program.data.keys()) ||
-            self.0.iter().any(|(family, values)| program.data.get(family) != Some(&values.len()))
+            self.0.iter().any(|(family, values)| {
+                program.data.get(family).map(DataFamily::count) != Some(values.len())
+            })
         {
             return Err(invalid("program data does not match the declared families"));
+        }
+        // A bounded family's entries (each wire member it selects, by the static check that
+        // the bound is at most the family's member count).
+        if program.data.iter().any(|(family, declaration)| {
+            declaration
+                .bound
+                .is_some_and(|bound| self.0[family].iter().any(|value| *value >= bound))
+        }) {
+            return Err(ProgramValidationError::MemberOutOfBounds);
         }
         for table in &program.luts {
             if let Some((family, offset)) = table.data_values() &&
@@ -761,15 +825,18 @@ impl ProgramData {
     }
 }
 
-/// The integer data families of `program` as graph inputs ([`ProgramData::input_name`]).
+/// The integer data families of `program` as graph inputs named by `name`
+/// ([`ProgramData::input_name`] for a Program's own data; a stage lowering a child Program
+/// next to another names its data under the child's namespace).
 pub(crate) fn data_inputs(
     program: &ExponentLutProgram,
+    name: impl Fn(DataId) -> String,
 ) -> BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>> {
     program
         .data
         .iter()
-        .map(|(family, count)| {
-            (*family, mxx_dsl::int_family_input(ProgramData::input_name(*family), *count))
+        .map(|(family, declaration)| {
+            (*family, mxx_dsl::int_family_input(name(*family), declaration.count))
         })
         .collect()
 }
@@ -803,8 +870,8 @@ impl EncryptionInputs {
 pub struct ExponentLutProgram {
     id: ExponentLutProgramId,
     inputs: BTreeMap<WireId, ProgramInputDeclaration>,
-    /// The integer data families supplied at run time, by their entry counts.
-    data: BTreeMap<DataId, usize>,
+    /// The integer data families supplied at run time.
+    data: BTreeMap<DataId, DataFamily>,
     rhs_inputs: BTreeMap<RhsId, InputShape>,
     luts: Vec<LutTable>,
     body: Body,
@@ -834,8 +901,8 @@ impl ExponentLutProgram {
     pub fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
         &self.rhs_inputs
     }
-    /// The declared integer data families, by their entry counts.
-    pub fn data_families(&self) -> &BTreeMap<DataId, usize> {
+    /// The declared integer data families.
+    pub fn data_families(&self) -> &BTreeMap<DataId, DataFamily> {
         &self.data
     }
     /// Resolve a LUT registration by its validated instruction output, including
@@ -897,12 +964,8 @@ impl ExponentLutProgram {
         fn visit(body: &Body, nested: bool, luts: &mut Vec<(WireId, LutId)>) {
             for step in &body.steps {
                 match step {
-                    Step::Lut {
-                        input: Operand::Scalar(input) | Operand::Member { family: input, .. },
-                        table,
-                        ..
-                    } if nested => {
-                        luts.push((*input, *table));
+                    Step::Lut { input, table, .. } if nested => {
+                        luts.push((*input.source(), *table));
                     }
                     Step::Parallel { body, .. } => visit(body, true, luts),
                     _ => {}
@@ -1047,8 +1110,9 @@ fn lut_values_digest(values: &[usize]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// The Program identity: the digest of its inputs, data families, RHS inputs, LUT tables
-/// (each with its values by their digest) and body. Data values are not part of it.
+/// The Program identity: the digest of its inputs, data families (their counts and bounds, see
+/// [`DataFamily`]'s encoding), RHS inputs, LUT tables (each with its values by their digest)
+/// and body. Data values are not part of it.
 pub(crate) fn canonical_program_id(program: &ExponentLutProgram) -> ExponentLutProgramId {
     let bytes = serde_json::to_vec(&(
         &program.inputs,
@@ -1081,8 +1145,8 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
     // when the fixture's eventual root output is itself not a scalar.
     for table in &program.luts {
         if let Some((family, offset)) = table.data_values() &&
-            !program.data.get(&family).is_some_and(|count| {
-                offset.checked_add(table.input_width).is_some_and(|end| end <= *count)
+            !program.data.get(&family).is_some_and(|declaration| {
+                offset.checked_add(table.input_width).is_some_and(|end| end <= declaration.count)
             })
         {
             return Err(ProgramValidationError::InvalidLut);
@@ -1113,6 +1177,7 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
                 ),
                 _ => true,
             },
+            // A root output names a fixed member.
             Operand::Selected { .. } => true,
         })
     {
@@ -1229,7 +1294,7 @@ fn derive_body_metadata(
                     .ok_or(ProgramValidationError::InvalidOutputCount)
                     .and_then(|operand| metadata_for_operand(operand, metadata))?
             }
-            Step::Sum { family, .. } => {
+            Step::Sum { family, columns, .. } => {
                 let member = metadata
                     .get(family)
                     .copied()
@@ -1246,6 +1311,8 @@ fn derive_body_metadata(
                                 "a coefficient Sum needs a constant member count".into(),
                             )
                         })?;
+                        // Every column of a row sum adds its own block of members.
+                        let count = count / *columns as u64;
                         Some(bound.checked_mul(count).ok_or_else(overflow)?)
                     }
                 };
@@ -1270,6 +1337,7 @@ fn metadata_for_operand(
     operand: &Operand<WireId>,
     metadata: &BTreeMap<WireId, WireMetadata>,
 ) -> Result<WireMetadata, ProgramValidationError> {
+    // A lookup reads a member of its family, like a member read.
     let wire = match operand {
         Operand::Scalar(wire) |
         Operand::Member { family: wire, .. } |
@@ -1296,7 +1364,7 @@ impl VisibleKind {
 fn validate_body(
     body: &Body,
     luts: &[LutTable],
-    data: &BTreeMap<DataId, usize>,
+    data: &BTreeMap<DataId, DataFamily>,
     visible: &mut BTreeMap<WireId, VisibleKind>,
     all_wires: &mut BTreeSet<WireId>,
     rhs: &mut BTreeMap<RhsId, VisibleKind>,
@@ -1309,29 +1377,29 @@ fn validate_body(
     for step in &body.steps {
         let (output, kind) = match step {
             Step::Add { lhs, rhs: right, output } => {
-                check_wire_operand(lhs, visible, false, depth, loop_bounds)?;
-                check_wire_operand(right, visible, false, depth, loop_bounds)?;
+                check_wire_operand(lhs, visible, data, false, depth, loop_bounds)?;
+                check_wire_operand(right, visible, data, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPublic { lhs, rhs, output } => {
-                check_wire_operand(lhs, visible, false, depth, loop_bounds)?;
-                check_wire_operand(rhs, visible, false, depth, loop_bounds)?;
+                check_wire_operand(lhs, visible, data, false, depth, loop_bounds)?;
+                check_wire_operand(rhs, visible, data, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPrivate { input, rhs: right, output } => {
-                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
                 check_rhs_operand(right, rhs, data, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::Lut { input, table, output } => {
-                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
                 if (*table).0 as usize >= luts.len() {
                     return Err(ProgramValidationError::InvalidLutId(*table));
                 }
                 (*output, VisibleKind::Scalar)
             }
             Step::MulSmallConstant { input, coefficients, shift, output } => {
-                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
                 check_small_constant(coefficients, shift, depth)?;
                 (*output, VisibleKind::Scalar)
             }
@@ -1362,8 +1430,38 @@ fn validate_body(
                 }
                 (*output, VisibleKind::Family(range.count.clone()))
             }
-            Step::Sum { family, output } => {
-                check_wire_operand(&Operand::Scalar(*family), visible, true, depth, loop_bounds)?;
+            Step::Sum { family, output, columns } => {
+                check_wire_operand(
+                    &Operand::Scalar(*family),
+                    visible,
+                    data,
+                    true,
+                    depth,
+                    loop_bounds,
+                )?;
+                if *columns == 0 {
+                    return Err(ProgramValidationError::InvalidStructure(
+                        "a Sum needs at least one column".into(),
+                    ));
+                }
+                if *columns > 1 {
+                    let count = match visible.get(family) {
+                        Some(VisibleKind::Family(count)) => count.canonicalize(),
+                        _ => return Err(ProgramValidationError::ExpectedFamilyWire(*family)),
+                    };
+                    let IntExpr::Const(count) = count else {
+                        return Err(ProgramValidationError::InvalidStructure(
+                            "a row Sum needs a constant member count".into(),
+                        ));
+                    };
+                    let columns = num_bigint::BigInt::from(*columns);
+                    if count < columns.clone() * 2u8 || !(count % columns).is_zero() {
+                        return Err(ProgramValidationError::InvalidStructure(
+                            "a row Sum needs at least two members per column, as many in each"
+                                .into(),
+                        ));
+                    }
+                }
                 (*output, VisibleKind::Scalar)
             }
         };
@@ -1374,7 +1472,7 @@ fn validate_body(
     }
     if check_outputs {
         for output in &body.outputs {
-            check_wire_operand(output, visible, false, depth, loop_bounds)?;
+            check_wire_operand(output, visible, data, false, depth, loop_bounds)?;
         }
     }
     if !root {
@@ -1439,6 +1537,7 @@ fn validate_range_with_bounds(
 fn check_wire_operand(
     operand: &Operand<WireId>,
     visible: &BTreeMap<WireId, VisibleKind>,
+    data: &BTreeMap<DataId, DataFamily>,
     family: bool,
     depth: u32,
     loop_bounds: &BTreeMap<u32, IntInterval>,
@@ -1466,16 +1565,51 @@ fn check_wire_operand(
             check_member_bounds(index, count, loop_bounds)?;
             Ok(())
         }
-        Operand::Selected { .. } => Err(ProgramValidationError::InvalidStructure(
-            "only a private product's RHS is selected at run time".into(),
-        )),
+        Operand::Selected { family: id, data: data_id, position } => {
+            if family {
+                return Err(ProgramValidationError::ExpectedFamilyWire(*id));
+            }
+            let Some(VisibleKind::Family(count)) = visible.get(id) else {
+                return Err(ProgramValidationError::ExpectedFamilyWire(*id));
+            };
+            let declaration = data.get(data_id).ok_or(ProgramValidationError::InvalidStructure(
+                "undeclared integer data family".into(),
+            ))?;
+            // Every entry must address a member, which only a bounded family guarantees.
+            let bound = declaration.bound.ok_or(ProgramValidationError::InvalidStructure(
+                "a wire member is selected by a bounded integer data family".into(),
+            ))?;
+            if let Some(slot) = invalid_loop_slot(position, depth) {
+                return Err(ProgramValidationError::InvalidLoopIndex(slot));
+            }
+            // The position addresses an entry, and every entry a member.
+            check_member_bounds(position, &IntExpr::constant(declaration.count), loop_bounds)?;
+            check_data_bound(bound, count, loop_bounds)
+        }
     }
+}
+
+/// Every entry of a bounded data family, in `[0, bound)`, addresses a member
+/// of a family of `count` members: `bound <= count`. As for a member index,
+/// the bound is checked against the smallest known count.
+fn check_data_bound(
+    bound: usize,
+    count: &IntExpr,
+    loop_bounds: &BTreeMap<u32, IntInterval>,
+) -> Result<(), ProgramValidationError> {
+    let count = interval_of(count, loop_bounds);
+    if let Some(count_min) = &count.minimum &&
+        num_bigint::BigInt::from(bound) > *count_min
+    {
+        return Err(ProgramValidationError::MemberOutOfBounds);
+    }
+    Ok(())
 }
 
 fn check_rhs_operand(
     operand: &Operand<RhsId>,
     rhs: &BTreeMap<RhsId, VisibleKind>,
-    data: &BTreeMap<DataId, usize>,
+    data: &BTreeMap<DataId, DataFamily>,
     depth: u32,
     loop_bounds: &BTreeMap<u32, IntInterval>,
 ) -> Result<(), ProgramValidationError> {
@@ -1496,17 +1630,21 @@ fn check_rhs_operand(
             Ok(())
         }
         Operand::Selected { family: id, data: data_id, position } => {
-            if !matches!(rhs.get(id), Some(VisibleKind::Family(_))) {
+            let Some(VisibleKind::Family(count)) = rhs.get(id) else {
                 return Err(ProgramValidationError::ExpectedFamilyRhs(*id));
-            }
-            let count = data.get(data_id).ok_or(ProgramValidationError::InvalidStructure(
+            };
+            let declaration = data.get(data_id).ok_or(ProgramValidationError::InvalidStructure(
                 "undeclared integer data family".into(),
             ))?;
             if let Some(slot) = invalid_loop_slot(position, depth) {
                 return Err(ProgramValidationError::InvalidLoopIndex(slot));
             }
-            check_member_bounds(position, &IntExpr::constant(*count), loop_bounds)?;
-            Ok(())
+            check_member_bounds(position, &IntExpr::constant(declaration.count), loop_bounds)?;
+            // An unbounded family's entries are checked with the data ([`ProgramData::validate`]).
+            match declaration.bound {
+                Some(bound) => check_data_bound(bound, count, loop_bounds),
+                None => Ok(()),
+            }
         }
     }
 }
@@ -2431,6 +2569,146 @@ mod tests {
         assert_eq!(canonical_program_id(&changed.without_lut_values()), changed.id());
     }
 
+    /// A Program without integer data has a pinned identity: the digest
+    /// covers inputs, (no) data families, RHS inputs, a LUT, a parallel
+    /// member read and a sum.
+    #[test]
+    fn canonical_identity_of_a_data_free_program_is_pinned() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let inputs =
+            builder.input_family(IntExpr::constant(3), AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(3)).unwrap();
+        let lut = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    4,
+                    vec![1, 3],
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let products = builder
+            .parallel(FamilyRange::full(IntExpr::constant(3)).unwrap(), |builder, index| {
+                let product = builder.mul_private(
+                    Operand::Member { family: inputs, index: index.clone() },
+                    Operand::Member { family: rhs, index },
+                )?;
+                builder.lut(Operand::Scalar(product), lut).map(Operand::Scalar)
+            })
+            .unwrap();
+        let sum = builder.sum(products).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(sum)]).unwrap();
+        assert_eq!(
+            program.id().hex(),
+            "850f9cae505a863d3d3c9d1815711561634c1938d1ed1b678032d1baef3ecc51"
+        );
+    }
+
+    /// A Program reading `family` (of `members`) through a data family of
+    /// `entries` entries in `[0, bound)`, in a loop over `reads` entries.
+    fn selection_program(
+        members: usize,
+        entries: usize,
+        bound: usize,
+        reads: usize,
+    ) -> Result<(ExponentLutProgram, WireId), ProgramValidationError> {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let family = builder
+            .input_family(IntExpr::constant(members), AttributeKnowledge::PublicPayload)
+            .unwrap();
+        let data = builder.data_family(entries, Some(bound))?;
+        let products = builder.parallel(FamilyRange::full(IntExpr::constant(reads))?, {
+            |builder, index| {
+                builder
+                    .add(
+                        Operand::Selected { family, data, position: index.clone() },
+                        Operand::Member { family, index: IntExpr::constant(0) },
+                    )
+                    .map(Operand::Scalar)
+            }
+        })?;
+        let output = builder.sum(products)?;
+        Ok((builder.finish(vec![Operand::Scalar(output)])?, products))
+    }
+
+    /// A wire selection reads a member of its family: its position stays
+    /// within the data, the data's bound within the family, and its metadata
+    /// is the family's.
+    #[test]
+    fn wire_selection_bounds_the_position_by_the_data_and_the_data_by_the_family() {
+        let (program, products) = selection_program(4, 6, 4, 6).unwrap();
+        assert_eq!(program.wire_knowledge(products).unwrap(), AttributeKnowledge::PublicPayload);
+        assert_eq!(
+            program.data_families().values().copied().collect::<Vec<_>>(),
+            [DataFamily { count: 6, bound: Some(4) }]
+        );
+        assert_eq!(
+            selection_program(4, 6, 4, 7).unwrap_err(),
+            ProgramValidationError::MemberOutOfBounds
+        );
+        assert_eq!(
+            selection_program(4, 6, 5, 6).unwrap_err(),
+            ProgramValidationError::MemberOutOfBounds
+        );
+        assert!(selection_program(4, 0, 4, 1).is_err());
+        assert!(selection_program(4, 6, 0, 1).is_err());
+    }
+
+    /// A wire selection reads through a declared, bounded data family, and
+    /// never at a root output; data are declared at root scope only.
+    #[test]
+    fn wire_selection_reads_a_declared_bounded_data_family() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let family =
+            builder.input_family(IntExpr::constant(2), AttributeKnowledge::PublicPayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let data = builder.data_family(2, Some(2)).unwrap();
+        let unbounded = builder.data_family(2, None).unwrap();
+        let read = |data| Operand::Selected { family, data, position: IntExpr::constant(0) };
+        assert!(matches!(
+            builder.add(read(DataId(7)), read(data)),
+            Err(ProgramValidationError::InvalidStructure(_))
+        ));
+        assert!(matches!(
+            builder.add(read(unbounded), read(data)),
+            Err(ProgramValidationError::InvalidStructure(_))
+        ));
+        builder
+            .mul_private(
+                read(data),
+                Operand::Selected { family: rhs, data, position: IntExpr::constant(0) },
+            )
+            .unwrap();
+        assert_eq!(
+            builder.parallel(FamilyRange::full(IntExpr::constant(1)).unwrap(), |builder, _| {
+                builder.data_family(1, Some(1))?;
+                Ok(read(data))
+            }),
+            Err(ProgramValidationError::InputInNestedBody)
+        );
+        assert_eq!(
+            builder.finish(vec![read(data)]),
+            Err(ProgramValidationError::InvalidOutputCount)
+        );
+    }
+
+    /// Data declarations, bounds included, enter the Program identity; an
+    /// unbounded declaration is encoded by its count alone.
+    #[test]
+    fn canonical_identity_commits_data_declarations() {
+        let id = |entries, bound| selection_program(4, entries, bound, 2).unwrap().0.id();
+        assert_eq!(id(6, 4), id(6, 4));
+        assert_ne!(id(6, 4), id(7, 4));
+        assert_ne!(id(6, 4), id(6, 3));
+        assert_eq!(
+            serde_json::to_string(&DataFamily { count: 3, bound: None }).unwrap(),
+            serde_json::to_string(&3usize).unwrap()
+        );
+    }
+
     #[test]
     fn canonical_identity_commits_lut_ids_when_equal_tables_are_registered() {
         fn build(swapped: bool) -> ExponentLutProgram {
@@ -2528,7 +2806,7 @@ mod tests {
                     }),
                     output: WireId(2),
                 },
-                Step::Sum { family: WireId(2), output: WireId(3) },
+                Step::Sum { family: WireId(2), output: WireId(3), columns: 1 },
             ],
             outputs: vec![Operand::Scalar(WireId(3))],
         };
@@ -2608,8 +2886,8 @@ mod tests {
         let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
-        let reads = builder.data_family(1).unwrap();
-        let tables = builder.data_family(2).unwrap();
+        let reads = builder.data_family(1, None).unwrap();
+        let tables = builder.data_family(2, None).unwrap();
         let product = builder
             .mul_private(
                 Operand::Scalar(input),
@@ -2636,7 +2914,14 @@ mod tests {
     #[test]
     fn program_data_is_checked_against_the_declared_families() {
         let (program, reads, tables) = data_program();
-        assert_eq!(program.data_families(), &BTreeMap::from([(reads, 1), (tables, 2)]));
+        assert_eq!(
+            program
+                .data_families()
+                .iter()
+                .map(|(id, family)| (*id, family.count()))
+                .collect::<Vec<_>>(),
+            [(reads, 1), (tables, 2)]
+        );
         let data = |read: usize, table: Vec<usize>| {
             ProgramData::new().with(reads, vec![read]).with(tables, table)
         };
@@ -2668,16 +2953,29 @@ mod tests {
         assert_ne!(first.commitment(), second.commitment());
     }
 
+    /// An unbounded data family selects only RHS members.
     #[test]
-    fn selected_operands_are_only_private_product_rhs() {
+    fn unbounded_selected_operands_are_only_private_product_rhs() {
         let mut builder = ExponentLutProgramBuilder::new();
         let inputs =
             builder.input_family(IntExpr::constant(2), AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_input().unwrap();
-        let reads = builder.data_family(1).unwrap();
+        let reads = builder.data_family(1, None).unwrap();
         let selected =
             Operand::Selected { family: inputs, data: reads, position: IntExpr::constant(0) };
         assert!(builder.add(selected.clone(), selected.clone()).is_err());
         assert!(builder.mul_private(selected, Operand::Scalar(rhs)).is_err());
+    }
+
+    /// The entries of a bounded data family stay below its bound.
+    #[test]
+    fn program_data_checks_bounded_entries() {
+        let (program, _) = selection_program(4, 2, 3, 2).unwrap();
+        let data = *program.data_families().keys().next().unwrap();
+        ProgramData::new().with(data, vec![2, 0]).validate(&program).unwrap();
+        assert_eq!(
+            ProgramData::new().with(data, vec![3, 0]).validate(&program),
+            Err(ProgramValidationError::MemberOutOfBounds)
+        );
     }
 }

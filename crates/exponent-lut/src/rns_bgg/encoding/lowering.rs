@@ -63,16 +63,18 @@ impl<'a> OnlineEvalFamilies<'a> {
 }
 
 impl OnlineEvalFamilies<'_> {
+    /// Read member `index`, a static index or a runtime data entry: an
+    /// input member's key is sampled from the hash key, and its row and
+    /// payload are read at the same member.
     fn member(
         &self,
         family: &OnlineEvalWireFamily,
-        index: IntExpr,
+        index: Int,
     ) -> Result<RnsBggEncoding, RnsBggError> {
         match family {
-            OnlineEvalWireFamily::Stored(family) => Ok(family.at(Int::evaluate(index))),
+            OnlineEvalWireFamily::Stored(family) => Ok(family.at(index)),
             OnlineEvalWireFamily::Input { wire, key, hash_key, rows, payloads } => {
                 let key = key.key(self.parameters, hash_key.clone(), *wire, Some(index.clone()))?;
-                let index = Int::evaluate(index);
                 let payload = payloads.as_ref().map(|payloads| payloads.at(index.clone()));
                 Ok(RnsBggEncoding::new(key, rows.at(index), payload))
             }
@@ -91,13 +93,30 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
     type WireFamily = OnlineEvalWireFamily;
     type RhsFamily = OnlineEvalRhsFamily;
 
+    /// The member at the data entry: a stored member is read there, and an
+    /// input member's key is sampled under the entry (a runtime hash
+    /// argument hashing as the static index encryption sampled it under)
+    /// next to its row and payload at the entry.
+    fn wire_selected(
+        &mut self,
+        _evaluator: &mut EncodingLowering<'a>,
+        family: &Self::WireFamily,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {
+        use crate::program::ProgramLowerError;
+        let member = self.selected_member(data, position).map_err(ProgramLowerError::Backend)?;
+        self.member(family, member).map_err(ProgramLowerError::Backend)
+    }
+
     fn wire_at(
         &mut self,
         _evaluator: &mut EncodingLowering<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {
-        self.member(family, index.clone()).map_err(crate::program::ProgramLowerError::Backend)
+        self.member(family, Int::evaluate(index.clone()))
+            .map_err(crate::program::ProgramLowerError::Backend)
     }
 
     fn rhs_at(
@@ -161,12 +180,30 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
         &mut self,
         evaluator: &mut EncodingLowering<'a>,
         family: &Self::WireFamily,
+        columns: usize,
     ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {
         use crate::program::ProgramLowerError;
-        crate::program::graph_sum(evaluator, Self::count(family), |index| {
+        let member = |index: Int| {
             let index = index.expression().map_err(ProgramLowerError::Dsl)?;
-            self.member(family, index).map_err(ProgramLowerError::Backend)
-        })
+            self.member(family, Int::evaluate(index)).map_err(ProgramLowerError::Backend)
+        };
+        if columns == 1 {
+            return crate::program::graph_sum(evaluator, Self::count(family), member);
+        }
+        let per_column = super::row_sum_block(&Self::count(family), columns)?;
+        crate::program::graph_column_sums(
+            evaluator,
+            (columns, per_column),
+            member,
+            |sum, column| {
+                let place = |entry| super::place_in_column(entry, columns, column);
+                RnsBggEncoding::new(
+                    RnsBggPublicKey::new(sum.wire(), map_matrix(sum.public_key.matrix, &place)),
+                    map_row(sum.row, &place),
+                    sum.public_payload.map(&place),
+                )
+            },
+        )
     }
 }
 
@@ -339,39 +376,40 @@ impl EncodingLowering<'_> {
         let inverse = ring.polynomial([IntExpr::constant(BigInt::from(inverse))]);
         let (family, offset) = match &values {
             LutEntries::Constant(values) => {
-                // The output monomial of entry `index`: the constant `v` or `X^(v stride)`.
-                let output_term = |index: usize| -> Result<Mat, RnsBggError> {
-                    Ok(match representation {
-                        crate::program::LutOutputRepresentation::Coefficient => {
-                            ring.polynomial([IntExpr::constant(BigInt::from(values[index]))])
-                        }
-                        crate::program::LutOutputRepresentation::Exponent(layout) => layout
-                            .mono(&ring, &BigInt::from(values[index]))
-                            .map_err(|_| RnsBggError::Lut)?,
-                    })
-                };
-                let mut terms = (0..width)
-                    .map(|index| {
-                        let left = output_term(index)?;
-                        let right = input_layout
-                            .mono(&ring, &-BigInt::from(index))
-                            .map_err(|_| RnsBggError::Lut)?
+                // Term `j` is `left(values[j]) * sigma(X^(-j stride))`. The values are read from
+                // one scalar index family (a `parallel` of `Int::evaluate`), and the terms are
+                // summed by one sequential loop over `j` whose monomials are products by runtime
+                // exponents, so the graph does not grow with the table width.
+                let outputs = mxx_dsl::parallel(IntExpr::constant(width), |index| {
+                    Ok(mxx_dsl::Int::evaluate(IntExpr::Select {
+                        selector: Box::new(index.expression()?),
+                        branches: values.iter().map(|value| IntExpr::constant(*value)).collect(),
+                    }))
+                })
+                .map_err(|_| RnsBggError::Lut)?;
+                let one = ring.polynomial([IntExpr::constant(1)]);
+                let input_stride = mxx_dsl::Int::constant(-BigInt::from(input_layout.stride()));
+                let sum =
+                    mxx_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
+                        let output = outputs.at(index.clone());
+                        let right = one
+                            .clone()
+                            .multiply_monomial(index.mul(input_stride.clone()))
                             .ring_automorphism(sigma.clone());
-                        Ok(left * right)
+                        let term = match representation {
+                            crate::program::LutOutputRepresentation::Coefficient => {
+                                output.lift_to_constant_polynomial(ring.matrix_type((1, 1))) * right
+                            }
+                            crate::program::LutOutputRepresentation::Exponent(layout) => right
+                                .multiply_monomial(
+                                    output
+                                        .mul(mxx_dsl::Int::constant(BigInt::from(layout.stride()))),
+                                ),
+                        };
+                        Ok(sum + term)
                     })
-                    .collect::<Result<Vec<_>, RnsBggError>>()?;
-                while terms.len() > 1 {
-                    let mut next = Vec::with_capacity(terms.len().div_ceil(2));
-                    let mut iterator = terms.into_iter();
-                    while let Some(left) = iterator.next() {
-                        next.push(match iterator.next() {
-                            Some(right) => left + right,
-                            None => left,
-                        });
-                    }
-                    terms = next;
-                }
-                return Ok(inverse * terms.pop().unwrap());
+                    .map_err(|_| RnsBggError::Lut)?;
+                return Ok(inverse * sum);
             }
             LutEntries::Graph { family, offset, .. } => (family, *offset),
         };

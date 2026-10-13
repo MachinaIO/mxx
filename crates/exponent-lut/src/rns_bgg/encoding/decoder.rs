@@ -130,16 +130,16 @@ mod tests {
     ) -> (crate::utils::DecoderSelection, Vec<crate::program_gadgets::pbc::PbcGeneratedKeyLayout>)
     {
         let generated = std::cell::RefCell::new(BTreeMap::new());
-        let layouts = |members: usize| {
+        let shapes = |members: usize| {
             let keys = crate::decoder::decoding::fixture::keys(members);
-            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect();
+            let shape = crate::decoder::decoding::fixture::shape(&keys);
             generated.borrow_mut().insert(members, keys);
-            Ok(layouts)
+            Ok(shape)
         };
         let decoder = crate::utils::DecoderRequest {
             output: input,
             profile: round_trip_profile(),
-            layouts: &layouts,
+            keys: &shapes,
             statistical_bits: read("STATISTICAL_BITS", 1),
             unmask_sigma: 4.578,
         };
@@ -268,11 +268,8 @@ mod tests {
             let smudge_program = declaration.smudge().program();
             let level = parameters.levels()[0].clone();
             let smudge_level = smudge_parameters.levels()[0].clone();
-            let selectors = declaration
-                .smudge()
-                .prf()
-                .selector_plaintexts::<DCRTPoly>(&smudge_level, &keys)
-                .unwrap();
+            let (selectors, tables) =
+                declaration.smudge().prf().key_inputs::<DCRTPoly>(&smudge_level, &keys).unwrap();
             let a = (0..4).map(|_| rand::random::<u32>() as usize % 8).collect::<Vec<_>>();
             let smudge_lhs =
                 declaration.smudge().prf().plaintext_inputs::<DCRTPoly>(&smudge_level, &a).unwrap();
@@ -326,7 +323,8 @@ mod tests {
             let static_payload = (!dynamic).then(|| sample_payload(&mut execution, &mut store));
 
             let no_rhs = PlaintextInputs::<RhsId, DCRTPoly>::new();
-            let mut smudge_preprocess = RnsPreprocessBuild::new(&smudge_parameters, context);
+            let mut smudge_preprocess =
+                RnsPreprocessBuild::new(&smudge_parameters, context).with_data(tables.clone());
             let mut source_preprocess = RnsPreprocessBuild::new(&parameters, context);
             if let Some(((source_setup, source_binding), (smudge_setup, smudge_binding))) = &setups
             {
@@ -341,7 +339,7 @@ mod tests {
                 .bind_rhs_inputs(
                     smudge_program,
                     &env,
-                    if dynamic { &no_rhs } else { &selectors },
+                    Some(if dynamic { &no_rhs } else { &selectors }),
                     static_payload
                         .as_ref()
                         .map(|payload| payload.at_level(&smudge_parameters, 0).unwrap())
@@ -395,7 +393,7 @@ mod tests {
                 .bind_lhs_inputs(
                     &smudge_inputs,
                     &env,
-                    &smudge_lhs,
+                    Some(&smudge_lhs),
                     &payload.at_level(&smudge_parameters, 0).unwrap(),
                     mask.as_ref()
                         .map(|mask| mask.at_level(&smudge_parameters, 0).unwrap())

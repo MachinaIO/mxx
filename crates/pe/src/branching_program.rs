@@ -250,8 +250,8 @@ impl PeClass {
             .transpose()
             .map_err(invalid)?;
         rhs.extend(attributes.map(|id| (id, ATTRIBUTE_COORDINATE)));
-        let reads = builder.data_family(self.max_steps).map_err(invalid)?;
-        let tables = builder.data_family(self.max_steps * width).map_err(invalid)?;
+        let reads = builder.data_family(self.max_steps, None).map_err(invalid)?;
+        let tables = builder.data_family(self.max_steps * width, None).map_err(invalid)?;
         let mut state = initial;
         for step in 0..self.max_steps {
             let selected = |family| Operand::Selected {

@@ -8,7 +8,7 @@ use crate::{
         simulation::AverageCaseConfig,
     },
     program::{ExponentLutProgram, Operand, WireId},
-    program_gadgets::{pbc::PbcPublicLayout, prf::SparseLwrPrfProfile},
+    program_gadgets::prf::{PrfKeyShape, SparseLwrPrfProfile},
     rns_bgg::{
         RhsMode, RnsBggDecoderNoise, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseTrace,
         RnsBggParameters, RnsBggPlanRequest, simulate_decoder_noise,
@@ -324,14 +324,14 @@ fn audit_planned(
 }
 
 /// A decoder for [`select_decoder_at_crt_depth`]: the decoded scalar output,
-/// the smudge PRF profile, the public layouts of `n` smudge members (one
-/// layout per member, with one bucket count for every `n`), the hiding
+/// the smudge PRF profile, the key shape of `n` smudge members (one key per
+/// member, with one bucket count for every `n`), the hiding
 /// target `statistical_bits` (`P^d > E 2^bits`) and the unmask trapdoor
 /// sigma.
 pub struct DecoderRequest<'a> {
     pub output: WireId,
     pub profile: SparseLwrPrfProfile,
-    pub layouts: &'a dyn Fn(usize) -> Result<Vec<PbcPublicLayout>, String>,
+    pub keys: &'a dyn Fn(usize) -> Result<PrfKeyShape, String>,
     pub statistical_bits: usize,
     pub unmask_sigma: f64,
 }
@@ -408,14 +408,14 @@ pub fn select_decoder_at_crt_depth(
         None
     };
     let declaration_with = |digits: usize| {
-        let layouts = (decoder.layouts)(coefficients * digits)?;
+        let keys = (decoder.keys)(coefficients * digits)?;
         let declaration = DecoderDeclaration::new(
             program,
             decoder.output,
             decoder.profile,
             coefficients,
             digits,
-            layouts,
+            keys,
             crate::decoder::decoding::DecoderTarget::Output,
         )
         .map_err(|error| to_string(&error))?;
@@ -533,7 +533,7 @@ fn fit_decoder(
                     .map_err(|error| to_string(&error))? !=
                     smudge_level
                 {
-                    return Err("smudge layouts change the smudge level".to_owned());
+                    return Err("smudge keys change the smudge level".to_owned());
                 }
                 let noise = simulate_decoder_noise(
                     parameters,

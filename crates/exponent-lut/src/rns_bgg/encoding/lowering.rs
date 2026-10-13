@@ -1174,6 +1174,74 @@ mod test {
         }
     }
 
+    /// A LUT reads the bit window of its input layout and keeps the exponent
+    /// bits above it: `X^(2^s e + N0 q)` maps to `X^(s' T[e] + N0 q)`, for a
+    /// window below the ring (`N0 < n`) and one reaching it (`N0 = n`), with
+    /// signed inputs and outputs.
+    #[test]
+    fn lut_coefficients_keep_the_exponent_bits_above_the_window() {
+        let level = DCRTPolyParams::new(16, 1, 17, 2, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let exponent = ExpLayout { stride_log2: 0, width_log2: 4 };
+        let output_layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let values = [1usize, 0, 3, 2];
+        let mut graph = DslContext::new("lut-window-arithmetic");
+        for input_layout in [
+            ExpLayout { stride_log2: 1, width_log2: 2 },
+            ExpLayout { stride_log2: 2, width_log2: 2 },
+        ] {
+            let window = 1usize << (input_layout.stride_log2 + input_layout.width_log2);
+            let sigmas = input_layout.automorphism_indices(16).unwrap();
+            for (e, output) in values.iter().copied().enumerate() {
+                for q in 0..32 / window {
+                    let m = (e << input_layout.stride_log2) + window * q;
+                    let monomial = exponent.mono(&ring, &BigInt::from(m)).unwrap();
+                    let mut actual = ring.zero((1, 1));
+                    for sigma in &sigmas {
+                        let coefficient = EncodingLowering::lut_coefficient(
+                            &parameters,
+                            0,
+                            input_layout,
+                            crate::program::LutOutputRepresentation::Exponent(output_layout),
+                            IntExpr::constant(*sigma),
+                            &values,
+                        )
+                        .unwrap();
+                        actual = actual + coefficient * monomial.clone().ring_automorphism(*sigma);
+                    }
+                    let expected =
+                        exponent.mono(&ring, &BigInt::from(output + window * q)).unwrap();
+                    graph = graph
+                        .output(format!("difference-{window}-{m}"), actual - expected)
+                        .unwrap();
+                }
+            }
+        }
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend([level]));
+        let mut store = MemoryArtifactStore::default();
+        let result = execute_graph(
+            StageGraph::new(graph.build().unwrap(), BTreeMap::new(), BTreeMap::new()),
+            &ParamEnv::default(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.outputs.len(), 4 * (32 / 8 + 32 / 16));
+        for (name, output) in &result.outputs {
+            let matrix = crate::test_support::full(output);
+            assert!(
+                matrix
+                    .entry(0, 0)
+                    .coeffs_biguints()
+                    .iter()
+                    .all(|value| *value == BigUint::from(0u8)),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn lut_coefficients_depend_on_values_not_only_width() {
         let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);

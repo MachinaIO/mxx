@@ -53,7 +53,7 @@ counters it totals, with `gadget_decomposed_words` the RNS residues decomposed i
 every one of the `depth * max_layer_width`
 slots is evaluated, active or not, and `select` evaluates every candidate. Its rustdoc lists the
 `MXX_KHE_RING_GSW_BGG_*` variables. It needs
-`lattice-estimator-cli` on `PATH` and about 40 GiB of host memory:
+`lattice-estimator-cli` on `PATH` and about 50 GiB of host memory:
 
 ```bash
 cargo test -r -p mxx-khe --features gpu --test test_gpu_ring_gsw_boolean_bgg

@@ -23,15 +23,15 @@ def parallel_generatedRoot_65 (_ : MxxRuntime.SampleTape) (_ : List Nat) (params
   let w_3_0 : Bool := decide (w_1_0 = w_2_0)
   parallel_generatedRoot_65.constraints_0 w_3_0 outputs
 
-abbrev parallel_sequential_generatedRoot_70_17.constraints_0 (w_16_0 : Fin 5435791071440480 → Int) (w_29_0 : Fin 5435791071440480 → Int) (w_38_0 : Fin 5435791071440480 → Int) (w_13_0 : Int) (w_20_0 : Int) (w_21_0 : Int) (w_30_0 : Int) (w_39_0 : Int) (w_45_0 : Bool) (w_190_0 : Bool) (w_191_0 : Bool) (w_201_0 : Bool) (outputs : Bool) : Prop :=
+abbrev parallel_sequential_generatedRoot_70_17.constraints_0 (w_16_0 : Fin 4817449462805760 → Int) (w_29_0 : Fin 4817449462805760 → Int) (w_38_0 : Fin 4817449462805760 → Int) (w_13_0 : Int) (w_20_0 : Int) (w_21_0 : Int) (w_30_0 : Int) (w_39_0 : Int) (w_45_0 : Bool) (w_190_0 : Bool) (w_191_0 : Bool) (w_201_0 : Bool) (outputs : Bool) : Prop :=
   0 ≤ w_20_0 ∧
-  w_20_0 < 5435791071440480 ∧
+  w_20_0 < 4817449462805760 ∧
   MxxRuntime.familyGetDynamic w_16_0 w_20_0 w_21_0 ∧
   0 ≤ w_20_0 ∧
-  w_20_0 < 5435791071440480 ∧
+  w_20_0 < 4817449462805760 ∧
   MxxRuntime.familyGetDynamic w_29_0 w_20_0 w_30_0 ∧
   0 ≤ w_20_0 ∧
-  w_20_0 < 5435791071440480 ∧
+  w_20_0 < 4817449462805760 ∧
   MxxRuntime.familyGetDynamic w_38_0 w_20_0 w_39_0 ∧
   0 ≤ w_13_0 ∧
   w_13_0 < 2 ∧
@@ -39,14 +39,14 @@ abbrev parallel_sequential_generatedRoot_70_17.constraints_0 (w_16_0 : Fin 54357
   MxxRuntime.select w_13_0 [w_45_0, w_190_0] w_191_0 ∧
   outputs = w_201_0
 
-def parallel_sequential_generatedRoot_70_17 (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : Bool × Int × (Fin 5435791071440480 → Int) × Int × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × Int × Bool × Unit) (outputs : Bool) : Prop :=
+def parallel_sequential_generatedRoot_70_17 (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : Bool × Int × (Fin 4817449462805760 → Int) × Int × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × Int × Bool × Unit) (outputs : Bool) : Prop :=
   let _params := params
   let w_2_0 : Bool := inputs.1
   let w_9_0 : Int := inputs.2.1
-  let w_16_0 : Fin 5435791071440480 → Int := inputs.2.2.1
+  let w_16_0 : Fin 4817449462805760 → Int := inputs.2.2.1
   let w_17_0 : Int := inputs.2.2.2.1
-  let w_29_0 : Fin 5435791071440480 → Int := inputs.2.2.2.2.1
-  let w_38_0 : Fin 5435791071440480 → Int := inputs.2.2.2.2.2.1
+  let w_29_0 : Fin 4817449462805760 → Int := inputs.2.2.2.2.1
+  let w_38_0 : Fin 4817449462805760 → Int := inputs.2.2.2.2.2.1
   let w_101_0 : Int := inputs.2.2.2.2.2.2.1
   let w_197_0 : Bool := inputs.2.2.2.2.2.2.2.1
   let w_0_0 : Bool := true
@@ -249,24 +249,24 @@ set_option genInjectivity false in
 set_option genSizeOf false in
 structure sequential_generatedRoot_70.Witness where
   w_3_0 : Int
-  w_17_0 : Fin 15057592995680 → Bool
+  w_17_0 : Fin 20072706095024 → Bool
 
-abbrev sequential_generatedRoot_70.constraints_0 (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_0_0 : Fin 15057592995680 → Bool) (w_7_0 : Int) (w_1_0 : Fin 361 → Int) (w_4_0 : Fin 5435791071440480 → Int) (w_5_0 : Fin 5435791071440480 → Int) (w_6_0 : Fin 5435791071440480 → Int) (w_2_0 : Int) (w_3_0 : Int) (w_16_0 : Bool) (w_17_0 : Fin 15057592995680 → Bool) (outputs : (Fin 15057592995680 → Bool) × Int × Unit) : Prop :=
+abbrev sequential_generatedRoot_70.constraints_0 (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_0_0 : Fin 20072706095024 → Bool) (w_7_0 : Int) (w_1_0 : Fin 240 → Int) (w_4_0 : Fin 4817449462805760 → Int) (w_5_0 : Fin 4817449462805760 → Int) (w_6_0 : Fin 4817449462805760 → Int) (w_2_0 : Int) (w_3_0 : Int) (w_16_0 : Bool) (w_17_0 : Fin 20072706095024 → Bool) (outputs : (Fin 20072706095024 → Bool) × Int × Unit) : Prop :=
   0 ≤ w_2_0 ∧
-  w_2_0 < 361 ∧
+  w_2_0 < 240 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_2_0 w_3_0 ∧
-  (params.«max_layer_width») = 15057592995680 ∧
-  (∀ i : Fin 15057592995680, parallel_sequential_generatedRoot_70_17 tape (path ++ [17, i.val]) params i_0 i ((w_0_0 i), (w_3_0, (w_4_0, (w_2_0, (w_5_0, (w_6_0, (w_7_0, (w_16_0, ())))))))) (w_17_0 i)) ∧
+  (params.«max_layer_width») = 20072706095024 ∧
+  (∀ i : Fin 20072706095024, parallel_sequential_generatedRoot_70_17 tape (path ++ [17, i.val]) params i_0 i ((w_0_0 i), (w_3_0, (w_4_0, (w_2_0, (w_5_0, (w_6_0, (w_7_0, (w_16_0, ())))))))) (w_17_0 i)) ∧
   outputs = (w_17_0, (w_3_0, ()))
 
-abbrev sequential_generatedRoot_70.body (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15057592995680 → Bool) × Int × (Fin 361 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × Int × Unit) (outputs : (Fin 15057592995680 → Bool) × Int × Unit) (witness : sequential_generatedRoot_70.Witness) : Prop :=
+abbrev sequential_generatedRoot_70.body (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 20072706095024 → Bool) × Int × (Fin 240 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × Int × Unit) (outputs : (Fin 20072706095024 → Bool) × Int × Unit) (witness : sequential_generatedRoot_70.Witness) : Prop :=
   let _params := params
-  let w_0_0 : Fin 15057592995680 → Bool := inputs.1
+  let w_0_0 : Fin 20072706095024 → Bool := inputs.1
   let w_7_0 : Int := inputs.2.1
-  let w_1_0 : Fin 361 → Int := inputs.2.2.1
-  let w_4_0 : Fin 5435791071440480 → Int := inputs.2.2.2.1
-  let w_5_0 : Fin 5435791071440480 → Int := inputs.2.2.2.2.1
-  let w_6_0 : Fin 5435791071440480 → Int := inputs.2.2.2.2.2.1
+  let w_1_0 : Fin 240 → Int := inputs.2.2.1
+  let w_4_0 : Fin 4817449462805760 → Int := inputs.2.2.2.1
+  let w_5_0 : Fin 4817449462805760 → Int := inputs.2.2.2.2.1
+  let w_6_0 : Fin 4817449462805760 → Int := inputs.2.2.2.2.2.1
   let w_11_0 : Int := inputs.2.2.2.2.2.2.1
   let w_2_0 : Int := (Int.ofNat i_0)
   let w_3_0 := witness.w_3_0
@@ -281,20 +281,20 @@ abbrev sequential_generatedRoot_70.body (tape : MxxRuntime.SampleTape) (path : L
   let w_17_0 := witness.w_17_0
   sequential_generatedRoot_70.constraints_0 tape path params i_0 w_0_0 w_7_0 w_1_0 w_4_0 w_5_0 w_6_0 w_2_0 w_3_0 w_16_0 w_17_0 outputs
 
-def sequential_generatedRoot_70 (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15057592995680 → Bool) × Int × (Fin 361 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × Int × Unit) (outputs : (Fin 15057592995680 → Bool) × Int × Unit) : Prop :=
+def sequential_generatedRoot_70 (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 20072706095024 → Bool) × Int × (Fin 240 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × Int × Unit) (outputs : (Fin 20072706095024 → Bool) × Int × Unit) : Prop :=
   ∃ witness : sequential_generatedRoot_70.Witness,
     sequential_generatedRoot_70.body tape path params i_0 inputs outputs witness
 
-abbrev sequential_generatedRoot_71.constraints_0 (w_2_0 : Fin 15057592995680 → Bool) (w_3_0 : Int) (w_4_0 : Bool) (w_8_0 : Bool) (outputs : Bool) : Prop :=
+abbrev sequential_generatedRoot_71.constraints_0 (w_2_0 : Fin 20072706095024 → Bool) (w_3_0 : Int) (w_4_0 : Bool) (w_8_0 : Bool) (outputs : Bool) : Prop :=
   0 ≤ w_3_0 ∧
-  w_3_0 < 15057592995680 ∧
+  w_3_0 < 20072706095024 ∧
   MxxRuntime.familyGetDynamic w_2_0 w_3_0 w_4_0 ∧
   outputs = w_8_0
 
-def sequential_generatedRoot_71 (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (inputs : Bool × (Fin 15057592995680 → Bool) × Unit) (outputs : Bool) : Prop :=
+def sequential_generatedRoot_71 (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (inputs : Bool × (Fin 20072706095024 → Bool) × Unit) (outputs : Bool) : Prop :=
   let _params := params
   let w_0_0 : Bool := inputs.1
-  let w_2_0 : Fin 15057592995680 → Bool := inputs.2.1
+  let w_2_0 : Fin 20072706095024 → Bool := inputs.2.1
   let w_1_0 : Int := if w_0_0 then 1 else 0
   let w_3_0 : Int := (Int.ofNat i_0)
   ∃ (w_4_0 : Bool),
@@ -307,28 +307,28 @@ def sequential_generatedRoot_71 (_ : MxxRuntime.SampleTape) (_ : List Nat) (para
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Witness where
-  w_65_0 : Fin 15057592995680 → Bool
-  w_70_0 : Fin 15057592995680 → Bool
+  w_65_0 : Fin 20072706095024 → Bool
+  w_70_0 : Fin 20072706095024 → Bool
   w_70_1 : Int
   w_71_0 : Bool
   w_79_0 : Int
 
-abbrev generatedRoot.constraints_0 (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_66_0 : Fin 361 → Int) (w_67_0 : Fin 5435791071440480 → Int) (w_68_0 : Fin 5435791071440480 → Int) (w_69_0 : Fin 5435791071440480 → Int) (w_78_0 : Fin 1 → Int) (w_27_0 : Int) (w_47_0 : Int) (w_64_0 : Bool) (w_65_0 : Fin 15057592995680 → Bool) (w_70_0 : Fin 15057592995680 → Bool) (w_70_1 : Int) (w_71_0 : Bool) (w_79_0 : Int) (w_92_0 : Bool) (outputs : Bool) : Prop :=
-  (params.«max_layer_width») = 15057592995680 ∧
-  (∀ i : Fin 15057592995680, parallel_generatedRoot_65 tape (path ++ [65, i.val]) params i () (w_65_0 i)) ∧
+abbrev generatedRoot.constraints_0 (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_66_0 : Fin 240 → Int) (w_67_0 : Fin 4817449462805760 → Int) (w_68_0 : Fin 4817449462805760 → Int) (w_69_0 : Fin 4817449462805760 → Int) (w_78_0 : Fin 1 → Int) (w_27_0 : Int) (w_47_0 : Int) (w_64_0 : Bool) (w_65_0 : Fin 20072706095024 → Bool) (w_70_0 : Fin 20072706095024 → Bool) (w_70_1 : Int) (w_71_0 : Bool) (w_79_0 : Int) (w_92_0 : Bool) (outputs : Bool) : Prop :=
+  (params.«max_layer_width») = 20072706095024 ∧
+  (∀ i : Fin 20072706095024, parallel_generatedRoot_65 tape (path ++ [65, i.val]) params i () (w_65_0 i)) ∧
   0 ≤ (params.«depth») ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : (Fin 15057592995680 → Bool) × Int × Unit) => sequential_generatedRoot_70 tape (path ++ [70, i]) params i (current.1, (current.2.1, (w_66_0, (w_67_0, (w_68_0, (w_69_0, (w_47_0, ()))))))) next) (Int.toNat (params.«depth»)) (w_65_0, (w_27_0, ())) (w_70_0, (w_70_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : (Fin 20072706095024 → Bool) × Int × Unit) => sequential_generatedRoot_70 tape (path ++ [70, i]) params i (current.1, (current.2.1, (w_66_0, (w_67_0, (w_68_0, (w_69_0, (w_47_0, ()))))))) next) (Int.toNat (params.«depth»)) (w_65_0, (w_27_0, ())) (w_70_0, (w_70_1, ())) ∧
   0 ≤ (params.«max_layer_width») ∧
   MxxIR.IterRuns (fun (i : Nat) (current next : Bool) => sequential_generatedRoot_71 tape (path ++ [71, i]) params i (current, (w_70_0, ())) next) (Int.toNat (params.«max_layer_width»)) w_64_0 w_71_0 ∧
   MxxRuntime.familyGetStatic w_78_0 (0) w_79_0 ∧
   outputs = w_92_0
 
-abbrev generatedRoot.body (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 361 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × (Fin 1 → Int) × Unit) (outputs : Bool) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 240 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × (Fin 1 → Int) × Unit) (outputs : Bool) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
-  let w_66_0 : Fin 361 → Int := inputs.1
-  let w_67_0 : Fin 5435791071440480 → Int := inputs.2.1
-  let w_68_0 : Fin 5435791071440480 → Int := inputs.2.2.1
-  let w_69_0 : Fin 5435791071440480 → Int := inputs.2.2.2.1
+  let w_66_0 : Fin 240 → Int := inputs.1
+  let w_67_0 : Fin 4817449462805760 → Int := inputs.2.1
+  let w_68_0 : Fin 4817449462805760 → Int := inputs.2.2.1
+  let w_69_0 : Fin 4817449462805760 → Int := inputs.2.2.2.1
   let w_78_0 : Fin 1 → Int := inputs.2.2.2.2.1
   let w_0_0 : Bool := true
   let w_1_0 : Int := if w_0_0 then 1 else 0
@@ -421,7 +421,7 @@ abbrev generatedRoot.body (tape : MxxRuntime.SampleTape) (path : List Nat) (para
   let w_92_0 : Bool := decide (w_90_0 = w_91_0)
   generatedRoot.constraints_0 tape path params w_66_0 w_67_0 w_68_0 w_69_0 w_78_0 w_27_0 w_47_0 w_64_0 w_65_0 w_70_0 w_70_1 w_71_0 w_79_0 w_92_0 outputs
 
-def generatedRoot (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 361 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × (Fin 5435791071440480 → Int) × (Fin 1 → Int) × Unit) (outputs : Bool) : Prop :=
+def generatedRoot (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 240 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × (Fin 4817449462805760 → Int) × (Fin 1 → Int) × Unit) (outputs : Bool) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body tape path params inputs outputs witness
 

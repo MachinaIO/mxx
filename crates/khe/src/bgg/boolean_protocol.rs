@@ -772,6 +772,7 @@ mod tests {
         let digit_polynomials = slots * m * m + m;
         BTreeMap::from([
             ("gadget_decompositions".to_owned(), inverse_polys),
+            ("gadget_decomposed_words".to_owned(), inverse_polys * n * crt_depth),
             ("gadget_digit_coefficients".to_owned(), digit_polynomials * n),
             ("gadget_digit_polynomials".to_owned(), digit_polynomials),
             ("mul64_instructions".to_owned(), wide_mul + 3 * shoup + mulmod),

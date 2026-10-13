@@ -15,8 +15,11 @@
 //! and whose Ring-LWE estimate (`lattice-estimator-cli`, which must be on `PATH` with its Sage
 //! environment) reaches the security target, printing the selection as a parameter row and the
 //! GPU work one evaluation of the row would issue, predicted from the evaluate graph without a
-//! device (`mxx_backends::gpu_cost_model`, one `RING_GSW_BGG_GPU_COUNT` line per counter). With
-//! `PARAMETER_ID` it instead checks that row of `lean/ring_gsw_bgg/parameters.csv` against the
+//! device (`mxx_backends::gpu_cost_model`, one `RING_GSW_BGG_GPU_COUNT` line per counter), and the
+//! sizes of a `1 x log_base q` public key or ciphertext, a `2 x log_base q` matrix, and a
+//! `(log_base q + 2) x 1` key preimage over that ring (`RING_GSW_BGG_SIZE`), with `log2 q`, the
+//! ring dimension, `C = 2 (log_base q)^2`, and `|1 x log_base q| C` in bits (`RING_GSW_BGG_C`).
+//! With `PARAMETER_ID` it instead checks that row of `lean/ring_gsw_bgg/parameters.csv` against the
 //! lowered circuit, the simulation, and the estimate, and exports the protocol's average-case
 //! correctness claim to `lean/ring_gsw_bgg/<id>/generated`. The protocol's execution is covered by
 //! the CPU unit tests of `mxx_khe::bgg::boolean_protocol`: the GPU runtime cannot yet carry a
@@ -33,9 +36,10 @@
 //! | `CRT_BITS`, `MAX_BASE_BITS`, `MAX_CRT_DEPTH` | 60, 20, 512 | BGG+ CRT width, gadget bases `2^1..2^MAX`, depth limit |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 16, 21 | BGG+ ring dimensions |
 //! | `SECURITY_BITS` | 128 | Ring-LWE security target |
+//! | `TRAPDOOR_SIGMA` | 4.578 | TrapGen width of the key preimage whose size is printed |
 //! | `PARAMETER_ID` | unset | check and export this row of the parameter table |
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, ToPrimitive};
 use mxx_backends::{
     gpu_cost_model::gpu_operation_counts,
     lattice_estimator::lattice_security_bits,
@@ -43,9 +47,9 @@ use mxx_backends::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
-    sampler::bounds::hard_cutoff_from_sigma_bound,
+    sampler::bounds::{default_preimage_cutoff, hard_cutoff_from_sigma_bound},
 };
-use mxx_ir_core::Rational;
+use mxx_ir_core::{Rational, types::TrapdoorInstantiation};
 use mxx_khe::{
     bgg::boolean_protocol::{
         BooleanBggProtocolGraphs, BooleanBggProtocolParameters, SECRET_DIMENSION,
@@ -199,6 +203,52 @@ impl ParameterRow {
     }
 }
 
+/// The size of one object over the BGG+ ring: `packed_bits` at `ceil(log2 q)` bits per `R_q`
+/// coefficient (`ceil(log2(2B + 1))` for a coefficient bounded by `B`), and `stored_bytes` as
+/// the backends store it, one 64-bit word per CRT residue.
+struct ObjectSize {
+    packed_bits: u128,
+    stored_bytes: u128,
+}
+
+/// The sizes, with `D = log_base q` gadget digits, of a `1 x D` matrix over `R_q` (a public key
+/// or a ciphertext), of a `2 x D` matrix, and of the `(D + 2) x 1` key preimage of a computational
+/// trapdoor `[a | 1 | G - (a R + E)]`, whose coefficients are bounded by the default preimage
+/// cutoff `floor(6.5 s_min)` of a TrapGen width `trapdoor_sigma`.
+fn object_sizes(
+    row: &ParameterRow,
+    modulus: &BigUint,
+    digit_count: usize,
+    trapdoor_sigma: f64,
+) -> Vec<(&'static str, ObjectSize)> {
+    let n = u128::from(row.ring_dimension);
+    let (digits, depth) = (digit_count as u128, row.crt_depth as u128);
+    let element = |entries: u128| ObjectSize {
+        packed_bits: entries * n * modulus.bits() as u128,
+        stored_bytes: entries * n * depth * 8,
+    };
+    let cutoff = default_preimage_cutoff(
+        row.ring_dimension,
+        1,
+        digit_count,
+        1u32 << row.base_bits,
+        trapdoor_sigma,
+        TrapdoorInstantiation::Computational,
+    )
+    .expect("valid trapdoor parameters");
+    let key_entries = digits + 2;
+    let key = ObjectSize {
+        packed_bits: key_entries * n * (&cutoff * 2u8 + 1u8).bits() as u128,
+        stored_bytes: key_entries * n * depth * 8,
+    };
+    println!("RING_GSW_BGG_KEY_CUTOFF {cutoff}");
+    vec![
+        ("public_key_or_ciphertext_1xD", element(digits)),
+        ("matrix_2xD", element(2 * digits)),
+        ("secret_key_preimage_(D+2)x1", key),
+    ]
+}
+
 #[test]
 fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     let fhe_ring_dimension = env_usize("FHE_RING_DIMENSION", 2048) as u32;
@@ -326,6 +376,25 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     for (name, count) in &counts {
         println!("RING_GSW_BGG_GPU_COUNT {name}={count}");
     }
+    let trapdoor_sigma = env_decimal("TRAPDOOR_SIGMA", "4.578").to_f64().unwrap();
+    let sizes = object_sizes(&row, &modulus, noise.digit_count, trapdoor_sigma);
+    for (name, size) in &sizes {
+        println!(
+            "RING_GSW_BGG_SIZE {name} packed_bytes={} stored_bytes={}",
+            size.packed_bits.div_ceil(8),
+            size.stored_bytes
+        );
+    }
+    // C = 2 D^2 for D = log_base q gadget digits; the scaled size is |1 x D| C.
+    println!("RING_GSW_BGG_LOG2_Q {}", modulus.bits());
+    println!("RING_GSW_BGG_RING_DIMENSION {}", row.ring_dimension);
+    let c = 2 * (noise.digit_count as u128).pow(2);
+    let row_matrix = &sizes[0].1;
+    println!(
+        "RING_GSW_BGG_C c={c} packed_bits_times_c={} stored_bits_times_c={}",
+        row_matrix.packed_bits * c,
+        row_matrix.stored_bytes * 8 * c
+    );
     if env_string("PARAMETER_ID").is_none() {
         return;
     }

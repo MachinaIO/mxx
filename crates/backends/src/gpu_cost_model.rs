@@ -15,6 +15,7 @@
 //! | `wide_mod_calls` | `raw_wide_mod` calls of that kernel (a 128-bit `%`, a 64-bit `%`, or nothing) |
 //! | `mulmod_u64` | `mul_mod_u64` calls of the gadget-scale, 1x1-scalar, scale, and tensor kernels |
 //! | `gadget_decompositions` | polynomials given to `GadgetDecompose` |
+//! | `gadget_decomposed_words` | 64-bit CRT residues it decomposes, one per kept limb of every coefficient |
 //! | `gadget_digit_polynomials`, `gadget_digit_coefficients` | digits it writes (shift, mask, and compare only) |
 //! | `mul64_instructions` | `wide_mul + 3 * shoup_mul + mulmod_u64`, a weighted operation count |
 //! | `unmodeled(<kind>)` | matrix-valued nodes whose work is not counted |
@@ -410,8 +411,9 @@ impl Model<'_> {
                 let form = self.values[input].form;
                 fresh(self, wires, form);
             }
-            NodeKind::GadgetDecompose { .. } => {
-                // `lower_gadget_decompose`: shifts and masks of the coefficient domain.
+            NodeKind::GadgetDecompose { base, small, digit_count } => {
+                // `lower_gadget_decompose`: shifts and masks of the coefficient domain. Each kept
+                // CRT residue of every coefficient, a 64-bit word, is decomposed on its own.
                 let source = argument(wires, 0)?;
                 let source = self.need_coeff(source)?;
                 let (polys, _) =
@@ -419,7 +421,22 @@ impl Model<'_> {
                 let output = output_ty()?;
                 let (digits, ring) = layout(&output).ok_or("GPU cost model: no digits")?;
                 let n = u128::from(ring.ring_dimension());
+                let evaluate = |expression: &mxx_ir_core::IntExpr| {
+                    expression.evaluate(env).ok().and_then(|value| value.to_u128())
+                };
+                let (base, digit_count) = evaluate(base)
+                    .zip(evaluate(digit_count))
+                    .ok_or("GPU cost model: an invalid gadget base or digit count")?;
+                if !base.is_power_of_two() || base < 2 {
+                    return Err("GPU cost model: a gadget base is not a power of two".into());
+                }
+                let bits = ring.crt_moduli().iter().map(|q| 64 - q.leading_zeros()).max();
+                let per_limb = u128::from(bits.unwrap_or(0)).div_ceil(u128::from(base.ilog2()));
+                // A regular decomposition keeps the first `digit_count / per_limb` limbs
+                // (`gadget_dropped_moduli`); a small one decomposes every limb.
+                let kept = if *small { ring.crt_depth() as u128 } else { digit_count / per_limb };
                 self.charge("gadget_decompositions", polys)?;
+                self.charge("gadget_decomposed_words", polys * n * kept)?;
                 self.charge("gadget_digit_polynomials", digits)?;
                 self.charge("gadget_digit_coefficients", digits * n)?;
                 fresh(self, wires, Form::Compact);
@@ -847,6 +864,8 @@ mod tests {
         assert_eq!(get(&digits, "ntt_inverse"), 0);
         assert_eq!(get(&digits, "ntt_forward"), 34 * 2);
         assert_eq!(get(&digits, "gadget_digit_coefficients"), 34 * 8);
+        // Two 33-bit limbs of 17 base-4 digits each: every coefficient decomposes two residues.
+        assert_eq!(get(&digits, "gadget_decomposed_words"), 8 * 2);
     }
 
     #[test]

@@ -550,6 +550,14 @@ mod tests {
             self.luts += 1;
             Ok(result)
         }
+        fn mul_small_constant(
+            &mut self,
+            _: &usize,
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<usize, ClearError> {
+            Err(ClearError("the AIR step has no small constants"))
+        }
     }
 
     impl ProgramLoweringContext for Clear {
@@ -564,10 +572,23 @@ mod tests {
         type WireFamily = ();
         type RhsFamily = ();
 
-        fn wire_at(&mut self, _: &(), _: &IntExpr) -> Result<usize, ProgramLowerError<ClearError>> {
+        fn wire_at(
+            &mut self,
+            _: &mut Clear,
+            _: &(),
+            _: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no families")))
         }
         fn rhs_at(&mut self, _: &(), _: &IntExpr) -> Result<(), ProgramLowerError<ClearError>> {
+            Err(ProgramLowerError::Backend(ClearError("the AIR step has no RHS")))
+        }
+        fn rhs_selected(
+            &mut self,
+            _: &(),
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<(), ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no RHS")))
         }
         fn parallel(

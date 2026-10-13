@@ -11,6 +11,7 @@ mod encoding;
 pub(crate) mod gpu;
 mod noise;
 mod public_key;
+mod public_lut;
 mod refresh;
 mod setup;
 mod workload;

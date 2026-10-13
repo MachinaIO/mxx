@@ -403,8 +403,10 @@ impl EncodingLowering<'_> {
     /// Evaluate a public LUT payload with the same Walsh/automorphism
     /// coefficients used by the online evaluation encoding.  The payload is public, so
     /// the complete evaluation can remain a graph expression; private and
-    /// unknown payloads never enter this path. It is the one step of the
-    /// online evaluation that reads the table's values.
+    /// unknown payloads never enter this path. With the branch coefficients
+    /// of the public LUT itself, it is what the online evaluation reads the
+    /// table's values (constants or Program data) for. A public LUT's output
+    /// is at the next level in either representation.
     fn lut_public_payload(
         &self,
         level: usize,
@@ -414,19 +416,14 @@ impl EncodingLowering<'_> {
         let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
         let input_layout = table.input_layout();
         input_layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        let output_level = if table.output_representation().is_coefficient() {
-            level
-        } else {
-            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?
-        };
+        let output_level =
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let output_ring = self.parameters.ring(output_level)?;
         let payload = checked_modulus_convert(payload, &output_ring)?;
         let sigmas =
             input_layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         // The output payload is computed in the clear, from the values.
-        let values = table
-            .values()
-            .ok_or(RnsBggError::Binding("the values of a LUT on a public payload are withheld"))?;
+        let values = self.public_lut_entries(table)?;
         // One loop body over the automorphism indices, as preprocessing builds
         // its switching ciphertexts, so the graph does not grow with the
         // square of the table width.
@@ -441,13 +438,27 @@ impl EncodingLowering<'_> {
                 input_layout,
                 table.output_representation(),
                 sigma.clone(),
-                values,
+                values.clone(),
             )
             .map_err(|_| DslError::Schema)?;
             Ok(coefficient * payload.clone().ring_automorphism(sigma))
         })
         .map_err(graph)?;
         crate::utils::balanced_sum_family(terms, |lhs, rhs| lhs + rhs).map_err(graph)
+    }
+
+    /// The output values of a LUT on a public payload: its constants or its
+    /// window of the bound Program data. Withheld constants are rejected.
+    pub(super) fn public_lut_entries<'t>(
+        &self,
+        table: &'t LutTable,
+    ) -> Result<crate::rns_bgg::dynamic::LutEntries<'t>, RnsBggError> {
+        if !table.has_values() {
+            return Err(RnsBggError::Binding(
+                "the values of a LUT on a public payload are withheld",
+            ));
+        }
+        crate::rns_bgg::dynamic::lut_entries(table, &self.data)
     }
 
     pub(super) fn site(&self) -> Result<&LoweringSite, RnsBggError> {
@@ -502,32 +513,65 @@ impl EncodingLowering<'_> {
 
     /// The Static material of LUT `lut_id` evaluated at `level`: the one
     /// imported where the Program was bound for a LUT in a family body,
-    /// otherwise imported here.
+    /// otherwise imported here. A LUT on a public payload reads only the
+    /// helpers (`switching` false), so its material may hold no switching
+    /// ciphertexts; a private use of such a cached entry imports them in its
+    /// own scope, which is the root scope (a private use in a family body
+    /// makes the root import complete, see [`Self::import_body_lut_material`]).
     fn lut_material(
         &self,
         level: usize,
         lut_id: crate::program::LutId,
         table: &LutTable,
+        switching: bool,
     ) -> Result<super::LutMaterial, RnsBggError> {
         if let Some(material) = self.lut_material.get(&(level, lut_id)) {
-            return Ok(material.clone());
+            if !switching || !material.0.is_empty() {
+                return Ok(material.clone());
+            }
+            let (switching, _) = self.lut_switching(level, lut_id, table)?;
+            return Ok((switching, material.1.clone(), material.2.clone()));
         }
-        let (switching, sigmas) = self.lut_switching(level, lut_id, table)?;
+        let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
+        let sigmas = table
+            .input_layout()
+            .automorphism_indices(ring_dimension)
+            .map_err(|_| RnsBggError::Lut)?;
+        let switching =
+            if switching { self.lut_switching(level, lut_id, table)?.0 } else { Vec::new() };
         let helper = self.lut_helpers(level, table, sigmas.len())?;
         Ok((switching, sigmas, helper))
     }
 
     /// Import, at root scope, the Static material of every LUT in a family
     /// body (see [`Self::lut_material`]); Dynamic LUTs read setup packages.
+    /// One entry serves every use of a LUT at a level, so the uses are
+    /// folded first: the entry holds the switching ciphertexts if any use
+    /// has a private payload, and only the helpers otherwise.
     pub(super) fn import_body_lut_material(&mut self) -> Result<(), RnsBggError> {
         if self.parameters.rhs_mode() == RhsMode::Dynamic {
             return Ok(());
         }
         let luts = self.program.encryption_inputs().luts().to_vec();
+        let mut order = Vec::new();
+        let mut uses = BTreeMap::<(usize, crate::program::LutId), bool>::new();
         for (input, lut_id) in self.program.family_body_luts() {
             let level = self.workload.level(input)?;
+            let private = self
+                .program
+                .wire_knowledge(input)
+                .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
+                AttributeKnowledge::PrivatePayload;
+            let switching = uses.entry((level, lut_id)).or_insert_with(|| {
+                order.push((level, lut_id));
+                false
+            });
+            *switching |= private;
+        }
+        // Import in body order, once per LUT and level.
+        for (level, lut_id) in order {
             let table = luts.get(lut_id.0 as usize).ok_or(RnsBggError::Lut)?;
-            let material = self.lut_material(level, lut_id, table)?;
+            let material = self.lut_material(level, lut_id, table, uses[&(level, lut_id)])?;
             self.lut_material.insert((level, lut_id), material);
         }
         Ok(())
@@ -829,21 +873,26 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         ))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
-        if self
+        let public = self
             .program
             .wire_knowledge(input.wire())
             .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
-            AttributeKnowledge::PublicPayload
-        {
-            return Err(RnsBggError::Binding("RNS-BGG LUT requires a private input"));
-        }
+            AttributeKnowledge::PublicPayload;
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
+        if public &&
+            self.decoder_smudge
+                .as_ref()
+                .is_some_and(|declaration| declaration.smudge().lut() == lut_id)
+        {
+            return Err(RnsBggError::Binding("a decoder smudge LUT needs a private input"));
+        }
         let level = self.workload.level(input.wire())?;
         let output = self.site()?.output;
-        let (row, public_key) = if self.parameters.rhs_mode() == RhsMode::Dynamic {
-            self.dynamic_lut(input, table)?
-        } else {
-            self.static_lut(input, lut_id, level, table)?
+        let (row, public_key) = match (self.parameters.rhs_mode(), public) {
+            (RhsMode::Dynamic, false) => self.dynamic_lut(input, table)?,
+            (RhsMode::Dynamic, true) => self.dynamic_public_lut(input, table)?,
+            (RhsMode::Static, false) => self.static_lut(input, lut_id, level, table)?,
+            (RhsMode::Static, true) => self.static_public_lut(input, lut_id, level, table)?,
         };
         self.finish_lut(input, table, lut_id, level, output, row, public_key)
     }
@@ -860,7 +909,7 @@ impl EncodingLowering<'_> {
         level: usize,
         table: &LutTable,
     ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
-        let (switching, sigmas, helper) = self.lut_material(level, lut_id, table)?;
+        let (switching, sigmas, helper) = self.lut_material(level, lut_id, table, true)?;
         let columns = self.parameters.lut_output_columns(
             level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
             table.output_representation(),
@@ -912,6 +961,46 @@ impl EncodingLowering<'_> {
             branch(Int::constant(last), sums, b_last).map_err(graph)?
         };
         Ok((row, public_key))
+    }
+
+    /// The Static LUT of a public `input` (see
+    /// [`crate::rns_bgg::public_lut::static_public_lut`]), before the one
+    /// ModDown in [`Self::finish_lut`]. Only the helpers are read; there is
+    /// no switching ciphertext.
+    fn static_public_lut(
+        &self,
+        input: &RnsBggEncoding,
+        lut_id: crate::program::LutId,
+        level: usize,
+        table: &LutTable,
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let (_, _, helpers) = self.lut_material(level, lut_id, table, false)?;
+        let (row, key) = crate::rns_bgg::public_lut::static_public_lut(
+            self.parameters,
+            self.hash_key.clone(),
+            level,
+            table,
+            self.public_lut_entries(table)?,
+            (Some(input.row.clone()), input.public_key.matrix.clone()),
+            Some(self.public_lut_payload_input(input, level)?),
+            Some(&helpers),
+        )?;
+        Ok((row.ok_or(RnsBggError::Lut)?, key))
+    }
+
+    /// The public payload of a public LUT `input` in the ring of `level`.
+    pub(super) fn public_lut_payload_input(
+        &self,
+        input: &RnsBggEncoding,
+        level: usize,
+    ) -> Result<Mat, RnsBggError> {
+        checked_modulus_convert(
+            input
+                .public_payload
+                .clone()
+                .ok_or(RnsBggError::Binding("public LUT input payload missing"))?,
+            &self.parameters.ring(level)?,
+        )
     }
 
     /// The common tail of a LUT: a decoder smudge member's transform, the
@@ -1162,6 +1251,7 @@ mod test {
                 artifact_prefix: None,
                 rhs_companions: BTreeMap::new(),
                 lut_material: BTreeMap::new(),
+                data: BTreeMap::new(),
                 output_use: RnsOutputUse::default(),
                 dynamic: None,
                 current_site: Some(LoweringSite {
@@ -1231,6 +1321,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1378,6 +1469,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1450,6 +1542,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: Some(LoweringSite {
@@ -1527,6 +1620,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1678,6 +1772,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: Some(LoweringSite {
@@ -1871,6 +1966,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1900,20 +1996,31 @@ mod test {
     }
 
     #[test]
-    fn public_lut_input_is_rejected_before_payload_propagation() {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let table = LutTable::unary(
-            2,
-            ExpLayout { stride_log2: 0, width_log2: 1 },
-            2,
-            vec![0, 1],
-            crate::program::LutOutputRepresentation::Coefficient,
-        )
-        .unwrap();
-        let lut = builder.register_lut(table.clone()).unwrap();
-        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
-        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
-        assert!(RnsBggDerivedWorkload::from_program(&program).is_err());
+    fn coefficient_lut_level_follows_input_knowledge() {
+        // A private coefficient output stays at its level until it is
+        // finalized; a public one is a finished encoding at the next level.
+        for (knowledge, level) in
+            [(AttributeKnowledge::PrivatePayload, 0), (AttributeKnowledge::PublicPayload, 1)]
+        {
+            let mut builder = crate::program::ExponentLutProgramBuilder::new();
+            let input = builder.input(knowledge).unwrap();
+            let table = LutTable::unary(
+                2,
+                ExpLayout { stride_log2: 0, width_log2: 1 },
+                2,
+                vec![0, 1],
+                crate::program::LutOutputRepresentation::Coefficient,
+            )
+            .unwrap();
+            let lut = builder.register_lut(table).unwrap();
+            let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+            assert_eq!(workload.level(output).unwrap(), level, "{knowledge:?}");
+            assert_eq!(
+                program.wire_is_coefficient_output(output).unwrap(),
+                knowledge == AttributeKnowledge::PrivatePayload
+            );
+        }
     }
 }

@@ -513,12 +513,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_key,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
                 setup,
                 binding,
                 automorphisms: None,
-                data: BTreeMap::new(),
             }),
         };
         if evaluator.dynamic.is_some() {
@@ -1180,12 +1180,12 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             hash_key,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data,
             output_use: self.output_use,
             dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
                 setup,
                 binding,
                 automorphisms: None,
-                data,
             }),
         };
         if evaluator.dynamic.is_some() {

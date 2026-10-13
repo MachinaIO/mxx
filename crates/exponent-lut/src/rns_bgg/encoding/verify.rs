@@ -958,6 +958,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: None,
@@ -1162,13 +1163,20 @@ mod test {
     /// Preprocess, encrypt and evaluate `program` with the private scalar
     /// input bound to `input` under Static parameters, and return the online
     /// result with the payload secret and the stage mask. The online
-    /// evaluation receives the Program without its LUT values.
+    /// evaluation receives the Program without its LUT values if
+    /// `withhold_values` (a LUT on a public payload needs them), and
+    /// `observe` sees its graph. Preprocessing and online evaluation are
+    /// given the Program data `data`.
+    #[allow(clippy::too_many_arguments)]
     fn run_without_rhs(
         parameters: &RnsBggParameters,
         program: &ExponentLutProgram,
+        data: &crate::program::ProgramData,
+        withhold_values: bool,
         lhs: &crate::api::PlaintextInputs<WireId, DCRTPoly>,
         execution: &mut mxx_backends::authority::CpuExecution,
         store: &mut MemoryArtifactStore,
+        observe: impl FnOnce(&mxx_ir_core::ValidatedGraph),
     ) -> (StageOutputs, RnsBggPayloadSecret, RnsBggMaskSecret) {
         let hash_key: [u8; 32] = rand::random();
         let context: [u8; 32] = rand::random();
@@ -1181,7 +1189,7 @@ mod test {
             &crate::api::PlaintextInputs::<RhsId, DCRTPoly>::new(),
             Some(&payload),
             &hash_key,
-            crate::rns_bgg::RnsPreprocessBuild::new(parameters, context),
+            crate::rns_bgg::RnsPreprocessBuild::new(parameters, context).with_data(data.clone()),
             execution,
             store,
             |_, outputs| Ok(outputs),
@@ -1206,17 +1214,22 @@ mod test {
             |_| Ok(()),
         )
         .unwrap();
+        let online_program =
+            if withhold_values { program.without_lut_values() } else { program.clone() };
         let result = crate::api::online_eval(
-            &program.without_lut_values(),
+            &online_program,
             &ParamEnv::default(),
             &online_eval,
             &encrypted,
             &hash_key,
-            RnsOnlineEvalBuild::new(parameters, context),
+            RnsOnlineEvalBuild::new(parameters, context).with_data(data.clone()),
             execution,
             store,
             |_, outputs| Ok(outputs),
-            |_| Ok(()),
+            |graph| {
+                observe(graph);
+                Ok(())
+            },
         )
         .unwrap();
         (result, payload, mask)
@@ -1296,8 +1309,16 @@ mod test {
                 parameters.levels().iter().cloned(),
             ));
             let mut store = MemoryArtifactStore::default();
-            let (result, payload, mask) =
-                run_without_rhs(&parameters, &program, &lhs, &mut execution, &mut store);
+            let (result, payload, mask) = run_without_rhs(
+                &parameters,
+                &program,
+                &crate::program::ProgramData::new(),
+                true,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |_| (),
+            );
 
             let finalized = 1;
             let ring = parameters.ring(finalized).unwrap();
@@ -1392,6 +1413,398 @@ mod test {
         }
     }
 
+    /// A LUT on a public payload in Static mode (width 4, so that `k^-1 != k`
+    /// for two branches), with constant and Program-data table values: the
+    /// output is a public encoding at the next
+    /// (terminal) level in either representation, verification accepts the
+    /// table value for every input entry and both signs of the input
+    /// monomial, and rejects another value; the measured residual is within
+    /// the simulated bound.
+    #[test]
+    fn public_lut_verifies_in_both_representations() {
+        let parameters = unequal_width_parameters();
+        let input_level = &parameters.levels()[0];
+        let output_level = &parameters.levels()[1];
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let values = vec![3usize, 5, 1, 6];
+        let exponent = crate::program::LutOutputRepresentation::Exponent(ExpLayout {
+            stride_log2: 0,
+            width_log2: 3,
+        });
+        let coefficient = crate::program::LutOutputRepresentation::Coefficient;
+        for (representation, data_backed) in
+            [(exponent, false), (coefficient, false), (exponent, true)]
+        {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+            let (table, data) = if data_backed {
+                let family = builder.data_family(values.len()).unwrap();
+                (
+                    LutTable::from_data(4, layout, 8, family, 0, representation).unwrap(),
+                    crate::program::ProgramData::new().with(family, values.clone()),
+                )
+            } else {
+                (
+                    LutTable::unary(4, layout, 8, values.clone(), representation).unwrap(),
+                    crate::program::ProgramData::new(),
+                )
+            };
+            let table = builder.register_lut(table).unwrap();
+            let output = builder.lut(Operand::Scalar(input), table).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            assert_eq!(program.wire_knowledge(output).unwrap(), AttributeKnowledge::PublicPayload);
+            assert_eq!(program.wire_coefficient_bound(output).unwrap(), None);
+            let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+            assert_eq!(workload.level(output).unwrap(), 1);
+            let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
+                &program,
+                &[crate::rns_bgg::RnsBggNoiseValue::sampled_encoding(
+                    &parameters,
+                    b"public-lut-input",
+                    &[BigInt::from(1u8)],
+                )],
+                &[],
+            )
+            .unwrap();
+            let report = crate::api::noise_simulate(
+                &program,
+                crate::rns_bgg::RnsNoiseBuild::new(&parameters, &program, &workload, &bindings)
+                    .unwrap(),
+                |_, outputs| Ok(outputs),
+            )
+            .unwrap();
+            let bound = report.outputs[0].bound.error.clone();
+            let modulus = parameters.level(1).unwrap().modulus();
+            assert!(&bound * 4u8 < *modulus.as_ref(), "{representation:?}: bound {bound}");
+            let expected = |value: usize, negative: bool| {
+                let plaintext = if representation.is_coefficient() {
+                    DCRTPoly::from_usize_to_constant(output_level, value)
+                } else {
+                    monomial(output_level, value)
+                };
+                if negative { -plaintext } else { plaintext }
+            };
+            for (entry, negative) in [(0, false), (1, true), (2, false), (3, true)] {
+                let plaintext = monomial(input_level, entry);
+                let lhs = BTreeMap::from([(
+                    input,
+                    InputBinding::Scalar(if negative { -plaintext } else { plaintext }),
+                )]);
+                let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                    parameters.levels().iter().cloned(),
+                ));
+                let mut store = MemoryArtifactStore::default();
+                let (result, payload, mask) = run_without_rhs(
+                    &parameters,
+                    &program,
+                    &data,
+                    false,
+                    &lhs,
+                    &mut execution,
+                    &mut store,
+                    |_| (),
+                );
+                let verify = |value: usize, execution: &mut _, store: &mut _| {
+                    verify_output(
+                        &program,
+                        &result,
+                        0,
+                        &expected(value, negative),
+                        &parameters,
+                        &payload,
+                        Some(&mask),
+                        RnsOutputUse::DirectDecode,
+                        execution,
+                        store,
+                    )
+                };
+                verify(values[entry], &mut execution, &mut store).unwrap_or_else(|error| {
+                    panic!("{representation:?} entry {entry} negative {negative}: {error}")
+                });
+                // The measured residual `row - s A + s y g` is within the
+                // simulated bound.
+                let ring = parameters.ring(1).unwrap();
+                let columns =
+                    parameters.key_component_columns(1, AttributeKnowledge::PublicPayload).unwrap();
+                let mut runtime = BTreeMap::new();
+                for port in 0..6 {
+                    runtime.insert(
+                        format!("port-{port}"),
+                        result.outputs[&format!("output-0.{port}")].clone(),
+                    );
+                }
+                let port = |index: usize| ring.input(format!("port-{index}"), (1, columns));
+                let stage_mask = stage_mask(&parameters, &payload, Some(&mask)).unwrap();
+                let s = reduce_secret(&parameters, &stage_mask.row, 1).unwrap();
+                let y = plaintext_constant(&ring, &expected(values[entry], negative)) *
+                    parameters.public_gadget(1).unwrap();
+                let residual = |component: usize, s_i: Mat| {
+                    port(4 + component) -
+                        (s.0.clone() * port(component) + s.1.clone() * port(2 + component)) +
+                        s_i * y.clone()
+                };
+                let graph = DslContext::new("public-lut-residual")
+                    .output("residual-0", residual(0, s.0.clone()))
+                    .unwrap()
+                    .output("residual-1", residual(1, s.1.clone()))
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                if let Some(binding) = &stage_mask.binding {
+                    binding.bind(&mut runtime);
+                }
+                let runtime = declared_runtime_inputs(&graph, runtime);
+                let residuals = execute_graph(
+                    StageGraph::new(graph, runtime, BTreeMap::new()),
+                    &ParamEnv::default(),
+                    &mut execution,
+                    &mut store,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                let modulus = BigInt::from(parameters.level(1).unwrap().modulus().as_ref().clone());
+                for name in ["residual-0", "residual-1"] {
+                    let matrix =
+                        <mxx_backends::authority::CpuExecution as crate::api::StageExecution<
+                            MemoryArtifactStore,
+                        >>::download_matrix(
+                            &execution, &residuals.outputs[name]
+                        )
+                        .unwrap();
+                    for column in 0..columns {
+                        for coefficient in matrix.entry(0, column).coeffs_biguints() {
+                            let value = BigInt::from(coefficient);
+                            let centered =
+                                if &value * 2u8 > modulus { value - &modulus } else { value };
+                            assert!(
+                                centered.magnitude() <= &bound,
+                                "{representation:?}: residual {centered} exceeds the simulated \
+                                 bound {bound}"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    verify(values[(entry + 1) % 4], &mut execution, &mut store).is_err(),
+                    "{representation:?}: another value must be rejected"
+                );
+            }
+        }
+    }
+
+    /// A public LUT output is the public left operand of a product with a
+    /// private LUT output of the same table at the same level: the product
+    /// `X^(L(a) + L(b))` verifies, and another exponent is rejected.
+    #[test]
+    fn public_lut_output_multiplies_a_private_lut_output() {
+        let parameters = unequal_width_parameters();
+        let input_level = &parameters.levels()[0];
+        let output_level = &parameters.levels()[1];
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let values = vec![3usize, 5, 1, 6];
+        let mut builder = ExponentLutProgramBuilder::new();
+        let table = builder
+            .register_lut(
+                LutTable::unary(
+                    4,
+                    layout,
+                    8,
+                    values.clone(),
+                    crate::program::LutOutputRepresentation::Exponent(ExpLayout {
+                        stride_log2: 0,
+                        width_log2: 3,
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let public_value = builder.lut(Operand::Scalar(public), table).unwrap();
+        let private_value = builder.lut(Operand::Scalar(private), table).unwrap();
+        let output = builder
+            .mul_public(Operand::Scalar(public_value), Operand::Scalar(private_value))
+            .unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let (a, b) = (rand::random::<u32>() as usize % 4, rand::random::<u32>() as usize % 4);
+        let lhs = BTreeMap::from([
+            (public, InputBinding::Scalar(monomial(input_level, a))),
+            (private, InputBinding::Scalar(monomial(input_level, b))),
+        ]);
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+            parameters.levels().iter().cloned(),
+        ));
+        let mut store = MemoryArtifactStore::default();
+        let (result, payload, mask) = run_without_rhs(
+            &parameters,
+            &program,
+            &crate::program::ProgramData::new(),
+            false,
+            &lhs,
+            &mut execution,
+            &mut store,
+            |_| (),
+        );
+        let verify = |exponent: usize, execution: &mut _, store: &mut _| {
+            verify_output(
+                &program,
+                &result,
+                0,
+                &monomial(output_level, exponent),
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                execution,
+                store,
+            )
+        };
+        verify(values[a] + values[b], &mut execution, &mut store).unwrap();
+        assert!(verify(values[a] + values[b] + 1, &mut execution, &mut store).is_err());
+    }
+
+    /// One LUT applied at one level to public and private payloads, in
+    /// family bodies and at root scope, in several orders: its root-scope
+    /// material holds the switching ciphertexts whenever a body uses it on a
+    /// private payload, a root private use completes a helpers-only entry,
+    /// every output verifies, and the LUT helpers are artifact inputs of the
+    /// root scope only (a family body captures them).
+    #[test]
+    fn public_and_private_uses_of_one_lut_share_its_material() {
+        #[derive(Clone, Copy, Debug)]
+        enum Use {
+            PublicBody,
+            PrivateBody,
+            PublicRoot,
+            PrivateRoot,
+        }
+        let parameters = unequal_width_parameters();
+        let input_level = &parameters.levels()[0];
+        let output_level = &parameters.levels()[1];
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let representation = crate::program::LutOutputRepresentation::Exponent(ExpLayout {
+            stride_log2: 0,
+            width_log2: 3,
+        });
+        let values = vec![3usize, 5, 1, 6];
+        let members = [1usize, 2];
+        for uses in [
+            vec![Use::PublicBody],
+            vec![Use::PublicBody, Use::PrivateBody, Use::PrivateRoot, Use::PublicRoot],
+            vec![Use::PublicRoot, Use::PrivateRoot, Use::PrivateBody, Use::PublicBody],
+            vec![Use::PublicBody, Use::PrivateRoot],
+            vec![Use::PrivateBody, Use::PublicRoot],
+        ] {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let table = builder
+                .register_lut(
+                    LutTable::unary(4, layout, 8, values.clone(), representation).unwrap(),
+                )
+                .unwrap();
+            let mut lhs = BTreeMap::new();
+            let mut outputs = Vec::new();
+            let mut expected = Vec::new();
+            for used in &uses {
+                let knowledge = match used {
+                    Use::PublicBody | Use::PublicRoot => AttributeKnowledge::PublicPayload,
+                    Use::PrivateBody | Use::PrivateRoot => AttributeKnowledge::PrivatePayload,
+                };
+                match used {
+                    Use::PublicBody | Use::PrivateBody => {
+                        let family = builder
+                            .input_family(IntExpr::constant(members.len()), knowledge)
+                            .unwrap();
+                        lhs.insert(
+                            family,
+                            InputBinding::Family(
+                                members.iter().map(|e| monomial(input_level, *e)).collect(),
+                            ),
+                        );
+                        let looked_up = builder
+                            .parallel(
+                                crate::program::FamilyRange::full(IntExpr::constant(members.len()))
+                                    .unwrap(),
+                                |b, o| {
+                                    b.lut(Operand::Member { family, index: o }, table)
+                                        .map(Operand::Scalar)
+                                },
+                            )
+                            .unwrap();
+                        outputs.push(Operand::Scalar(builder.sum(looked_up).unwrap()));
+                        expected.push(
+                            members.iter().fold(DCRTPoly::const_zero(output_level), |sum, e| {
+                                sum + monomial(output_level, values[*e])
+                            }),
+                        );
+                    }
+                    Use::PublicRoot | Use::PrivateRoot => {
+                        let input = builder.input(knowledge).unwrap();
+                        lhs.insert(input, InputBinding::Scalar(monomial(input_level, 3)));
+                        outputs.push(Operand::Scalar(
+                            builder.lut(Operand::Scalar(input), table).unwrap(),
+                        ));
+                        expected.push(monomial(output_level, values[3]));
+                    }
+                }
+            }
+            let program = builder.finish(outputs).unwrap();
+            let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                parameters.levels().iter().cloned(),
+            ));
+            let mut store = MemoryArtifactStore::default();
+            let mut helper_inputs = 0;
+            let (result, payload, mask) = run_without_rhs(
+                &parameters,
+                &program,
+                &crate::program::ProgramData::new(),
+                false,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |graph| {
+                    // Every helper artifact is imported at root scope; a
+                    // family body only captures it (sealing then gives the
+                    // body its own copy of the captured input).
+                    let root = mxx_ir_core::graph::current_construction_scope();
+                    let mut helpers = BTreeMap::<String, bool>::new();
+                    for scope in graph.source.scopes().values() {
+                        for node in scope.nodes() {
+                            if let mxx_ir_core::node::NodeKind::Input {
+                                artifact: Some(artifact),
+                                ..
+                            } = node.kind() &&
+                                artifact.artifact_name.contains("lut-helper")
+                            {
+                                *helpers.entry(artifact.artifact_name.clone()).or_default() |=
+                                    node.construction_scope() == root;
+                            }
+                        }
+                    }
+                    for (name, at_root) in &helpers {
+                        assert!(at_root, "{uses:?}: LUT helper {name} is not a root-scope input");
+                    }
+                    helper_inputs = helpers.len();
+                },
+            );
+            assert!(helper_inputs > 0, "{uses:?}: the LUT helpers are read");
+            for (index, expected) in expected.iter().enumerate() {
+                verify_output(
+                    &program,
+                    &result,
+                    index,
+                    expected,
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    RnsOutputUse::DirectDecode,
+                    &mut execution,
+                    &mut store,
+                )
+                .unwrap_or_else(|error| panic!("{uses:?}: output {index}: {error}"));
+            }
+        }
+    }
+
     /// `X^k` in the negacyclic ring of `level`.
     fn monomial(level: &DCRTPolyParams, k: usize) -> DCRTPoly {
         let n = level.ring_dimension() as usize;
@@ -1447,8 +1860,16 @@ mod test {
         let mut execution =
             mxx_backends::authority::CpuExecution::new(cpu_backend([level.clone()]));
         let mut store = MemoryArtifactStore::default();
-        let (result, payload, mask) =
-            run_without_rhs(&parameters, &program, &lhs, &mut execution, &mut store);
+        let (result, payload, mask) = run_without_rhs(
+            &parameters,
+            &program,
+            &crate::program::ProgramData::new(),
+            true,
+            &lhs,
+            &mut execution,
+            &mut store,
+            |_| (),
+        );
         let verify = |expected: &DCRTPoly, execution: &mut _, store: &mut _| {
             verify_output(
                 &program,
@@ -1516,8 +1937,16 @@ mod test {
                 parameters.levels().iter().cloned(),
             ));
             let mut store = MemoryArtifactStore::default();
-            let (result, payload, mask) =
-                run_without_rhs(&parameters, &program, &lhs, &mut execution, &mut store);
+            let (result, payload, mask) = run_without_rhs(
+                &parameters,
+                &program,
+                &crate::program::ProgramData::new(),
+                true,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |_| (),
+            );
             verify_output(
                 &program,
                 &result,

@@ -934,22 +934,38 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         ))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
-        if self
+        let public = self
             .program
             .wire_knowledge(input.wire)
             .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
-            AttributeKnowledge::PublicPayload
-        {
-            return Err(RnsBggError::Binding("RNS-BGG LUT requires a private input"));
-        }
+            AttributeKnowledge::PublicPayload;
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
+        if public &&
+            self.decoder_smudge
+                .as_ref()
+                .is_some_and(|declaration| declaration.smudge().lut() == lut_id)
+        {
+            return Err(RnsBggError::Binding("a decoder smudge LUT needs a private input"));
+        }
         let source_level = self.workload.level(input.wire)?;
         if self.parameters.rhs_mode() == RhsMode::Dynamic {
-            let normalized =
-                source_level + usize::from(table.output_representation().is_coefficient());
-            self.parameters.dynamic_route(normalized.max(self.workload.level(self.output()?)?))?;
-            let (result, branches) = self.dynamic_lut_key(source_level, &input.matrix, table)?;
+            // A public LUT is evaluated at its input level only; its output
+            // is a finished public encoding.
+            let (result, branches) = if public {
+                self.parameters.dynamic_route(source_level)?;
+                (self.dynamic_public_lut_key(source_level, &input.matrix, table)?, None)
+            } else {
+                let normalized =
+                    source_level + usize::from(table.output_representation().is_coefficient());
+                self.parameters
+                    .dynamic_route(normalized.max(self.workload.level(self.output()?)?))?;
+                self.dynamic_lut_key(source_level, &input.matrix, table)?
+            };
             self.record_public_action(&result, branches)?;
+            return self.finish_lut(lut_id, source_level, result);
+        }
+        if public {
+            let result = self.static_public_lut_key(source_level, &input.matrix, table)?;
             return self.finish_lut(lut_id, source_level, result);
         }
         let switching_ciphertexts =
@@ -1012,6 +1028,54 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
 }
 
 impl PublicKeyLowering<'_> {
+    /// The Static key of a LUT on a public payload with key `key` at `level`
+    /// (see [`crate::rns_bgg::public_lut::static_public_lut`]), before its
+    /// ModDown; the encoding lowering builds the same key.
+    fn static_public_lut_key(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+        table: &LutTable,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        Ok(crate::rns_bgg::public_lut::static_public_lut(
+            self.parameters,
+            self.hash_key.clone(),
+            level,
+            table,
+            crate::rns_bgg::dynamic::lut_entries(table, &self.data)?,
+            (None, key.clone()),
+            None,
+            None,
+        )?
+        .1)
+    }
+
+    /// The Dynamic key of a LUT on a public payload with key `key` at
+    /// `level` (see [`crate::rns_bgg::public_lut::dynamic_public_lut`]); the
+    /// encoding lowering builds the same key, or imports it at root scope.
+    fn dynamic_public_lut_key(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+        table: &LutTable,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let (setup, _) = self.dynamic_state()?;
+        crate::rns_bgg::public_lut::dynamic_public_lut(
+            self.parameters,
+            setup,
+            self.hash_key.clone(),
+            level,
+            table,
+            crate::rns_bgg::dynamic::lut_entries(table, &self.data)?,
+            (None, key.clone()),
+            None,
+            None,
+            true,
+        )?
+        .1
+        .ok_or(RnsBggError::Lut)
+    }
+
     /// The common tail of a LUT key at `source_level`: a decoder smudge
     /// member's normalization and transform, or the ModDown of an exponent
     /// output to its level.
@@ -1171,6 +1235,7 @@ mod test {
             artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: None,

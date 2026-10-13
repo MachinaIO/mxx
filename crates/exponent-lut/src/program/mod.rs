@@ -412,6 +412,10 @@ impl FamilyRange {
 /// constant coefficient. A root coefficient output is scaled for decryption
 /// only when it is finalized; a decoder adds unfinalized ones as its smudge.
 ///
+/// A LUT on a public payload returns a public wire at the next level in
+/// either representation; a public coefficient output is finished (see
+/// [`ExponentLutProgram::wire_coefficient_bound`]).
+///
 /// A LUT reads one signed monomial `±X^(stride e)` of its input layout and
 /// returns `±T[e]`. The LUT is linear in its input, so any other input (for
 /// example `Add(x, x)`) is outside this contract; it is a plaintext property
@@ -937,26 +941,34 @@ impl ExponentLutProgram {
         Ok(None)
     }
 
-    /// Return whether a validated wire is the raw output of a coefficient LUT
-    /// lineage.  Input declarations intentionally have no inferred layout.
+    /// Return whether a validated wire is the raw output of a private
+    /// coefficient LUT lineage, a carrier finalized once at its output (see
+    /// [`Self::wire_coefficient_bound`]). Input declarations intentionally
+    /// have no inferred layout.
     pub fn wire_is_coefficient_output(&self, wire: WireId) -> Result<bool, ProgramValidationError> {
         Ok(self.wire_coefficient_bound(wire)?.is_some())
     }
 
-    /// The payload bound `W` of a coefficient wire (`|v| <= W` for every
-    /// coefficient of its payload under the LUT input contract of
+    /// The payload bound `W` of a private coefficient wire (`|v| <= W` for
+    /// every coefficient of its payload under the LUT input contract of
     /// [`LutOutputRepresentation`]), or `None` for an exponent wire: the
     /// largest table value of a coefficient LUT, the sum of the bounds of an
     /// `Add`, and `n W` for the `Sum` of `n` members.
+    ///
+    /// A public wire is `None` as well: a coefficient LUT on a public payload
+    /// yields an ordinary public encoding of its (public) value, which needs no
+    /// finalization. Program validation still treats such a wire as a
+    /// coefficient wire, so it cannot be the input of a LUT or a product.
     pub fn wire_coefficient_bound(
         &self,
         wire: WireId,
     ) -> Result<Option<u64>, ProgramValidationError> {
-        let metadata = self.metadata()?;
-        metadata
-            .get(&wire)
-            .map(|metadata| metadata.coefficient_bound)
-            .ok_or(ProgramValidationError::UndefinedWire(wire))
+        let metadata =
+            self.metadata()?.get(&wire).ok_or(ProgramValidationError::UndefinedWire(wire))?;
+        Ok(match metadata.knowledge {
+            AttributeKnowledge::PrivatePayload => metadata.coefficient_bound,
+            AttributeKnowledge::PublicPayload => None,
+        })
     }
 
     /// Wire metadata of the immutable program. The structure is validated
@@ -2011,6 +2023,44 @@ mod tests {
             program.wire_knowledge(WireId(999)),
             Err(ProgramValidationError::UndefinedWire(WireId(999)))
         );
+    }
+
+    /// A coefficient LUT on a public payload is a finished public wire, with
+    /// no coefficient bound to finalize, but validation still treats it as a
+    /// coefficient wire: it is neither a LUT input nor a product operand.
+    #[test]
+    fn public_coefficient_lut_output_is_finished_but_still_a_coefficient_wire() {
+        let program = |next: Option<bool>| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+            let table = builder
+                .register_lut(
+                    LutTable::unary(
+                        2,
+                        ExpLayout { stride_log2: 0, width_log2: 1 },
+                        2,
+                        vec![0, 1],
+                        LutOutputRepresentation::Coefficient,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let output = builder.lut(Operand::Scalar(input), table).unwrap();
+            let output = match next {
+                None => output,
+                Some(true) => builder.lut(Operand::Scalar(output), table).unwrap(),
+                Some(false) => {
+                    builder.mul_public(Operand::Scalar(output), Operand::Scalar(input)).unwrap()
+                }
+            };
+            builder.finish(vec![Operand::Scalar(output)]).map(|program| (program, output))
+        };
+        let (finished, output) = program(None).unwrap();
+        assert_eq!(finished.wire_knowledge(output).unwrap(), AttributeKnowledge::PublicPayload);
+        assert_eq!(finished.wire_coefficient_bound(output).unwrap(), None);
+        assert!(!finished.wire_is_coefficient_output(output).unwrap());
+        assert!(program(Some(true)).is_err(), "a coefficient wire is not a LUT input");
+        assert!(program(Some(false)).is_err(), "a coefficient wire is not a product operand");
     }
 
     #[test]

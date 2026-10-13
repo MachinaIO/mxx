@@ -216,6 +216,107 @@ impl RnsBggNoiseEvaluator<'_> {
         self.operation_node(wire, value, node)
     }
 
+    /// The Dynamic LUT of a public `input` by `table` (see
+    /// [`RnsBggParameters::dynamic_public_lut_noise_bound`]), term by term
+    /// with the encoding lowering: no companion is read; the helpers form the
+    /// one coherent package source the private LUTs read too.
+    pub(super) fn dynamic_public_lut(
+        &mut self,
+        input: &(WireId, RnsBggNoiseValue),
+        table: &LutTable,
+    ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
+        let contracts = self.dynamic_contracts()?.clone();
+        let level = self.level(input.0)?;
+        let wire = self.site()?.output;
+        let lut = self.program.lut_id_at(wire).map_err(|_| RnsBggError::Lut)?;
+        self.parameters.dynamic_route(level)?;
+        let automorphisms = crate::rns_bgg::dynamic::lut_automorphisms(
+            self.parameters,
+            &contracts.automorphisms,
+            level,
+            table,
+        )?;
+        let branches = automorphisms.len();
+        // `depths[d - 1]` branches are switched `d` times.
+        let mut depths = Vec::new();
+        for k in &automorphisms[1..] {
+            let depth = contracts.depths.get(k).copied().unwrap_or(1);
+            if depths.len() < depth {
+                depths.resize(depth, 0);
+            }
+            depths[depth - 1] += 1;
+        }
+        let output_payload_l1 = match table.output_representation() {
+            crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
+            crate::program::LutOutputRepresentation::Coefficient => {
+                BigUint::from(table.max_output())
+            }
+        };
+        let helper_error = contracts.distributions.helper.cutoff().clone();
+        let bound = self.parameters.dynamic_public_lut_noise_bound(
+            level,
+            &input.1.bound,
+            &depths,
+            &helper_error,
+            output_payload_l1.clone(),
+        )?;
+        let (input_gain, helper_gain) =
+            self.parameters.dynamic_public_lut_gains(level, &depths, &input.1.bound.payload_l1)?;
+        let helper_source = self.package_source("automorphism-helper", None)?;
+        // The branches add coherently: the squared `l1` gains.
+        let mean_gain =
+            NonnegativeRational::new(input_gain.clone(), BigUint::one()).expect("unit denominator");
+        let input_variance_gain = input_gain.pow(2u32);
+        let helper_variance = encoding_variance_from_sigma(contracts.distributions.helper.sigma())
+            .scaled(&helper_gain.pow(2u32));
+        let breakdown = input.1.contributions("dynamic-public-lut-input").map(|input_terms| {
+            let terms = input_terms.transform(|term| {
+                (mean_gain.clone(), term.moments.variance.scaled(&input_variance_gain), false)
+            });
+            if branches == 1 {
+                return terms;
+            }
+            terms.merge(&self.package_term(
+                helper_source,
+                "dynamic-automorphism-helper-error",
+                None,
+                helper_variance.clone(),
+            ))
+        });
+        let sources = if branches == 1 {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(
+                helper_source,
+                NoiseSourceProvenance { source: helper_source, route: vec![level] },
+            )])
+        };
+        let value = self.carry_provenance(
+            RnsBggNoiseValue {
+                bound,
+                payload_l2_squared: output_payload_l1.pow(2u32),
+                moments: None,
+                provenance: BTreeMap::new(),
+                heuristics: input.1.heuristics.clone(),
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
+            [input.1.provenance.clone(), sources],
+        );
+        let node = crate::noise_utils::NoiseDependencyNode::Lut {
+            gate: Some(wire),
+            table: lut,
+            input: self.node_for_wire(input.0)?,
+            helper: None,
+        };
+        self.operation_node_with_multiplier(
+            wire,
+            value,
+            node,
+            self.event_multiplier.clone() * BigUint::from(branches),
+        )
+    }
+
     /// The Dynamic LUT of `input` by `table`.
     pub(super) fn dynamic_lut(
         &mut self,

@@ -936,7 +936,7 @@ impl EncodingLowering<'_> {
         self.parameters.dynamic_route(normalized.max(self.workload.level(self.site()?.output)?))?;
         let automorphisms =
             lut_automorphisms(self.parameters, setup.automorphisms(), level, table)?;
-        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.dynamic_state()?.data)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.data)?;
         let layout = table.input_layout();
         let representation = table.output_representation();
         let columns = self.parameters.component_columns(level)?;
@@ -1082,6 +1082,38 @@ impl EncodingLowering<'_> {
 }
 
 impl EncodingLowering<'_> {
+    /// The Dynamic LUT of a public `input` (see
+    /// [`crate::rns_bgg::public_lut::dynamic_public_lut`]): no digit
+    /// companion is read. A root-scope site uses the output key preprocessing
+    /// published and accumulates only the row. Only the evaluation level
+    /// needs a successor; the output is a finished public encoding.
+    pub(super) fn dynamic_public_lut(
+        &self,
+        input: &RnsBggEncoding,
+        table: &LutTable,
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let state = self.dynamic_state()?;
+        let level = self.workload.level(input.wire())?;
+        let imported = self.imported_public_action(level, 0)?.map(|(key, _)| key);
+        let (row, key) = crate::rns_bgg::public_lut::dynamic_public_lut(
+            self.parameters,
+            &state.setup,
+            self.hash_key.clone(),
+            level,
+            table,
+            self.public_lut_entries(table)?,
+            (Some(input.row.clone()), input.public_key.matrix.clone()),
+            Some(self.public_lut_payload_input(input, level)?),
+            state.automorphisms.as_ref().map(|(helpers, _)| helpers),
+            imported.is_none(),
+        )?;
+        let key = match imported {
+            Some(key) => key,
+            None => key.ok_or(RnsBggError::Lut)?,
+        };
+        Ok((row.ok_or(RnsBggError::Lut)?, key))
+    }
+
     /// The Dynamic LUT of `input` by the radix plan `plan` of more than one
     /// depth (see [`crate::rns_bgg::dynamic`]), continuing from the identity
     /// branch `initial`. Per depth, one companion loop nest builds the
@@ -1103,7 +1135,7 @@ impl EncodingLowering<'_> {
             .as_ref()
             .ok_or(RnsBggError::Binding("the automorphism packages are not imported"))?;
         let level = self.workload.level(input.wire())?;
-        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.dynamic_state()?.data)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.data)?;
         let layout = table.input_layout();
         let representation = table.output_representation();
         let columns = self.parameters.component_columns(level)?;
@@ -1406,11 +1438,13 @@ pub(crate) mod test_support {
         DCRTPoly::const_rotate_poly(&parameters.levels()[0], exponent)
     }
 
-    /// One setup with its public seed.
+    /// One setup with its public seed, and the Program data its
+    /// preprocessing and online evaluation are given (none by default).
     pub(crate) struct Setup {
         pub(crate) setup: RnsBggDynamicSetup,
         pub(crate) context: [u8; 32],
         pub(crate) hash_key: [u8; 32],
+        pub(crate) data: crate::program::ProgramData,
     }
 
     impl Setup {
@@ -1433,7 +1467,7 @@ pub(crate) mod test_support {
                 RnsBggDynamicDistributions::uniform(parameters.encoding_contract()),
             )
             .unwrap();
-            Self { setup, context, hash_key }
+            Self { setup, context, hash_key, data: crate::program::ProgramData::new() }
         }
 
         /// The setup of `program` with the identity mapping.
@@ -1453,7 +1487,7 @@ pub(crate) mod test_support {
                 RnsBggDynamicDistributions::uniform(parameters.encoding_contract()),
             )
             .unwrap();
-            (Self { setup, context, hash_key }, binding)
+            (Self { setup, context, hash_key, data: crate::program::ProgramData::new() }, binding)
         }
 
         /// Compile `program` against the setup.
@@ -1479,6 +1513,7 @@ pub(crate) mod test_support {
                 None,
                 &self.hash_key,
                 crate::rns_bgg::RnsPreprocessBuild::new(parameters, self.context)
+                    .with_data(self.data.clone())
                     .with_output_use(output_use)
                     .with_dynamic_setup(&self.setup, binding.clone())
                     .map_err(ApiError::scheme)?,
@@ -1541,6 +1576,7 @@ pub(crate) mod test_support {
                 encrypted,
                 &self.hash_key,
                 RnsOnlineEvalBuild::new(parameters, self.context)
+                    .with_data(self.data.clone())
                     .with_output_use(output_use)
                     .with_dynamic_setup(&self.setup, binding.clone())
                     .map_err(ApiError::scheme)?,
@@ -1552,13 +1588,14 @@ pub(crate) mod test_support {
         }
     }
 
-    /// The four key ports of output `wire` that preprocessing published, as
-    /// host matrices.
+    /// The four key ports of output `wire` that preprocessing published under
+    /// `availability` (a public output's key is cached), as host matrices.
     pub(crate) fn preprocessed_key(
         parameters: &RnsBggParameters,
         online_eval: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
         wire: WireId,
         columns: usize,
+        availability: ArtifactAvailability,
         execution: &mut CpuExecution,
         store: &mut MemoryArtifactStore,
     ) -> Vec<mxx_backends::matrix::dcrt_poly::DCRTPolyMatrix> {
@@ -1572,7 +1609,7 @@ pub(crate) mod test_support {
                         online_eval.production().clone(),
                         format!("public-key/{wire:?}.{port}"),
                         (1, columns),
-                        ArtifactAvailability::Transferred,
+                        availability,
                     ),
                 )
                 .unwrap();
@@ -1641,7 +1678,15 @@ mod test {
             )
             .unwrap();
         let Operand::Scalar(output) = program.outputs()[0] else { panic!("scalar output") };
-        let key = preprocessed_key(parameters, &online_eval, output, 1, &mut execution, &mut store);
+        let key = preprocessed_key(
+            parameters,
+            &online_eval,
+            output,
+            1,
+            ArtifactAvailability::Transferred,
+            &mut execution,
+            &mut store,
+        );
         let mut rows = Vec::new();
         for _ in 0..2 {
             let ((lhs, rhs), expected, wrong) = batch();
@@ -1818,6 +1863,219 @@ mod test {
                 wrong,
             )
         });
+    }
+
+    /// A LUT on a public payload under a Dynamic setup, switched directly and
+    /// over a radix-2 decomposition (whose branch `g^3` is switched twice),
+    /// with constant and Program-data table values,
+    /// at root scope (with the key preprocessing published) and in a family
+    /// body (recomputed): the output verifies as the table value at the next
+    /// level and a wrong value is rejected; its measured residual is within
+    /// the simulated bound; the online key is the compiled key.
+    #[test]
+    fn dynamic_public_lut_verifies_directly_and_by_radix() {
+        let parameters = parameters(2);
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let values = (0..4).map(|_| rand::random::<u32>() as usize % 4).collect::<Vec<_>>();
+        for (radix, body, data_backed) in [
+            (None, false, false),
+            (None, true, false),
+            (Some(2), false, false),
+            (Some(2), true, false),
+            (None, false, true),
+        ] {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let representation = LutOutputRepresentation::Exponent(layout);
+            let (table, data) = if data_backed {
+                let family = builder.data_family(values.len()).unwrap();
+                (
+                    LutTable::from_data(4, layout, 4, family, 0, representation).unwrap(),
+                    crate::program::ProgramData::new().with(family, values.clone()),
+                )
+            } else {
+                (
+                    LutTable::unary(4, layout, 4, values.clone(), representation).unwrap(),
+                    crate::program::ProgramData::new(),
+                )
+            };
+            let table = builder.register_lut(table).unwrap();
+            let entries = [rand::random::<u32>() as usize % 4, rand::random::<u32>() as usize % 4];
+            let (input, output, lhs, expected, wrong) = if body {
+                let input = builder
+                    .input_family(IntExpr::constant(2), AttributeKnowledge::PublicPayload)
+                    .unwrap();
+                let looked_up = builder
+                    .parallel(FamilyRange::full(IntExpr::constant(2)).unwrap(), |b, o| {
+                        b.lut(Operand::Member { family: input, index: o }, table)
+                            .map(Operand::Scalar)
+                    })
+                    .unwrap();
+                let output = builder.sum(looked_up).unwrap();
+                let lhs = BTreeMap::from([(
+                    input,
+                    InputBinding::Family(
+                        entries.iter().map(|u| monomial(&parameters, *u)).collect(),
+                    ),
+                )]);
+                let expected = monomial(&parameters, values[entries[0]]) +
+                    monomial(&parameters, values[entries[1]]);
+                let wrong = monomial(&parameters, values[entries[0]]) +
+                    monomial(&parameters, (values[entries[1]] + 1) % 4);
+                (input, output, lhs, expected, wrong)
+            } else {
+                let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+                let output = builder.lut(Operand::Scalar(input), table).unwrap();
+                let lhs = BTreeMap::from([(
+                    input,
+                    InputBinding::Scalar(monomial(&parameters, entries[0])),
+                )]);
+                let expected = monomial(&parameters, values[entries[0]]);
+                let wrong = monomial(&parameters, (values[entries[0]] + 1) % 4);
+                (input, output, lhs, expected, wrong)
+            };
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            assert_eq!(program.wire_knowledge(input).unwrap(), AttributeKnowledge::PublicPayload);
+            let mut execution = execution(&parameters);
+            let mut store = MemoryArtifactStore::default();
+            let (mut setup, binding) = Setup::for_program(&parameters, &program, layout);
+            setup.data = data;
+            if let Some(radix) = radix {
+                setup.setup = setup.setup.with_lut_radix(radix).unwrap();
+                assert_eq!(setup.setup.radix_depths().values().max(), Some(&2));
+            }
+            let (_, online_eval) = setup
+                .preprocess(
+                    &parameters,
+                    &program,
+                    &binding,
+                    RnsOutputUse::DirectDecode,
+                    &mut execution,
+                    &mut store,
+                )
+                .unwrap();
+            let (encrypted, secret) =
+                setup.encrypt(&parameters, &lhs, &BTreeMap::new(), &mut execution, &mut store);
+            let result = setup
+                .evaluate(
+                    &parameters,
+                    &program,
+                    &binding,
+                    RnsOutputUse::DirectDecode,
+                    &online_eval,
+                    &encrypted,
+                    &mut execution,
+                    &mut store,
+                )
+                .unwrap();
+            let verify = |plaintext: &DCRTPoly, execution: &mut _, store: &mut _| {
+                verify_output(
+                    &program,
+                    &result,
+                    0,
+                    plaintext,
+                    &parameters,
+                    &secret,
+                    None,
+                    RnsOutputUse::DirectDecode,
+                    execution,
+                    store,
+                )
+            };
+            verify(&expected, &mut execution, &mut store)
+                .unwrap_or_else(|error| panic!("radix {radix:?} body {body}: {error}"));
+            assert!(
+                verify(&wrong, &mut execution, &mut store).is_err(),
+                "radix {radix:?} body {body}: a wrong output must be rejected"
+            );
+            // The measured residual `row - s A + s y g` is within the
+            // simulated bound.
+            let initial = crate::rns_bgg::RnsBggNoiseValue::sampled_gaussian(
+                &setup.setup.distributions().input,
+                b"dynamic-public-lut-input",
+                &[BigInt::from(1u8)],
+            );
+            let bindings =
+                crate::rns_bgg::RnsBggNoiseBindings::from_inputs(&program, &[initial], &[])
+                    .unwrap()
+                    .with_dynamic(
+                        crate::rns_bgg::RnsBggDynamicNoise::from_setup(
+                            &setup.setup,
+                            &binding,
+                            &program,
+                        )
+                        .unwrap(),
+                    );
+            let workload =
+                RnsBggDerivedWorkload::from_program_with_parameters(&parameters, &program).unwrap();
+            let report = crate::api::noise_simulate(
+                &program,
+                crate::rns_bgg::RnsNoiseBuild::new(&parameters, &program, &workload, &bindings)
+                    .unwrap(),
+                |_, outputs| Ok(outputs),
+            )
+            .unwrap();
+            let bound = report.outputs[0].bound.error.clone();
+            let modulus = parameters.level(1).unwrap().modulus();
+            assert!(&bound * 4u8 < *modulus.as_ref(), "radix {radix:?} body {body}: bound {bound}");
+            let columns =
+                parameters.key_component_columns(1, AttributeKnowledge::PublicPayload).unwrap();
+            let ring = parameters.ring(1).unwrap();
+            let gadget = parameters.public_gadget(1).unwrap();
+            let mut runtime = BTreeMap::new();
+            secret.bind_runtime(&mut runtime);
+            for port in 0..6 {
+                runtime.insert(
+                    format!("port-{port}"),
+                    result.outputs[&format!("output-0.{port}")].clone(),
+                );
+            }
+            let port = |index: usize| ring.input(format!("port-{index}"), (1, columns));
+            let s = secret.row().clone();
+            let y = plaintext_constant(&ring, &expected);
+            let residual = |component: usize, s_i: Mat| {
+                port(4 + component) -
+                    (s.0.clone() * port(component) + s.1.clone() * port(2 + component)) +
+                    s_i * y.clone() * gadget.clone()
+            };
+            let graph = DslContext::new("dynamic-public-lut-residual")
+                .output("residual-0", residual(0, s.0.clone()))
+                .unwrap()
+                .output("residual-1", residual(1, s.1.clone()))
+                .unwrap()
+                .build()
+                .unwrap();
+            let outputs = crate::api::execute_graph(
+                StageGraph::new(graph, runtime, BTreeMap::new()),
+                &ParamEnv::default(),
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let row =
+                [0, 1].map(|port| download(&execution, &outputs, &format!("residual-{port}")));
+            let measured = row_norm(&parameters, &row);
+            assert!(
+                measured <= bound,
+                "radix {radix:?} body {body}: measured {measured} exceeds the simulated {bound}"
+            );
+            let key = preprocessed_key(
+                &parameters,
+                &online_eval,
+                output,
+                columns,
+                ArtifactAvailability::Cached,
+                &mut execution,
+                &mut store,
+            );
+            for (port, key) in key.iter().enumerate() {
+                assert_eq!(
+                    &download(&execution, &result, &format!("output-0.{port}")),
+                    key,
+                    "radix {radix:?} body {body}: the online key must be the compiled key"
+                );
+            }
+        }
     }
 
     /// The largest centered coefficient of a downloaded row.

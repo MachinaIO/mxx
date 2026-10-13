@@ -56,6 +56,19 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   value of the data; preprocessing binds the data's commitment, and online evaluation checks it.
   The noise simulator treats a selected member as member 0.
 
+## LUTs on public payloads
+
+A LUT may read a public input (or any public wire); its output is public, and its payload is
+evaluated in the clear from the table (constants or Program data). Encryption publishes nothing
+new: a public encoding has one secret for its mask and payload, so instead of a switching
+ciphertext each branch `k` is switched by the LUT helpers. The helper of `k^-1`, automorphed by
+`sigma_k`, switches the payload back with a public product that also applies the branch
+coefficient as a bounded scalar action, and the helper of `k` then switches the mask
+(`rns_bgg::public_lut`). Static helpers carry the level's scale, so a public LUT ends with one
+ModDown and its output is a public encoding at the next level in either output representation;
+Dynamic LUTs read no digit companion and follow the setup's radix plan. A public coefficient
+output needs no finalization, but it is still not a LUT input or a product operand.
+
 Sampling contracts (`RnsBggGaussian`) keep their sigma as a `BigDecimal` and their cutoff as a
 `BigUint`, so a contract may be wide: above `2^40` the backends sample by convolution, as for the
 noise-flooding contract of predicate encryption (sigmas up to `2^58`). The noise simulator reads

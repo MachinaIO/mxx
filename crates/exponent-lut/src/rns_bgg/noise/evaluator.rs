@@ -264,11 +264,15 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     /// commits to the evaluation/decomposition levels, its explicit input
     /// layout, and sigma.  No site, family scope, input wire, or program
     /// identity is part of these keys.
+    /// The provenance of a Static LUT's material at `evaluation_level`: per
+    /// automorphism, the public matrix and helper (`A`, `F`) and, if
+    /// `switching` (a private payload), the switching ciphertext (`B`).
     fn lut_material_provenance(
         &self,
         evaluation_level: usize,
         lut: LutId,
         table: &LutTable,
+        switching: bool,
     ) -> Result<BTreeMap<[u8; 32], NoiseSourceProvenance>, RnsBggError> {
         let decomposition_level = evaluation_level
             .checked_add(1)
@@ -289,6 +293,9 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 source: f,
                 route: vec![evaluation_level, sigma],
             });
+            if !switching {
+                continue;
+            }
             let b = stable_source_id(&(
                 b"rns-bgg/lut/B",
                 evaluation_level,
@@ -1447,19 +1454,30 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         self.operation_node(wire, value, node)
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
-        if self
+        let public = self
             .program
             .wire_knowledge(input.0)
             .map_err(|_| RnsBggError::Graph("invalid LUT input metadata".into()))? ==
-            crate::program::AttributeKnowledge::PublicPayload
-        {
-            return Err(RnsBggError::Parameters("RNS-BGG LUT requires a private input"));
-        }
+            crate::program::AttributeKnowledge::PublicPayload;
         let lut = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
+        if public &&
+            self.decoder_smudge
+                .as_ref()
+                .is_some_and(|declaration| declaration.smudge().lut() == lut)
+        {
+            return Err(RnsBggError::Parameters("a decoder smudge LUT needs a private input"));
+        }
         let level = self.level(input.0)?;
         if self.parameters.rhs_mode() == RhsMode::Dynamic {
-            let value = self.dynamic_lut(input, table)?;
+            let value = if public {
+                self.dynamic_public_lut(input, table)?
+            } else {
+                self.dynamic_lut(input, table)?
+            };
             return self.finish_lut(lut, level, value);
+        }
+        if public {
+            return self.public_lut(input, table, lut, level);
         }
         let fresh_error_gain = self.fresh_gain(level)?;
         let wire = self.site()?.output;
@@ -1510,7 +1528,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 self.lut_contributions(level, lut, table, &input.1, input_terms, coefficient_output)
             })
             .transpose()?;
-        let material = self.lut_material_provenance(level, lut, table)?;
+        let material = self.lut_material_provenance(level, lut, table, true)?;
         let mut heuristics = input.1.heuristics.clone();
         if !terminal_coefficient {
             heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
@@ -1544,6 +1562,126 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
 }
 
 impl RnsBggNoiseEvaluator<'_> {
+    /// A Static LUT on a public payload at `level` (see
+    /// [`RnsBggParameters::public_lut_noise_bound`]), term by term with the
+    /// encoding lowering: the input decomposed once per branch, the helpers
+    /// (one coherent source per level, shared with private LUTs, which read
+    /// the same helpers), and the mask and ModDown remainders, all in
+    /// level-`l + 1` units after the one scale-and-round.
+    fn public_lut(
+        &mut self,
+        input: &(WireId, RnsBggNoiseValue),
+        table: &LutTable,
+        lut: LutId,
+        level: usize,
+    ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
+        let wire = self.site()?.output;
+        let branches = table.input_width();
+        let output_payload_l1 = match table.output_representation() {
+            crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
+            crate::program::LutOutputRepresentation::Coefficient => {
+                BigUint::from(table.max_output())
+            }
+        };
+        let bound = self.parameters.public_lut_noise_bound(
+            level,
+            &input.1.bound,
+            branches,
+            output_payload_l1.clone(),
+        )?;
+        let (input_gain, helper_gain, _) =
+            self.parameters.public_lut_gains(level, branches, &input.1.bound.payload_l1)?;
+        let rounding = self.parameters.lut_noise_terms(
+            level,
+            branches,
+            &RightActionNoiseGain {
+                l1: input.1.bound.payload_l1.clone(),
+                l2_squared: input.1.payload_l2_squared.clone(),
+            },
+            &self.fresh_gain(level)?,
+        )?;
+        let scale = self.parameters.scale(level)?.clone();
+        let units = |variance: &NonnegativeRational| {
+            variance.scaled_ratio(&BigUint::one(), &scale.pow(2u32))
+        };
+        let breakdown = input.1.contributions("public-lut-input").map(|input_terms| {
+            // The branches add coherently: the squared `l1` gains.
+            let mean_gain =
+                NonnegativeRational::new(input_gain.clone(), scale.clone()).expect("scale");
+            let input_variance_gain = input_gain.pow(2u32);
+            let inherited = input_terms.transform(|term| {
+                (
+                    mean_gain.clone(),
+                    units(&term.moments.variance.scaled(&input_variance_gain)),
+                    false,
+                )
+            });
+            let helper = NoiseBreakdown::sampled(
+                stable_source_id(&(b"rns-bgg/lut/helper".as_slice(), level)),
+                "lut-helper",
+                zero_mean_moments(units(
+                    &self.parameters.encoding_error_variance().scaled(&helper_gain.pow(2u32)),
+                )),
+                false,
+            );
+            // The mask remainders and the one ModDown's public and
+            // encoding remainders, as for a private LUT.
+            let operand = input_terms.operand();
+            let residual =
+                |tag: &'static [u8], origin: &'static str, variance: NonnegativeRational| {
+                    match &operand {
+                        Some((operand, sample)) => NoiseBreakdown::object_residual(
+                            stable_source_id(&(tag, operand, lut, level)),
+                            origin,
+                            sample.clone(),
+                            zero_mean_moments(variance),
+                            true,
+                        ),
+                        None => NoiseBreakdown::opaque(origin, zero_mean_moments(variance)),
+                    }
+                };
+            inherited
+                .merge(&helper)
+                .merge(&residual(
+                    b"rns-bgg/lut/public-rounding",
+                    "public-lut-rounding",
+                    units(&rounding.internal_rounding),
+                ))
+                .merge(&residual(
+                    b"rns-bgg/lut/public-outer-rounding",
+                    "public-lut-outer-rounding",
+                    rounding.outer_rounding.clone(),
+                ))
+        });
+        let material = self.lut_material_provenance(level, lut, table, false)?;
+        let mut heuristics = input.1.heuristics.clone();
+        heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
+        let value = self.carry_provenance(
+            RnsBggNoiseValue {
+                bound,
+                payload_l2_squared: output_payload_l1.pow(2u32),
+                moments: None,
+                provenance: BTreeMap::new(),
+                heuristics,
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
+            [input.1.provenance.clone(), material],
+        );
+        let node = crate::noise_utils::NoiseDependencyNode::Lut {
+            gate: Some(wire),
+            table: lut,
+            input: self.node_for_wire(input.0)?,
+            helper: None,
+        };
+        self.operation_node_with_multiplier(
+            wire,
+            value,
+            node,
+            self.event_multiplier.clone() * BigUint::from(branches),
+        )
+    }
+
     /// The common tail of a LUT at `level`: a decoder smudge member is
     /// normalized once in its root body, then weighted and placed.
     fn finish_lut(
@@ -2009,16 +2147,36 @@ mod test {
         let evaluator = RnsBggNoiseEvaluator::new(&parameters, &program, &workload, &bindings);
         let projection = program.encryption_inputs();
         let first = evaluator
-            .lut_material_provenance(0, first_table, &projection.luts()[first_table.0 as usize])
+            .lut_material_provenance(
+                0,
+                first_table,
+                &projection.luts()[first_table.0 as usize],
+                true,
+            )
             .unwrap();
         let same = evaluator
-            .lut_material_provenance(0, first_table, &projection.luts()[first_table.0 as usize])
+            .lut_material_provenance(
+                0,
+                first_table,
+                &projection.luts()[first_table.0 as usize],
+                true,
+            )
             .unwrap();
         let different = evaluator
-            .lut_material_provenance(0, second_table, &projection.luts()[second_table.0 as usize])
+            .lut_material_provenance(
+                0,
+                second_table,
+                &projection.luts()[second_table.0 as usize],
+                true,
+            )
             .unwrap();
         let different_level = evaluator
-            .lut_material_provenance(1, first_table, &projection.luts()[first_table.0 as usize])
+            .lut_material_provenance(
+                1,
+                first_table,
+                &projection.luts()[first_table.0 as usize],
+                true,
+            )
             .unwrap();
 
         assert_eq!(first, same);

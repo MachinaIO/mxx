@@ -503,6 +503,9 @@ pub struct EncodingLowering<'a> {
     /// Dynamic: the setup, the Program's mapping to its coordinates, and the
     /// imported automorphism packages.
     pub(crate) dynamic: Option<DynamicEvaluation>,
+    /// The Program's integer data inputs ([`crate::program::data_inputs`]),
+    /// read by data-backed LUT tables in either RHS mode.
+    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
 }
 
 /// The Dynamic state of an online evaluation.
@@ -514,8 +517,6 @@ pub(crate) struct DynamicEvaluation {
     /// nonidentity setup automorphism, member `i` for the `i`-th one; absent
     /// when `H` is trivial.
     pub(crate) automorphisms: Option<(Family<RnsBggRow>, Family<RnsBggRow>)>,
-    /// The Program's integer data inputs ([`crate::program::data_inputs`]).
-    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
 }
 
 /// A Static LUT's imported switching ciphertexts (one family per matrix

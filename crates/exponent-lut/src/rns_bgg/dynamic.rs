@@ -30,6 +30,9 @@
 //! are applied last, per branch. A LUT's `branches` public action holds the
 //! product keys `T` depth by depth, in the order of [`RadixDepth::branches`].
 //!
+//! A LUT on a public payload switches its branches with the helpers alone,
+//! with no digit companion (see [`super::public_lut`]).
+//!
 //! With compact encodings ([`RnsBggDynamicSetup::with_compact_encodings`]),
 //! the digit companions are stored in two columns over `pq` and expanded where
 //! they are read ([`expand_compact_row`]); their keys are the expansions of
@@ -169,13 +172,16 @@ pub(crate) fn scalar_action(
 }
 
 /// `row V_D` for a two-block row: each block times the `D x D` block.
-pub(crate) fn scalar_action_row(row: RnsBggRow, action: &Preimage) -> RnsBggRow {
-    map_row(row, |entry| entry.mul_small_rhs(action.clone()))
+pub(crate) fn scalar_action_row<D: RightAction>(row: RnsBggRow, action: &D) -> RnsBggRow {
+    map_row(row, |entry| action.clone().right_multiply(entry))
 }
 
 /// `A V_D` for a `2 x 2` block key.
-pub(crate) fn scalar_action_matrix(matrix: RnsBggMatrix, action: &Preimage) -> RnsBggMatrix {
-    map_matrix(matrix, |entry| entry.mul_small_rhs(action.clone()))
+pub(crate) fn scalar_action_matrix<D: RightAction>(
+    matrix: RnsBggMatrix,
+    action: &D,
+) -> RnsBggMatrix {
+    map_matrix(matrix, |entry| action.clone().right_multiply(entry))
 }
 
 /// The branches of one depth of a LUT's radix plan (see the module

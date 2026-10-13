@@ -631,10 +631,18 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             );
         }
         // Static LUT switching material is prepared at root scope, so that
-        // a LUT in a family body only reads it in every member.
+        // a LUT in a family body only reads it in every member. A LUT on a
+        // public payload has none.
         if !dynamic {
             let luts = program.encryption_inputs().luts().to_vec();
             for (input, lut) in program.family_body_luts() {
+                if program
+                    .wire_knowledge(input)
+                    .map_err(|error| ApiError::input(error.to_string()))? ==
+                    crate::program::AttributeKnowledge::PublicPayload
+                {
+                    continue;
+                }
                 let level = evaluator.workload.level(input).map_err(ApiError::scheme)?;
                 let table =
                     luts.get(lut.0 as usize).ok_or_else(|| ApiError::scheme(RnsBggError::Lut))?;

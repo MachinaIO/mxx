@@ -42,6 +42,11 @@
 //! | `SECURITY_BITS` | 0 | Required estimated security (`0`: not checked) |
 //! | `SIMULATE_ONLY` | unset | `1`: only the accepted parameters and the checks above |
 //! | `NOISE_MODEL` | `worst` | Claim of an export without a recorded set: `worst`, or `average` (failure probability `2^-FAILURE_EXPONENT`, the sampling tape) |
+//! | `PARAMETER_ID` | unset | A recorded set: a row of `lean/refresh_top/parameters.csv` |
+//!
+//! A recorded set fixes every setting it has a column for (the noise model, the failure exponent,
+//! the ring, the primes, the slots, the digits, the Gaussian widths, the key seed and the PRF), and
+//! exports its claim to `lean/refresh_top/<id>/generated`.
 //!
 //! The noise and the graphs depend on the key shapes only. The digit search, `SIMULATE_ONLY` and an
 //! `EXPORT_ONLY` run without a recorded set generate no PRF keys: they declare each key set by a
@@ -93,13 +98,13 @@ type ParameterRow = BTreeMap<String, String>;
 /// The sparse-LWR PRF of every child
 /// (`MXX_EXPONENT_LUT_REFRESH_TOP_{LWR_DIMENSION,SUPPORT_WEIGHT,INPUT_MODULUS,OUTPUT_MODULUS,
 /// BUCKET_WIDTH}`).
-fn prf_settings() -> PrfSettings {
+fn prf_settings(row: Option<&ParameterRow>) -> PrfSettings {
     let settings = PrfSettings {
-        lwr_dimension: setting("LWR_DIMENSION", 4),
-        support_weight: setting("SUPPORT_WEIGHT", 1),
-        input_modulus: setting("INPUT_MODULUS", 8),
-        output_modulus: setting("OUTPUT_MODULUS", 4),
-        bucket_width: setting("BUCKET_WIDTH", 0),
+        lwr_dimension: row_setting(row, "lwr_dimension", "LWR_DIMENSION", 4),
+        support_weight: row_setting(row, "support_weight", "SUPPORT_WEIGHT", 1),
+        input_modulus: row_setting(row, "input_modulus", "INPUT_MODULUS", 8),
+        output_modulus: row_setting(row, "output_modulus", "OUTPUT_MODULUS", 4),
+        bucket_width: row_setting(row, "bucket_width", "BUCKET_WIDTH", 0),
     };
     assert!(
         settings.support_weight > 0 && settings.support_weight <= settings.lwr_dimension,
@@ -221,12 +226,12 @@ fn setup(row: Option<&ParameterRow>) -> (RnsBggRefresh, WireId) {
     let bits = setting("STATISTICAL_BITS", 1);
     let failure_exponent = setting("FAILURE_EXPONENT", 100) as u32;
     let seed = row_setting(row, "key_seed", "KEY_SEED", 0) as u64;
-    let ring_dimension = setting("RING_DIMENSION", 8);
+    let ring_dimension = row_setting(row, "ring_dimension", "RING_DIMENSION", 8);
     assert!(ring_dimension.is_power_of_two(), "{PREFIX}RING_DIMENSION must be a power of two");
-    let crt_bits = setting("CRT_BITS", 30);
-    let base_bits = setting("BASE_BITS", 15);
-    let extension_primes = setting("EXTENSION_PRIMES", 14);
-    let prf = prf_settings();
+    let crt_bits = row_setting(row, "crt_bits", "CRT_BITS", 30);
+    let base_bits = row_setting(row, "base_bits", "BASE_BITS", 15);
+    let extension_primes = row_setting(row, "extension_primes", "EXTENSION_PRIMES", 14);
+    let prf = prf_settings(row);
     let pool = DCRTPolyParams::new(
         ring_dimension as u32,
         primes + extension_primes,

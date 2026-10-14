@@ -5,6 +5,7 @@
 //! backend evaluator.
 
 pub mod api;
+pub mod claim;
 pub mod decoder;
 #[cfg(feature = "gpu")]
 mod gpu_execution;

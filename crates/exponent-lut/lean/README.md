@@ -45,7 +45,7 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 | `ExponentDecomp.lean` | The pairings with the cell, alignment and block numerators of `lwr_prf` as sums over their sources |
 | `ExponentCellStep.lean` | The pairing with the error leaving a block of cells and with the finalized LUT error, in site form: the next weight, the residue sites with their coefficients, and the remainder with its bound |
 | `ExponentH2.lean` | The tail of a noise form under H2 (`h2_tail`): Hoeffding on the clamped mask for the key sites, energies with tape-dependent bounds, the block bounds in terms of the `l1` norm of the weight, the one-tower gadget, and the numeric tails |
-| `ExponentRefresh.lean` | The refresh to the top level (`crate::refresh::top`), see below |
+| `ExponentRefresh.lean` | The refresh to the top level (`crate::refresh`), see below |
 
 ### The refresh to the top level (`ExponentRefresh.lean`)
 

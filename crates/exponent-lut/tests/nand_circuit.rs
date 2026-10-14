@@ -21,7 +21,7 @@ use mxx_backends::{
 };
 use mxx_dsl::{DslContext, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
-    ExpLayout, NandCircuit, api,
+    ExpLayout, NandCircuit, api, claim,
     decoder::simulation::{AverageCaseConfig, NoiseModelKind},
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise,
@@ -691,7 +691,7 @@ fn nand_protocol(
     let graph = |name: &str| &graphs[name];
     let stages = stage_names
         .iter()
-        .map(|name| common::stage(name, graph(name), &productions, &links))
+        .map(|name| claim::stage(name, graph(name), &productions, &links).expect("protocol stage"))
         .collect::<Vec<_>>();
 
     // The ideal NAND circuit and the requirement `exponent_i = 8 * bit_i`.
@@ -723,7 +723,7 @@ fn nand_protocol(
     // The plaintext inputs of the RHS stage (RHS `X^(8 bit)`: preprocessing when Static,
     // encryption when Dynamic) and of encryption (state `X^2`).
     let only = |stage: &str, suffix: String| -> String {
-        let [name] = <[String; 1]>::try_from(common::inputs_ending_with(graph(stage), &suffix))
+        let [name] = <[String; 1]>::try_from(claim::inputs_ending_with(graph(stage), &suffix))
             .unwrap_or_else(|_| panic!("{stage} must declare one input ending with {suffix}"));
         name
     };
@@ -731,39 +731,39 @@ fn nand_protocol(
         lower: lower.into(),
         upper: upper.into(),
     };
-    let mut unit = vec![common::to_stage(
+    let mut unit = vec![claim::to_stage(
         "encrypt",
         &only("encrypt", format!("/input/{:?}.coefficient", compiled.state_input())),
     )];
     let mut exponents = vec![Vec::new(); leaves];
     for (rhs, leaf) in compiled.rhs_ids().iter().zip(compiled.circuit_input_indices()) {
-        unit.push(common::to_stage(
+        unit.push(claim::to_stage(
             rhs_stage,
             &only(rhs_stage, format!("/rhs/{rhs:?}.coefficient")),
         ));
         exponents[*leaf]
-            .push(common::to_stage(rhs_stage, &only(rhs_stage, format!("/rhs/{rhs:?}.exponent"))));
+            .push(claim::to_stage(rhs_stage, &only(rhs_stage, format!("/rhs/{rhs:?}.exponent"))));
     }
     let hash_key = stage_names
         .iter()
         .copied()
-        .filter(|stage| !common::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
-        .map(|stage| common::to_stage(stage, "rns-bgg/hash-key"))
+        .filter(|stage| !claim::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
+        .map(|stage| claim::to_stage(stage, "rns-bgg/hash-key"))
         .collect();
     let mut externals = vec![
-        common::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
-        common::external("unit_coefficient", range(1, 1), unit),
-        common::external(
+        claim::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
+        claim::external("unit_coefficient", range(1, 1), unit),
+        claim::external(
             "state_exponent",
             range(2, 2),
-            vec![common::to_stage(
+            vec![claim::to_stage(
                 "encrypt",
                 &only("encrypt", format!("/input/{:?}.exponent", compiled.state_input())),
             )],
         ),
     ];
     for (leaf, mut destinations) in exponents.into_iter().enumerate() {
-        externals.push(common::external(
+        externals.push(claim::external(
             &format!("bit_{leaf}"),
             range(0, 1),
             vec![
@@ -778,7 +778,7 @@ fn nand_protocol(
             requirement: 0,
             input: format!("exponent_{leaf}"),
         });
-        externals.push(common::external(&format!("exponent_{leaf}"), range(0, 8), destinations));
+        externals.push(claim::external(&format!("exponent_{leaf}"), range(0, 8), destinations));
     }
     let (contracts, bindings): (Vec<_>, Vec<_>) = externals.into_iter().unzip();
 

@@ -1,3 +1,5 @@
-parameter_id,noise_model,failure_exponent,ring_dimension,crt_bits,base_bits,primes,digits,error_sigma,trapdoor_sigma,key_seed,slots
-worst-n8-crt4x30,worst,,8,30,15,4,20,4,4.578,1,4
-average-n8-crt4x30,average,100,8,30,15,4,20,4,4.578,1,4
+parameter_id,noise_model,failure_exponent,ring_dimension,crt_bits,base_bits,primes,digits,error_sigma,trapdoor_sigma,key_seed,slots,extension_primes,lwr_dimension,support_weight,input_modulus,output_modulus,bucket_width
+worst-n8-crt4x30,worst,,8,30,15,4,20,4,4.578,1,4,14,4,1,8,4,0
+average-n8-crt4x30,average,100,8,30,15,4,20,4,4.578,1,4,14,4,1,8,4,0
+worst-n17-crt8x40,worst,,131072,40,10,8,42,4,4.578,0,8,48,1024,31,256,32,0
+average-n17-crt8x40,average,100,131072,40,10,8,42,4,4.578,0,8,48,1024,31,256,32,0

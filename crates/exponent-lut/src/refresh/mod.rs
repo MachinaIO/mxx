@@ -1,58 +1,68 @@
-//! Noise refresh of a private encoding row.
+//! Noise refresh of an exponent LUT output to the top level.
 //!
-//! The target is component 1 of a private Program output at a non-terminal
-//! level `l` with modulus `Q = q_1 ... q_L` (`L >= 2`):
-//! `c_x = s K_x - Delta x G^st + e_x`, where `G^st` is the level's state gadget
-//! (the gadget of level `l + 1`, modulus `q_(l+1)`) and `Delta = Q / q_(l+1)`.
-//! The refresh outputs, without any secret, the row
+//! The target is a private Program output `c_x` at level `L` (both component rows, payload
+//! `Delta_L r_j x G^st_L`, `r = (r_0, 1)`). The refresh outputs, without any secret, the two rows
+//! of a level-0 private encoding of the same `x` under a new mask `sigma = (sigma_0, 1)`:
 //!
-//! `y = s A' - Delta x G_Q + e'      in R_Q^(1 x m)`
+//! `y_j = sigma A'_(j) - Delta_0 r_j x G^st_0 + e'_j      (j = 0, 1)`
 //!
-//! for the hash-sampled public `A' in R_Q^(2 x m)`, the full gadget `G_Q` of
-//! level `l` (`m` columns) and a fresh noise `e'` of `m` CBD polynomials
-//! computed by the sparse-LWR PRF ([`FreshNoiseProgram`]).
+//! in the format of a reference chain ([`TopReference`]: its level-0 primes `Q_0` and level-1
+//! primes `Q_1`, `Delta_0 = Q_0 / Q_1`, `G^st_0` the gadget of `Q_1`), with `sigma_0` a uniform
+//! binary polynomial and `e'_j` CBD vectors, both computed by the sparse-LWR PRF
+//! ([`FreshNoiseProgram`]), and hash-sampled public `A'_(j) in R_(Q_0)^(2 x w_0)`.
 //!
-//! # Computation
+//! # Chains
 //!
-//! With the one encoding `c_1 = s A_1 - s (I_2 ⊗ G_Q) + e_1` (a public-payload
-//! encoding of `1` at level `l`) and the fresh-noise carriers
-//! `f_j = s K_(f,j) - e'_j G_Q + e_(f,j)` (scale 1), for every prime `q_i`,
-//! `Q_i = Q / q_i`:
+//! Decoding `y_j mod q` needs `q` in the decoding modulus, but level `L` has lost most primes of
+//! `Q_0`. The refresh therefore evaluates the source Program on one chain per refreshed slot, a
+//! prime `q` of `Q_0`: level `l` of chain `q` has the first `depths[l]` primes of its pool order
+//! `[q, the other primes of Q_0 in canonical order, extension primes]`, so it keeps `q` to level
+//! `L + 1` (the plaintext modulus of level `L`). Every ring lists its towers in the canonical
+//! order, so a modulus has one tower order on every chain. On chain `q` the part `(q, j)` decodes
+//! `y_j mod q` (the per-chain decoding step, see `part`): it combines the one encoding
+//! `[g | c_one]`, with `g` the mask child's carrier of payload `(M + 1) sigma_0 G`
+//! (`= sigma_0 G` modulo `q`), the target's component `j` and the fresh-noise carriers into a row
+//! that one smudged trapdoor decoder rounds to `y_j mod q`; the target action maps
+//! `Delta_L r_j x G^st_L` to `Q_q (Delta_0 r_j x G^st_0 mod q)`. [`crate::rns_bgg`] recombines
+//! the residues of every chain modulo the product `P` of the refreshed slots' primes (`Q_0` when
+//! every slot is refreshed); refreshing a subset of the slots yields `y_j mod P` only.
 //!
-//! - `u_i = c_1 (I_2 ⊗ G_Q)^-1(Q_i A') = s A_1 X_i - Q_i s A' + e_1 X_i`;
-//! - `v_i = c_x G^st^-1(Q_i G_Q mod q_(l+1)) = s K_x Y_i - Q_i Delta x G_Q + e_x Y_i`, exact modulo
-//!   `Q` because `Delta q_(l+1) = Q`;
-//! - `w_i = [f_j G_Q^-1(Q_i)]_j = s K_f Z_i - Q_i e' + e_f Z_i`;
-//! - `d_i = u_i - v_i + w_i = s K_i - Q_i y + E_i`.
+//! # Shared and chain-specific material
 //!
-//! The row `d_i` is decoded by one smudged trapdoor decoder per prime
-//! ([`crate::decoder`], target [`DecoderTarget::Refresh`]) to `y mod q_i`:
-//! every column `j` has its own smudge keys and its own preimage column, so
-//! the columns are decoded independently, but as one `1 x m` row (one
-//! smudge family over the columns, one preimage of `m` columns). A CRT
-//! recomposition over the primes returns `y`. Preprocessing computes the
-//! decoded keys `K_i` by the same steps on the public keys to sample the
-//! decoders' preimages; the output key `A'` is public.
+//! The mask and the CBD children of every chain use the same keys (one mask key set, one CBD key
+//! set per component) and the same label, so all chains compute the same `sigma_0` and `e'_j`;
+//! every decoder has its own smudge keys, one key set per column (one family over the columns).
+//! The stages of chain `q` run under the hash namespace [`RefreshDeclaration::chain_namespace`],
+//! so no two chains share a hash-derived public matrix (with a shared mask, two input rows under
+//! one key would cancel it). `A'_(j)` and the label are sampled under the refresh's own
+//! namespaces, identical for every chain.
 //!
-//! # Caller responsibilities
+//! # Declaring and running a refresh
 //!
+//! [`PrfSettings::declare_refresh`] declares a refresh from the settings of its sparse-LWR PRF and
+//! a key seed, generating the keys ([`RefreshKeyLayouts`]) or only declaring their shapes (the
+//! noise and the stage graphs depend on the shapes only). [`crate::rns_bgg::RnsBggRefresh`] runs
+//! it on RNS-BGG stages and states the claim of a run for the source [`bit_flip_source`].
+//!
+//! # Caller responsibilities and preconditions
+//!
+//! - The target must be the output of an exponent LUT, whose plaintext is one signed table monomial
+//!   (`||x||_1 = 1`) under the crate's LUT input contract (every LUT input is one signed monomial);
+//!   a Program that sums before its last LUT is outside the claim.
 //! - `A'` is fixed by the declaration's matrix tag and reused across encryptions (each with a fresh
-//!   mask secret). Refreshing two encodings under the same secret and the same `A'` reveals the
-//!   difference of their payloads; the refresh does not track it.
-//! - Every invocation uses a fresh label tag: the PRF label `a` is hashed from it (see
-//!   [`RefreshDeclaration::label`]), and a repeated label with the same keys repeats `e'` and every
-//!   smudge.
+//!   mask). Refreshing two encodings under the same secret and the same `A'` reveals the difference
+//!   of their payloads; the refresh does not track it.
+//! - Every invocation uses a fresh label tag ([`RefreshDeclaration::label`]); a repeated label with
+//!   the same keys repeats `sigma_0`, `e'` and every smudge, and two refreshes of `x` and `x~` then
+//!   differ by `-Delta_0 r_j (x - x~) G^st_0` exactly.
+//! - Label encodings of another label under the right artifact names are outside the contract.
 //!
-//! The smudge hides the decoders' noise under the heuristic of the existing
-//! decoder, which ignores the correlation of the smudge carriers' errors with
-//! the smudge values.
-//!
-//! [`top`] builds on this refresh to re-encrypt a level-`L` encoding as a
-//! level-0 encoding under a new mask, with one decoding chain per prime of
-//! the top modulus.
+//! The smudges hide the decoders' noise under the heuristic of the existing decoder, which
+//! ignores the correlation of the smudge carriers' errors with the smudge values, over the joint
+//! view of every chain's hint, preimages and child encodings.
 
 use crate::{
-    decoder::decoding::{DecoderDeclaration, DecoderError, DecoderSmudgeProgram, DecoderTarget},
+    decoder::decoding::{DecoderDeclaration, DecoderError},
     program::{
         ExponentLutProgram, ExponentLutProgramBuilder, ExponentLutProgramId, FamilyRange, Operand,
         ProgramValidationError, WireId,
@@ -62,13 +72,14 @@ use crate::{
         prf_sampler::{PrfDistribution, PrfSampler, PrfSamplerError},
     },
 };
-use mxx_backends::sampler::hash::sample_hash_integers;
-
-pub mod top;
 use mxx_ir_core::IntExpr;
-use num_bigint::BigUint;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+mod part;
+mod setup;
+pub(crate) use part::RefreshPartDeclaration;
+pub use setup::{PrfSettings, RefreshKeyLayouts, bit_flip_source};
 
 /// Errors in a refresh declaration.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -81,6 +92,10 @@ pub enum RefreshError {
     Sampler(#[from] PrfSamplerError),
     #[error(transparent)]
     Program(#[from] ProgramValidationError),
+    #[error(transparent)]
+    Prf(#[from] crate::program_gadgets::prf::PrfError),
+    #[error(transparent)]
+    Pbc(#[from] crate::program_gadgets::pbc::PbcError),
 }
 
 /// The fresh-noise child Program: one output, the row of `m` column blocks
@@ -114,7 +129,7 @@ impl FreshNoiseProgram {
     }
 
     /// The `columns` polynomials of `coefficients` samples of `distribution`
-    /// (see [`Self::new`]); the top refresh's mask child is one polynomial of
+    /// (see [`Self::new`]); the refresh's mask child is one polynomial of
     /// [`PrfDistribution::Binary`] samples.
     pub fn with_distribution(
         profile: SparseLwrPrfProfile,
@@ -211,399 +226,260 @@ impl TopReference {
     }
 }
 
-/// What makes a [`RefreshDeclaration`] one part of a refresh to the top
-/// level ([`top::TopRefreshDeclaration`]): it refreshes component
-/// `component` of its target into the reference format and decodes only the
-/// output prime `output_prime` (an index into the decoding level's primes),
-/// with the new mask `(sigma_0, 1)` whose `sigma_0` is the mask child's
-/// binary polynomial.
-#[derive(Clone, Debug)]
-pub struct TopRefreshPart {
-    top: [u8; 32],
-    component: usize,
-    output_prime: usize,
-    output_modulus: u64,
-    output_moduli: Vec<u64>,
-    reference: TopReference,
-    mask: FreshNoiseProgram,
+/// The key shapes of a refresh's PRF keys. Each shape commits to its key set (see
+/// [`PrfKeyShape`]); the keys' layouts are the stages' integer data (coordinate tables, see
+/// [`crate::program::ProgramData`]).
+pub struct RefreshKeys<'a> {
+    /// The mask child's `n` keys, shared by every chain and component.
+    pub mask: PrfKeyShape,
+    /// Component `j`'s CBD child keys (`w_0 n`), shared by every chain.
+    pub fresh: [PrfKeyShape; 2],
+    /// The `w_0 n d` smudge keys of the decoder of part `(chain, component)`, column `j` the keys
+    /// from `j n d`; every call must return fresh keys.
+    pub smudge: &'a mut dyn FnMut(usize, usize) -> PrfKeyShape,
 }
 
-impl TopRefreshPart {
-    /// The commitment of the top refresh: it names the label and `A'`.
-    pub const fn top(&self) -> &[u8; 32] {
-        &self.top
-    }
-
-    pub const fn component(&self) -> usize {
-        self.component
-    }
-
-    pub const fn output_prime(&self) -> usize {
-        self.output_prime
-    }
-
-    /// The output prime `q` itself.
-    pub const fn output_modulus(&self) -> u64 {
-        self.output_modulus
-    }
-
-    /// The refreshed primes of the top refresh, in canonical order: their
-    /// product `P` is the modulus of the recombined rows, to which every
-    /// part contributes its residue's CRT term.
-    pub fn output_moduli(&self) -> &[u64] {
-        &self.output_moduli
-    }
-
-    pub const fn reference(&self) -> &TopReference {
-        &self.reference
-    }
-
-    pub const fn mask(&self) -> &FreshNoiseProgram {
-        &self.mask
-    }
-}
-
-/// Immutable, committed declaration of one noise refresh.
+/// Immutable, committed declaration of a refresh to the top level.
+///
+/// Its parts `(chain, component)`, one per refreshed slot and component, each run their own
+/// preprocessing, encryption and online evaluation (the `rns_bgg` stage builders take the part
+/// as `(chain, component)`); [`Self::fresh`], [`Self::decoder`], [`Self::mask_namespace`] and
+/// [`Self::fresh_namespace`] give the children of a part.
 #[derive(Clone, Debug)]
 pub struct RefreshDeclaration {
-    source_program: ExponentLutProgramId,
-    target_output: WireId,
     profile: SparseLwrPrfProfile,
-    eta: u32,
-    primes: usize,
-    columns: usize,
-    coefficients: usize,
-    digits: usize,
-    matrix_tag: Vec<u8>,
-    fresh: FreshNoiseProgram,
-    /// One decoder of the whole row per decoded prime
-    /// ([`Self::decoded_primes`]), in order.
-    decoders: Vec<DecoderDeclaration>,
+    reference: TopReference,
+    depths: Vec<usize>,
+    extension: Vec<u64>,
+    level: usize,
+    /// The refreshed slots: chain `chain` decodes prime `reference.top[slots[chain]]`.
+    slots: Vec<usize>,
+    /// Part `(chain, component)` at `2 chain + component`.
+    parts: Vec<RefreshPartDeclaration>,
     spec: [u8; 32],
-    top: Option<TopRefreshPart>,
 }
 
 impl RefreshDeclaration {
-    /// Check and freeze the refresh of `target_output` of `source_program`
-    /// over a decoding modulus of `primes` CRT primes (`>= 2`) and a gadget of
-    /// `columns` digits, in a ring of dimension `coefficients`: the fresh noise
-    /// is CBD(`eta`) on the keys of shape `fresh_keys` (`columns *
-    /// coefficients` members), the decoder of prime `i` smudges every column
-    /// with `digits` digits on the keys of shape `smudge_keys[i]` (`columns *
-    /// coefficients * digits` members, column `j` the members from `j
-    /// coefficients digits`), and `A'` is sampled under `matrix_tag`. The
-    /// keys must be pairwise distinct; the specification commits to every key
-    /// set.
+    /// Check and freeze the refresh of `target_output` of `source_program`, whose level is
+    /// `depths.len() - 2`, to the format `reference`: the chains have `depths[l]` primes at level
+    /// `l` (`depths[0]` the primes of `reference.top`, `depths[1]` those of `reference.next`),
+    /// the children extend them with primes of `extension`, the fresh noise is CBD(`eta`) and
+    /// every decoder smudges with `digits` digits, on the keys of `keys`. `slots` lists the
+    /// refreshed primes of `reference.top` by increasing index, one chain each. The
+    /// specification commits to the mask and CBD key sets, and every part's to its smudge key
+    /// sets, so refreshes of distinct key sets share no hash namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_program: &ExponentLutProgram,
         target_output: WireId,
         profile: SparseLwrPrfProfile,
         eta: u32,
-        primes: usize,
-        columns: usize,
-        digits: usize,
-        fresh_keys: PrfKeyShape,
-        smudge_keys: Vec<PrfKeyShape>,
-        matrix_tag: Vec<u8>,
-    ) -> Result<Self, RefreshError> {
-        Self::build(
-            source_program,
-            target_output,
-            profile,
-            eta,
-            primes,
-            columns,
-            digits,
-            fresh_keys,
-            smudge_keys,
-            matrix_tag,
-            None,
-        )
-    }
-
-    /// Part `(output_prime, component)` of the refresh to the top level
-    /// committed by `top` (see [`top::TopRefreshDeclaration`]): the decoding
-    /// level has `primes` primes, the refreshed row has the `columns()` of
-    /// `reference`, CBD(`eta`) noise on the keys of shape `fresh_keys` (one
-    /// polynomial per column), the decoder of `output_prime` on the keys of
-    /// shape `smudge_keys[0]`, the mask child's binary samples on the keys of
-    /// shape `mask_keys` (`n` members, the bit modulo the output prime
-    /// `q_min`), and `A'` under `matrix_tag`; `output_moduli` are the
-    /// refreshed primes (the output prime among them).
-    #[allow(clippy::too_many_arguments)]
-    pub fn top_part(
-        source_program: &ExponentLutProgram,
-        target_output: WireId,
-        profile: SparseLwrPrfProfile,
-        eta: u32,
-        primes: usize,
-        output_prime: (usize, u64),
-        output_moduli: Vec<u64>,
-        component: usize,
-        digits: usize,
         reference: TopReference,
-        mask_keys: PrfKeyShape,
-        fresh_keys: PrfKeyShape,
-        smudge_keys: Vec<PrfKeyShape>,
-        matrix_tag: Vec<u8>,
-        top: [u8; 32],
-    ) -> Result<Self, RefreshError> {
-        let coefficients =
-            profile.ring_dimension().map_err(|_| RefreshError::InvalidDeclaration)?;
-        if component > 1 || output_prime.0 >= primes || !output_moduli.contains(&output_prime.1) {
-            return Err(RefreshError::InvalidDeclaration);
-        }
-        // One polynomial of `n` bits `h (1 +- 1)`, `h = 2^-1 mod q`.
-        let mask = FreshNoiseProgram::with_distribution(
-            profile,
-            PrfDistribution::Binary { q_min: output_prime.1 },
-            1,
-            coefficients,
-            mask_keys,
-        )?;
-        let columns = reference.columns();
-        Self::build(
-            source_program,
-            target_output,
-            profile,
-            eta,
-            primes,
-            columns,
-            digits,
-            fresh_keys,
-            smudge_keys,
-            matrix_tag,
-            Some(TopRefreshPart {
-                top,
-                component,
-                output_prime: output_prime.0,
-                output_modulus: output_prime.1,
-                output_moduli,
-                reference,
-                mask,
-            }),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        source_program: &ExponentLutProgram,
-        target_output: WireId,
-        profile: SparseLwrPrfProfile,
-        eta: u32,
-        primes: usize,
-        columns: usize,
+        depths: Vec<usize>,
+        slots: Vec<usize>,
+        extension: Vec<u64>,
         digits: usize,
-        fresh_keys: PrfKeyShape,
-        smudge_keys: Vec<PrfKeyShape>,
+        keys: RefreshKeys<'_>,
         matrix_tag: Vec<u8>,
-        top: Option<TopRefreshPart>,
     ) -> Result<Self, RefreshError> {
+        let invalid = RefreshError::InvalidDeclaration;
+        let level = depths.len().checked_sub(2).ok_or(RefreshError::InvalidDeclaration)?;
         let coefficients =
             profile.ring_dimension().map_err(|_| RefreshError::InvalidDeclaration)?;
-        let decoded = top.as_ref().map_or(primes, |_| 1);
-        if primes < 2 || smudge_keys.len() != decoded {
-            return Err(RefreshError::InvalidDeclaration);
+        if reference.ring_dimension as usize != coefficients ||
+            depths.first() != Some(&reference.top.len()) ||
+            depths.get(1) != Some(&reference.next.len()) ||
+            !reference.next.iter().all(|prime| reference.top.contains(prime)) ||
+            depths.windows(2).any(|pair| pair[1] > pair[0]) ||
+            depths[level] < 2 ||
+            depths[level + 1] == 0 ||
+            extension.iter().any(|prime| reference.top.contains(prime)) ||
+            slots.is_empty() ||
+            slots.windows(2).any(|pair| pair[1] <= pair[0]) ||
+            slots.last().is_some_and(|slot| *slot >= reference.top.len())
+        {
+            return Err(invalid);
         }
-        let fresh = FreshNoiseProgram::new(profile, eta, columns, coefficients, fresh_keys)?;
-        let smudges = smudge_keys
-            .into_iter()
-            .map(|keys| {
-                if Some(keys.members()) != columns.checked_mul(coefficients * digits) {
-                    return Err(RefreshError::InvalidDeclaration);
-                }
-                Ok(DecoderSmudgeProgram::new(&profile, keys, columns)?)
-            })
-            .collect::<Result<Vec<_>, RefreshError>>()?;
-        // The children's Programs depend on their key shapes only; the
-        // shapes' key-set commitments bind the specification, and so every
-        // hash namespace derived from it, to the key sets (the decoders'
-        // commitments cover their smudge keys).
-        let mask_keys = top.as_ref().map(|part| part.mask.keys()).transpose()?;
+        target_admission(source_program, target_output)?;
         let spec = commitment(&(
-            b"mxx-exponent-lut/refresh/spec/v2".as_slice(),
+            b"mxx-exponent-lut/refresh-top/spec/v2".as_slice(),
             source_program.id(),
             target_output,
             &profile,
             eta,
-            primes,
-            columns,
-            coefficients,
+            &reference,
+            &depths,
+            &slots,
+            &extension,
             digits,
             &matrix_tag,
-            fresh.id(),
-            fresh.keys()?,
-            smudges.iter().map(DecoderSmudgeProgram::id).collect::<Vec<_>>(),
-            smudges
-                .iter()
-                .map(|smudge| smudge.prf().key_shape())
-                .collect::<Option<Vec<_>>>()
-                .ok_or(RefreshError::InvalidDeclaration)?,
-            mask_keys,
-            top.as_ref().map(|part| {
-                (
-                    part.top,
-                    part.component,
-                    part.output_prime,
-                    part.output_modulus,
-                    &part.output_moduli,
-                    &part.reference,
-                    part.mask.id(),
-                )
-            }),
+            &keys.mask,
+            &keys.fresh,
         ))?;
-        let decoded_primes =
-            top.as_ref().map_or_else(|| (0..primes).collect(), |part| vec![part.output_prime]);
-        let decoders = smudges
-            .into_iter()
-            .zip(decoded_primes)
-            .map(|(smudge, prime)| {
-                Ok(DecoderDeclaration::from_smudge(
+        let primes = depths[level];
+        let outputs = slots.iter().map(|slot| reference.top[*slot]).collect::<Vec<_>>();
+        let mut parts = Vec::with_capacity(2 * slots.len());
+        for (chain, prime) in slots.iter().map(|slot| &reference.top[*slot]).enumerate() {
+            // The decoding level keeps the output prime and the first `primes - 1` other
+            // primes of `Q_0`, in canonical tower order.
+            let kept = reference.top.iter().filter(|other| *other != prime).take(primes - 1);
+            let kept = kept.collect::<Vec<_>>();
+            let position = reference
+                .top
+                .iter()
+                .take_while(|other| *other != prime)
+                .filter(|other| kept.contains(other))
+                .count();
+            for component in 0..2 {
+                parts.push(RefreshPartDeclaration::new(
                     source_program,
                     target_output,
                     profile,
-                    (columns, coefficients, digits),
-                    smudge,
-                    DecoderTarget::Refresh { spec, prime },
-                )?)
-            })
-            .collect::<Result<Vec<_>, RefreshError>>()?;
-        Ok(Self {
-            source_program: source_program.id(),
-            target_output,
-            profile,
-            eta,
-            primes,
-            columns,
-            coefficients,
-            digits,
-            matrix_tag,
-            fresh,
-            decoders,
-            spec,
-            top,
-        })
+                    eta,
+                    primes,
+                    (position, *prime),
+                    outputs.clone(),
+                    component,
+                    digits,
+                    reference.clone(),
+                    keys.mask.clone(),
+                    keys.fresh[component].clone(),
+                    (keys.smudge)(chain, component),
+                    matrix_tag.clone(),
+                    spec,
+                )?);
+            }
+        }
+        Ok(Self { profile, reference, depths, extension, level, slots, parts, spec })
     }
 
-    pub const fn source_program(&self) -> ExponentLutProgramId {
-        self.source_program
-    }
-
-    pub const fn target_output(&self) -> WireId {
-        self.target_output
-    }
-
-    pub const fn profile(&self) -> &SparseLwrPrfProfile {
-        &self.profile
-    }
-
-    /// The CBD parameter of the fresh noise: `||e'||_inf <= eta`.
-    pub const fn eta(&self) -> u32 {
-        self.eta
-    }
-
-    /// The number `L` of CRT primes of the decoding modulus.
-    pub const fn primes(&self) -> usize {
-        self.primes
-    }
-
-    /// The number of columns of the refreshed row: the decoding level's `m`
-    /// gadget columns, or the reference's `w_0` for a top-refresh part.
-    pub const fn columns(&self) -> usize {
-        self.columns
-    }
-
-    /// The top-refresh part this declaration is, if any.
-    pub const fn top(&self) -> Option<&TopRefreshPart> {
-        self.top.as_ref()
-    }
-
-    /// The refreshed component of the target: 1, or the part's component.
-    pub fn component(&self) -> usize {
-        self.top.as_ref().map_or(1, TopRefreshPart::component)
-    }
-
-    /// The primes decoded, as indices into the decoding level's primes: all
-    /// of them, or the part's output prime.
-    pub fn decoded_primes(&self) -> Vec<usize> {
-        self.top.as_ref().map_or_else(|| (0..self.primes).collect(), |part| vec![part.output_prime])
-    }
-
-    /// The ring dimension `n`.
-    pub const fn coefficients(&self) -> usize {
-        self.coefficients
-    }
-
-    /// The smudge digit count of every decoder.
-    pub const fn digits(&self) -> usize {
-        self.digits
-    }
-
-    /// The tag of the public matrix `A'`.
-    pub fn matrix_tag(&self) -> &[u8] {
-        &self.matrix_tag
-    }
-
-    pub const fn fresh(&self) -> &FreshNoiseProgram {
-        &self.fresh
-    }
-
-    /// The decoder of a decoded prime.
-    pub fn decoder(&self, prime: usize) -> Option<&DecoderDeclaration> {
-        let position = self.decoded_primes().iter().position(|decoded| *decoded == prime)?;
-        self.decoders.get(position)
-    }
-
-    /// Every decoder, the decoder of `prime` at the position of `prime`
-    /// among [`Self::decoded_primes`].
-    pub fn decoders(&self) -> &[DecoderDeclaration] {
-        &self.decoders
-    }
-
-    /// The specification commitment (see [`DecoderTarget::Refresh`]).
     pub const fn spec(&self) -> &[u8; 32] {
         &self.spec
     }
 
-    /// The hash tag of the PRF label of an invocation with label tag
-    /// `label_tag`.
-    pub fn label_hash_tag(&self, label_tag: &[u8]) -> Vec<u8> {
-        match &self.top {
-            // Every part of a top refresh shares the top refresh's label.
-            Some(part) => top::label_hash_tag(&part.top, label_tag),
-            None => [b"refresh/v1/label".as_slice(), self.spec.as_slice(), label_tag].concat(),
-        }
+    /// The sparse-LWR PRF profile of every child.
+    pub const fn profile(&self) -> &SparseLwrPrfProfile {
+        &self.profile
+    }
+
+    pub const fn reference(&self) -> &TopReference {
+        &self.reference
+    }
+
+    /// The target's level `L`.
+    pub const fn level(&self) -> usize {
+        self.level
+    }
+
+    /// The prime count of every level of every chain.
+    pub fn depths(&self) -> &[usize] {
+        &self.depths
+    }
+
+    /// The number of chains: one per refreshed slot.
+    pub fn chains(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The refreshed slots, indices into the reference's `Q_0` primes.
+    pub fn slots(&self) -> &[usize] {
+        &self.slots
+    }
+
+    /// Chain `chain`'s output prime.
+    pub fn output_prime(&self, chain: usize) -> Option<u64> {
+        self.slots.get(chain).map(|slot| self.reference.top[*slot])
+    }
+
+    /// The primes of the refreshed slots in canonical order; their product
+    /// `P` is the modulus of the recombined rows.
+    pub fn output_primes(&self) -> Vec<u64> {
+        self.slots.iter().map(|slot| self.reference.top[*slot]).collect()
+    }
+
+    /// Chain `chain`'s pool order: its output prime, the other primes of
+    /// `Q_0` in canonical order, then the extension primes.
+    pub fn pool_order(&self, chain: usize) -> Option<Vec<u64>> {
+        let prime = self.output_prime(chain)?;
+        Some(
+            std::iter::once(prime)
+                .chain(self.reference.top.iter().copied().filter(|other| *other != prime))
+                .chain(self.extension.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Part `(chain, component)`.
+    pub(crate) fn part(
+        &self,
+        (chain, component): (usize, usize),
+    ) -> Option<&RefreshPartDeclaration> {
+        (component < 2).then(|| self.parts.get(2 * chain + component)).flatten()
+    }
+
+    /// Chain `chain`'s mask child: one polynomial of `n` bits modulo its output prime, the same
+    /// bits on every chain.
+    pub fn mask(&self, chain: usize) -> Option<&FreshNoiseProgram> {
+        self.part((chain, 0)).map(RefreshPartDeclaration::mask)
+    }
+
+    /// The fresh-noise child of part `(chain, component)`: the CBD noise `e'_j` of the
+    /// component.
+    pub fn fresh(&self, part: (usize, usize)) -> Option<&FreshNoiseProgram> {
+        self.part(part).map(RefreshPartDeclaration::fresh)
+    }
+
+    /// The decoder of part `(chain, component)`, which decodes the chain's output prime and
+    /// whose smudge child runs under its commitment.
+    pub fn decoder(&self, part: (usize, usize)) -> Option<&DecoderDeclaration> {
+        self.part(part).map(RefreshPartDeclaration::decoder)
+    }
+
+    /// The hash namespace of the mask child of part `(chain, component)`: a refresh child's
+    /// stage builders take it through `with_hash_namespace`.
+    pub fn mask_namespace(&self, part: (usize, usize)) -> Option<[u8; 32]> {
+        self.part(part).map(RefreshPartDeclaration::mask_namespace)
+    }
+
+    /// The hash namespace of the fresh-noise child of part `(chain, component)` (see
+    /// [`Self::mask_namespace`]).
+    pub fn fresh_namespace(&self, part: (usize, usize)) -> Option<[u8; 32]> {
+        self.part(part).map(RefreshPartDeclaration::fresh_namespace)
+    }
+
+    /// The hash namespace of chain `chain`'s stages.
+    pub fn chain_namespace(&self, chain: usize) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/refresh-top/chain-namespace/v1");
+        digest.update(self.spec);
+        digest.update((chain as u64).to_le_bytes());
+        digest.finalize().into()
+    }
+
+    /// The hash namespace of `A'_(0)` and `A'_(1)`, shared by every chain.
+    pub fn matrix_namespace(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/refresh-top/matrix-namespace/v1");
+        digest.update(self.spec);
+        digest.finalize().into()
     }
 
     /// The PRF label `a in Z_Q'^v` of an invocation with label tag
-    /// `label_tag` under the stage hash key: uniform weak-PRF input of every
-    /// fresh-noise and smudge key (random-oracle model).
+    /// `label_tag` under the stage hash key, shared by every part.
     pub fn label(&self, hash_key: [u8; 32], label_tag: &[u8]) -> Result<Vec<usize>, RefreshError> {
-        let q = self.profile.q().map_err(|_| RefreshError::InvalidDeclaration)?;
-        sample_hash_integers::<keccak_asm::Keccak256>(
-            hash_key,
-            &self.label_hash_tag(label_tag),
-            self.profile.lwr_dimension,
-            &BigUint::from(q),
-        )
-        .into_iter()
-        .map(|value| usize::try_from(value).map_err(|_| RefreshError::InvalidDeclaration))
-        .collect()
+        self.parts[0].label(hash_key, label_tag)
     }
+}
 
-    /// The hash tag of the public matrix `A'`: the matrix tag, and for a part of a refresh to the
-    /// top level its component as an integer component (parts differ only in integers, so their
-    /// stages share one structure).
-    pub fn matrix_hash_tag(&self) -> mxx_dsl::HashTag {
-        let mut tag = mxx_dsl::HashTag::from(
-            [b"refresh/v1/A".as_slice(), self.matrix_tag.as_slice()].concat(),
-        );
-        if self.top.is_some() {
-            tag.push("component");
-            tag.push(mxx_ir_core::IntExpr::constant(self.component()));
-        }
-        tag
+/// The admission rule of a refresh target: the output of a LUT with an exponent representation
+/// (one signed table monomial, `||x||_1 = 1`, under the LUT input contract), so
+/// `||r_j x||_inf <= 1 < q_min / 2` for the ternary payload secret and the same integer
+/// represents `r_j x` modulo the target's plaintext modulus and modulo `Q_1`.
+fn target_admission(program: &ExponentLutProgram, target: WireId) -> Result<(), RefreshError> {
+    let representation = program.lut_output_representation(target)?;
+    match representation {
+        Some(crate::program::LutOutputRepresentation::Exponent(_)) => Ok(()),
+        _ => Err(RefreshError::InvalidDeclaration),
     }
 }
 
@@ -613,87 +489,4 @@ fn commitment(value: &impl Serialize) -> Result<[u8; 32], RefreshError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        decoder::decoding::fixture::{keys, profile, shape},
-        program::AttributeKnowledge,
-    };
-
-    fn identity() -> (ExponentLutProgram, WireId) {
-        let mut builder = ExponentLutProgramBuilder::new();
-        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
-        (builder.finish(vec![Operand::Scalar(input)]).unwrap(), input)
-    }
-
-    /// The key shape of `count` fresh keys.
-    fn key_shape(count: usize) -> PrfKeyShape {
-        shape(&keys(count))
-    }
-
-    /// Two primes, two columns, one digit: the fresh program has two outputs
-    /// of `n` members each, and decoder `i` targets prime `i` under the
-    /// specification commitment with `2 n` smudge members over both columns;
-    /// labels are reproducible.
-    #[test]
-    fn declaration_lays_out_fresh_outputs_and_decoders() {
-        let (source, input) = identity();
-        let n = profile().ring_dimension().unwrap();
-        let declaration = RefreshDeclaration::new(
-            &source,
-            input,
-            profile(),
-            1,
-            2,
-            2,
-            1,
-            key_shape(2 * n),
-            (0..2).map(|_| key_shape(2 * n)).collect(),
-            b"tag".to_vec(),
-        )
-        .unwrap();
-        assert_eq!(declaration.fresh().columns(), 2);
-        assert_eq!(declaration.fresh().sampler().prf().members(), 2 * n);
-        for prime in 0..2 {
-            let decoder = declaration.decoder(prime).unwrap();
-            assert_eq!(
-                decoder.target(),
-                DecoderTarget::Refresh { spec: *declaration.spec(), prime }
-            );
-            assert_eq!((decoder.columns(), decoder.smudge().members()), (2, 2 * n));
-        }
-        assert!(declaration.decoder(2).is_none());
-        let label = declaration.label([7; 32], b"nu").unwrap();
-        assert_eq!(label, declaration.label([7; 32], b"nu").unwrap());
-        assert_ne!(label, declaration.label([7; 32], b"other").unwrap());
-        let q = profile().q().unwrap();
-        assert!(label.len() == profile().lwr_dimension && label.iter().all(|value| *value < q));
-    }
-
-    /// One prime, a missing smudge key set, a short fresh key set or a
-    /// smudge set of the wrong size is rejected; so is a coefficient target.
-    #[test]
-    fn declaration_rejects_malformed_refreshes() {
-        let (source, input) = identity();
-        let n = profile().ring_dimension().unwrap();
-        let build = |primes: usize, fresh: usize, smudges: usize, smudge: usize| {
-            RefreshDeclaration::new(
-                &source,
-                input,
-                profile(),
-                1,
-                primes,
-                1,
-                1,
-                key_shape(fresh),
-                (0..smudges).map(|_| key_shape(smudge)).collect(),
-                Vec::new(),
-            )
-        };
-        assert!(build(2, n, 2, n).is_ok());
-        assert_eq!(build(1, n, 1, n).unwrap_err(), RefreshError::InvalidDeclaration);
-        assert_eq!(build(2, n, 1, n).unwrap_err(), RefreshError::InvalidDeclaration);
-        assert_eq!(build(2, n - 1, 2, n).unwrap_err(), RefreshError::InvalidDeclaration);
-        assert_eq!(build(2, n, 2, n + 1).unwrap_err(), RefreshError::InvalidDeclaration);
-    }
-}
+pub(crate) mod tests;

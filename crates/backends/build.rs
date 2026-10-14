@@ -103,7 +103,10 @@ fn main() {
         let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let cuda_lib_dir =
             env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{cuda_home}/lib64"));
-        let debug_build = env::var("DEBUG").is_ok_and(|debug| debug == "true");
+        // Device debug code (`-G`) disables nvcc's optimizations, so only an unoptimized build
+        // gets it; an optimized build with host debug info (`DEBUG=true`) keeps optimized kernels.
+        let debug_build = env::var("DEBUG").is_ok_and(|debug| debug == "true") &&
+            env::var("OPT_LEVEL").is_ok_and(|level| level == "0");
         println!(
             "cargo::rustc-env=MXX_NATIVE_KERNEL_BUILD_REVISION={}",
             native_kernel_build_revision(Path::new("cuda"), &cuda_arch, debug_build)
@@ -120,6 +123,7 @@ fn main() {
         let mut build = cc::Build::new();
         build
             .cuda(true)
+            .debug(debug_build)
             .file("cuda/src/Runtime.cu")
             .file("cuda/src/Primitive.cu")
             .file("cuda/src/Control.cu")

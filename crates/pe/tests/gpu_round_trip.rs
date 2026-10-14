@@ -54,6 +54,14 @@
 //! | `NOISE_MODEL`, `FAILURE_EXPONENT` | `worst`, 128 | Noise model of the correctness check |
 //! | `SECURITY_BITS` | 128 | Required lattice security of the encryption secret |
 //! | `STORAGE` | `device` | Stage artifacts: `device` (matrices in GPU memory, others in host memory), `host`, `file` (a temporary directory), or `file:<directory>` |
+//! | `CRT_DEPTH` | unset | `test_gpu_pe_time_window`: the parameters at this CRT depth and the smallest ring dimension, without the noise simulation and the security estimate (parameters a search already accepted) |
+//! | `SINGLE_TIME` | 0 | `test_gpu_pe_time_window`: 1 encrypts and decrypts once, at a random accepted time of `[0900, 1759]`, instead of every vector of `TIME_VECTORS` |
+//! | `ESTIMATE_FROM` | unset | `test_gpu_pe_time_window`: `encrypt` runs setup and key generation, then only plans the encryption and the online evaluation (`MXX_EXPONENT_LUT_ESTIMATE_ONLY` from then on) |
+//! | `DISCARD_CIPHERTEXTS` | 0 | `test_gpu_pe_time_window` with `file` storage: 1 deletes each vector's ciphertext productions after its decryption, so the store holds one ciphertext at a time |
+//!
+//! With `MXX_EXPONENT_LUT_ESTIMATE_ONLY=1` (see `mxx_exponent_lut::gpu_execution`),
+//! `test_gpu_pe_time_window` plans every stage and logs its estimate without executing the stages
+//! with artifact I/O; it stops after planning the first vector's online evaluation.
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{
@@ -127,15 +135,14 @@ fn lean_directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lean")
 }
 
-/// The first accepted candidate over the ring dimensions, with its noise report.
-fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
+/// The parameter request of `class` from the environment, with the ring-dimension candidates.
+fn request(class: PeClass) -> (PeParameterRequest, Vec<u32>) {
     let crt_bits = count("CRT_BITS", 50);
     let base_bits = u32::try_from(count("BASE_BITS", crt_bits.div_ceil(2))).unwrap();
     let max_depth = count("MAX_CRT_DEPTH", 12);
     let security = u64::try_from(count("SECURITY_BITS", 128)).unwrap();
     assert!(security > 0, "{} must be positive", variable("SECURITY_BITS"));
     let trapdoor_sigma = decimal("TRAPDOOR_SIGMA", "4.578").to_string().parse::<f64>().unwrap();
-    let failure_exponent = noise_model();
     let dimensions = ring_dimension_candidates(
         &variable("MIN_LOG_RING_DIMENSION"),
         &variable("MAX_LOG_RING_DIMENSION"),
@@ -143,26 +150,41 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
         15,
     )
     .unwrap();
-    {
-        let request = PeParameterRequest {
-            class,
-            ring_dimension: dimensions[0],
-            crt_bits,
-            base_bits,
-            crt_depths: 1..=max_depth,
-            trapdoor_sigma,
-            error_sigma: decimal("ERROR_SIGMA", "3.19"),
-            lut_radix: match env::var(variable("LUT_RADIX")) {
-                Err(_) => class.default_lut_radix(),
-                Ok(_) => Some(count("LUT_RADIX", 0)).filter(|radix| *radix > 0),
-            },
-            compact_encodings: count("COMPACT_ENCODINGS", 1) != 0,
-            failure_exponent,
-            lattice_security_bits: Some(security),
-        };
-        PeParameters::select_dimension(&request, dimensions)
-            .unwrap_or_else(|error| panic!("no parameter candidate was accepted: {error}"))
-    }
+    let request = PeParameterRequest {
+        class,
+        ring_dimension: dimensions[0],
+        crt_bits,
+        base_bits,
+        crt_depths: 1..=max_depth,
+        trapdoor_sigma,
+        error_sigma: decimal("ERROR_SIGMA", "3.19"),
+        lut_radix: match env::var(variable("LUT_RADIX")) {
+            Err(_) => class.default_lut_radix(),
+            Ok(_) => Some(count("LUT_RADIX", 0)).filter(|radix| *radix > 0),
+        },
+        compact_encodings: count("COMPACT_ENCODINGS", 1) != 0,
+        failure_exponent: noise_model(),
+        lattice_security_bits: Some(security),
+    };
+    (request, dimensions)
+}
+
+/// The first accepted candidate over the ring dimensions, with its noise report.
+fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
+    let (request, dimensions) = request(class);
+    PeParameters::select_dimension(&request, dimensions)
+        .unwrap_or_else(|error| panic!("no parameter candidate was accepted: {error}"))
+}
+
+/// With `CRT_DEPTH`, the parameters at that depth and the first ring dimension, built without
+/// the noise simulation and the security estimate (`PeParameters::at_depth`): a run of
+/// parameters a search already accepted.
+fn fixed_parameters(class: PeClass) -> Option<PeParameters> {
+    let depth = env_usize(&variable("CRT_DEPTH"), 0).unwrap();
+    (depth > 0).then(|| {
+        let (request, _) = request(class);
+        PeParameters::at_depth(&request, depth).expect("parameters at CRT_DEPTH")
+    })
 }
 
 /// A random program of the class's maximal length whose output on `attribute` is `value`:
@@ -795,13 +817,26 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "the PE time window round trip needs a CUDA device");
     let started = Instant::now();
-    let (parameters, report) = search(class);
-    let failure_exponent = report.average.as_ref().map(|(exponent, ..)| *exponent);
-    assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
+    let (parameters, failure_exponent) = match fixed_parameters(class) {
+        Some(parameters) => {
+            eprintln!("fixed PE parameters (CRT_DEPTH): no noise simulation or security estimate");
+            (parameters, noise_model())
+        }
+        None => {
+            let (parameters, report) = search(class);
+            assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
+            eprintln!(
+                "noise: log2 E_F = {}, log2 E_PE = {}",
+                report.evaluation.bits(),
+                report.decryption.bits()
+            );
+            (parameters, report.average.as_ref().map(|(exponent, ..)| *exponent))
+        }
+    };
     let level = parameters.level();
     eprintln!(
-        "accepted PE parameters in {:?}: n = {}, CRT {} x {} bits, base 2^{}, m_B = {}, W = {}, \
-         T_max = {}; noise model {}; log2 E_F = {}, log2 E_PE = {}",
+        "PE parameters in {:?}: n = {}, CRT {} x {} bits, base 2^{}, m_B = {}, W = {}, \
+         T_max = {}; noise model {}",
         started.elapsed(),
         level.ring_dimension(),
         level.to_crt().0.len(),
@@ -811,9 +846,8 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
         class.lookup_width(),
         class.max_steps(),
         failure_exponent.map_or("worst".to_owned(), |exponent| format!("average 2^-{exponent}")),
-        report.evaluation.bits(),
-        report.decryption.bits(),
     );
+    let estimate = env::var("MXX_EXPONENT_LUT_ESTIMATE_ONLY").is_ok_and(|value| value == "1");
     let mut runtime = GpuRuntime::new(gpu_backend_on(
         parameters.rings().unwrap().into_iter().map(|ring| {
             GpuDCRTPolyParams::new(ring.ring_dimension(), ring.to_crt().0, ring.base_bits(), None)
@@ -822,6 +856,12 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     ))
     .expect("GPU runtime");
     let (storage, _directory) = storage();
+    let discard = count("DISCARD_CIPHERTEXTS", 0) != 0;
+    let productions = match (&storage, discard) {
+        (StageStorage::File(root), true) => Some(root.join("productions")),
+        (_, false) => None,
+        _ => panic!("{} needs file storage", variable("DISCARD_CIPHERTEXTS")),
+    };
     let mut store = storage.open().expect("stage storage");
     let mut execution = Recording { inner: &mut runtime, graphs: Vec::new() };
 
@@ -833,20 +873,63 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     let key = keygen(&public_key, &master, window, &mut execution, &mut store).unwrap();
     eprintln!("key generation ([0900, 1759]): {:?}", stage.elapsed());
     report_device_bytes(&store);
-    for (attribute, expected) in TIME_VECTORS {
+    // `ESTIMATE_FROM=encrypt`: setup and key generation run, so the encryption and online
+    // evaluation that read their artifacts can be planned; those are then only planned.
+    let estimate = estimate ||
+        match env::var(variable("ESTIMATE_FROM")).as_deref() {
+            Err(_) => false,
+            Ok("encrypt") => {
+                // SAFETY: set before the encryption stages read it; this test is the only thread
+                // touching the environment.
+                unsafe { env::set_var("MXX_EXPONENT_LUT_ESTIMATE_ONLY", "1") };
+                eprintln!(
+                    "estimate mode from encryption on: the remaining stages are only planned"
+                );
+                true
+            }
+            Ok(value) => panic!("{} must be `encrypt`, got `{value}`", variable("ESTIMATE_FROM")),
+        };
+    let listing = |directory: &PathBuf| -> std::collections::BTreeSet<PathBuf> {
+        std::fs::read_dir(directory)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    };
+    // `SINGLE_TIME=1`: one encryption and decryption, at a random accepted time of the window.
+    let vectors = if count("SINGLE_TIME", 0) != 0 {
+        let minute = 9 * 60 + rand::random::<u32>() as usize % (18 * 60 - 9 * 60);
+        let (hour, minute) = (minute / 60, minute % 60);
+        let attribute = [hour / 10, hour % 10, minute / 10, minute % 10];
+        assert_eq!(window.evaluate(&attribute).unwrap(), 0, "{attribute:?} is accepted");
+        vec![(attribute, 0)]
+    } else {
+        TIME_VECTORS.to_vec()
+    };
+    for (attribute, expected) in vectors {
         let message =
             (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let before = productions.as_ref().map(listing);
         let stage = Instant::now();
         let ciphertext =
             encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
         eprintln!("encryption of {attribute:?}: {:?}", stage.elapsed());
         let stage = Instant::now();
-        let decrypted =
-            decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
+        let decrypted = decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store);
+        if estimate {
+            // The online evaluation is planned but not executed, so decoding has no inputs.
+            eprintln!("estimate mode: decryption stopped after planning: {:?}", decrypted.err());
+            break;
+        }
+        let decrypted = decrypted.unwrap();
         eprintln!("decryption of {attribute:?} (F(x) = {expected}): {:?}", stage.elapsed());
         report_device_bytes(&store);
         if expected == 0 {
             assert_eq!(decrypted, message, "the time {attribute:?} must decrypt the message");
+        }
+        // `DISCARD_CIPHERTEXTS=1`: delete the productions this vector's encryption wrote.
+        if let (Some(directory), Some(before)) = (&productions, before) {
+            for created in listing(directory).difference(&before) {
+                std::fs::remove_dir_all(created).expect("discard a ciphertext production");
+            }
         }
     }
     // The first execution of every graph: the later vectors repeat encryption and decryption.

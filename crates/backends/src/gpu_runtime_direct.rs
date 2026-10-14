@@ -34,17 +34,23 @@
 //! matrix any scope computes. Both come from geometric grids that always include their extremes.
 //! Wider tiles and narrower waves are preferred: the planner narrows C from the widest at the
 //! narrowest W, then widens W at the chosen C. A candidate replaces the best only when it is 5%
-//! faster; each sweep measures all of its candidates, since times are not monotonic in either
-//! width, and only widening W stops at a rejection. For each `(W, C)` candidate it lowers the
-//! graph, actually allocates it, checks its persistent allocations against the device budget
-//! (`MXX_GPU_MEMORY_FRACTION`), compiles its regions, and times `measurement_warmups +
+//! faster. A sweep stops after three consecutive candidates that do not replace the best (a
+//! rejection after a feasible candidate counts as one): wider tiles and waves launch fewer jobs,
+//! so narrower ones past such a plateau are not measured. Widening W also stops at a rejection. For
+//! each `(W, C)` candidate it lowers the graph, actually allocates it, checks its persistent
+//! allocations against the device budget (`MXX_GPU_MEMORY_FRACTION`), compiles its regions with a
+//! boundary also at every graph node's operations, and times `measurement_warmups +
 //! measurement_iterations` trials. A trial does not launch a region whose work (operations, value
 //! types and shapes, and launch shapes, not where the data is) a trial of this runtime already
 //! timed: that time is reused per launch, and a host-driven loop's body runs for its first
-//! iteration only, its time counting for every iteration. A candidate whose allocation,
-//! compilation, or trial fails is rejected; no VRAM requirement is predicted. Each region's time
-//! is weighted by how often production replays it, and the fastest feasible candidate is frozen
-//! into a value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected report.
+//! iteration only, its time counting for every iteration. The node boundaries make that reuse per
+//! node, so candidates that differ only in some nodes' tiling time only those nodes; a candidate's
+//! time is the sum of its segments, which pays a launch per segment and no overlap across them. A
+//! candidate whose segmented allocation, compilation, or trial fails is measured again with its
+//! production regions, and is rejected when that fails too; no VRAM requirement is predicted. Each
+//! region's time is weighted by how often production replays it, and the fastest feasible candidate
+//! is frozen into a value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected
+//! report.
 //!
 //! With `profile_nodes`, planning then lowers the selected candidate once more with a Graph region
 //! boundary at every graph node's operations and times it the same way. Every separate launch pays
@@ -2714,12 +2720,81 @@ impl GpuRuntime {
             "GPU trial region times"
         );
         let iterations = self.options.measurement_iterations.get() as f64;
+        // The slowest regions with their operations' primitives, for locating
+        // where a stage's time goes.
+        let mut slowest = (0..graph.regions.len()).collect::<Vec<_>>();
+        slowest.sort_by(|&a, &b| measured[b].total_cmp(&measured[a]));
+        for &region in slowest.iter().take(8) {
+            let range = graph.regions[region].start_operation as usize..
+                graph.regions[region].end_operation as usize;
+            let mut primitives = BTreeMap::<String, usize>::new();
+            for op in &frame.program.operations[range.clone()] {
+                let name = format!(
+                    "{:?}",
+                    frame.program.implementations.resolve(op.implementation).map(|i| &i.primitive)
+                );
+                *primitives.entry(name).or_default() += 1;
+            }
+            tracing::debug!(
+                target: "mxx_backends::gpu_runtime",
+                region,
+                operations = ?range,
+                seconds = measured[region] / iterations,
+                cached = cached[region].is_some(),
+                ?primitives,
+                "GPU trial slow region"
+            );
+        }
         Ok(graph
             .regions
             .iter()
             .zip(measured)
             .map(|(region, seconds)| (region.start_operation, seconds / iterations))
             .collect())
+    }
+
+    /// Lower, allocate, compile, and time the `(W, C)` candidate `geometry`,
+    /// returning each region's start operation with its seconds. With
+    /// `segmented`, a region boundary also lies at every graph node's
+    /// operations, so a segment of work an earlier candidate timed is reused
+    /// even when the rest of its production region differs.
+    #[allow(clippy::too_many_arguments)]
+    fn measure_candidate(
+        &mut self,
+        validated: &ValidatedGraph,
+        contract: &crate::gpu_execution_plan::GpuPlanContract,
+        inputs: &BTreeMap<String, RuntimeValue>,
+        artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
+        device_artifact_exports: bool,
+        (candidate_w, candidate_c): (usize, usize),
+        segmented: bool,
+    ) -> Result<Vec<(u32, f64)>, GpuPlanError> {
+        let logical =
+            single_root_physical_plan(validated, contract.clone(), candidate_c, candidate_w)
+                .map_err(GpuPlanError::InvalidInput)?;
+        let mut frame = plan_physical_graph(
+            &self.backend,
+            validated,
+            &logical,
+            inputs,
+            &self.options.integer_input_ranges,
+            artifact_payload_sizes,
+            &self.options.subgraph_kernels,
+            device_artifact_exports,
+            segmented,
+        )
+        .map_err(GpuPlanError::Resource)?;
+        validate_allocated_budget(&frame, contract, None)?;
+        wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
+        frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
+        let boundaries = std::mem::take(&mut frame.node_operations)
+            .into_iter()
+            .flat_map(|(_, _, range)| [range.start as usize, range.end as usize])
+            .collect::<Vec<_>>();
+        let mut graph = DirectGraph::compile(&self.backend, &mut frame, &boundaries)?;
+        validate_allocated_budget(&frame, contract, Some(&graph))?;
+        graph.bind(&frame).map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+        self.measure_regions(&frame, &mut graph)
     }
 
     /// Complete the frees of dropped candidate owners and Graphs and return
@@ -2927,10 +3002,13 @@ impl GpuRuntime {
         // Wider tiles and narrower waves are preferred: the tile width
         // shrinks from the widest at the narrowest wave, then the wave width
         // grows at the chosen tile, and a candidate replaces the best only
-        // when it is `PREFERENCE` faster. Times are not monotonic in either
-        // width, so each sweep measures every candidate past a plateau; only
-        // a wider wave stops at a rejection, since it only needs more memory.
+        // when it is `PREFERENCE` faster. A wider wave also stops at a
+        // rejection, since it only needs more memory.
         const PREFERENCE: f64 = 0.05;
+        // A sweep stops after this many consecutive candidates that do not
+        // replace the best: wider tiles and waves launch fewer jobs, so the
+        // narrower ones past a plateau are not expected to win.
+        const PLATEAU: usize = 3;
         let mut waves = candidate_waves.clone();
         waves.sort_unstable();
         let narrowest = waves.first().copied().unwrap_or(1);
@@ -2942,37 +3020,48 @@ impl GpuRuntime {
                 let Some(c) = best.as_ref().map(|b| b.1) else { break };
                 phases.push(waves.iter().skip(1).map(|&w| (w, c)).collect());
             }
+            let mut stale = 0;
             for (candidate_w, candidate_c) in phases[phase].clone() {
-                let trial = (|| -> Result<Vec<(u32, f64)>, GpuPlanError> {
-                    let logical = single_root_physical_plan(
-                        &validated,
-                        contract.clone(),
-                        candidate_c,
+                if stale >= PLATEAU {
+                    tracing::debug!(
                         candidate_w,
-                    )
-                    .map_err(GpuPlanError::InvalidInput)?;
-                    let mut frame = plan_physical_graph(
-                        &self.backend,
+                        candidate_c,
+                        "GPU plan sweep stopped after {PLATEAU} candidates without improvement"
+                    );
+                    break;
+                }
+                // Node segments let a candidate reuse the times of the
+                // segments it shares with earlier ones; a candidate whose
+                // segmented frame fails is measured with its production
+                // regions instead.
+                let trial = self
+                    .measure_candidate(
                         &validated,
-                        &logical,
+                        &contract,
                         inputs,
-                        &self.options.integer_input_ranges,
                         artifact_payload_sizes,
-                        &self.options.subgraph_kernels,
                         device_artifact_exports,
-                        false,
+                        (candidate_w, candidate_c),
+                        true,
                     )
-                    .map_err(GpuPlanError::Resource)?;
-                    validate_allocated_budget(&frame, &contract, None)?;
-                    wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
-                    frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
-                    let mut graph = DirectGraph::compile(&self.backend, &mut frame, &[])?;
-                    validate_allocated_budget(&frame, &contract, Some(&graph))?;
-                    graph
-                        .bind(&frame)
-                        .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-                    self.measure_regions(&frame, &mut graph)
-                })();
+                    .or_else(|error| {
+                        tracing::debug!(
+                            candidate_w,
+                            candidate_c,
+                            %error,
+                            "segmented GPU plan candidate failed; measuring its production regions"
+                        );
+                        self.release_candidate_memory(&contract)?;
+                        self.measure_candidate(
+                            &validated,
+                            &contract,
+                            inputs,
+                            artifact_payload_sizes,
+                            device_artifact_exports,
+                            (candidate_w, candidate_c),
+                            false,
+                        )
+                    });
                 // The candidate's owners and Graphs are gone; complete their
                 // frees and return the pools' retained memory so the next
                 // candidate, and the selected plan, are admitted on their own.
@@ -2991,9 +3080,13 @@ impl GpuRuntime {
                             seconds < *current * (1.0 - PREFERENCE)
                         }) {
                             best = Some((candidate_w, candidate_c, seconds, regions));
+                            stale = 0;
+                        } else {
+                            stale += 1;
                         }
                     }
                     Ok(_) => {
+                        stale += usize::from(best.is_some());
                         rejected.push(format!("W={candidate_w}, C={candidate_c}: non-finite time"));
                         if phase == 1 {
                             break;
@@ -3001,6 +3094,7 @@ impl GpuRuntime {
                     }
                     Err(error) => {
                         tracing::debug!(candidate_w, candidate_c, %error, "rejected GPU plan candidate");
+                        stale += usize::from(best.is_some());
                         rejected.push(format!("W={candidate_w}, C={candidate_c}: {error}"));
                         if phase == 1 {
                             break;

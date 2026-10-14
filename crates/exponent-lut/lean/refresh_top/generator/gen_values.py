@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate `Gen_Online_Values.lean` (WP G): the instance certificates of the LUT member values of
-the fresh noise and the mask, for `GenFinal.fresh_value_gen` / `mask_value_gen`.
+the fresh noise, for `GenFinal.fresh_value_gen` (the mask is the caller's encoding of `σ_0 G`,
+evaluated in its own stages).
 
 Recognition (data flow, through `gen_final`): for each of the fresh carrier and the mask sampler,
 the preprocess key member (`lut.key-member.carrier` / `.sampler`, the sampling LUT) and the
@@ -158,8 +159,6 @@ def main():
     luts = {
         'fresh_sampler': table_of(pre, roles, 'lut.key-member.carrier', M, 'sampler'),
         'fresh_readout': table_of(pre, roles, 'lut.key-member.carrier', M, 'readout'),
-        'mask_sampler': table_of(pre, roles, 'lut.key-member.sampler', n, 'sampler'),
-        'mask_readout': table_of(pre, roles, 'lut.key-member.sampler', n, 'readout'),
     }
     out = a.out or os.path.join(a.d, 'Gen_Online_Values.lean')
     lab = labels(gdir, R, roles, a.requirement or os.path.join(a.d, 'Gen_Requirement.lean'))

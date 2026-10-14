@@ -1,6 +1,7 @@
 import GenIface
 import GenRel
 import GenKey
+import GenLabel
 
 /-!
 # Bundle bridges of the PRF cells
@@ -15,6 +16,9 @@ encoding-level conclusion of the cell.
 * `PrfCell1.rel` (online, buckets `≥ 1`): the same after the alignment of the input encoding to
   the lower modulus (`Gen.cell_step_aligned_gen`); the keys are `Gen.cellKeyG` of the aligned
   input keys `Gen.alignKeyG`.
+* `PrfCell0.rel_1` / `PrfCell1.rel_1`: the same for a Program in its own stages (variant 1), whose
+  cells hash-sample the input encoding's keys per member (`Gen.labelKeyG`) and read the payload
+  directly.
 * `PrfKeyCell0.rel` / `PrfKeyCell1.rel` (preprocessing): the cell's keys as the same
   `Gen.cellKeyG` of the label keys (aligned for buckets `≥ 1`) and the member's state keys, the
   tops as `Gen.topPairG`, and the selector right-hand side `s top_j + bot_j = p μ u_j G + e_j`
@@ -519,6 +523,495 @@ theorem PrfCell1.rel (hn : 0 < n) {Q q q' pA p p' mA m m' m'' K W bound : Nat}
       (c := ![matrixAdd v22 (matrixMulScalarRight (cs0 o) v25),
         matrixAdd v35 (matrixMulScalarRight (cs1 o) v25)])
       (A := ![![v26, v37], ![v27, v38]]) c37 c38 c54 c55 c56 hXb hE' hE hM0 hM1 hA''
+    rw [← htop, ← hal]
+    exact cellKeyG_of_parts hM hK
+
+set_option maxHeartbeats 4000000 in
+/-- **PRF cell, bucket 0, of a Program in its own stages** (online; `prf.cell0`, variant 1): as
+`PrfCell0.rel`, with the input encoding's keys hash-sampled from the key at the gathered member
+`idx` (`labelKeyG`), the payload read directly, and the key as the selector tops' seed. -/
+theorem PrfCell0.rel_1 (hn : 0 < n) {q q' p p' m m' m'' bound E : Nat} (hq : q = p * q')
+    (hq1 : 1 < q) (hq' : 1 < q') (hp : 0 < p)
+    {backend : BackendContext} {hashModel : HashModel} {base digits base' digits' : Int}
+    (layout : RegularLayout q) (hlayout : backend.regularLayout q n = some layout)
+    (hexact : layout.droppedModuli = 0) (hm : m = 1 * layout.digitCount)
+    (layout' : RegularLayout q') (hlayout' : backend.regularLayout q' n = some layout')
+    (hexact' : layout'.droppedModuli = 0) (hm' : m' = 1 * layout'.digitCount)
+    {lo P a b : Int} {pre rhsPre : Blob} {basis : List Nat} {i : Nat}
+    {idx : Int} {x0 x1 : ExactMatrix q n 1 m} {key : ByteArray}
+    {As00 As10 As01 As11 cs0 cs1 : ExactMatrix q n 1 m'} {pay : ExactMatrix q n 1 1}
+    {bot0 bot1 : ExactMatrix q' n 1 m''}
+    {outputs : ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' ×
+      ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' × Unit}
+    (h : PrfCell0.Comp_1 q n m' m' m' m' m'' m'' m m q q q' q' q' m'' q' m'' q' m'' q' m'' q' m''
+      q' m'' lo P E pre lo P E pre lo P E pre lo P E pre base digits bound m' m' m' base digits
+      bound m' m' m' a b rhsPre base' digits' bound m'' basis a b rhsPre base' digits' bound m''
+      basis m'' basis m'' basis m'' basis m'' basis backend hashModel i
+      (idx, x0, key, x1, As00, As10, cs0, pay, As01, As11, cs1, bot0, bot1, ()) outputs)
+    {sm sp μ ν α : ErrorPoly n} (hsm : polyNorm sm ≤ 1)
+    {G : ExactMatrix q n 1 m} (hG : gadgetMatrixRuns backend base digits G) {Ba : Nat}
+    {Kα : Nat} (hα : SmulGain α Kα) (hαμ : polyNorm (α * μ) ≤ 1)
+    (ha : Rel sm ![![labelKeyG hashModel q n m key pre idx 0, labelKeyG hashModel q n m key pre idx 1], ![labelKeyG hashModel q n m key pre idx 2, labelKeyG hashModel q n m key pre idx 3]]
+      (fun j ↦ reducePoly q n (α * unitPair sm j) • G) ![x0, x1] Ba)
+    (hpay : pay = fun _ _ ↦ reducePoly q n α)
+    {g' : ExactMatrix q' n 1 m'} (hg' : gadgetMatrixRuns backend base' digits' g')
+    {g : ExactMatrix q n 1 m'} (hg : centeredRebaseRuns g' g) {Bs : Nat}
+    (hs : Rel sm ![![As00, As01], ![As10, As11]]
+      (fun j ↦ reducePoly q n ((p : Int) * μ * unitPair sp j) • g) ![cs0, cs1] Bs)
+    {hT : ExactMatrix q' n 1 m''} {eB : Fin 2 → ErrorMatrix n 1 m''} {BB : Nat}
+    (hrhs : ∀ j, reducePoly q' n sp • topPairG hashModel key q' m'' rhsPre (prfTopTags a b i) j +
+      ![bot0, bot1] j =
+        reducePoly q' n ((p' : Int) * ν * unitPair sp j) • hT + reduceMatrix q' n 1 m'' (eB j))
+    (heB : ∀ j, CoeffBound (eB j) BB) :
+    EncRel sm outputs (fun j ↦ reducePoly q' n ((p' : Int) * (α * μ * ν) * unitPair sp j) • hT)
+        (cellBoundK n m m' bound p Ba Bs BB Kα) ∧
+      Enc.A outputs = cellKeyG backend base digits base' digits' basis
+        ![![labelKeyG hashModel q n m key pre idx 0, labelKeyG hashModel q n m key pre idx 1], ![labelKeyG hashModel q n m key pre idx 2, labelKeyG hashModel q n m key pre idx 3]] ![![As00, As01], ![As10, As11]]
+        (topPairG hashModel key q' m'' rhsPre (prfTopTags a b i)) ![bot0, bot1] := by
+  obtain ⟨v0, h⟩ := h
+  obtain ⟨v1, h⟩ := h
+  obtain ⟨v2, h⟩ := h
+  obtain ⟨v3, h⟩ := h
+  obtain ⟨v4, h⟩ := h
+  obtain ⟨v5, h⟩ := h
+  obtain ⟨v6, h⟩ := h
+  obtain ⟨v7, h⟩ := h
+  obtain ⟨v8, h⟩ := h
+  obtain ⟨v9, h⟩ := h
+  obtain ⟨v10, h⟩ := h
+  obtain ⟨v11, h⟩ := h
+  obtain ⟨v12, h⟩ := h
+  obtain ⟨v13, h⟩ := h
+  obtain ⟨v14, h⟩ := h
+  obtain ⟨v15, h⟩ := h
+  obtain ⟨v16, h⟩ := h
+  obtain ⟨v17, h⟩ := h
+  obtain ⟨v18, h⟩ := h
+  obtain ⟨v19, h⟩ := h
+  obtain ⟨v20, h⟩ := h
+  obtain ⟨v21, h⟩ := h
+  obtain ⟨v22, h⟩ := h
+  obtain ⟨v23, h⟩ := h
+  obtain ⟨v24, h⟩ := h
+  obtain ⟨v25, h⟩ := h
+  obtain ⟨v26, h⟩ := h
+  obtain ⟨v27, h⟩ := h
+  obtain ⟨v28, h⟩ := h
+  obtain ⟨v29, h⟩ := h
+  obtain ⟨v30, h⟩ := h
+  obtain ⟨v31, h⟩ := h
+  obtain ⟨v32, h⟩ := h
+  obtain ⟨v33, h⟩ := h
+  obtain ⟨v34, h⟩ := h
+  obtain ⟨v35, h⟩ := h
+  obtain ⟨v36, h⟩ := h
+  obtain ⟨v37, h⟩ := h
+  obtain ⟨v38, h⟩ := h
+  obtain ⟨v39, h⟩ := h
+  obtain ⟨v40, h⟩ := h
+  obtain ⟨v41, h⟩ := h
+  obtain ⟨v42, h⟩ := h
+  obtain ⟨v43, h⟩ := h
+  obtain ⟨v44, h⟩ := h
+  obtain ⟨v45, h⟩ := h
+  obtain ⟨c1, h⟩ := h
+  obtain ⟨c2, h⟩ := h
+  obtain ⟨c3, h⟩ := h
+  obtain ⟨c4, h⟩ := h
+  obtain ⟨c5, h⟩ := h
+  obtain ⟨c6, h⟩ := h
+  obtain ⟨c7, h⟩ := h
+  obtain ⟨c8, h⟩ := h
+  obtain ⟨c9, h⟩ := h
+  obtain ⟨c10, h⟩ := h
+  obtain ⟨c11, h⟩ := h
+  obtain ⟨c12, h⟩ := h
+  obtain ⟨c13, h⟩ := h
+  obtain ⟨c14, h⟩ := h
+  obtain ⟨c15, h⟩ := h
+  obtain ⟨c16, h⟩ := h
+  obtain ⟨c17, h⟩ := h
+  obtain ⟨c18, h⟩ := h
+  obtain ⟨c19, h⟩ := h
+  obtain ⟨c20, h⟩ := h
+  obtain ⟨c21, h⟩ := h
+  obtain ⟨c22, h⟩ := h
+  obtain ⟨c23, h⟩ := h
+  obtain ⟨c24, h⟩ := h
+  obtain ⟨c25, h⟩ := h
+  obtain ⟨c26, h⟩ := h
+  obtain ⟨c27, h⟩ := h
+  obtain ⟨c28, h⟩ := h
+  obtain ⟨c29, h⟩ := h
+  obtain ⟨c30, h⟩ := h
+  obtain ⟨c31, h⟩ := h
+  obtain ⟨c32, h⟩ := h
+  obtain ⟨c33, h⟩ := h
+  obtain ⟨c34, h⟩ := h
+  obtain ⟨c35, h⟩ := h
+  obtain ⟨c36, h⟩ := h
+  obtain ⟨c37, h⟩ := h
+  obtain ⟨c38, h⟩ := h
+  obtain ⟨c39, h⟩ := h
+  obtain ⟨c40, h⟩ := h
+  obtain ⟨c41, h⟩ := h
+  obtain ⟨c42, h⟩ := h
+  obtain ⟨c43, h⟩ := h
+  obtain ⟨c44, h⟩ := h
+  obtain ⟨c45, h⟩ := h
+  obtain ⟨c46, h⟩ := h
+  obtain ⟨c47, h⟩ := h
+  obtain ⟨c48, h⟩ := h
+  obtain ⟨c49, h⟩ := h
+  obtain ⟨c50, h⟩ := h
+  obtain ⟨c51, h⟩ := h
+  obtain ⟨c52, h⟩ := h
+  obtain ⟨c53, h⟩ := h
+  obtain ⟨c54, h⟩ := h
+  subst h
+  have e0 := labelKeyG_of c3
+  have e1 := labelKeyG_of c6
+  have e4 := labelKeyG_of c11
+  have e5 := labelKeyG_of c14
+  subst e0 e1 e4 e5
+  have htop := prf_tops c35 c41
+  have hXs : ∀ j, concatRows (![![As00, As01], ![As10, As11]] 0 j) (![![As00, As01], ![As10, As11]] 1 j)
+      (![v9, v17] j) := fun j ↦ by fin_cases j; exacts [c18, c26]
+  have hD' : ∀ j, gadgetDecomposeRuns backend base digits (![v9, v17] j) (![v10, v18] j) :=
+    fun j ↦ by fin_cases j; exacts [c19, c27]
+  have hD : ∀ j, compactCenteredRebaseRuns bound (![v10, v18] j) (![v11, v19] j) :=
+    fun j ↦ by fin_cases j; exacts [c20, c28]
+  have hA0 : ∀ j, sliceMatrix (matrixMul v8 (![v11, v19] j)) 1 2 0 m' (![![v13, v21], ![v14, v22]] 0 j) :=
+    fun j ↦ by fin_cases j; exacts [c22, c30]
+  have hA1 : ∀ j, sliceMatrix (matrixMul v8 (![v11, v19] j)) 2 3 0 m' (![![v13, v21], ![v14, v22]] 1 j) :=
+    fun j ↦ by fin_cases j; exacts [c23, c31]
+  have hXb : ∀ j, concatRows (![v26, v32] j) (![bot0, bot1] j) (![v27, v33] j) :=
+    fun j ↦ by fin_cases j; exacts [c36, c42]
+  have hE' : ∀ j, gadgetDecomposeRuns backend base' digits' (![v27, v33] j) (![v28, v34] j) :=
+    fun j ↦ by fin_cases j; exacts [c37, c43]
+  have hE : ∀ j, compactCenteredRebaseRuns bound (![v28, v34] j) (![v29, v35] j) :=
+    fun j ↦ by fin_cases j; exacts [c38, c44]
+  have hM0 : ∀ j, sliceMatrix (matrixMul v25 (![v29, v35] j)) 1 2 0 m'' (![![v30, v36], ![v38, v40]] 0 j) :=
+    fun j ↦ by fin_cases j; exacts [c39, c45]
+  have hM1 : ∀ j, sliceMatrix (matrixMul v25 (![v29, v35] j)) 2 3 0 m'' (![![v30, v36], ![v38, v40]] 1 j) :=
+    fun j ↦ by fin_cases j; exacts [c47, c49]
+  have hA'' : ∀ a j, blockModSwitchRuns basis 1 (![![v30, v36], ![v38, v40]] a j)
+      (![![v31, v37], ![v39, v41]] a j) := fun a j ↦ by
+    fin_cases a <;> fin_cases j; exacts [c40, c46, c48, c50]
+  have hrhs' : ∀ j, reducePoly q' n sp • ![v26, v32] j + ![bot0, bot1] j =
+      reducePoly q' n ((p' : Int) * ν * unitPair sp j) • hT + reduceMatrix q' n 1 m'' (eB j) := by
+    rw [htop]; exact hrhs
+  refine ⟨?_, ?_⟩
+  · exact cell_mul_genK hn hq hq1 hq' hp layout hlayout hexact layout' hlayout' hexact' hsm hG hα hαμ
+      ha hpay hg' hg hs c7 c8 c15 c16 c17 hXs hD' hD
+      (Y := ![v12, v20]) (fun j ↦ by fin_cases j; exacts [c21, c29]) hA0 hA1
+      (c' := ![matrixAdd v12 (matrixMulScalarRight cs0 pay), matrixAdd v20 (matrixMulScalarRight cs1 pay)])
+      (fun j ↦ by fin_cases j <;> rfl) c24 c25 c32 c33 c34 hXb hE' hE hrhs' heB
+      (X := ![v42, v44]) (fun j ↦ by fin_cases j; exacts [c51, c53]) hM0 hM1
+      (c'' := ![v43, v45]) (fun j ↦ by fin_cases j; exacts [c52, c54]) hA''
+  · have hM := pubKeyG_of_stacks hn hq1 layout hlayout hexact hm
+      (A := ![![labelKeyG hashModel q n m key pre idx 0, labelKeyG hashModel q n m key pre idx 1], ![labelKeyG hashModel q n m key pre idx 2, labelKeyG hashModel q n m key pre idx 3]]) c7 c8 c15 c16 c17 hXs hD' hD hA0 hA1
+    have hK := privKeyG_of_stacks hn hq' layout' hlayout' hexact' hm'
+      (c := ![matrixAdd v12 (matrixMulScalarRight cs0 pay), matrixAdd v20 (matrixMulScalarRight cs1 pay)])
+      (A := ![![v13, v21], ![v14, v22]]) c24 c25 c32 c33 c34 hXb hE' hE hM0 hM1 hA''
+    rw [← htop]
+    exact cellKeyG_of_parts hM hK
+
+set_option maxHeartbeats 8000000 in
+/-- **PRF cell, buckets `≥ 1`, of a Program in its own stages** (online; `prf.cell1`, variant 1):
+as `PrfCell1.rel`, with the input encoding's keys hash-sampled from the key at the gathered member
+`idx` (`labelKeyG`), the payload read directly, and the key as the selector tops' seed. -/
+theorem PrfCell1.rel_1 (hn : 0 < n) {Q q q' pA p p' mA m m' m'' K W bound E : Nat}
+    (hQ : Q = pA * q) (hQ1 : 1 < Q) (hpA : 0 < pA) (hq : q = p * q') (hq1 : 1 < q)
+    (hq' : 1 < q') (hp : 0 < p)
+    {backend : BackendContext} {hashModel : HashModel}
+    {baseA digitsA base digits base' digits' : Int}
+    (layoutA : RegularLayout Q) (hlayoutA : backend.regularLayout Q n = some layoutA)
+    (hexactA : layoutA.droppedModuli = 0)
+    (layout : RegularLayout q) (hlayout : backend.regularLayout q n = some layout)
+    (hexact : layout.droppedModuli = 0) (hm : m = 1 * layout.digitCount)
+    (layout' : RegularLayout q') (hlayout' : backend.regularLayout q' n = some layout')
+    (hexact' : layout'.droppedModuli = 0) (hm' : m' = 1 * layout'.digitCount)
+    {pAi lo hi P a b lo64 P64 : Int} (hpAi : (pA : Int) = pAi) {pre rhsPre : Blob}
+    {basisA basis : List Nat} {i : Nat}
+    {idx : Int} {x0 x1 : ExactMatrix Q n 1 mA} {key : ByteArray}
+    {As00 As10 As01 As11 cs0 cs1 : Fin W → ExactMatrix q n 1 m'}
+    {pay : ExactMatrix Q n 1 1} {bot0 bot1 : ExactMatrix q' n 1 m''}
+    {outputs : ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' ×
+      ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' × ExactMatrix q' n 1 m'' × Unit}
+    (h : PrfCell1.Comp_1 Q n m Q q m' m' m' m' m'' m'' mA W q W W Q W q W W q' q' q' m'' q' m''
+      q' m'' q' m'' q' m'' q' m'' q mA q
+      base digits baseA digitsA [pAi] basisA lo64 P64 E pre base digits baseA digitsA [pAi] basisA
+      lo64 P64 E pre basisA basisA lo64 P64 E pre basisA lo64 P64 E pre basisA
+      lo P hi P P lo P hi P P base digits bound m' lo P hi P P m' m'
+      lo P hi P P lo P hi P P base digits bound m' lo P hi P P m' m'
+      a b rhsPre base' digits' bound m'' basis a b rhsPre base' digits' bound m'' basis
+      m'' basis m'' basis m'' basis m'' basis
+      backend hashModel i
+      (idx, x0, key, x1, As00, As10, cs0, pay, As01, As11, cs1, bot0, bot1, ()) outputs)
+    {sm sp ν α : ErrorPoly n} {μ : Fin W → ErrorPoly n} (hsm : polyNorm sm ≤ 1)
+    {GA : ExactMatrix Q n 1 mA} (hGA : gadgetMatrixRuns backend baseA digitsA GA) {Ba : Nat}
+    {Kα : Nat} (hα : SmulGain α Kα) (hαμ : ∀ o, polyNorm (α * μ o) ≤ 1)
+    (ha : Rel sm ![![labelKeyG hashModel Q n mA key pre idx 0, labelKeyG hashModel Q n mA key pre idx 1], ![labelKeyG hashModel Q n mA key pre idx 2, labelKeyG hashModel Q n mA key pre idx 3]]
+      (fun j ↦ reducePoly Q n (α * unitPair sm j) • GA) ![x0, x1] Ba)
+    (k : Fin K) (hidx : idx = ((k : Nat) : Int)) (hpay : pay = fun _ _ ↦ reducePoly Q n α)
+    {G : ExactMatrix q n 1 m} (hG : gadgetMatrixRuns backend base digits G)
+    {GR : ExactMatrix Q n 1 m} (hGR : centeredRebaseRuns G GR)
+    {g' : ExactMatrix q' n 1 m'} (hg' : gadgetMatrixRuns backend base' digits' g')
+    {g : ExactMatrix q n 1 m'} (hg : centeredRebaseRuns g' g) {Bs : Nat}
+    (hs : ∀ o, Rel sm ![![As00 o, As01 o], ![As10 o, As11 o]]
+      (fun j ↦ reducePoly q n ((p : Int) * μ o * unitPair sp j) • g) ![cs0 o, cs1 o] Bs)
+    {hT : ExactMatrix q' n 1 m''} {eB : Fin 2 → ErrorMatrix n 1 m''} {BB : Nat}
+    (hrhs : ∀ j, reducePoly q' n sp • topPairG hashModel key q' m'' rhsPre (prfTopTags a b i) j +
+      ![bot0, bot1] j =
+        reducePoly q' n ((p' : Int) * ν * unitPair sp j) • hT + reduceMatrix q' n 1 m'' (eB j))
+    (heB : ∀ j, CoeffBound (eB j) BB) :
+    ∃ o : Fin W, ((o : Nat) : Int) = Int.fdiv (Int.ofNat i) P ∧
+      EncRel sm outputs
+        (fun j ↦ reducePoly q' n ((p' : Int) * (α * μ o * ν) * unitPair sp j) • hT)
+        (cellBoundK n m m' bound p ((mA * n * Ba * (baseA.toNat / 2) + (n + 2) * (pA / 2)) / pA)
+          Bs BB Kα) ∧
+      Enc.A outputs = cellKeyG backend base digits base' digits' basis
+        (alignKeyG backend baseA digitsA basisA ![![labelKeyG hashModel Q n mA key pre idx 0, labelKeyG hashModel Q n mA key pre idx 1], ![labelKeyG hashModel Q n mA key pre idx 2, labelKeyG hashModel Q n mA key pre idx 3]]
+          (reducePoly Q n ((pA : Int) : ErrorPoly n) • GR))
+        ![![As00 o, As01 o], ![As10 o, As11 o]]
+        (topPairG hashModel key q' m'' rhsPre (prfTopTags a b i)) ![bot0, bot1] := by
+  subst hpAi
+  obtain ⟨v0, h⟩ := h
+  obtain ⟨v1, h⟩ := h
+  obtain ⟨v2, h⟩ := h
+  obtain ⟨v3, h⟩ := h
+  obtain ⟨v4, h⟩ := h
+  obtain ⟨v5, h⟩ := h
+  obtain ⟨v6, h⟩ := h
+  obtain ⟨v7, h⟩ := h
+  obtain ⟨v8, h⟩ := h
+  obtain ⟨v9, h⟩ := h
+  obtain ⟨v10, h⟩ := h
+  obtain ⟨v11, h⟩ := h
+  obtain ⟨v12, h⟩ := h
+  obtain ⟨v13, h⟩ := h
+  obtain ⟨v14, h⟩ := h
+  obtain ⟨v15, h⟩ := h
+  obtain ⟨v16, h⟩ := h
+  obtain ⟨v17, h⟩ := h
+  obtain ⟨v18, h⟩ := h
+  obtain ⟨v19, h⟩ := h
+  obtain ⟨v20, h⟩ := h
+  obtain ⟨v21, h⟩ := h
+  obtain ⟨v22, h⟩ := h
+  obtain ⟨v23, h⟩ := h
+  obtain ⟨v24, h⟩ := h
+  obtain ⟨v25, h⟩ := h
+  obtain ⟨v26, h⟩ := h
+  obtain ⟨v27, h⟩ := h
+  obtain ⟨v28, h⟩ := h
+  obtain ⟨v29, h⟩ := h
+  obtain ⟨v30, h⟩ := h
+  obtain ⟨v31, h⟩ := h
+  obtain ⟨v32, h⟩ := h
+  obtain ⟨v33, h⟩ := h
+  obtain ⟨v34, h⟩ := h
+  obtain ⟨v35, h⟩ := h
+  obtain ⟨v36, h⟩ := h
+  obtain ⟨v37, h⟩ := h
+  obtain ⟨v38, h⟩ := h
+  obtain ⟨v39, h⟩ := h
+  obtain ⟨v40, h⟩ := h
+  obtain ⟨v41, h⟩ := h
+  obtain ⟨v42, h⟩ := h
+  obtain ⟨v43, h⟩ := h
+  obtain ⟨v44, h⟩ := h
+  obtain ⟨v45, h⟩ := h
+  obtain ⟨v46, h⟩ := h
+  obtain ⟨v47, h⟩ := h
+  obtain ⟨v48, h⟩ := h
+  obtain ⟨v49, h⟩ := h
+  obtain ⟨v50, h⟩ := h
+  obtain ⟨v51, h⟩ := h
+  obtain ⟨v52, h⟩ := h
+  obtain ⟨v53, h⟩ := h
+  obtain ⟨v54, h⟩ := h
+  obtain ⟨v55, h⟩ := h
+  obtain ⟨v56, h⟩ := h
+  obtain ⟨v57, h⟩ := h
+  obtain ⟨v58, h⟩ := h
+  obtain ⟨v59, h⟩ := h
+  obtain ⟨v60, h⟩ := h
+  obtain ⟨v61, h⟩ := h
+  obtain ⟨v62, h⟩ := h
+  obtain ⟨v63, h⟩ := h
+  obtain ⟨v64, h⟩ := h
+  obtain ⟨c1, h⟩ := h
+  obtain ⟨c2, h⟩ := h
+  obtain ⟨c3, h⟩ := h
+  obtain ⟨c4, h⟩ := h
+  obtain ⟨c5, h⟩ := h
+  obtain ⟨c6, h⟩ := h
+  obtain ⟨c7, h⟩ := h
+  obtain ⟨c8, h⟩ := h
+  obtain ⟨c9, h⟩ := h
+  obtain ⟨c10, h⟩ := h
+  obtain ⟨c11, h⟩ := h
+  obtain ⟨c12, h⟩ := h
+  obtain ⟨c13, h⟩ := h
+  obtain ⟨c14, h⟩ := h
+  obtain ⟨c15, h⟩ := h
+  obtain ⟨c16, h⟩ := h
+  obtain ⟨c17, h⟩ := h
+  obtain ⟨c18, h⟩ := h
+  obtain ⟨c19, h⟩ := h
+  obtain ⟨c20, h⟩ := h
+  obtain ⟨c21, h⟩ := h
+  obtain ⟨c22, h⟩ := h
+  obtain ⟨c23, h⟩ := h
+  obtain ⟨c24, h⟩ := h
+  obtain ⟨c25, h⟩ := h
+  obtain ⟨c26, h⟩ := h
+  obtain ⟨c27, h⟩ := h
+  obtain ⟨c28, h⟩ := h
+  obtain ⟨c29, h⟩ := h
+  obtain ⟨c30, h⟩ := h
+  obtain ⟨c31, h⟩ := h
+  obtain ⟨c32, h⟩ := h
+  obtain ⟨c33, h⟩ := h
+  obtain ⟨c34, h⟩ := h
+  obtain ⟨c35, h⟩ := h
+  obtain ⟨c36, h⟩ := h
+  obtain ⟨c37, h⟩ := h
+  obtain ⟨c38, h⟩ := h
+  obtain ⟨c39, h⟩ := h
+  obtain ⟨c40, h⟩ := h
+  obtain ⟨c41, h⟩ := h
+  obtain ⟨c42, h⟩ := h
+  obtain ⟨c43, h⟩ := h
+  obtain ⟨c44, h⟩ := h
+  obtain ⟨c45, h⟩ := h
+  obtain ⟨c46, h⟩ := h
+  obtain ⟨c47, h⟩ := h
+  obtain ⟨c48, h⟩ := h
+  obtain ⟨c49, h⟩ := h
+  obtain ⟨c50, h⟩ := h
+  obtain ⟨c51, h⟩ := h
+  obtain ⟨c52, h⟩ := h
+  obtain ⟨c53, h⟩ := h
+  obtain ⟨c54, h⟩ := h
+  obtain ⟨c55, h⟩ := h
+  obtain ⟨c56, h⟩ := h
+  obtain ⟨c57, h⟩ := h
+  obtain ⟨c58, h⟩ := h
+  obtain ⟨c59, h⟩ := h
+  obtain ⟨c60, h⟩ := h
+  obtain ⟨c61, h⟩ := h
+  obtain ⟨c62, h⟩ := h
+  obtain ⟨c63, h⟩ := h
+  obtain ⟨c64, h⟩ := h
+  obtain ⟨c65, h⟩ := h
+  obtain ⟨c66, h⟩ := h
+  obtain ⟨c67, h⟩ := h
+  obtain ⟨c68, h⟩ := h
+  obtain ⟨c69, h⟩ := h
+  obtain ⟨c70, h⟩ := h
+  obtain ⟨c71, h⟩ := h
+  obtain ⟨c72, h⟩ := h
+  obtain ⟨c73, h⟩ := h
+  obtain ⟨c74, h⟩ := h
+  obtain ⟨c75, h⟩ := h
+  obtain ⟨c76, h⟩ := h
+  obtain ⟨c77, h⟩ := h
+  obtain ⟨c78, h⟩ := h
+  obtain ⟨c79, h⟩ := h
+  obtain ⟨c80, h⟩ := h
+  obtain ⟨c81, h⟩ := h
+  obtain ⟨c82, h⟩ := h
+  obtain ⟨c83, h⟩ := h
+  obtain ⟨c84, h⟩ := h
+  obtain ⟨c85, h⟩ := h
+  subst h
+  have ex0 := labelKeyG_of c7
+  have ex2 := labelKeyG_of c14
+  have ex1 := labelKeyG_of c21
+  have ex3 := labelKeyG_of c25
+  subst ex0 ex1 ex2 ex3
+  have e0 := gadgetMatrixRuns_unique c1 hG
+  have e4 := gadgetMatrixRuns_unique c8 hG
+  subst v0 v5
+  have e1 := centeredRebaseRuns_unique c2 hGR
+  have e5 := centeredRebaseRuns_unique c9 hGR
+  subst v1 v6
+  have e6 := gadgetDecomposeRuns_unique c10 c3
+  subst v7
+  obtain ⟨o, ho, rfl⟩ := c32
+  obtain ⟨o1, ho1, rfl⟩ := c35
+  obtain ⟨o2, ho2, rfl⟩ := c42
+  obtain ⟨o3, ho3, rfl⟩ := c50
+  obtain ⟨o4, ho4, rfl⟩ := c53
+  obtain ⟨o5, ho5, rfl⟩ := c60
+  have e1o : o1 = o := Fin.ext (by have := ho1.trans ho.symm; omega)
+  subst o1
+  have e2o : o2 = o := Fin.ext (by have := ho2.trans ho.symm; omega)
+  subst o2
+  have e3o : o3 = o := Fin.ext (by have := ho3.trans ho.symm; omega)
+  subst o3
+  have e4o : o4 = o := Fin.ext (by have := ho4.trans ho.symm; omega)
+  subst o4
+  have e5o : o5 = o := Fin.ext (by have := ho5.trans ho.symm; omega)
+  subst o5
+  have hscaled : matrixMulScalarLeft (matrixPolynomial [((pA : Nat) : Int)]) GR =
+      reducePoly Q n ((pA : Int) : ErrorPoly n) • GR := by
+    rw [matrixMulScalarLeft_eq, matrixPolynomial_reduceG]
+  have htop := prf_tops c66 c72
+  have hXs : ∀ j, concatRows (![![As00 o, As01 o], ![As10 o, As11 o]] 0 j)
+      (![![As00 o, As01 o], ![As10 o, As11 o]] 1 j) (![v23, v35] j) :=
+    fun j ↦ by fin_cases j; exacts [c36, c54]
+  have hD' : ∀ j, gadgetDecomposeRuns backend base digits (![v23, v35] j) (![v24, v36] j) :=
+    fun j ↦ by fin_cases j; exacts [c37, c55]
+  have hD : ∀ j, compactCenteredRebaseRuns bound (![v24, v36] j) (![v25, v37] j) :=
+    fun j ↦ by fin_cases j; exacts [c38, c56]
+  have hA0 : ∀ j, sliceMatrix (matrixMul v20 (![v25, v37] j)) 1 2 0 m'
+      (![![v29, v40], ![v30, v41]] 0 j) := fun j ↦ by fin_cases j; exacts [c44, c61]
+  have hA1 : ∀ j, sliceMatrix (matrixMul v20 (![v25, v37] j)) 2 3 0 m'
+      (![![v29, v40], ![v30, v41]] 1 j) := fun j ↦ by fin_cases j; exacts [c45, c62]
+  have hXb : ∀ j, concatRows (![v45, v51] j) (![bot0, bot1] j) (![v46, v52] j) :=
+    fun j ↦ by fin_cases j; exacts [c67, c73]
+  have hE' : ∀ j, gadgetDecomposeRuns backend base' digits' (![v46, v52] j) (![v47, v53] j) :=
+    fun j ↦ by fin_cases j; exacts [c68, c74]
+  have hE : ∀ j, compactCenteredRebaseRuns bound (![v47, v53] j) (![v48, v54] j) :=
+    fun j ↦ by fin_cases j; exacts [c69, c75]
+  have hM0 : ∀ j, sliceMatrix (matrixMul v44 (![v48, v54] j)) 1 2 0 m''
+      (![![v49, v55], ![v57, v59]] 0 j) := fun j ↦ by fin_cases j; exacts [c70, c76]
+  have hM1 : ∀ j, sliceMatrix (matrixMul v44 (![v48, v54] j)) 2 3 0 m''
+      (![![v49, v55], ![v57, v59]] 1 j) := fun j ↦ by fin_cases j; exacts [c78, c80]
+  have hA'' : ∀ a j, blockModSwitchRuns basis 1 (![![v49, v55], ![v57, v59]] a j)
+      (![![v50, v56], ![v58, v60]] a j) := fun a j ↦ by
+    fin_cases a <;> fin_cases j; exacts [c71, c77, c79, c81]
+  have hrhs' : ∀ j, reducePoly q' n sp • ![v45, v51] j + ![bot0, bot1] j =
+      reducePoly q' n ((p' : Int) * ν * unitPair sp j) • hT + reduceMatrix q' n 1 m'' (eB j) := by
+    rw [htop]; exact hrhs
+  refine ⟨o, ho, ?_, ?_⟩
+  · exact cell_step_aligned_genK hn hQ hQ1 hpA hq hq1 hq' hp layoutA hlayoutA hexactA layout hlayout
+      hexact layout' hlayout' hexact' hsm hGA (ca0 := fun _ ↦ x0) (ca1 := fun _ ↦ x1)
+      (aA00 := fun _ ↦ labelKeyG hashModel Q n mA key pre idx 0) (aA10 := fun _ ↦ labelKeyG hashModel Q n mA key pre idx 2) (aA01 := fun _ ↦ labelKeyG hashModel Q n mA key pre idx 1) (aA11 := fun _ ↦ labelKeyG hashModel Q n mA key pre idx 3)
+      (apay := fun _ ↦ pay) (α := fun _ ↦ α) (fun _ ↦ hα) (fun _ ↦ hαμ o) (fun _ ↦ ha)
+      (fun _ ↦ hpay) k hidx ⟨k, hidx.symm, rfl⟩ ⟨k, hidx.symm, rfl⟩ ⟨k, hidx.symm, rfl⟩
+      ⟨k, hidx.symm, rfl⟩ ⟨k, hidx.symm, rfl⟩ ⟨k, hidx.symm, rfl⟩ ⟨k, hidx.symm, rfl⟩
+      hG hGR hscaled c3 c4 c18 c11 c15 c22 c26 c43 hg' hg (hs o) c16 c17 c27 c28 c29 hXs hD' hD
+      (Y := ![v26, v38]) (fun j ↦ by fin_cases j; exacts [c39, c57]) hA0 hA1
+      (c' := ![matrixAdd v26 (matrixMulScalarRight (cs0 o) v28),
+        matrixAdd v38 (matrixMulScalarRight (cs1 o) v28)])
+      (fun j ↦ by fin_cases j <;> rfl) c46 c47 c63 c64 c65 hXb hE' hE hrhs' heB
+      (X := ![v61, v63]) (fun j ↦ by fin_cases j; exacts [c82, c84]) hM0 hM1
+      (c'' := ![v62, v64]) (fun j ↦ by fin_cases j; exacts [c83, c85]) hA''
+  · have hal := alignKeyG_of_runs (A := ![![labelKeyG hashModel Q n mA key pre idx 0, labelKeyG hashModel Q n mA key pre idx 1], ![labelKeyG hashModel Q n mA key pre idx 2, labelKeyG hashModel Q n mA key pre idx 3]])
+      (A' := ![![v8, v15], ![v10, v17]]) (basis := basisA) c3
+      (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [c11, c22, c15, c26])
+    rw [hscaled] at hal
+    have hM := pubKeyG_of_stacks hn hq1 layout hlayout hexact hm
+      (A := ![![v8, v15], ![v10, v17]]) c16 c17 c27 c28 c29 hXs hD' hD hA0 hA1
+    have hK := privKeyG_of_stacks hn hq' layout' hlayout' hexact' hm'
+      (c := ![matrixAdd v26 (matrixMulScalarRight (cs0 o) v28),
+        matrixAdd v38 (matrixMulScalarRight (cs1 o) v28)])
+      (A := ![![v29, v40], ![v30, v41]]) c46 c47 c63 c64 c65 hXb hE' hE hM0 hM1 hA''
     rw [← htop, ← hal]
     exact cellKeyG_of_parts hM hK
 

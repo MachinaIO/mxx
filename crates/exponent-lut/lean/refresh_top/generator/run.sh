@@ -55,22 +55,24 @@ g() {  # g <name> <command...>: run one generator, log, record status
   return 0
 }
 STAGES="Stage_preprocess Stage_encrypt Stage_online_eval"
+# the caller's encoding of sigma_0 G, one instance per chain (the parts read it through stage links)
+SIGMA="Stage_sigma_preprocess Stage_sigma_encrypt Stage_sigma_online_eval"
 
 # 1. roles and adapters
 if [ -n "$ADAPT" ]; then
   cp "$ADAPT"/GenIface.lean "$ADAPT"/Gen_Stage_*_Scopes.lean "$ADAPT"/roles.json "$OUT/"
 else
   cp "$GENERIC_DIR/GenIface.lean" "$OUT/GenIface.lean"  # template: its COMP section is regenerated
-  g adapters python3 "$GEN/gen_adapters.py" "$OUT/generated" "$OUT" $STAGES Stage_decode --iface "$OUT/GenIface.lean"
+  g adapters python3 "$GEN/gen_adapters.py" "$OUT/generated" "$OUT" $STAGES $SIGMA Stage_decode --iface "$OUT/GenIface.lean"
   g roles python3 "$GEN/xroles.py" "$OUT/generated" --json "$OUT/roles.json"
 fi
 ROLES=$OUT/roles.json
 
 # 2. instance pipeline (D, F)
-g inst_certs     python3 "$GEN/gen_inst_certs.py" "$OUT/generated" "$OUT/Gen_InstCerts.lean" $STAGES --R "$R"
-g instance       python3 "$GEN/gen_instance.py" "$OUT/generated" "$OUT" "$OUT" "$ROLES" $STAGES
-g instance_pre   python3 "$GEN/gen_instance_pre.py" "$OUT/generated" "$OUT" "$OUT" "$ROLES"
-g online_keys    python3 "$GEN/gen_instance_pre.py" "$OUT/generated" "$OUT" "$OUT" "$ROLES" Stage_online_eval
+g inst_certs     python3 "$GEN/gen_inst_certs.py" "$OUT/generated" "$OUT/Gen_InstCerts.lean" $STAGES $SIGMA --R "$R"
+g instance       python3 "$GEN/gen_instance.py" "$OUT/generated" "$OUT" "$OUT" "$ROLES" $STAGES $SIGMA
+g instance_pre   python3 "$GEN/gen_instance_pre.py" "$OUT/generated" "$OUT" "$OUT" "$ROLES" Stage_preprocess Stage_sigma_preprocess
+g online_keys    python3 "$GEN/gen_instance_pre.py" "$OUT/generated" "$OUT" "$OUT" "$ROLES" Stage_online_eval Stage_sigma_online_eval
 g online_smudge  python3 "$GEN/gen_online_smudge.py" "$OUT/generated" "$OUT/Gen_Online_Smudge.lean" "$OUT" "$ROLES"
 g stage_links    python3 "$GEN/gen_stage_links.py" "$OUT/generated" "$OUT/Gen_Stage_Links.lean"
 # 3.-4. decode loops, requirement facts
@@ -81,6 +83,7 @@ g final          python3 "$GEN/gen_final.py" "$OUT" --out "$OUT" --roles "$ROLES
 g online_fresh   python3 "$GEN/gen_online_fresh.py" "$OUT" --out "$OUT/Gen_Online_Fresh.lean" --roles "$ROLES"
 g values         python3 "$GEN/gen_values.py" "$OUT" --roles "$ROLES" --out "$OUT/Gen_Online_Values.lean"
 g wiring         python3 "$GEN/gen_wiring.py" "$OUT/generated" "$OUT" --out "$OUT/Gen_Wiring.lean"
+g wiring_sigma   python3 "$GEN/gen_wiring.py" "$OUT/generated" "$OUT" --sigma
 # 6. part theorem, correctness
 g inst_keys      python3 "$GEN/gen_inst_keys.py" "$OUT/generated" "$OUT" "$ROLES"
 g part_ctx       python3 "$GEN/gen_part_ctx.py" "$OUT/generated" "$OUT/Gen_Part_Ctx.lean"
@@ -90,16 +93,25 @@ g part_ctx       python3 "$GEN/gen_part_ctx.py" "$OUT/generated" "$OUT/Gen_Part_
 # empty directory.
 late() {
   g summands     python3 "$GEN/gen_summands.py" "$OUT" --out "$OUT/Gen_Summands.lean" "$@"
+  g summands_sigma python3 "$GEN/gen_summands.py" "$OUT" --sigma "$@"
   g inst_cx      python3 "$GEN/gen_inst_cx.py" "$OUT/generated" "$OUT" "$ROLES"
   g key_eq       python3 "$GEN/gen_key_eq.py" "$OUT/generated" "$OUT" "$ROLES"
+  g key_eq_sigma python3 "$GEN/gen_key_eq.py" "$OUT/generated" "$OUT" "$ROLES" --sigma
   g part2        python3 "$GEN/gen_part2.py" "$OUT/generated" "$OUT/Gen_Part.lean" "$ROLES"
   g correct2     python3 "$GEN/gen_correct2.py" "$OUT" --part Gen_Part
 }
 # first pass: `--probe` makes every summand log its bounds' values per instance when built
 for round in 1 2 3; do late --probe; done
 
+# The chain theorems are test theorems (the part theorem and the mask summand inline their
+# steps); they are not built.
+set_aside_chains() {
+  for m in Stage_online_eval Stage_sigma_online_eval; do
+    mv -f "$OUT/Gen_Inst_${m}_Chains.lean" "$OUT/Gen_Inst_${m}_Chains.lean.test" 2>/dev/null || true
+  done
+}
 if [ -n "${SKIP_BUILD:-}" ]; then
-  mv -f "$OUT/Gen_Inst_Stage_online_eval_Chains.lean" "$OUT/Gen_Inst_Stage_online_eval_Chains.lean.test" 2>/dev/null || true
+  set_aside_chains
   exit 0
 fi
 
@@ -110,7 +122,7 @@ build() { LEAN_PATH=$OUT/olean:$LP LEAN=$LEAN python3 "$HERE/build.py" "$OUT" --
 
 # 7a. probe build: the summand modules and their imports only (Gen_Summands does not import the
 # chain test module, so it is not built), then the second pass with the probed closed bounds
-build --only Gen_Summands ${KEEP:+--keep}
+build --only Gen_Summands,Gen_Summands_Sigma ${KEEP:+--keep}
 PROBE_LOGS=$(ls "$OUT"/logs/Gen_Summands_*Summand.log 2>/dev/null | paste -sd,)
 if [ -n "$PROBE_LOGS" ]; then
   for round in 1 2 3; do late --bounds "$PROBE_LOGS"; done
@@ -118,8 +130,7 @@ else
   echo "summands_bounds exit=1 (no probe logs)" | tee -a "$OUT/gen_status.txt"
 fi
 
-# The chain theorems are test theorems (the part theorem inlines their steps); they are not built.
-mv -f "$OUT/Gen_Inst_Stage_online_eval_Chains.lean" "$OUT/Gen_Inst_Stage_online_eval_Chains.lean.test" 2>/dev/null || true
+set_aside_chains
 
 # 7b. full build (the probe build's oleans are reused; the regenerated summand modules are rebuilt)
 build --keep

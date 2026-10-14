@@ -159,11 +159,14 @@ def enc_steps(I, M, roles, adapters, gt):
         call = f'{child}.sem ({I.F(a)} i)'
         name = f's_{a["field"]}'
         if role == 'enc.label-entry':
-            hs, ho = M.fact(args[4]), M.fact(args[5])
+            # variant 1 (a Program in its own stages): inputs (s, key, 1, c, e), keys hash-sampled
+            v1 = bool(comp) and comp.endswith('_1')
+            hs, ho = (M.fact(args[0]), M.fact(args[2])) if v1 else (M.fact(args[4]), M.fact(args[5]))
             if None in (hs, ho):
                 notes.append(f'{a["field"]}: label entry masks unknown')
                 continue
-            steps.append(f'  node_have {name} := fun i ↦ EncLabelEntry.rel ({call}) {hs} {ho} rfl rfl')
+            rel = 'rel_1' if v1 else 'rel'
+            steps.append(f'  node_have {name} := fun i ↦ EncLabelEntry.{rel} ({call}) {hs} {ho} rfl rfl')
         elif role == 'enc.lut-branch-key' and comp:
             v = comp.split('.Comp')[1]
             hs, ho = M.fact(args[0]), M.fact(args[2])
@@ -792,6 +795,148 @@ def emit_cell1(I, a, C, P, child_atoms, name):
 {layout_obtain(C, Qa, ['LA', 'hLA', 'hLxA', '-'])}{layout_obtain(C, q, ['L', 'hL', 'hLx', 'hd'])}{layout_obtain(C, q2, ["L'", "hL'", "hLx'", "hd'"])}  obtain ⟨o, ho, hr, -⟩ := PrfCell1.rel (by decide) {hQ} {C.gt(Qa)} (by have := {hpA}; omega) {hq} {C.gt(q)} {C.gt(q2)}
     (by have := {hp}; omega) LA hLA hLxA L hL hLx (by rw [hd]) L' hL' hLx' (by rw [hd']) (by decide)
     (h := {L['child']}.sem hc) hsm hGA (hα k) (hαμ k) (ha k) k hk.symm (hpay k) hG hGR hg' hg hs
+    (hrhs i) (heB i)
+  exact ⟨k, hk, o, ho, hr⟩
+'''
+
+
+def label_hashes(child_atoms):
+    """The child's label key samples (`member, idx, component, c`) and its selector tops (`.decimal`)."""
+    hs = [x for x in child_atoms if x['head'].endswith('hashSample')]
+    lab = [x for x in hs if '.decimal' not in x['args'][2]]
+    top = [x for x in hs if '.decimal' in x['args'][2]]
+    return lab, top
+
+
+def emit_cell0_1(I, a, C, P, child_atoms, name):
+    """Segment theorem of a bucket-0 PRF cell gather of a Program in its own stages (`prf.cell0`,
+    variant 1: the input encoding's keys hash-sampled per member, `labelKeyG`; `PrfCell0.rel_1`)."""
+    L = a['loop']
+    args = [x.strip() for x in L['args']]
+    t = wire_of(args[0].replace(' i', ''))
+    fams = [f for (f, _, _) in L['gathered']]
+    key = wire_of(args[2])
+    As00, As10, cs0 = [wire_of(x) for x in args[4:7]]
+    As01, As11, cs1 = [wire_of(x) for x in args[8:11]]
+    bot0, bot1 = [wire_of(x.replace(' i', '')) for x in args[11:13]]
+    W = lambda w: f'{I.inst}.{w} ctx'
+    K, q, nn, _, m = mat_type(I.wires[fams[0]]['type'])
+    _, _, _, _, m1 = mat_type(I.wires[As00]['type'])
+    F_, q2, _, _, m2 = mat_type(I.wires[bot0]['type'])
+    import xmodel
+    lab, top = label_hashes(child_atoms)
+    lpre = lab[0]['args'][1].strip('()')
+    pre = top[0]['args'][1].strip('()')
+    items = xmodel.split_top(xmodel.strip_parens(top[0]['args'][2])[1:-1], ', ')
+    dec = [xmodel.strip_parens(x.strip()[len('.decimal '):]).replace('((Int.ofNat i_0))', '(Int.ofNat i_0)')
+           for x in items if x.strip().startswith('.decimal')]
+    Q, Q2 = qterm(q), qterm(q2)
+    p = f'({Q} / {Q2})'
+    hq, hp = C.div(q, q2)
+    lk = lambda c: f'labelKeyG hashModel {Q} {nn} {m} ({W(key)}) {lpre} ((k : Nat) : Int) {c}'
+    outs = ', '.join(f'{I.inst}.{wire_of(o.replace(" i", ""))} ctx i' for o in L['outs'])
+    return f'''theorem {name} {{backend : BackendContext}} {{hashModel : HashModel}} {{params : Params}} {{i_0 : Nat}}
+    [Fact (i_0 < S)] {{ctx : {I.inst}.Ctx backend hashModel params i_0}} {{outputs}}
+    (F : {I.inst}.Facts ctx outputs) (hb : backend = Backend.backend)
+    {{sm sp μ : ErrorPoly {nn}}} (hsm : polyNorm sm ≤ 1)
+    {{α : Fin {K} → ErrorPoly {nn}}} (hα : ∀ k, SmulGain (α k) 1) (hαμ : ∀ k, polyNorm (α k * μ) ≤ 1)
+    {{G : ExactMatrix {Q} {nn} 1 {m}}} (hG : gadgetMatrixRuns backend {GBASE} {m} G) {{Ba : Nat}}
+    (ha : ∀ k : Fin {K}, MxxExponentLut.Rel sm ![![{lk(0)}, {lk(1)}], ![{lk(2)}, {lk(3)}]]
+      (fun j ↦ reducePoly {Q} {nn} (α k * unitPair sm j) • G) ![{W(fams[0])} k, {W(fams[1])} k] Ba)
+    (hpay : ∀ k : Fin {K}, {W(fams[2])} k = fun _ _ ↦ reducePoly {Q} {nn} (α k))
+    {{g' : ExactMatrix {Q2} {nn} 1 {m1}}} (hg' : gadgetMatrixRuns backend {GBASE} {m1} g')
+    {{g : ExactMatrix {Q} {nn} 1 {m1}}} (hg : centeredRebaseRuns g' g) {{Bs : Nat}}
+    (hs : MxxExponentLut.Rel sm ![![{W(As00)}, {W(As01)}], ![{W(As10)}, {W(As11)}]]
+      (fun j ↦ reducePoly {Q} {nn} ((({p} : Nat) : Int) * μ * unitPair sp j) • g) ![{W(cs0)}, {W(cs1)}] Bs)
+    {{p' : Nat}} {{ν : Fin {F_} → ErrorPoly {nn}}} {{hT : ExactMatrix {Q2} {nn} 1 {m2}}}
+    {{eB : Fin {F_} → Fin 2 → ErrorMatrix {nn} 1 {m2}}} {{BB : Nat}}
+    (hrhs : ∀ (i : Fin {F_}) j, reducePoly {Q2} {nn} sp • topPairG hashModel ({W(key)}) {Q2} {m2} {pre}
+        (prfTopTags ({dec[0]}) ({dec[1]}) i) j + ![{W(bot0)} i, {W(bot1)} i] j =
+      reducePoly {Q2} {nn} ((p' : Int) * ν i * unitPair sp j) • hT +
+        reduceMatrix {Q2} {nn} 1 {m2} (eB i j))
+    (heB : ∀ i j, CoeffBound (eB i j) BB) :
+    ∀ i : Fin {F_}, ∃ k : Fin {K}, ((k : Nat) : Int) = {W(t)} i ∧
+      EncRel sm ({outs}, ())
+        (fun j ↦ reducePoly {Q2} {nn} ((p' : Int) * (α k * μ * ν i) * unitPair sp j) • hT)
+        (cellBoundK {nn} {m} {m1} {GHALF} {p} Ba Bs BB 1) := by
+  intro i
+  obtain ⟨k, hk, hc⟩ := Gen.gather_loop3 {P} {I.F(a)} i
+  subst hb
+  have hak := ha k
+  rw [hk] at hak
+{layout_obtain(C, q, ['L', 'hL', 'hLx', 'hd'])}{layout_obtain(C, q2, ["L'", "hL'", "hLx'", "hd'"])}  refine ⟨k, hk, (PrfCell0.rel_1 (by decide) {hq} {C.gt(q)} {C.gt(q2)} (by have := {hp}; omega)
+    L hL hLx (by rw [hd]) L' hL' hLx' (by rw [hd'])
+    (h := {L['child']}.sem hc) hsm hG (hα k) (hαμ k) hak (hpay k) hg' hg hs
+    (hrhs i) (heB i)).1⟩
+'''
+
+
+def emit_cell1_1(I, a, C, P, child_atoms, name):
+    """Segment theorem of a bucket-1 PRF cell gather of a Program in its own stages (`prf.cell1`,
+    variant 1: `PrfCell1.rel_1`)."""
+    L = a['loop']
+    args = [x.strip() for x in L['args']]
+    t = wire_of(args[0].replace(' i', ''))
+    fams = [f for (f, _, _) in L['gathered']]
+    key = wire_of(args[2])
+    As00, As10, cs0 = [wire_of(x) for x in args[4:7]]
+    As01, As11, cs1 = [wire_of(x) for x in args[8:11]]
+    bot0, bot1 = [wire_of(x.replace(' i', '')) for x in args[11:13]]
+    W = lambda w: f'{I.inst}.{w} ctx'
+    K, Qa, nn, _, mA = mat_type(I.wires[fams[0]]['type'])
+    Wm, q, _, _, m1 = mat_type(I.wires[As00]['type'])
+    F_, q2, _, _, m2 = mat_type(I.wires[bot0]['type'])
+    gm = [x for x in child_atoms if x['head'].endswith('gadgetMatrixRuns')][0]
+    m = gm['args'][-2].strip('()')
+    import xmodel
+    lab, top = label_hashes(child_atoms)
+    lpre = lab[0]['args'][1].strip('()')
+    pre = top[0]['args'][1].strip('()')
+    items = xmodel.split_top(xmodel.strip_parens(top[0]['args'][2])[1:-1], ', ')
+    dec = [xmodel.strip_parens(x.strip()[len('.decimal '):]).replace('((Int.ofNat i_0))', '(Int.ofNat i_0)')
+           for x in items if x.strip().startswith('.decimal')]
+    QA, Q, Q2 = qterm(Qa), qterm(q), qterm(q2)
+    pA = f'({QA} / {Q})'
+    p = f'({Q} / {Q2})'
+    hQ, hpA = C.div(Qa, q)
+    hq, hp = C.div(q, q2)
+    Pdiv = F_ // Wm
+    lk = lambda c: f'labelKeyG hashModel {QA} {nn} {mA} ({W(key)}) {lpre} ((k : Nat) : Int) {c}'
+    outs = ', '.join(f'{I.inst}.{wire_of(o.replace(" i", ""))} ctx i' for o in L['outs'])
+    return f'''theorem {name} {{backend : BackendContext}} {{hashModel : HashModel}} {{params : Params}} {{i_0 : Nat}}
+    [Fact (i_0 < S)] {{ctx : {I.inst}.Ctx backend hashModel params i_0}} {{outputs}}
+    (F : {I.inst}.Facts ctx outputs) (hb : backend = Backend.backend)
+    {{sm sp : ErrorPoly {nn}}} {{μ : Fin {Wm} → ErrorPoly {nn}}} (hsm : polyNorm sm ≤ 1)
+    {{α : Fin {K} → ErrorPoly {nn}}} (hα : ∀ k, SmulGain (α k) 1) (hαμ : ∀ k o, polyNorm (α k * μ o) ≤ 1)
+    {{GA : ExactMatrix {QA} {nn} 1 {mA}}} (hGA : gadgetMatrixRuns backend {GBASE} {mA} GA) {{Ba : Nat}}
+    (ha : ∀ k : Fin {K}, MxxExponentLut.Rel sm ![![{lk(0)}, {lk(1)}], ![{lk(2)}, {lk(3)}]]
+      (fun j ↦ reducePoly {QA} {nn} (α k * unitPair sm j) • GA) ![{W(fams[0])} k, {W(fams[1])} k] Ba)
+    (hpay : ∀ k : Fin {K}, {W(fams[2])} k = fun _ _ ↦ reducePoly {QA} {nn} (α k))
+    {{G : ExactMatrix {Q} {nn} 1 {m}}} (hG : gadgetMatrixRuns backend {GBASE} {m} G)
+    {{GR : ExactMatrix {QA} {nn} 1 {m}}} (hGR : centeredRebaseRuns G GR)
+    {{g' : ExactMatrix {Q2} {nn} 1 {m1}}} (hg' : gadgetMatrixRuns backend {GBASE} {m1} g')
+    {{g : ExactMatrix {Q} {nn} 1 {m1}}} (hg : centeredRebaseRuns g' g) {{Bs : Nat}}
+    (hs : ∀ o : Fin {Wm}, MxxExponentLut.Rel sm ![![{W(As00)} o, {W(As01)} o], ![{W(As10)} o, {W(As11)} o]]
+      (fun j ↦ reducePoly {Q} {nn} ((({p} : Nat) : Int) * μ o * unitPair sp j) • g) ![{W(cs0)} o, {W(cs1)} o] Bs)
+    {{p' : Nat}} {{ν : Fin {F_} → ErrorPoly {nn}}} {{hT : ExactMatrix {Q2} {nn} 1 {m2}}}
+    {{eB : Fin {F_} → Fin 2 → ErrorMatrix {nn} 1 {m2}}} {{BB : Nat}}
+    (hrhs : ∀ (i : Fin {F_}) j, reducePoly {Q2} {nn} sp • topPairG hashModel ({W(key)}) {Q2} {m2} {pre}
+        (prfTopTags ({dec[0]}) ({dec[1]}) i) j + ![{W(bot0)} i, {W(bot1)} i] j =
+      reducePoly {Q2} {nn} ((p' : Int) * ν i * unitPair sp j) • hT +
+        reduceMatrix {Q2} {nn} 1 {m2} (eB i j))
+    (heB : ∀ i j, CoeffBound (eB i j) BB) :
+    ∀ i : Fin {F_}, ∃ k : Fin {K}, ((k : Nat) : Int) = {W(t)} i ∧ ∃ o : Fin {Wm}, ((o : Nat) : Int) = Int.fdiv (Int.ofNat i) {Pdiv} ∧
+      EncRel sm ({outs}, ())
+        (fun j ↦ reducePoly {Q2} {nn} ((p' : Int) * (α k * μ o * ν i) * unitPair sp j) • hT)
+        (cellBoundK {nn} {m} {m1} {GHALF} {p} (({mA} * {nn} * Ba * (({GBASE} : Int).toNat / 2) + ({nn} + 2) * ({pA} / 2)) / {pA}) Bs BB 1) := by
+  intro i
+  obtain ⟨k, hk, hc⟩ := Gen.gather_loop3 {P} {I.F(a)} i
+  subst hb
+  have hak := ha k
+  rw [hk] at hak
+{layout_obtain(C, Qa, ['LA', 'hLA', 'hLxA', '-'])}{layout_obtain(C, q, ['L', 'hL', 'hLx', 'hd'])}{layout_obtain(C, q2, ["L'", "hL'", "hLx'", "hd'"])}  obtain ⟨o, ho, hr, -⟩ := PrfCell1.rel_1 (by decide) {hQ} {C.gt(Qa)} (by have := {hpA}; omega) {hq} {C.gt(q)} {C.gt(q2)}
+    (by have := {hp}; omega) LA hLA hLxA L hL hLx (by rw [hd]) L' hL' hLx' (by rw [hd']) (by decide)
+    (h := {L['child']}.sem hc) hsm hGA (hα k) (hαμ k) hak k hk.symm (hpay k) hG hGR hg' hg hs
     (hrhs i) (heB i)
   exact ⟨k, hk, o, ho, hr⟩
 '''

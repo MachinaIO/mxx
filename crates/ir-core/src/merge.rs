@@ -767,9 +767,10 @@ mod tests {
 
     /// A consumer merged over four instances reads, with groups of two, member `floor(k / 2)` of
     /// a family of two members over different rings (instance `k` reading chain `floor(k / 2)`):
-    /// the family input has two members, the loop reads it by `ZipQuotient { divisor: 2 }`, and
-    /// the merged graph validates member by member. Instances of one group over different rings,
-    /// and a group size that does not divide the instance count, are rejected.
+    /// the family input has two members, the loop reads it by `ZipQuotient { divisor: 2 }`, the
+    /// merged graph validates member by member and its Lean export casts the member's modulus.
+    /// Instances of one group over different rings, and a group size that does not divide the
+    /// instance count, are rejected.
     #[test]
     fn grouped_family_input_reads_member_k_over_group() {
         let primes = [17, 97];
@@ -821,6 +822,12 @@ mod tests {
             })
             .unwrap();
         assert_ne!(sigma[0], sigma[1], "one member per ring");
+        // In Lean the member's modulus is a table at `i / 2`, the instance's a table at `i`: the
+        // root casts the member to the instance's modulus.
+        let lean = crate::lean::export(&validated, &crate::lean::ExportOptions::default()).unwrap();
+        assert!(lean.source.contains(
+            "(Mxx.Primitives.castModulus (w_0_0 ⟨i.val / 2, by omega⟩) (by revert i; decide +kernel))"
+        ));
         // The groups' first instances give the members' types.
         let mixed = [17, 97, 97, 17].map(|prime| instance("sigma", prime, 1));
         let (mixed, _) = merge(&mixed, 2).unwrap();

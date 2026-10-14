@@ -23,8 +23,16 @@ import gen_final  # noqa: E402
 import xsem  # noqa: E402
 from gen_instance import facts_fields  # noqa: E402
 
-STAGES = {'stage_2': 'Stage_preprocess', 'stage_3': 'Stage_encrypt', 'stage_4': 'Stage_online_eval'}
+#: The part stages, and the stages of the caller's encoding of `σ_0 G` (one instance per chain).
+PART = ('Stage_preprocess', 'Stage_encrypt', 'Stage_online_eval')
+SIGMA = ('Stage_sigma_preprocess', 'Stage_sigma_encrypt', 'Stage_sigma_online_eval')
 SHORT = {'Stage_preprocess': 'p', 'Stage_encrypt': 'e', 'Stage_online_eval': 'o'}
+
+
+def stage_keys(gdir):
+    """The Claim's execution field (`stage_k`) of every part stage."""
+    return {c['output'].split('«')[1].rstrip('»'): c['module'] for c in xmodel.parse_claim(gdir)
+            if c.get('module') in PART}
 
 
 def proj(k):
@@ -59,7 +67,8 @@ DATA = {'Gr': 'hGr', 'gx\'': 'hgx\'', 'gx': 'hgx', 'YI': 'hYI', 'BY': 'hYb', 'DI
         'es': 'hs', 'Bs': 'hes', 'M': 'hTH', 'BM': 'hM'}
 
 
-SH = {'Stage_preprocess': 'P', 'Stage_encrypt': 'E', 'Stage_online_eval': 'O'}
+SH = {'Stage_preprocess': 'P', 'Stage_encrypt': 'E', 'Stage_online_eval': 'O',
+      'Stage_sigma_preprocess': 'σP', 'Stage_sigma_encrypt': 'σE', 'Stage_sigma_online_eval': 'σO'}
 
 
 class LinkTerms:
@@ -248,6 +257,85 @@ NOISE_MONO = [
     '  lt_of_le_of_lt (by gcongr) hc']
 
 
+def sigma_mask(pdir, gdir, binders, over, ctxa):
+    """The mask row `hg` of the final combination: the caller's encoding of `σ_0 G` of the part's
+    chain (the σ stages at instance `i / d`, `Gen_Summands_Sigma` mask_summand), its keys
+    (`GenInst.KeyEqSigma.mask_keys`) and the stage links that cast it, its keys and its gadget to
+    the part's ring (`GenFinal.castModulus_maskRow`); the residue `hβ` of its scalar
+    (`GenFinalInst.mask_inst`). Fills `over` (`β`, `Kg`, `eg`, `Beg`, `heg`, `hg`, `hβ`)."""
+    sm = open(f'{pdir}/Gen_Summands_Sigma_MaskSummand.lean').read()
+    ns = re.search(r'^namespace (\S+)', sm, re.M).group(1)
+    st = re.search(r'^theorem mask_summand .*?:= by', sm, re.S | re.M).group(0)
+    links = open(f'{pdir}/Gen_Stage_Links.lean').read()
+    ctx = open(f'{pdir}/Gen_Part_Ctx.lean').read()
+    Sσ = int(re.search(r'^theorem inst_Stage_sigma_preprocess .*?\(i : Fin (\d+)\)', ctx, re.S | re.M).group(1))
+    # the part's mask row (final_inst's `hg`) and the σ online output it casts
+    hg = [ty for br, names, ty in binders if 'hg' in names][0]
+    wg = re.match(r'^(w_\d+_\d+) = maskPart', hg.strip()).group(1)
+    wσ = re.search(r'^\s+Stage_sigma_online_eval\.\w+\.(w_\d+_\d+) ctx = maskPart', st, re.M).group(1)
+    lk = re.search(r'^theorem (link_Stage_sigma_online_eval_%s_Stage_online_eval_%s) .*?⟨i\.val / (\d+), by omega⟩'
+                   % (wσ, wg), links, re.S | re.M)
+    if not lk:
+        raise SystemExit(f'no stage link of the mask row {wσ} -> {wg}')
+    d = lk.group(2)
+    # the summand's gadget (`gadgetOf … (<σ modulus> iS) n m`), as a statement about every modulus
+    gq = re.search(r'• \((gadgetOf Backend\.backend \(\(\d+\) : Int\) \(\(\d+\) : Int\)) \((Stage_sigma_\w+\.mod_\d+) \(\(Int\.ofNat \(iS : Nat\)\)\)\) (\d+) (\d+)\)', st)
+    gnm = re.search(r'open .*?(RefreshTopProof\.GenInst\.Sigma\w+Keys)', sm).group(1)
+    motive = f'(fun Q x ↦ x = {gnm}.{gq.group(1)} Q {gq.group(3)} {gq.group(4)})'
+    # the keys: the σ preprocessing's rows, linked to the part preprocessing's
+    kt = ''.join(open(f'{pdir}/{m}.lean').read() for m in
+                 re.findall(r'^import (\S+)', open(f'{pdir}/Gen_Inst_KeyEqSigma.lean').read(), re.M)
+                 if os.path.exists(f'{pdir}/{m}.lean'))
+    kst = re.search(r'^theorem mask_keys .*?:= by', kt, re.S | re.M).group(0)
+    kσ = re.findall(r'\(Stage_sigma_preprocess\.\w+\.(w_\d+_\d+) pctx\)', kst[kst.rindex(') :'):])
+    kp, kl = [], []
+    for w in kσ:
+        m = re.search(r'^theorem (link_Stage_sigma_preprocess_%s_Stage_preprocess_(w_\d+_\d+)) ' % w, links, re.M)
+        if not m:
+            raise SystemExit(f'no stage link of the mask key {w}')
+        kl.append(f'(StageLinks.{m.group(1)} houtσP hinstσP hinP hrootP).symm')
+        kp.append(m.group(2))
+    pinst = re.search(r'Stage_preprocess\.(parallel_generatedRoot_\d+)\.Ctx', ctx).group(1)
+    Kg = '![' + ', '.join(f'(Stage_preprocess.{pinst}.{w} cP)' for w in kp) + ']'
+    LT = LinkTerms(pdir)
+    ka, kg = inst_args(kt, 'mask_keys', LT, {'sp': 'hspE', 'sm': 'hsmE'}, gdir)
+    ka = [a.replace('(FP := FP)', '(FP := FσP)').replace('(FE := FE)', '(FE := FσE)').replace('(FO := FO)', '(FO := FσO)')
+          for a in ka]
+    kg = [(g, t and t.replace(' cP)', ' cσP)').replace(' cE)', ' cσE)').replace(' cO)', ' cσO)')) for g, t in kg]
+    Sp = int(re.search(r'^theorem inst_Stage_preprocess .*?\(i : Fin (\d+)\)', ctx, re.S | re.M).group(1))
+    ix = f'⟨(i : Nat) / {d}, hiσ⟩'
+    σctx = (ctxa.replace('(FP := FP) (hinP := hinP) (hrootP := hrootP) (houtP := houtP) (hinstP := hinstP)',
+                         '(FP := FσP) (hinP := hinσP) (hrootP := hrootσP) (houtP := houtσP) (hinstP := hinstσP)')
+            .replace('(FE := FE) (hinE := hinE) (hrootE := hrootE) (houtE := houtE) (hinstE := hinstE)',
+                     '(FE := FσE) (hinE := hinσE) (hrootE := hrootσE) (houtE := houtσE) (hinstE := hinstσE)')
+            .replace('(F := FO) (hinO := hinO) (hrootO := hrootO) (houtO := houtO) (hinstO := hinstO)',
+                     '(F := FσO) (hinO := hinσO) (hrootO := hrootσO) (houtO := houtσO) (hinstO := hinstσO)'))
+    hbound = ', hBeg' if re.search(r'CoeffBound eg Beg ∧ Beg ≤', st) else ''
+    L = [f'  -- the mask row: the chain\'s encoding of σ_0 G (the σ stages at instance i / {d}), cast to the part\'s ring',
+         f'  have hiσ : (i : Nat) / {d} < {Sσ} := by have hi : (i : Nat) < {Sp} := i.isLt; omega',
+         f'  haveI : Fact ((i : Nat) / {d} < {Sσ}) := ⟨hiσ⟩',
+         f'  obtain ⟨rσP, cσP, FσP, houtσP, hinstσP, hinσP, hrootσP⟩ := GenPartCtx.inst_Stage_sigma_preprocess hR {ix}',
+         f'  obtain ⟨rσE, cσE, FσE, houtσE, hinstσE, hinσE, hrootσE⟩ := GenPartCtx.inst_Stage_sigma_encrypt hR {ix}',
+         f'  obtain ⟨rσO, cσO, FσO, houtσO, hinstσO, hinσO, hrootσO⟩ := GenPartCtx.inst_Stage_sigma_online_eval hR {ix}',
+         f'  obtain ⟨zN, Kσ, eg, Beg, heg{hbound}, hgσ, hz, hσ0, hKσ⟩ := {ns}.mask_summand (iS := {ix}) {σctx}']
+    if hbound:  # the closed bound at the chain index (not at the `Fin` term, which reads `hiσ`)
+        L.append(f'  replace hBeg : Beg ≤ {ns}.bound_mask_Beg ((i : Nat) / {d}) := hBeg')
+    L += gap_haves(kg)
+    L += [f'  have hKσK := GenInst.KeyEqSigma.mask_keys ' + ' '.join(ka),
+          '  rw [hKσK] at hKσ',
+          '  subst hKσ',
+          f'  have hg := (StageLinks.{lk.group(1)} houtσO hinstσO hinO hrootO).trans',
+          f'    (RefreshTopProof.GenFinal.castModulus_maskRow _ (K\' := {Kg})',
+          '      (fun k ↦ by fin_cases k <;> [exact ' + '; exact '.join(kl) + '])',
+          f'      ((Mxx.Primitives.castModulus_transport _ {motive} rfl).trans ({gnm}.gadgetOf_eq {over["hGr"]})) hgσ)',
+          '  have hβ := GenFinalInst.mask_inst (i : Nat) (inputs := decodeInputs external execution)',
+          '    (hσ := fun o ho ↦ hσ0 o ho) hz rfl']
+    over.update({'β': None, 'Kg': Kg, 'eg': 'eg', 'Beg': None, 'heg': 'heg', 'hg': 'hg', 'hβ': 'hβ'})
+    over['__keq__'] = over.get('__keq__', set()) | {'Kg'}
+    over['__novar__'] = over.get('__novar__', set()) | {'Kg'}
+    return L
+
+
 def summand_wiring(pdir, gdir, binders, fields, inst, over):
     """Lines that obtain F's summand facts (Gen_Summands_*: hint, preimage, keys, smudge, mask, fresh,
     pre) with the shared context arguments, the digit link `pre_link` (hD/hY of `pre_summand`) and
@@ -279,17 +367,8 @@ def summand_wiring(pdir, gdir, binders, fields, inst, over):
         kp = re.findall(r'= (Stage_preprocess\.\S+\.w_\d+_\d+) cP', kc)
         over.update({'Tsm': 'Tsm', 'es': 'es', 'Bs': None, 'hs': 'hs', 'hes': 'hes', 'M': 'M', 'BM': None,
                      'hTH': 'hTH', 'hM': 'hM', 'Ks': f'![{kp[0]} cP, {kp[1]} cP]'})
-    if 'Mask' in text:
-        kgE = ', hKgE' if re.search(r'∧\n      K = fun k ↦', text['Mask']) else ''
-        L.append(f'  obtain ⟨zN, Kg, eg, Beg, heg, hBeg, hg, hβ{kgE}⟩ := {NS}.mask_summand (inputs := decodeInputs external execution) {ctxa} (hin := rfl)')
-        g = re.search(r'• \(gadgetOf (Backend\.backend \(\(\d+\) : Int\) \(\(\d+\) : Int\) \(Stage_\w+\.mod_0 \(\(Int\.ofNat \(iS : Nat\)\)\)\) \d+ \d+)\)', text['Mask']).group(1)
-        g = g.replace('(iS : Nat)', '(i : Nat)')
-        L.append(f'  have hGrE : RefreshTopProof.GenInst.PreprocessKeys.gadgetOf {g} = {over["Gr"]} := '
-                 f'RefreshTopProof.GenInst.PreprocessKeys.gadgetOf_eq {over["hGr"]}')
-        L.append('  rw [← hGrE] at hc₁')
-        over.update({'Gr': f'(RefreshTopProof.GenInst.PreprocessKeys.gadgetOf {g})',
-                     'hGr': f'(RefreshTopProof.GenInst.PreprocessKeys.gadgetOf_runs ⟨_, {over["hGr"]}⟩)',
-                     'β': None, 'Kg': 'Kg', 'eg': 'eg', 'Beg': None, 'heg': 'heg', 'hg': 'hg', 'hβ': 'hβ'})
+    if os.path.exists(f'{pdir}/Gen_Summands_Sigma_MaskSummand.lean'):
+        L += sigma_mask(pdir, gdir, binders, over, ctxa)
     if 'Fresh' in text:
         kfE = ', hKfE' if re.search(r'∧\n      Kf = fun k _ l ↦', text['Fresh']) else ''
         L.append(f'  obtain ⟨Kf, ef, Bf, hef, hBf, hf{kfE}⟩ := {NS}.fresh_summand {ctxa}')
@@ -322,7 +401,7 @@ def summand_wiring(pdir, gdir, binders, fields, inst, over):
                 elif nm == 'hhash_p':
                     hw = re.match(r'^p_(w_\d+_\d+) = ', ty).group(1)
                     for f, (fr, t) in pf.items():
-                        mm = re.search(r'hashSample .*\(\(%s\.(w_\d+_\d+) ctx\)\) \(%s\.%s ctx\)$' % (pinst, pinst, hw), t)
+                        mm = re.search(r'sliceMatrix \(%s\.(w_\d+_\d+) ctx\) .* \(%s\.%s ctx\)$' % (pinst, pinst, hw), t)
                         if mm:
                             hp_fact = (f'FP.c{fr}.{f}', mm.group(1))
                     args.append('(hhash_p := hhash_p)')
@@ -330,9 +409,9 @@ def summand_wiring(pdir, gdir, binders, fields, inst, over):
                     args.append(f'({nm} := FO.c{fields[nm][0]}.{nm})')
                 else:
                     args.append(f'({nm} := ?pre_link_{nm})')
-        L.append(f'  have hhash_p := GenFinalInst.hash_pre (i : Nat) (inputs := decodeInputs external execution) '
+        L.append(f'  have hhash_p := GenFinalInst.slice_pre (i : Nat) (inputs := decodeInputs external execution) '
                  f'{hp_fact[0]} (StageLinks.src_Stage_preprocess_{hp_fact[1]} hinP hrootP)')
-        L.append(f'  obtain ⟨hD, hY⟩ := GenFinalInst.pre_link (i : Nat) (model := model) (inputs := decodeInputs external execution) ((i : Nat) % R) ' + ' '.join(args))
+        L.append(f'  obtain ⟨hD, hY⟩ := GenFinalInst.pre_link (i : Nat) (inputs := decodeInputs external execution) ((i : Nat) % R) ' + ' '.join(args))
         L.append(f'  have hpreP := {NS}.pre_summand {ctxa} hD hY')
         # the online keys are the preprocessing's (the combination / fresh key equalities)
         kp = re.findall(r'!\[\((Stage_preprocess\.\S+) cP\), \((Stage_preprocess\.\S+) cP\)\] k', text['Pre'])
@@ -342,17 +421,17 @@ def summand_wiring(pdir, gdir, binders, fields, inst, over):
         ke = over.get('__keyeq__', {})
         kE = {'Kg': 'hKgE' if 'hKgE' in ''.join(L) else None, 'Kf': 'hKfE' if 'hKfE' in ''.join(L) else None}
         for nm, (a, b) in zip(names, kp[:4]):
-            if nm in done:
+            if nm in done or nm in over.get('__novar__', set()):
                 continue
             if nm in ke and kE.get(nm):
                 L.append(f'  have {hn[nm]} : {nm} = ![({a} cP), ({b} cP)] := {kE[nm]}.trans {ke[nm]}')
             else:
                 L.append(f'  have {hn[nm]} : {nm} = ![({a} cP), ({b} cP)] := by sorry -- D: online keys = preprocessing keys')
-        L.append('  subst ' + ' '.join(hn[nm] for nm in names[:len(kp[:4])]))
+        L.append('  subst ' + ' '.join(hn[nm] for nm in names[:len(kp[:4])] if nm not in over.get('__novar__', set())))
         for nm, (a, b) in zip(names, kp[:4]):
             over[nm] = f'![({a} cP), ({b} cP)]'
         over.update({'hpre': 'hpreP'})
-    if all(k in text for k in ('Mask', 'Fresh', 'Smudge')):
+    if 'hgσ' in ''.join(L) and all(k in text for k in ('Fresh', 'Smudge')):
         # the noise certificate: per instance, at the closed bound tables
         over['hnoise'] = '(noise_mono hBeg hBf hBs hBM ?hnoise)'
         over['__cases__'] = ['  case hnoise =>', '    have hlt := i.isLt',
@@ -500,7 +579,7 @@ def part_skeleton(pdir, gdir, jterm, decode=None, req=None):
             elif nm == 'hhash':
                 hw = re.match(r'^(w_\d+_\d+) = ', ty).group(1)
                 for f, (fr, t) in fields.items():
-                    mm = re.search(r'hashSample .*\(\(%s\.(w_\d+_\d+) ctx\)\) \(%s\.%s ctx\)$' % (inst, inst, hw), t)
+                    mm = re.search(r'sliceMatrix \(%s\.(w_\d+_\d+) ctx\) .* \(%s\.%s ctx\)$' % (inst, inst, hw), t)
                     if mm:
                         hash_fact = (f'FO.c{fr}.{f}', mm.group(1))
                 args.append(f'(hhash := hhash)')
@@ -517,11 +596,11 @@ def part_skeleton(pdir, gdir, jterm, decode=None, req=None):
          f'    rw [term, houtO]; exact congrArg (fun x ↦ x{proj(jterm)}) hinstO',
          '  rw [hterm]']
     if hash_fact:
-        L += ['  -- the combination hash: the decode key is the online key (hkey: stage link source)',
-              f'  have hhash := GenFinalInst.hash_online (i : Nat) (inputs := decodeInputs external execution) '
+        L += ['  -- the combination\'s A\': the instance\'s column block of the decode stage\'s A\' (stage link source)',
+              f'  have hhash := GenFinalInst.slice_online (i : Nat) (inputs := decodeInputs external execution) '
               f'{hash_fact[0]} (StageLinks.src_{M}_{hash_fact[1]} hinO hrootO)']
     L += post
-    L.append('  refine GenFinalInst.final_inst (i : Nat) (model := model) (inputs := decodeInputs external execution)')
+    L.append('  refine GenFinalInst.final_inst (i : Nat) (inputs := decodeInputs external execution)')
     L.append('    (E := errE external) ((i : Nat) % R) hG')
     for k in range(0, len(args), 4):
         L.append('    ' + ' '.join(args[k:k + 4]))
@@ -535,6 +614,8 @@ def part_skeleton(pdir, gdir, jterm, decode=None, req=None):
 def main():
     gdir, out, roles = sys.argv[1], sys.argv[2], sys.argv[3]
     claim = {c['module']: c for c in xmodel.parse_claim(gdir) if c.get('module')}
+    STAGES = stage_keys(gdir)
+    onkey = next(k for k, M in STAGES.items() if M == 'Stage_online_eval')
     info = {}
     for st, M in STAGES.items():
         sc = xmodel.load(gdir, M)
@@ -574,7 +655,7 @@ def main():
                 links.append((f'{lhs} = {T}', None))
     on = info['Stage_online_eval']
     decode = claim['Stage_decode']['args']
-    m3 = re.match(r'^execution\.«stage_4»((?:\.2)*)\.1$', decode[0])
+    m3 = re.match(r'^execution\.«%s»((?:\.2)*)\.1$' % onkey, decode[0])
     jterm = m3.group(1).count('.2')
     req = claim['Requirement_0']['args']
     dl = open(f'{os.path.dirname(gdir.rstrip("/"))}/TopDecodeLoops.lean').read()
@@ -593,7 +674,8 @@ def main():
     L = ['import Claim', 'import Gen_Requirement', 'import TopDecodeLoops', 'import GenFinal']
     if os.path.exists(f'{pdir}/Gen_Final_Inst.lean'):
         L += ['import Gen_Final_Inst', 'import Gen_Part_Ctx']
-        for mod in ('Gen_Inst_Keys', 'Gen_Inst_Cx', 'Gen_Summands', 'Gen_Inst_KeyEq'):
+        for mod in ('Gen_Inst_Keys', 'Gen_Inst_Cx', 'Gen_Summands', 'Gen_Inst_KeyEq', 'Gen_Summands_Sigma',
+                    'Gen_Inst_KeyEqSigma'):
             if os.path.exists(f'{pdir}/{mod}.lean'):
                 L.append(f'import {mod}')
     for M in STAGES.values():
@@ -611,7 +693,7 @@ def main():
           f'/-- The CRT basis element of instance `i` (the online instance table). -/',
           f'abbrev KOf (i : Nat) : Int := Stage_online_eval.{kO.group(1)} (Int.ofNat i)', '',
           f'/-- The online output family the decode stage reads. -/',
-          f'abbrev term (execution : GeneratedClaim.Execution) := execution.«stage_4»{proj(jterm)}', '',
+          f'abbrev term (execution : GeneratedClaim.Execution) := execution.«{onkey}»{proj(jterm)}', '',
           '/-- The decode stage\'s inputs in a run (the `Runs` argument of `Stage_decode`). -/',
           '@[reducible] def decodeInputs (external : GeneratedClaim.ExternalInputs) (execution : GeneratedClaim.Execution) :',
           '    DecodeLoops.Inputs :=',
@@ -627,16 +709,16 @@ def main():
           f'    ∀ j c i, 4 * |(errE external j 0 c).coeff i| + 4 < ({qd} : Int) := by',
           err_proof, '',
           '/-- The value whose CRT terms component `j` reads (`DecodeLoops.decodeValue`). -/',
-          '@[reducible] noncomputable def valueOf (model : HashModel) (external : GeneratedClaim.ExternalInputs)',
+          '@[reducible] noncomputable def valueOf (external : GeneratedClaim.ExternalInputs)',
           f'    (execution : GeneratedClaim.Execution) (G : {gty.group(1)}) (j : Nat) :=',
-          '  DecodeLoops.decodeValue model (decodeInputs external execution) G (errE external) j', '',
+          '  DecodeLoops.decodeValue (decodeInputs external execution) G (errE external) j', '',
           *NOISE_MONO, '',
           '/-- **The part theorem.** -/',
           'theorem part {model : HashModel} {external : GeneratedClaim.ExternalInputs}',
           '    {execution : GeneratedClaim.Execution} (hR : GeneratedClaim.Runs model external execution)',
           f'    (hreq : Req external) (i : Fin S) {{G : {gty.group(1)}}}',
           f'    (hG : {gty.group(2).replace("backend", "Backend.backend")} G) :',
-          '    TermOf (qOf i) (KOf i) (term execution i) (valueOf model external execution G ((i : Nat) % R)) := by',
+          '    TermOf (qOf i) (KOf i) (term execution i) (valueOf external execution G ((i : Nat) % R)) := by',
           *part_skeleton(pdir, gdir, jterm, decode, req), '', 'end RefreshTopProof.GenPart', '']
     links = []
     open(out, 'w').write('\n'.join(L))

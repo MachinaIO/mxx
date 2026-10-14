@@ -39,7 +39,12 @@ Large-n rules the emitted proofs follow (each one cost minutes or a timeout at n
 `convert (config := { closePre := false, closePost := false })`, `Xe_congr_nat` + `ring`); every
 `bucket_of_cells*` step gets `M`/`W` explicitly (`pin_bucket_dims`).
 
-Usage: gen_summands.py <param dir> [--out FILE] [--probe | --bounds LOG[,LOG…]] [--test-chains]
+With `--sigma` the stages are those of the caller's encoding of `σ_0 G` (`Stage_sigma_*`, one
+instance per chain) and the output is `Gen_Summands_Sigma.lean` with `mask_summand` only: the row
+`g` of the chain's instance, its keys and the PRF outputs `zN` as the requirement's sums (`hz`, the
+`mask_inst` hypothesis of the parts reading the row).
+
+Usage: gen_summands.py <param dir> [--out FILE] [--probe | --bounds LOG[,LOG…]] [--test-chains] [--sigma]
   <param dir>: the pipeline output dir (generated/, roles.json, Gen_Inst_Stage_online_eval_Chains.lean,
   Gen_Inst_Stage_encrypt.lean, Gen_Inst_Stage_preprocess_Keys.lean, Gen_Online_Smudge.lean, Gen_Requirement.lean).
   Two passes: build the `--probe` output (`_Pre`, then the summand modules), then regenerate with
@@ -54,6 +59,22 @@ sys.path.insert(0, os.path.dirname(__file__))
 import xmodel  # noqa: E402
 import gen_stage_links as SL  # noqa: E402
 import gen_wiring as GW  # noqa: E402
+
+#: The stage triple: the parts', or with `--sigma` the stages of the caller's encoding of `σ_0 G`.
+SIGMA = '--sigma' in sys.argv
+PRE, ENC, ON = (('Stage_sigma_preprocess', 'Stage_sigma_encrypt', 'Stage_sigma_online_eval') if SIGMA
+                else ('Stage_preprocess', 'Stage_encrypt', 'Stage_online_eval'))
+
+
+def stage_ns(M):
+    """The namespace stem of a stage's generated instance modules (`gen_instance`, `gen_instance_pre`)."""
+    return M.replace('Stage_', '').title().replace('_', '')
+
+
+PRE_KEYS = f'RefreshTopProof.GenInst.{stage_ns(PRE)}Keys'
+WIRING = GW.NS
+#: The online stage's params (set by `Ctx`).
+ON_PARAMS = None
 
 
 class Fail(Exception):
@@ -136,18 +157,20 @@ class Ctx:
         self.roles = json.load(open(f'{pdir}/roles.json'))
         calls = [c for c in xmodel.parse_claim(self.gdir) if c.get('module')]
         self.stages = {c['module']: SL.Stage(self.gdir, c) for c in calls}
-        self.O = self.stages['Stage_online_eval']
-        self.P = self.stages['Stage_preprocess']
-        self.E = self.stages['Stage_encrypt']
+        self.O = self.stages[ON]
+        self.P = self.stages[PRE]
+        self.E = self.stages[ENC]
+        global ON_PARAMS
+        ON_PARAMS = self.O.params
         self.links_text, _ = SL.gen(self.gdir)
-        self.S = int(re.search(r'^abbrev S : Nat := (\d+)', self.links_text, re.M).group(1))
+        self.S = self.O.S
         self.links = self.parse_links()
-        self.chains = open(f'{pdir}/Gen_Inst_Stage_online_eval_Chains.lean').read()
+        self.chains = open(f'{pdir}/Gen_Inst_{ON}_Chains.lean').read()
         self.n = int(re.search(r'\{sm sp : ErrorPoly (\d+)\}', self.chains).group(1))
-        self.enc = open(f'{pdir}/Gen_Inst_Stage_encrypt.lean').read()
-        self.keys = open(f'{pdir}/Gen_Inst_Stage_preprocess_Keys.lean').read()
-        self.smudge = open(f'{pdir}/Gen_Online_Smudge.lean').read()
-        self.efacts = open(f'{self.gdir}/Stage_encrypt_Facts.lean').read()
+        self.enc = open(f'{pdir}/Gen_Inst_{ENC}.lean').read()
+        self.keys = open(f'{pdir}/Gen_Inst_{PRE}_Keys.lean').read()
+        self.smudge = '' if SIGMA else open(f'{pdir}/Gen_Online_Smudge.lean').read()
+        self.efacts = open(f'{self.gdir}/{ENC}_Facts.lean').read()
         self.wiring = GW.gen(self.gdir, pdir)
         self.claim = open(f'{self.gdir}/Claim.lean').read()
         self.types, self.vproj = GW.claim_info(self.gdir)
@@ -161,9 +184,9 @@ class Ctx:
             hyps = m.group(6)
             lhs_w = m.group(7).split('.')[-1]
             outlink = 'houtA' in hyps
-            if B == 'Stage_online_eval':
+            if B == ON:
                 src, sw, ow = A, a, b
-            elif A == 'Stage_online_eval':
+            elif A == ON:
                 src, sw, ow = B, b, a
             else:
                 continue
@@ -174,7 +197,7 @@ class Ctx:
         return out
 
     def hyp_args(self, M):
-        t = {'Stage_preprocess': 'P', 'Stage_encrypt': 'E', 'Stage_online_eval': 'O'}[M]
+        t = {PRE: 'P', ENC: 'E', ON: 'O'}[M]
         return t
 
     def link_term(self, ow, src):
@@ -235,13 +258,12 @@ class EncFacts:
             m = re.match(r'^  node_have (\S+) := (.*)$', txt, re.S)
             if m:
                 self.steps[m.group(1)] = m.group(2)
-            elif txt.startswith('  have m_w_') or txt.startswith('  rw [h_w_4_0] at m_w_'):
+            elif txt.startswith('  have m_w_') or re.match(r'^  rw \[h_w_\d+_\d+\] at m_w_', txt):
                 self.masks.append(txt)
-        mm = re.findall(r'^  rw \[h_w_4_0\] at (m_w_\d+_0_a)$', body, re.M)
-        self.mask_lines = [ln for ln in body.split('\n') if re.match(r'^  (have m_w_|rw \[h_w_4_0\] at m_w_)', ln)]
+        self.mask_lines = [ln for ln in body.split('\n') if re.match(r'^  (have m_w_|rw \[h_w_\d+_\d+\] at m_w_)', ln)]
 
     def rescope(self, text):
-        t = qualify(text, 'Stage_encrypt', None)
+        t = qualify(text, ENC, None)
         t = re.sub(r'\bF\.', 'FE.', t)
         t = re.sub(r'\bctx\b', 'cE', t)
         t = re.sub(r'\bhsmsmall\b', 'hsm', t)
@@ -368,6 +390,15 @@ theorem binTable_of {q n P : Nat} (tv : Fin P → Int) (g : Nat → Int) (h0 : �
   rw [h0 k]
   split_ifs <;> simp
 
+theorem Xe_mul_Xe {n : Nat} (a b : Nat) : Xe (n := n) a * Xe (n := n) b = Xe (n := n) (a + b) := by
+  simp only [Xe, pow_add]
+
+/-- Equal exponents give equal monomials (used instead of `congr`/`rfl`, which unfold `X ^ k` at large `n`). -/
+theorem Xe_congr_nat {n a b : Nat} (h : a = b) : Xe (n := n) a = Xe (n := n) b := h ▸ rfl
+'''
+
+#: The column placements of the fresh and smudge summands (`GenOnlineSmudge.colPlace_eq_place`).
+LEMMAS_COLUMNS = r'''
 theorem blk_colPlace {n q C m i : Nat} (y : ExactMatrix q n 1 m) (cc : Fin C) :
     blk (colPlace q n C m i y) cc = if (cc : Nat) = i then y else 0 := by
   rw [colPlace_eq_place]
@@ -398,11 +429,6 @@ theorem column_rel_of_colsum {n q m C F W : Nat} (hF : W * C ≤ F) {sm : ErrorP
   rw [enc_sum_A _ _ hg, enc_sum_c _ _ hg]
   exact hsum.mono (le_of_eq (by simp))
 
-theorem Xe_mul_Xe {n : Nat} (a b : Nat) : Xe (n := n) a * Xe (n := n) b = Xe (n := n) (a + b) := by
-  simp only [Xe, pow_add]
-
-/-- Equal exponents give equal monomials (used instead of `congr`/`rfl`, which unfold `X ^ k` at large `n`). -/
-theorem Xe_congr_nat {n a b : Nat} (h : a = b) : Xe (n := n) a = Xe (n := n) b := h ▸ rfl
 '''
 
 
@@ -417,7 +443,7 @@ def chain_info(C, name):
 
 
 def online_role(C, h):
-    return C.roles['Stage_online_eval'].get(f'parallel_parallel_generatedRoot_{C.O.inst.split("_")[-1]}_{h}', {}).get('role')
+    return C.roles[ON].get(f'parallel_parallel_generatedRoot_{C.O.inst.split("_")[-1]}_{h}', {}).get('role')
 
 
 
@@ -477,7 +503,7 @@ def hv_proj(C, ext):
 
 # --------------------------------------------------------------------------- the chain emitter
 
-STAGE_LETTER = {'Stage_preprocess': 'P', 'Stage_encrypt': 'E', 'Stage_online_eval': 'O'}
+STAGE_LETTER = {PRE: 'P', ENC: 'E', ON: 'O'}
 
 
 class Chain:
@@ -501,7 +527,7 @@ class Chain:
         ws = online_wires(ty)
         srcs = link_sources(C, ws)
         if stage is None:
-            cands = [s for s in srcs if s != 'Stage_online_eval']
+            cands = [s for s in srcs if s != ON]
             if not cands:
                 return [], None
             stage = max(cands, key=lambda s: len(srcs[s]))
@@ -523,10 +549,33 @@ class Chain:
         return pat.sub(lambda m: self.sub[m.group(1)], text)
 
 
+def online_hash_keys(G, ws):
+    """Rewrites turning online key wires `ws` that the online instance hash-samples itself (the four
+    components of one `hashPair`) into the encrypt stage's `hashPair` of the linked key."""
+    if not ws:
+        return []
+    C = G.C
+    ofacts = open(f'{C.gdir}/{ON}_Facts.lean').read()
+    comp, key = {}, None
+    for w in ws:
+        f = find_field(ofacts, r'hashSample .* \(parallel_generatedRoot_\d+\.' + w + r' ctx\)$')
+        if not f:
+            raise Fail(f'online key {w} is neither linked nor hash-sampled')
+        m = re.search(r'\.u64Le \((\d+)\)\]\) \(\(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\)\)', f[2])
+        comp[int(m.group(1))] = f'F.{f[0]}.{f[1]}'
+        key = m.group(2)
+    if sorted(comp) != [0, 1, 2, 3]:
+        raise Fail(f'online keys {ws}: components {sorted(comp)}')
+    kt, _ = C.link_term(key, ENC)
+    if not kt:
+        raise Fail(f'online hash key {key} not linked to {ENC}')
+    return [f'← hashPair_of_samples (pre := []) {comp[0]} {comp[1]} {comp[2]} {comp[3]}', kt]
+
+
 def scope_sub(text, n):
     """D's chain text -> the summand theorem's names."""
     t = text.replace('(backend := backend)', '(backend := Backend.backend)')
-    t = t.replace('(params := params)', '(params := stage_4_params)')
+    t = t.replace('(params := params)', f'(params := {ON_PARAMS})')
     t = t.replace('(i_0 := i_0)', '(i_0 := (iS : Nat))')
     t = t.replace('(hb := hb)', '(hb := rfl)')
     t = re.sub(r'(?<![\w.])backend\b(?! :=)', 'Backend.backend', t)
@@ -534,11 +583,11 @@ def scope_sub(text, n):
     return t
 
 def pre_ref(C, w):
-    return f'(Stage_preprocess.{C.P.inst}.{w} cP)'
+    return f'({PRE}.{C.P.inst}.{w} cP)'
 
 
 def enc_ref(C, w):
-    return f'(Stage_encrypt.{C.E.inst}.{w} cE)'
+    return f'({ENC}.{C.E.inst}.{w} cE)'
 
 
 def find_field(facts, pat):
@@ -602,25 +651,34 @@ def emit_chain(G, ch):
             sub[nm] = NORM_TAC
             ch.norms.append(nm)
         elif k == 'ha':
-            terms, _ = ch.links(ty, 'Stage_encrypt')
-            enc_w = [C.link_term(w, 'Stage_encrypt')[1] for w in online_wires(ty)]
-            loop = int(enc_w[0].split('_')[1])
+            terms, _ = ch.links(ty, ENC)
+            enc_w = [C.link_term(w, ENC)[1] for w in online_wires(ty)]
+            # the encrypt label entry loop producing the encodings (a Program in its own stages also
+            # links its hash key, an input of both stages)
+            loops = [int(w.split('_')[1]) for w in enc_w if w and G.enc.step_of_loop(int(w.split('_')[1]))[1]]
+            if not loops:
+                raise Fail(f'no encrypt step for the label encodings {enc_w}')
+            loop = loops[0]
             sname, step = G.enc.step_of_loop(loop)
-            if step is None:
-                raise Fail(f'no encrypt step for label loop {loop}')
             G.enc_masks()
             key = f'lab{loop}'
             fld = find_field(C.efacts, r'parallel_parallel_generatedRoot_\d+_' + str(loop) + r' backend')
             body_ = fld[2][fld[2].index(', ') + 2:].rstrip(')')
             _, fargs = xmodel.app_split(body_)
             ins = [re.search(r'(w_\d+_\d+)', x).group(1) for x in xmodel.tuple_items(fargs[-2])]
-            cw, ew = ins[6], ins[7]
+            # variant 1 (`rel_1`, keys hash-sampled): inputs (s, key, 1, c, e), conclusions (G, rel, μ)
+            v1 = 'EncLabelEntry.rel_1' in step
+            cw, ew = (ins[3], ins[4]) if v1 else (ins[6], ins[7])
             G.label_need(cw, ew)
             G.pre(f'  have h{key} := {step}')
-            G.pre(f'  choose G{key} hG{key} _ _ _ _ hrel{key} _ using h{key}')
+            if v1:
+                G.pre(f'  choose G{key} hG{key} hrel{key} hmu{key} using h{key}')
+                G.labmu = key
+            else:
+                G.pre(f'  choose G{key} hG{key} _ _ _ _ hrel{key} _ using h{key}')
             G.pre(f'  have hG{key}0 : ∀ k, G{key} k = G{key} 0 := fun k ↦ gadgetMatrixRuns_unique (hG{key} k) (hG{key} 0)')
             G.pre(f'  have he{key} : ∀ k, message (n := {n}) ({enc_ref(C, cw)} k) ({enc_ref(C, ew)} k) = {G.alpha} k := fun k ↦ by\n'
-                  f'    rw [StageLinks.src_Stage_encrypt_{cw} hinE hrootE, StageLinks.src_Stage_encrypt_{ew} hinE hrootE]\n'
+                  f'    rw [StageLinks.src_{ENC}_{cw} hinE hrootE, StageLinks.src_{ENC}_{ew} hinE hrootE]\n'
                   f'    exact label_payload hv hreq iS k')
             sub['G_' + tag] = f'(G{key} 0)'
             sub['hG_' + tag] = f'(hG{key} 0)'
@@ -628,8 +686,15 @@ def emit_chain(G, ch):
             sub[nm] = f'(by intro k; rw [{", ".join(terms)}, ← hG{key}0 k, ← he{key} k]; exact hrel{key} k)'
         elif k == 'hpay':
             w = online_wires(ty)[0]
-            G.hpay_need(w)
-            sub[nm] = f'hpay_{w}'
+            t, ew = C.link_term(w, ENC)
+            if t and G.labmu:
+                # the payloads are the encrypt label entries' `μ` (a Program in its own stages)
+                key = G.labmu
+                sub[nm] = (f'(fun k ↦ by rw [{t}]; refine (hmu{key} k).trans ?_; dsimp only; '
+                           f'rw [he{key} k])')
+            else:
+                G.hpay_need(w)
+                sub[nm] = f'hpay_{w}'
     # pass 2: per-bucket and LUT binders in order
     for idx, nm in enumerate(names):
         k, tag = kind_of(nm)
@@ -642,19 +707,21 @@ def emit_chain(G, ch):
             # PRF top: g', g from the encrypt source encoding of the hs wires
             hs_nm = next(x for x in names[idx:] if kind_of(x)[0] == 'hs')
             hsty = scope_sub(tys[hs_nm], n)
-            terms, _ = ch.links(hsty, 'Stage_encrypt')
-            wires = [C.link_term(w, 'Stage_encrypt')[1] for w in online_wires(hsty)]
+            terms, _ = ch.links(hsty, ENC)
+            wires = [C.link_term(w, ENC)[1] for w in online_wires(hsty)]
             c0 = [w for w in wires if w and G.enc.step_of_output(w)[0]]
             if not c0:
                 raise Fail(f'{ch.name}: no encrypt source for {hs_nm}')
             sname, step = G.enc.step_of_output(c0[0])
-            gw = re.search(r'\(Stage_encrypt\.parallel_generatedRoot_\d+\.(w_\d+_\d+) cE\) FE\.c\d+\.h\w+ FE\.c\d+\.h\w+ \(c0 :=', step).group(1)
+            gw = re.search(rf'\({ENC}\.parallel_generatedRoot_\d+\.(w_\d+_\d+) cE\) FE\.c\d+\.h\w+ FE\.c\d+\.h\w+ \(c0 :=', step).group(1)
             f1 = find_field(C.efacts, r'centeredRebaseRuns \(parallel_generatedRoot_\d+\.w_\d+_\d+ ctx\) \(parallel_generatedRoot_\d+\.' + gw + r' ctx\)')
             gty = re.search(r'centeredRebaseRuns \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\)', f1[2]).group(1)
             f2 = find_field(C.efacts, r'gadgetMatrixRuns backend \S+ \S+ \(parallel_generatedRoot_\d+\.' + gty + r' ctx\)')
             G.enc_masks()
             G.pre(f'  have htop{c0[0]} := {step}')
             G.seed_need(step, c0[0])
+            # a Program in its own stages hash-samples the top's keys in the online instance as well
+            terms += online_hash_keys(G, [w for w in online_wires(hsty) if not C.link_term(w, ENC)[0]])
             sub[nm] = enc_ref(C, gty)
             sub[nxt] = f'FE.{f2[0]}.{f2[1]}'
             sub[nxt2] = enc_ref(C, gw)
@@ -668,7 +735,7 @@ def emit_chain(G, ch):
             h_nm = f'hrhs_{tag}'
             hty = scope_sub(tys[h_nm], n)
             src = link_sources(C, online_wires(hty))
-            pre_w = [sw for (w, sw) in src.get('Stage_preprocess', [])]
+            pre_w = [sw for (w, sw) in src.get(PRE, [])]
             rc = None
             for mrc in re.finditer(r'^theorem (rootcell_(w_\d+_\d+)) ', C.keys, re.M):
                 th = theorem_text(C.keys, mrc.group(1))
@@ -690,11 +757,11 @@ def emit_chain(G, ch):
             sub[f'eB_{tag}'] = f'eR{tag}'
             sub[f'BB_{tag}'] = '_'
             sub[f'heB_{tag}'] = f'hbR{tag}'
-            terms, _ = ch.links(hty, 'Stage_preprocess')
+            terms, _ = ch.links(hty, PRE)
             msc = re.search(r'reducePoly \S+ \d+ \((\(\(\(.*?\) : Nat\) : Int\)) \* ', hty)
             pcv = re.search(r'\(\(\((.*?) : Int\) : ErrorPoly \d+\) \* message', rt).group(1)
             sc = G.scale_cert(msc.group(1), f'({pcv})')
-            G.pre(f'  obtain ⟨eR{tag}, hbR{tag}, heR{tag}⟩ := RefreshTopProof.GenInst.PreprocessKeys.{rc} FP hsp hP9')
+            G.pre(f'  obtain ⟨eR{tag}, hbR{tag}, heR{tag}⟩ := {PRE_KEYS}.{rc} FP hsp hP9')
             sub[h_nm] = (f"(by intro j; rw [{', '.join(terms)}]; have h := heR{tag} j; rw [hseedP{cw}] at h; "
                          f"convert (config := {{ closePre := false, closePost := false }}) h using 4 <;> first | with_reducible rfl | exact congrArg (fun x : Int ↦ (x : ErrorPoly {n})) {sc} | (congr 1))")
             continue
@@ -702,7 +769,7 @@ def emit_chain(G, ch):
             h_nm = next(x for x in names[idx:] if kind_of(x)[0] == 'hrhs')
             hty = scope_sub(tys[h_nm], n)
             src = link_sources(C, online_wires(hty))
-            pre_w = [sw for (w, sw) in src.get('Stage_preprocess', [])]
+            pre_w = [sw for (w, sw) in src.get(PRE, [])]
             loops = sorted({int(w.split('_')[1]) for w in pre_w}, key=lambda x: -x)
             rhs = None
             for L in loops:
@@ -715,16 +782,16 @@ def emit_chain(G, ch):
             rt = theorem_text(C.keys, rhs)
             mm = re.search(r'\* message \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx i\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx i\) \* unitPair sp j\) • \((rebasedGadget backend .*?)\) \+ reduceMatrix', rt)
             cw, ew, gad = mm.group(1), mm.group(2), mm.group(3)
-            gad = qualify(gad, 'Stage_preprocess', None).replace('backend', 'Backend.backend').replace('i_0', '(iS : Nat)')
+            gad = qualify(gad, PRE, None).replace('backend', 'Backend.backend').replace('i_0', '(iS : Nat)')
             seg = next((e for (nmh, e) in ch.nh if re.search(r'\(ν := ' + re.escape(nm) + r'\)', e)), None)
             pp = re.search(r"\(p' := (.*?)\) \(ν :=", seg).group(1)
             G.pre_secret()
             bn = f'B{tag}'
             hpv = re.search(r"\(hp' : \(\(p' : Nat\) : Int\) = (.*?)\) :\n", rt).group(1)
-            hpv = qualify(hpv, 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+            hpv = qualify(hpv, PRE, None).replace('i_0', '(iS : Nat)')
             ppc = G.scale_cert(f'((({scope_sub(pp, n)} : Nat)) : Int)', hpv)
-            G.pre(f"  obtain ⟨eB{bn}, heB{bn}, hrhs{bn}⟩ := RefreshTopProof.GenInst.PreprocessKeys.{rhs} FP rfl hsp hP9 (p' := {scope_sub(pp, n)}) {ppc}")
-            terms, _ = ch.links(hty, 'Stage_preprocess')
+            G.pre(f"  obtain ⟨eB{bn}, heB{bn}, hrhs{bn}⟩ := {PRE_KEYS}.{rhs} FP rfl hsp hP9 (p' := {scope_sub(pp, n)}) {ppc}")
+            terms, _ = ch.links(hty, PRE)
             sub[nm] = f"(fun i' ↦ message (n := {n}) ({pre_ref(C, cw)} i') ({pre_ref(C, ew)} i'))"
             sub[f'hT_{tag}'] = f'({gad})'
             sub[f'eB_{tag}'] = f'eB{bn}'
@@ -744,7 +811,7 @@ def emit_chain(G, ch):
             if grp not in G.oh_done:
                 G.oh_done.add(grp)
                 hs = ' '.join(f'hreq.{f}' for f in G.oh[grp]['fields'])
-                G.pre(f'  have hoh{grp} := fun o : Fin {M} ↦ RefreshTopProof.Wiring.onehot_{grp} hv {hs} iS.isLt o.isLt')
+                G.pre(f'  have hoh{grp} := fun o : Fin {M} ↦ {WIRING}.onehot_{grp} hv {hs} iS.isLt o.isLt')
                 G.pre(f'  choose sel{grp} hsel{grp} using hoh{grp}')
             ext_c = G.ext_of_pre(info['cw'])
             ext_e = G.ext_of_pre(info['ew'])
@@ -755,7 +822,7 @@ def emit_chain(G, ch):
                   f"      ({pre_ref(C, info['ew'])} (cellAt o j)) = if j = sel{grp} o {b} then 1 else 0 := by\n"
                   f"    intro o j\n"
                   f"    have h := hsel{grp} o {b} j\n"
-                  f"    rw [StageLinks.src_Stage_preprocess_{info['cw']} hinP hrootP, StageLinks.src_Stage_preprocess_{info['ew']} hinP hrootP]\n"
+                  f"    rw [StageLinks.src_{PRE}_{info['cw']} hinP hrootP, StageLinks.src_{PRE}_{info['ew']} hinP hrootP]\n"
                   f"    have he := {pe} iS (cellAt o j)\n"
                   f"    rw [show {ext_e} iS (cellAt o j) = 0 by omega]\n"
                   f"    apply message_onehot\n"
@@ -803,9 +870,9 @@ def emit_chain(G, ch):
             mm = re.match(r'^\(*rebasedGadget Backend\.backend \S+ \S+ \S+ (\S+|\(.*?\)) ', tgt)
             tq = mm.group(1) if mm else None
             if tq is None:
-                mp_ = re.match(r'^\(*Stage_preprocess\.parallel_generatedRoot_\d+\.(w_\d+_\d+) cP\)*$', tgt)
+                mp_ = re.match(rf'^\(*{PRE}\.parallel_generatedRoot_\d+\.(w_\d+_\d+) cP\)*$', tgt)
                 if mp_:
-                    pf = open(f'{C.gdir}/Stage_preprocess_Facts.lean').read()
+                    pf = open(f'{C.gdir}/{PRE}_Facts.lean').read()
                     f1 = find_field(pf, r'centeredRebaseRuns \(parallel_generatedRoot_\d+\.w_\d+_\d+ ctx\) \(parallel_generatedRoot_\d+\.' + mp_.group(1) + r' ctx\)')
                     gx = re.search(r'centeredRebaseRuns \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\)', f1[2]).group(1)
                     f2 = find_field(pf, r'gadgetMatrixRuns backend \S+ \S+ \(parallel_generatedRoot_\d+\.' + gx + r' ctx\)')
@@ -814,7 +881,7 @@ def emit_chain(G, ch):
                     sub[nxt2] = f'FP.{f1[0]}.{f1[1]}'
                     G.gadfacts[tgt0] = f'(rebasedGadget_eq FP.{f2[0]}.{f2[1]} FP.{f1[0]}.{f1[1]}).symm'
                     continue
-                me = re.match(r'^\(*Stage_encrypt\.parallel_generatedRoot_\d+\.(w_\d+_\d+) cE\)*$', tgt)
+                me = re.match(rf'^\(*{ENC}\.parallel_generatedRoot_\d+\.(w_\d+_\d+) cE\)*$', tgt)
                 if not me:
                     raise Fail(f'{ch.name}: rebase target of {nxt2}: {tgt[:80]}')
                 f1 = find_field(C.efacts, r'centeredRebaseRuns \(parallel_generatedRoot_\d+\.w_\d+_\d+ ctx\) \(parallel_generatedRoot_\d+\.' + me.group(1) + r' ctx\)')
@@ -834,8 +901,8 @@ def emit_chain(G, ch):
             sub[nm] = '_'
             continue
         if k == 'hhelp':
-            terms, _ = ch.links(ty, 'Stage_encrypt')
-            ews = [C.link_term(w, 'Stage_encrypt')[1] for w in online_wires(ty)]
+            terms, _ = ch.links(ty, ENC)
+            ews = [C.link_term(w, ENC)[1] for w in online_wires(ty)]
             loops = sorted({int(w.split('_')[1]) for w in ews if w})
             step = None
             for L in loops:
@@ -864,8 +931,8 @@ def emit_chain(G, ch):
             sub[nm] = f'(1 : ErrorPoly {n})'
             continue
         if k == 'hswitch':
-            terms, _ = ch.links(ty, 'Stage_preprocess')
-            pws = [C.link_term(w, 'Stage_preprocess')[1] for w in online_wires(ty)]
+            terms, _ = ch.links(ty, PRE)
+            pws = [C.link_term(w, PRE)[1] for w in online_wires(ty)]
             loops = sorted({int(w.split('_')[1]) for w in pws if w})
             sw = None
             for L in loops:
@@ -877,7 +944,7 @@ def emit_chain(G, ch):
                 raise Fail(f'{ch.name}: no switch for {nm}')
             st = theorem_text(C.wiring, sw)
             mc = re.search(r'\(\(fun \(i : Fin (\d+)\) ↦ (.*?)\) k \*\n', st)
-            ktxt = qualify(mc.group(2), "Stage_preprocess", None).replace('i_0', '(iS : Nat)')
+            ktxt = qualify(mc.group(2), PRE, None).replace('i_0', '(iS : Nat)')
             W_ = mc.group(1)
             hb_ = binders(split_header(st)[0])
             bty = {nms[0]: ty for br, nms, ty in hb_ if len(nms) == 1}
@@ -898,8 +965,8 @@ def emit_chain(G, ch):
             if 'hg0' in bty:
                 t0, tg = toks(bty['g0']), toks(bty["g'"])
                 th0 = toks(bty['hg0'])
-                q0 = qualify(t0[1], 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
-                q = qualify(tg[1], 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+                q0 = qualify(t0[1], PRE, None).replace('i_0', '(iS : Nat)')
+                q = qualify(tg[1], PRE, None).replace('i_0', '(iS : Nat)')
                 nn, m = xmodel.strip_parens(tg[2]), xmodel.strip_parens(tg[4])
                 base, digits = th0[2], th0[3]
                 cert = G.gadget_cert(q0, nn, m, base, digits)
@@ -907,7 +974,7 @@ def emit_chain(G, ch):
                 gargs = f'(gadgetOf_runs {cert}) (rebasedGadget_runs {G.gt_cert(q)})'
             else:
                 tq, th_ = toks(bty["g'"]), toks(bty["hg'"])
-                q = qualify(tq[1], 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+                q = qualify(tq[1], PRE, None).replace('i_0', '(iS : Nat)')
                 nn, m = xmodel.strip_parens(tq[2]), xmodel.strip_parens(tq[4])
                 base, digits = th_[2], th_[3]
                 cert = G.gadget_cert(q, nn, m, base, digits)
@@ -915,7 +982,7 @@ def emit_chain(G, ch):
                 gargs = f'(gadgetOf_runs {cert})'
             sub[f'gq_{tag}'] = gq
             sub[f'BB_{tag}'] = '_'
-            G.pre(f'  obtain ⟨eS{tag}, hbS{tag}, heS{tag}⟩ := RefreshTopProof.Wiring.{sw} FP hsp hP9 {gargs}')
+            G.pre(f'  obtain ⟨eS{tag}, hbS{tag}, heS{tag}⟩ := {WIRING}.{sw} FP hsp hP9 {gargs}')
             if unit:
                 sub[f'C_{tag}'] = f'(fun (i : Fin {W_}) ↦ {ktxt})'
                 sub[nm] = f'(by intro k; refine ⟨eS{tag} k, hbS{tag} k, fun j ↦ ?_⟩; rw [{", ".join(terms)}]; exact heS{tag} k j)'
@@ -986,6 +1053,7 @@ class Gen:
         self.pregad = {}
         self.readouts = {}
         self.gadfacts = {}
+        self.labmu = None      # the label entries' `μ` facts of a Program in its own stages
         self.top = []          # top-level theorems (label payload)
         self._gc = {}
         self.oh = self.parse_onehot()
@@ -1004,11 +1072,11 @@ class Gen:
             r'\(h_(w_\d+_\d+) : parallel_generatedRoot_\d+\.w_\d+_\d+ ctx = fun _ _ ↦ reducePoly \S+ \d+ (sm|sp)\)', hdr))
         self.stage_of = {}
         for v, w in self.enc_secret.items():
-            m = re.search(r'theorem src_Stage_encrypt_' + w + r' .*?\n.*?\n.*?\n    \S+ cM = \((.*?)\) :=', C.links_text)
+            m = re.search(rf'theorem src_{ENC}_' + w + r' .*?\n.*?\n.*?\n    \S+ cM = \((.*?)\) :=', C.links_text)
             self.stage_of[v] = m.group(1)
         m = re.search(r'\(h_(w_\d+_\d+) : parallel_generatedRoot_\d+\.w_\d+_\d+ ctx = fun _ _ ↦ reducePoly \S+ \d+ sp\)', C.keys)
         self.pre_sp = m.group(1)
-        mm = re.search(r'theorem src_Stage_preprocess_' + self.pre_sp + r' .*?\n.*?\n.*?\n    \S+ cM = \((.*?)\) :=', C.links_text)
+        mm = re.search(rf'theorem src_{PRE}_' + self.pre_sp + r' .*?\n.*?\n.*?\n    \S+ cM = \((.*?)\) :=', C.links_text)
         if mm.group(1) != self.stage_of['sp']:
             raise Fail('preprocess and encrypt payload secrets differ')
 
@@ -1017,16 +1085,16 @@ class Gen:
         n = C.n
         for v in ('sm', 'sp'):
             w = self.enc_secret[v]
-            self.pre(f'  have h_{w} : Stage_encrypt.{C.E.inst}.{w} cE = fun _ _ ↦ reducePoly _ {n} {v} :=\n'
-                     f'    (StageLinks.src_Stage_encrypt_{w} hinE hrootE).trans h{v}E')
+            self.pre(f'  have h_{w} : {ENC}.{C.E.inst}.{w} cE = fun _ _ ↦ reducePoly _ {n} {v} :=\n'
+                     f'    (StageLinks.src_{ENC}_{w} hinE hrootE).trans h{v}E')
         for ln in self.enc.mask_lines:
             self.pre(self.enc.rescope(ln))
 
     def pre_secret(self):
         C = self.C
         w = self.pre_sp
-        self.pre(f'  have hP9 : Stage_preprocess.{C.P.inst}.{w} cP = fun _ _ ↦ reducePoly _ {C.n} sp :=\n'
-                 f'    (StageLinks.src_Stage_preprocess_{w} hinP hrootP).trans hspE')
+        self.pre(f'  have hP9 : {PRE}.{C.P.inst}.{w} cP = fun _ _ ↦ reducePoly _ {C.n} sp :=\n'
+                 f'    (StageLinks.src_{PRE}_{w} hinP hrootP).trans hspE')
 
     # ---- certificates
     def gadget_cert(self, q, n, m, base, digits):
@@ -1055,7 +1123,7 @@ class Gen:
 
     def enc_pc(self, loop):
         """The scale `pc` of an encrypt LUT branch key loop (its Comp parameter `p21 = [pc]`)."""
-        sc = open(f'{self.C.pdir}/Gen_Stage_encrypt_Scopes.lean').read()
+        sc = open(f'{self.C.pdir}/Gen_{ENC}_Scopes.lean').read()
         m = re.search(r'^theorem (parallel_parallel_generatedRoot_\d+_' + str(loop) + r')\.sem .*\n.*\n    (EncLutBranchKey\.Comp\w*) (.*) backend hashModel', sc, re.M)
         if not m:
             return None
@@ -1065,7 +1133,7 @@ class Gen:
         if not mm:
             return None
         pc = xmodel.strip_parens(mm.group(1))
-        return '(' + qualify(pc, 'Stage_encrypt', None).replace('i_0', '(iS : Nat)') + ')'
+        return '(' + qualify(pc, ENC, None).replace('i_0', '(iS : Nat)') + ')'
 
     def readout_value(self, ch, tag, ty, m, per):
         """For an exponent-table (readout) LUT on a monomial PRF output: the value `ν = X^(s1 readoutExpG P W z)`
@@ -1144,7 +1212,7 @@ theorem {name}_hC {hdr}(i : Fin (2 ^ {L})) :
         (fun k : Fin (2 ^ {L}) ↦ reducePoly {qq} {n} (Xe (n := {n}) ({s1} * readoutVal ({P} / 2) (2 ^ {L}) k))) ({idx} i) := by
   have hb : (((({bb} : Int)).toNat : Nat) : ExactPoly {qq} {n}) = (({bb} : Int) : ExactPoly {qq} {n}) := by
     rw [← Int.cast_natCast, Int.toNat_of_nonneg ({name}_nonneg{' i_0' if idep else ''})]
-  refine (RefreshTopProof.Wiring.keyTableE_walsh_int (q := {qq}) (n := {n}) (s := {s}) (W := {W}) (o := {o})
+  refine ({WIRING}.keyTableE_walsh_int (q := {qq}) (n := {n}) (s := {s}) (W := {W}) (o := {o})
     {self.gt_cert(q).replace('(iS : Nat)', 'i_0')} (by norm_num) (σ := {sig.replace('((i : Nat))', '(i : Nat)')}) (by revert i; decide) (by norm_num) 1 ({bb}) {tv.replace('(iS : Nat)', 'i_0')} (by decide)).trans ?_
   rw [Int.cast_one, one_mul, hb]
   congr 1
@@ -1199,7 +1267,7 @@ theorem {name}_hC {hdr}(i : Fin (2 ^ {L})) :
         q = xmodel.strip_parens(q.strip())
         m = re.match(r'^(?:(Stage_\w+)\.)?(mod_\d+) \(\(?Int\.ofNat \(iS : Nat\)\)?\)$', q)
         if m:
-            M = m.group(1) or 'Stage_online_eval'
+            M = m.group(1) or ON
             return f'(RefreshTopProof.GenInst.Certs.{M}.{m.group(2)}_gt (iS : Nat))'
         return '(by decide)'
 
@@ -1209,7 +1277,7 @@ theorem {name}_hC {hdr}(i : Fin (2 ^ {L})) :
         return m.group(1) if m else None
 
     def ext_of_pre(self, w):
-        r = self.src_rhs('Stage_preprocess', w)
+        r = self.src_rhs(PRE, w)
         m = re.fullmatch(r'\((external\.input_\d+)\) i', r or '')
         if not m:
             raise Fail(f'preprocess {w} is not a member family ({r})')
@@ -1217,18 +1285,18 @@ theorem {name}_hC {hdr}(i : Fin (2 ^ {L})) :
 
     def ext_of_online(self, w):
         C = self.C
-        m = re.search(r'theorem ext_Stage_online_eval_' + w + r' .*?\n    \S+ cB = \((external\.input_\d+)\) i :=', C.links_text, re.S)
-        if m and re.search(r'^theorem ext_Stage_online_eval_' + w + ' ', C.links_text, re.M):
-            th = theorem_text(C.links_text, f'ext_Stage_online_eval_{w}')
+        m = re.search(rf'theorem ext_{ON}_' + w + r' .*?\n    \S+ cB = \((external\.input_\d+)\) i :=', C.links_text, re.S)
+        if m and re.search(rf'^theorem ext_{ON}_' + w + ' ', C.links_text, re.M):
+            th = theorem_text(C.links_text, f'ext_{ON}_{w}')
             e = re.search(r'cB = \((external\.input_\d+)\) i :=', th).group(1)
             hy = 'hinA hrootA houtA hinstA hinB hrootB'
             src = re.search(r'\{rA : (Stage_\w+)\.generatedRoot', th).group(1)
             a = STAGE_LETTER[src]
-            return f'StageLinks.ext_Stage_online_eval_{w} hin{a} hroot{a} hout{a} hinst{a} hinO hrootO', e
-        r = self.src_rhs('Stage_online_eval', w)
+            return f'StageLinks.ext_{ON}_{w} hin{a} hroot{a} hout{a} hinst{a} hinO hrootO', e
+        r = self.src_rhs(ON, w)
         mm = re.fullmatch(r'\((external\.input_\d+)\) i', r or '')
         if mm:
-            return f'StageLinks.src_Stage_online_eval_{w} hinO hrootO', mm.group(1)
+            return f'StageLinks.src_{ON}_{w} hinO hrootO', mm.group(1)
         raise Fail(f'online table {w} has no external source')
 
     # ---- one-hot groups (Gen_Wiring)
@@ -1254,8 +1322,8 @@ theorem {name}_hC {hdr}(i : Fin (2 ^ {L})) :
             return
         C, R = self.C, self.req
         L = R.label
-        ec = self.src_rhs('Stage_encrypt', cw)
-        ee = self.src_rhs('Stage_encrypt', ew)
+        ec = self.src_rhs(ENC, cw)
+        ee = self.src_rhs(ENC, ew)
         ec = re.fullmatch(r'\((external\.input_\d+)\) i', ec).group(1)
         ee = re.fullmatch(r'\((external\.input_\d+)\) i', ee).group(1)
         bc, zc, pc, xc = R.label_source(ec)
@@ -1292,10 +1360,10 @@ theorem label_payload {{external : ExternalInputs}} (hv : ValidExternals externa
     def hpay_need(self, w):
         C, R = self.C, self.req
         n = C.n
-        fld = find_field(open(f'{C.gdir}/Stage_online_eval_Facts.lean').read(),
+        fld = find_field(open(f'{C.gdir}/{ON}_Facts.lean').read(),
                          r'\(\(parallel_generatedRoot_\d+\.' + w + r' ctx\) i\)\)$')
         loop = re.search(r'(parallel_parallel_generatedRoot_\d+_\d+) backend', fld[2]).group(1)
-        sc = open(f'{C.gdir}/Stage_online_eval.lean').read()
+        sc = open(f'{C.gdir}/{ON}.lean').read()
         d = sc[sc.index(f'def {loop} '):]
         d = d[:d.index('\n\n')]
         lists = re.findall(r':= \(MxxIR\.selectInt \(\(Int\.ofNat i_1\)\) \[(.*?)\]\)', d)
@@ -1329,14 +1397,14 @@ theorem label_payload {{external : ExternalInputs}} (hv : ValidExternals externa
     def pre_seed(self, cw, ew):
         """`hseedP<cw>`: a preprocess root cell's payload `message c e` is `1` (ValidExternals: c = 1, e = 0)."""
         C = self.C
-        ec = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs('Stage_preprocess', cw)).group(1)
-        ee = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs('Stage_preprocess', ew)).group(1)
+        ec = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs(PRE, cw)).group(1)
+        ee = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs(PRE, ew)).group(1)
         pc, bc = hv_proj(C, ec)
         pe, be = hv_proj(C, ee)
         if bc != (1, 1) or be != (0, 0):
             raise Fail(f'root cell payload bounds {bc} {be}')
         self.pre(f'''  have hseedP{cw} : message (n := {C.n}) {pre_ref(C, cw)} {pre_ref(C, ew)} = 1 := by
-    rw [StageLinks.src_Stage_preprocess_{cw} hinP hrootP, StageLinks.src_Stage_preprocess_{ew} hinP hrootP]
+    rw [StageLinks.src_{PRE}_{cw} hinP hrootP, StageLinks.src_{PRE}_{ew} hinP hrootP]
     have b1 := {pc} iS
     have b2 := {pe} iS
     rw [show {ec} iS = 1 by omega, show {ee} iS = 0 by omega, message_zero]; simp''')
@@ -1364,14 +1432,14 @@ theorem label_payload {{external : ExternalInputs}} (hv : ValidExternals externa
         if not mm:
             raise Fail(f'no payload of the top {c0}')
         cw, ew = mm
-        ec = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs('Stage_encrypt', cw)).group(1)
-        ee = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs('Stage_encrypt', ew)).group(1)
+        ec = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs(ENC, cw)).group(1)
+        ee = re.fullmatch(r'\((external\.input_\d+)\) i', self.src_rhs(ENC, ew)).group(1)
         pc, bc = hv_proj(C, ec)
         pe, be = hv_proj(C, ee)
         if bc != (1, 1) or be != (0, 0):
             raise Fail(f'top payload bounds {bc} {be}')
         self.pre(f'''  have hseed{c0} : message (n := {C.n}) {enc_ref(C, cw)} {enc_ref(C, ew)} = 1 := by
-    rw [StageLinks.src_Stage_encrypt_{cw} hinE hrootE, StageLinks.src_Stage_encrypt_{ew} hinE hrootE]
+    rw [StageLinks.src_{ENC}_{cw} hinE hrootE, StageLinks.src_{ENC}_{ew} hinE hrootE]
     have b1 := {pc} iS
     have b2 := {pe} iS
     rw [show {ec} iS = 1 by omega, show {ee} iS = 0 by omega, message_zero]; simp''')
@@ -1381,8 +1449,8 @@ theorem label_payload {{external : ExternalInputs}} (hv : ValidExternals externa
 
 def ctx_binders(C):
     out = []
-    for M, a, cn, on, fn in (('Stage_preprocess', 'P', 'cP', 'oP', 'FP'), ('Stage_encrypt', 'E', 'cE', 'oE', 'FE'),
-                             ('Stage_online_eval', 'O', 'ctx', 'outputs', 'F')):
+    for M, a, cn, on, fn in ((PRE, 'P', 'cP', 'oP', 'FP'), (ENC, 'E', 'cE', 'oE', 'FE'),
+                             (ON, 'O', 'ctx', 'outputs', 'F')):
         st = C.stages[M]
         out.append(f'''    {{r{a} : {M}.generatedRoot.Ctx Backend.backend hashModel {st.params}}}
     {{{cn} : {M}.{st.inst}.Ctx Backend.backend hashModel {st.params} (iS : Nat)}} {{{on}}} ({fn} : {M}.{st.inst}.Facts {cn} {on})
@@ -1442,7 +1510,7 @@ def smudge_summand(G, ch, body):
     intro o
     simp only [o.isLt, dite_true, Xe_mul_Xe, mul_one, Fin.eta]
     exact congrArg (reducePoly _ _) (Xe_congr_nat (by ring))
-  have hdig := RefreshTopProof.Wiring.{dk} (iS : Nat) (μ := {mu_sub}) (ν := {nu}) (Δ' := 1)
+  have hdig := {WIRING}.{dk} (iS : Nat) (μ := {mu_sub}) (ν := {nu}) (Δ' := 1)
     (z := {zf}) hμz {hw} (map_one _)
   obtain ⟨M, hM, hTH⟩ := RefreshTopProof.GenOnlineSmudge.smudge_hTH_{stag} F (sp := sp) (Δ' := 1) (ν := {nu}) (z := {zf}) hdig
   exact ⟨_, _, _, es, M, hes, hs, hTH, hM⟩'''
@@ -1452,7 +1520,7 @@ def smudge_summand(G, ch, body):
 
 
 
-CTXN = {'Stage_preprocess': 'cP', 'Stage_encrypt': 'cE', 'Stage_online_eval': 'ctx'}
+CTXN = {PRE: 'cP', ENC: 'cE', ON: 'ctx'}
 
 
 def link_proof(C, M1, w1, M2, w2):
@@ -1530,15 +1598,15 @@ def emit_pre(G):
         pw = re.search(r'\.(w_\d+_\d+) ctx\)$', bs[hn]).group(1)
         if pw in online_of:
             ow = online_of[pw]
-            sub[v] = f'(Stage_online_eval.{C.O.inst}.{ow} ctx)'
-            hyps.append(f'    ({hn} : Stage_online_eval.{C.O.inst}.{ow} ctx = Stage_preprocess.{C.P.inst}.{pw} cP)')
+            sub[v] = f'({ON}.{C.O.inst}.{ow} ctx)'
+            hyps.append(f'    ({hn} : {ON}.{C.O.inst}.{ow} ctx = {PRE}.{C.P.inst}.{pw} cP)')
             extra.append(hn)
             continue
         got = None
-        for M in ('Stage_online_eval', 'Stage_encrypt'):
-            for L in re.finditer(r'^theorem link_(?:Stage_preprocess_' + pw + r'_' + M + r'_(w_\d+_\d+)|' + M + r'_(w_\d+_\d+)_Stage_preprocess_' + pw + r') ', C.links_text, re.M):
+        for M in (ON, ENC):
+            for L in re.finditer(rf'^theorem link_(?:{PRE}_' + pw + r'_' + M + r'_(w_\d+_\d+)|' + M + rf'_(w_\d+_\d+)_{PRE}_' + pw + r') ', C.links_text, re.M):
                 w = L.group(1) or L.group(2)
-                pf = link_proof(C, M, w, 'Stage_preprocess', pw)
+                pf = link_proof(C, M, w, PRE, pw)
                 if pf:
                     got = (M, w, pf)
                     break
@@ -1553,9 +1621,9 @@ def emit_pre(G):
     for v, s in sub.items():
         concl = re.sub(r'(?<![\w.])' + v + r'(?![\w.])', s, concl)
     concl = stage_refs(C, concl, {'ctx': 'cP'})
-    concl = concl.replace('(Stage_online_eval.' + C.O.inst, '(Stage_online_eval.' + C.O.inst)
-    concl = re.sub(r'(Stage_online_eval\.\S+ )cP\)', r'\1ctx)', concl)
-    concl = re.sub(r'(Stage_encrypt\.\S+ )cP\)', r'\1cE)', concl)
+    concl = concl.replace(f'({ON}.' + C.O.inst, f'({ON}.' + C.O.inst)
+    concl = re.sub(rf'({ON}\.\S+ )cP\)', r'\1ctx)', concl)
+    concl = re.sub(rf'({ENC}\.\S+ )cP\)', r'\1cE)', concl)
     concl = concl.replace('i_0', '(iS : Nat)')
     head = theorem_head(G, 'pre_summand', '**The preimage summand** (`final_inst`\'s `hpre`): `hD`/`hY` are `GenFinalInst.pre_link` (the online decompositions are the preprocess ones).')
     head = head[:-2] + '\n' + '\n'.join(hyps) + ' :'
@@ -1659,7 +1727,7 @@ theorem {name}_hC (i_0 : Nat) [Fact (i_0 < S)] (i : Fin (2 ^ {L})) :
         (fun k ↦ reducePoly {qq} {n} (Gen.binTable (n := {n}) (2 ^ {L}) (fun _ ↦ {hh}) k)) ({idx.replace("(iS : Nat)", "i_0")} i) := by
   have hb : (((({bb} : Int)).toNat : Nat) : ExactPoly {qq} {n}) = (({bb} : Int) : ExactPoly {qq} {n}) := by
     rw [← Int.cast_natCast, Int.toNat_of_nonneg ({name}_nonneg i_0)]
-  refine (RefreshTopProof.Wiring.keyTableC_walsh' (q := {qq}) (n := {n}) (s := {s}) (W := {W}) {gt} (by norm_num)
+  refine ({WIRING}.keyTableC_walsh' (q := {qq}) (n := {n}) (s := {s}) (W := {W}) {gt} (by norm_num)
     (σ := {sigv}) (by revert i; decide) (by norm_num) 1 _ {tvv}).trans ?_
   rw [Int.cast_one, one_mul, hb, binTable_const {tvv} _ ({name}_tab i_0)]
   rfl
@@ -1672,7 +1740,7 @@ theorem {name}_hC (i_0 : Nat) [Fact (i_0 < S)] (i : Fin (2 ^ {L})) :
 def mask_summand(G, ch, body):
     C, n = G.C, G.C.n
     nh = dict(ch.nh)
-    O = f'Stage_online_eval.{C.O.inst}'
+    O = f'{ON}.{C.O.inst}'
     # the sampler-offset LUT member segment and the offset source
     so = None
     for nmh, e in ch.nh:
@@ -1689,24 +1757,24 @@ def mask_summand(G, ch, body):
     srcnode = nh[src]
     r_off = re.match(r'encRel_of_rel (\S+)', srcnode).group(1)
     muoff = ch.subst(scope_sub(node_arg(nh[r_off], 'μ'), n))
-    segth = theorem_text(open(f'{C.pdir}/Gen_Inst_Stage_online_eval.lean').read(), re.match(r'(seg_h\d+_\d+)', e).group(1))
+    segth = theorem_text(open(f'{C.pdir}/Gen_Inst_{ON}.lean').read(), re.match(r'(seg_h\d+_\d+)', e).group(1))
     famw = re.search(r'fam4 \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\)', segth).groups()
     sigma = re.search(r'branchTargetG \(q := \S+\) \(p := .*?\) (\(sig \[[^\]]*\] \d+\)) ', segth).group(1)
     fam = 'fam4 ' + ' '.join(f'({O}.{w} ctx)' for w in famw)
     # the sampler switch (preprocess table of the fam wires)
-    pws = [C.link_term(w, 'Stage_preprocess') for w in famw]
+    pws = [C.link_term(w, PRE) for w in famw]
     loops = sorted({int(sw.split('_')[1]) for _, sw in pws if sw})
     sw = next(re.search(r'^theorem (switch_h' + str(L) + r'_\d+) ', C.wiring, re.M).group(1) for L in loops
               if re.search(r'^theorem switch_h' + str(L) + r'_\d+ ', C.wiring, re.M))
     st = theorem_text(C.wiring, sw)
     mc = re.search(r'\(\(fun \(i : Fin (\d+)\) ↦ (.*?)\) k \*\n', st)
     Wsm = int(mc.group(1))
-    kt = qualify(mc.group(2), 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+    kt = qualify(mc.group(2), PRE, None).replace('i_0', '(iS : Nat)')
     Cw = f'(fun (i : Fin {Wsm}) ↦ {kt})'
     hb_ = binders(split_header(st)[0])
     bty = {nms[0]: ty for br, nms, ty in hb_ if len(nms) == 1}
     tq, th_ = toks(bty["g'"]), toks(bty["hg'"])
-    q = qualify(tq[1], 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+    q = qualify(tq[1], PRE, None).replace('i_0', '(iS : Nat)')
     nn, m = xmodel.strip_parens(tq[2]), xmodel.strip_parens(tq[4])
     base, digits = th_[2], th_[3]
     cert = G.gadget_cert(q, nn, m, base, digits)
@@ -1719,7 +1787,7 @@ def mask_summand(G, ch, body):
     hv1 = mif.index('fun _ ↦ ', hv0) + len('fun _ ↦ ')
     hconst = mif[hv1:xmodel.matching(mif, hv1) + 1]
     hconst_i = hconst.replace('i0', '(iS : Nat)')
-    R = f'(Stage_online_eval.mod_0 ((Int.ofNat (iS : Nat))))'
+    R = f'({ON}.mod_0 ((Int.ofNat (iS : Nat))))'
     smc = sampler_certs(G, kt, Wsm, n, q, hconst_i)
     # the readout feeding the sampler: its value form
     rtag = None
@@ -1748,10 +1816,10 @@ def mask_summand(G, ch, body):
     nu = f'(fun o ↦ centeredIntLift (∑ k, reducePoly {R} {n} (substitution ({sigma} k).toNat ({hodd} k) ({mu} o)) * {Cw} k))'
     nuoff = f'(centeredIntLift (∑ k, reducePoly {R} {n} (substitution ({sigma} k).toNat ({hodd} k) {muoff}) * {Cw} k))'
     atom = re.search(r'\(h(\d+_\d+) : blockModSwitchRuns', mif).group(1)
-    fs = find_field(open(f'{C.gdir}/Stage_online_eval_Facts.lean').read(), r'blockModSwitchRuns .* \(parallel_generatedRoot_\d+\.w_' + atom + r' ctx\)$')
+    fs = find_field(open(f'{C.gdir}/{ON}_Facts.lean').read(), r'blockModSwitchRuns .* \(parallel_generatedRoot_\d+\.w_' + atom + r' ctx\)$')
     out_w = 'w_' + atom
     lines = [
-        f'  obtain ⟨eM, hbM, heM⟩ := RefreshTopProof.Wiring.{sw} FP hsp hP9 (gadgetOf_runs {cert})',
+        f'  obtain ⟨eM, hbM, heM⟩ := {WIRING}.{sw} FP hsp hP9 (gadgetOf_runs {cert})',
         f'  have hsw : ∀ (k : Fin {Wsm}) (j : Fin 2), reducePoly {R} {n} (substitution ({sigma} k).toNat ({hodd} k) sp) •',
         f'      {fam} 0 j k + {fam} 1 j k =',
         f'      ({Cw} k * reducePoly {R} {n} (1 * unitPair sp j)) • {gq} + reduceMatrix {R} {n} 1 {m} (eM k j) := by',
@@ -1821,8 +1889,11 @@ def mask_summand(G, ch, body):
            f'    push_cast [Int.toNat_of_nonneg (ha _)]',
            f'    ring']
     lines += hz
-    lines += [f'  have hβ := RefreshTopProof.GenFinalInst.mask_inst (iS : Nat) (inputs := inputs) (hσ := fun o ho ↦ by rw [hin]; exact hreq.{fz} o ho) hz rfl',
-              f'  exact ⟨{zN}, K, eg, _, heg, hg, hβ, hK⟩']
+    # the requirement's mask formula (the parts' `mask_inst` hypothesis on `σ_0`)
+    fz_ty = req.fields[fz]
+    for x, e_ in sorted(req.ext.items(), key=lambda kv: -int(kv[0][1:])):
+        fz_ty = re.sub(r'\b' + x + r'\b', e_, fz_ty)
+    lines += [f'  exact ⟨{zN}, K, eg, _, heg, hg, hz, hreq.{fz}, hK⟩']
     # conclusion: from mask_inst_form / mask_inst
     cf = split_header(mif)[1]
     cf = cf.replace('i0', '(iS : Nat)')
@@ -1837,14 +1908,11 @@ def mask_summand(G, ch, body):
     if not beta:
         beta = re.search(r' - (reducePoly .* \(∑ o : Fin \d+, .*\)) • g\' \+', mb.group(4), re.S)
     betat = beta.group(1).replace('zN o', f'zN o')
-    mi = theorem_text(open(f'{C.pdir}/Gen_Final_Inst.lean').read(), 'mask_inst')
-    rho = split_header(mi)[1].replace('i0', '(iS : Nat)').replace('β', f'({betat})')
     eq = mb.group(4).replace("g'", gq)
     concl = (f'∃ (zN : Fin {M} → Nat) (K : {mb.group(1)}) (eg : {mb.group(2)}) (Beg : Nat), CoeffBound eg Beg ∧\n'
-             f'      {O}.{mb.group(3)} ctx = {eq} ∧\n      {rho} ∧\n      K = {kterm}')
-    head = theorem_head(G, 'mask_summand', '**The mask summand** (`final_inst`\'s `hg`/`heg` and `hβ`): chain `' + ch.name + '` closed from the stage facts, the mask carrier (`mask_inst_form`) and its residue (`mask_inst`); `hin` = `decodeInputs`\' second component.')
-    head = head.replace('theorem mask_summand {hashModel', 'theorem mask_summand {inputs : DecodeLoops.Inputs} {hashModel')
-    head = head[:-2] + '\n    (hin : inputs.2.1 = ' + outext + ') :'
+             f'      {O}.{mb.group(3)} ctx = {eq} ∧\n'
+             f'      (∀ o : Fin {M}, ((zN o : Nat) : Int) = {zR} (o : Nat)) ∧\n      ({fz_ty}) ∧\n      K = {kterm}')
+    head = theorem_head(G, 'mask_summand', '**The mask summand** of chain `iS` (the parts\' `hg`/`heg`, and `mask_inst`\'s `hz` and `hσ`): chain `' + ch.name + '` closed from the stage facts and the mask row (`mask_inst_form`); the PRF outputs `zN` are the requirement\'s sums `zR`, whose mask formula gives `σ_0`.')
     return head + '\n    ' + concl + ' := by\n  haveI : Fact ((iS : Nat) < S) := ⟨iS.isLt⟩\n' + '\n'.join(G.pre_lines + body + lines) + '\n'
 
 
@@ -1897,7 +1965,7 @@ theorem {name}_hC (i_0 : Nat) [Fact (i_0 < S)] (i : Fin (2 ^ {L})) :
         (fun k ↦ reducePoly {qq} {n} (Gen.binTable (n := {n}) (2 ^ {L}) {g} k)) ({idx} i) := by
   have hb : (((({bb} : Int)).toNat : Nat) : ExactPoly {qq} {n}) = (({bb} : Int) : ExactPoly {qq} {n}) := by
     rw [← Int.cast_natCast, Int.toNat_of_nonneg ({name}_nonneg i_0)]
-  refine (RefreshTopProof.Wiring.keyTableC_walsh' (q := {qq}) (n := {n}) (s := {s}) (W := {W}) {gt} (by norm_num)
+  refine ({WIRING}.keyTableC_walsh' (q := {qq}) (n := {n}) (s := {s}) (W := {W}) {gt} (by norm_num)
     (σ := {sigv}) (by revert i; decide) (by norm_num) 1 _ {tvv}).trans ?_
   rw [Int.cast_one, one_mul, hb, binTable_of {tvv} _ ({name}_tab{" i_0" if tdep else ""})]
   rfl
@@ -1939,7 +2007,7 @@ def prf_link(G, ch, keys, idx_var, jterm, req_vec):
 def fresh_summand(G, ch, body):
     C, n = G.C, G.C.n
     nh = dict(ch.nh)
-    O = f'Stage_online_eval.{C.O.inst}'
+    O = f'{ON}.{C.O.inst}'
     last, lexpr = ch.nh[-1]
     # the placed members' family and the sampler member segment
     mpl = re.search(r'\(parallel_parallel_generatedRoot_\d+_(\d+)\.sem \(F\.c\d+\.h(\d+)_5 i\)\) \((r_h\d+) i\)', lexpr)
@@ -1952,7 +2020,7 @@ def fresh_summand(G, ch, body):
         raise Fail('fresh: placement source is not a sampler member')
     mu = ch.subst(scope_sub(node_arg(e, 'μ'), n))
     hodd = ch.subst(scope_sub(node_arg(e, 'hodd'), n))
-    segth = theorem_text(open(f'{C.pdir}/Gen_Inst_Stage_online_eval.lean').read(), re.match(r'(seg_h\d+_\d+)', e).group(1))
+    segth = theorem_text(open(f'{C.pdir}/Gen_Inst_{ON}.lean').read(), re.match(r'(seg_h\d+_\d+)', e).group(1))
     famw = re.search(r'fam4 \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\) \(parallel_generatedRoot_\d+\.(w_\d+_\d+) ctx\)', segth).groups()
     sigma = re.search(r'branchTargetG \(q := \S+\) \(p := .*?\) (\(sig \[[^\]]*\] \d+\)) ', segth).group(1)
     fam = 'fam4 ' + ' '.join(f'({O}.{w} ctx)' for w in famw)
@@ -1975,19 +2043,19 @@ def fresh_summand(G, ch, body):
     fint = '(' + ', '.join(f'({O}.{w} ctx)' for w in outs) + ', ())'
     projs = ' | '.join(f'exact hcs{".2" * c}{".1" if c < 5 else ""}' for c in range(6))
     # the sampler switch
-    pws = [C.link_term(w, 'Stage_preprocess') for w in famw]
+    pws = [C.link_term(w, PRE) for w in famw]
     loops = sorted({int(sw.split('_')[1]) for _, sw in pws if sw})
     sw = next(re.search(r'^theorem (switch_h' + str(L) + r'_\d+) ', C.wiring, re.M).group(1) for L in loops
               if re.search(r'^theorem switch_h' + str(L) + r'_\d+ ', C.wiring, re.M))
     st = theorem_text(C.wiring, sw)
     mc = re.search(r'\(\(fun \(i : Fin (\d+)\) ↦ (.*?)\) k \*\n', st)
     Wsm = int(mc.group(1))
-    kt = qualify(mc.group(2), 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+    kt = qualify(mc.group(2), PRE, None).replace('i_0', '(iS : Nat)')
     Cw = f'(fun (i : Fin {Wsm}) ↦ {kt})'
     hb_ = binders(split_header(st)[0])
     bty = {nms[0]: ty for br, nms, ty in hb_ if len(nms) == 1}
     tq, th_ = toks(bty["g'"]), toks(bty["hg'"])
-    q = qualify(tq[1], 'Stage_preprocess', None).replace('i_0', '(iS : Nat)')
+    q = qualify(tq[1], PRE, None).replace('i_0', '(iS : Nat)')
     nn, m = xmodel.strip_parens(tq[2]), xmodel.strip_parens(tq[4])
     base, digits = th_[2], th_[3]
     cert = G.gadget_cert(q, nn, m, base, digits)
@@ -2006,7 +2074,7 @@ def fresh_summand(G, ch, body):
     val = f'(GenFinal.samplerVal {Psv} {Wsv} (GenFinal.listTable {glist}))'
     z = f'(fun f : Nat ↦ GenFinal.prfZB {Wz} (famAt {aext}) ![{srow}] ![{trow}] f)'
     fcs = sampler_certs_g(G, kt, Wsm, n, q, glist)
-    R = '(Stage_online_eval.mod_0 ((Int.ofNat (iS : Nat))))'
+    R = f'({ON}.mod_0 ((Int.ofNat (iS : Nat))))'
     gtR = G.gt_cert(R)
     zs = re.search(r'readoutExpG \d+ \(2 \^ \d+\) \((.*)\)\)\)$', mu)
     if not zs:
@@ -2036,7 +2104,7 @@ def fresh_summand(G, ch, body):
     grp = sels[0][1]
     B = len(sels)
     atoms = re.findall(r'\((h\d+_0) : ', split_header(theorem_text(open(f'{C.pdir}/Gen_Online_Fresh.lean').read(), 'fresh_inst'))[0])
-    ofacts = open(f'{C.gdir}/Stage_online_eval_Facts.lean').read()
+    ofacts = open(f'{C.gdir}/{ON}_Facts.lean').read()
     arefs = []
     for a_ in atoms:
         cur = None
@@ -2058,7 +2126,7 @@ def fresh_summand(G, ch, body):
         f'    (fams := {famt}) (final := {fint})',
         f'    (by intro c; fin_cases c <;> first | {projs})',
         f'    (fun f ↦ {last} f) cc',
-        f'  obtain ⟨eF, hbF, heF⟩ := RefreshTopProof.Wiring.{sw} FP hsp hP9 (gadgetOf_runs {cert})',
+        f'  obtain ⟨eF, hbF, heF⟩ := {WIRING}.{sw} FP hsp hP9 (gadgetOf_runs {cert})',
         f'  have hsw : ∀ (k : Fin {Wsm}) (j : Fin 2), reducePoly {R} {n} (substitution ({sigma} k).toNat ({hodd} k) sp) •',
         f'      {fam} 0 j k + {fam} 1 j k =',
         f'      ({Cw} k * reducePoly {R} {n} (1 * unitPair sp j)) • {gq} + reduceMatrix {R} {n} 1 {m} (eF k j) := by',
@@ -2084,7 +2152,7 @@ def fresh_summand(G, ch, body):
         f'    simp only [Int.toNat_natCast, Fin.sum_univ_succ, Fin.sum_univ_zero, Matrix.cons_val_zero, Matrix.cons_val_succ, add_zero]',
         f'    push_cast [Int.toNat_of_nonneg (ha _)]',
         f'    ring',
-        f'  obtain ⟨Kf, ef, hef, hf, hKf⟩ := RefreshTopProof.GenOnlineFresh.fresh_inst (iS : Nat) (hashModel := hashModel) (params := stage_4_params) hsm {sigma} {hodd}',
+        f'  obtain ⟨Kf, ef, hef, hf, hKf⟩ := RefreshTopProof.GenOnlineFresh.fresh_inst (iS : Nat) (hashModel := hashModel) (params := {ON_PARAMS}) hsm {sigma} {hodd}',
         f'    ({fam}) {mu} (fun f k ↦ polyNorm_substitution_Xe_gen (by norm_num) _ _) r_col (gadgetOf_runs {cert}) hsw hbF',
         f'    {nu}',
         f'    (fun f ↦ (reducePoly_centeredIntLift {gtR} (by norm_num) _).symm)',
@@ -2144,7 +2212,7 @@ def emit_preimage(G):
     """`final_inst`'s `hP`/`hPd`: the online preimage is the preprocess `preimageRunsDispatched` output, a
     reduced matrix within the trapdoor's cutoff (`preimage_target_gen`)."""
     C = G.C
-    pf = open(f'{C.gdir}/Stage_preprocess_Facts.lean').read()
+    pf = open(f'{C.gdir}/{PRE}_Facts.lean').read()
     fp = find_field(pf, r'^MxxRuntime\.preimageRunsDispatched ')
     if fp is None:
         raise Fail('no preimage fact')
@@ -2156,17 +2224,17 @@ def emit_preimage(G):
     if ft is None:
         raise Fail('no trapdoor fact')
     ow = None
-    for L in re.finditer(r'^theorem link_Stage_preprocess_' + Pw + r'_Stage_online_eval_(w_\d+_\d+) ', C.links_text, re.M):
+    for L in re.finditer(rf'^theorem link_{PRE}_' + Pw + rf'_{ON}_(w_\d+_\d+) ', C.links_text, re.M):
         ow = L.group(1)
     if ow is None:
         raise Fail(f'no online link of {Pw}')
-    pfk = link_proof(C, 'Stage_online_eval', ow, 'Stage_preprocess', Pw)
+    pfk = link_proof(C, ON, ow, PRE, Pw)
     ty = re.search(r'\(hP : ' + ow + r' = reduceMatrix _ (\d+) (\d+) (\d+) Pd\)', open(f'{C.pdir}/Gen_Final_Inst.lean').read())
     if not ty:
         raise Fail(f'no final_inst type of {ow}')
     nn, r_, c_ = ty.groups()
     head = theorem_head(G, 'preimage_summand', "**The preimage bound** (`final_inst`'s `hP`/`hPd`): the online preimage is the preprocess `preimageRunsDispatched` output (`preimage_target_gen`).")
-    return (head + f'\n    ∃ Pd : ErrorMatrix {nn} {r_} {c_}, Stage_online_eval.{C.O.inst}.{ow} ctx = reduceMatrix _ {nn} {r_} {c_} Pd ∧ CoeffBound Pd {cut} := by\n'
+    return (head + f'\n    ∃ Pd : ErrorMatrix {nn} {r_} {c_}, {ON}.{C.O.inst}.{ow} ctx = reduceMatrix _ {nn} {r_} {c_} Pd ∧ CoeffBound Pd {cut} := by\n'
             f'  obtain ⟨_, d, hd, hb⟩ := RefreshTopProof.Gen.preimage_target_gen FP.{ft[0]}.{ft[1]} FP.{fp[0]}.{fp[1]}\n'
             f'  exact ⟨d, {pfk}.trans hd, hb⟩\n')
 
@@ -2246,7 +2314,8 @@ def read_probe(logs):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     pdir = args[0]
-    out = sys.argv[sys.argv.index('--out') + 1] if '--out' in sys.argv else f'{pdir}/Gen_Summands.lean'
+    out = sys.argv[sys.argv.index('--out') + 1] if '--out' in sys.argv else (
+        f'{pdir}/Gen_Summands_Sigma.lean' if SIGMA else f'{pdir}/Gen_Summands.lean')
     C = Ctx(pdir)
     G = Gen(C)
     names = re.findall(r'^theorem (chain_h\d+)', C.chains, re.M)
@@ -2257,6 +2326,11 @@ def main():
         mseg = re.match(r'seg_(h\d+)_\d+', last)
         role = online_role(C, mseg.group(1)[1:]) if mseg else None
         G.pre_lines, G.done = [], set()
+        if SIGMA:
+            # the stages of `σ_0 G` evaluate one PRF chain, the mask
+            body, missing = emit_chain(G, ch)
+            thms.append(mask_summand(G, ch, body))
+            continue
         if role == 'smudge.member':
             body, missing = emit_chain(G, ch)
             thms.append(smudge_summand(G, ch, body))
@@ -2267,13 +2341,6 @@ def main():
                 continue
             except Fail as e:
                 G.notes.append(f'fresh: {e}')
-        elif nm == names[0] or role == 'lut.member.sampler-offset' or (mseg is None and 'member_total_rel' in last):
-            try:
-                body, missing = emit_chain(G, ch)
-                thms.append(mask_summand(G, ch, body))
-                continue
-            except Fail as e:
-                G.notes.append(f'mask: {e}')
         if '--test-chains' in sys.argv and role != 'smudge.member':
             try:
                 body, missing = emit_chain(G, ch)
@@ -2282,7 +2349,7 @@ def main():
                 continue
             head = theorem_head(G, f'test_{nm}', f'Test: the binders of `{nm}` discharged.')
             thms.append(head + '\n    True := by\n  haveI : Fact ((iS : Nat) < S) := ⟨iS.isLt⟩\n' + '\n'.join(G.pre_lines + body) + '\n  trivial\n')
-    for f in (emit_hint, emit_pre, emit_keys, emit_preimage):
+    for f in (() if SIGMA else (emit_hint, emit_pre, emit_keys, emit_preimage)):
         try:
             thms.append(f(G))
         except Fail as e:
@@ -2297,24 +2364,27 @@ def main():
     elif table is not None:
         thms = apply_bounds(G, thms, 'bounds', table)
         extra = bound_defs(table)
-    ns = 'RefreshTopProof.GenInst.OnlineEval'
+    ns = f'RefreshTopProof.GenInst.{stage_ns(ON)}'
     opens = [
-        'open Stage_online_eval RefreshTopProof.GenInst RefreshTopProof.GenIface RefreshTopProof.GenIface.BrLut RefreshTopProof.Gen',
-        'open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof.GenFinal GeneratedClaim RefreshTopProof.GenInst.PreprocessKeys',
-        'open RefreshTopProof.GenIface.BrLutKey RefreshTopProof.GenOnlineSmudge Mxx.ExponentLut.Refresh',
+        f'open {ON} RefreshTopProof.GenInst RefreshTopProof.GenIface RefreshTopProof.GenIface.BrLut RefreshTopProof.Gen',
+        f'open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof.GenFinal GeneratedClaim {PRE_KEYS}',
+        'open RefreshTopProof.GenIface.BrLutKey' + ('' if SIGMA else ' RefreshTopProof.GenOnlineSmudge') + ' Mxx.ExponentLut.Refresh',
         'open scoped BigOperators', '']
     opts = ['set_option maxHeartbeats 64000000', 'set_option maxRecDepth 65536', '']
     base = os.path.splitext(out)[0]
     stem = os.path.basename(base)
     outd = os.path.dirname(out) or '.'
     # one module per summand (each elaborates in its own process; one module of all of them exceeds 20 GB)
+    imports = ([f'import Gen_Wiring_Sigma', f'import Gen_Inst_{ON}', f'import Gen_Inst_{ENC}', 'import Gen_Requirement',
+                'import Gen_Online_Fresh'] if SIGMA else
+               ['import Gen_Wiring', f'import Gen_Inst_{ON}', f'import Gen_Inst_{ENC}', 'import Gen_Online_Values',
+                'import Gen_Requirement', 'import Gen_Inst_Keys', 'import Gen_Online_Fresh', 'import Gen_Final_Inst'])
     pre = '\n'.join([
-        'import Gen_Wiring', 'import Gen_Inst_Stage_online_eval', 'import Gen_Inst_Stage_encrypt',
-        'import Gen_Online_Values', 'import Gen_Requirement', 'import Gen_Inst_Keys', 'import Gen_Online_Fresh', 'import Gen_Final_Inst', 'import Mathlib.Tactic.IntervalCases', '',
+        *imports, 'import Mathlib.Tactic.IntervalCases', '',
         '/-! Generated by `generator/gen_summands.py` (WP F): lemmas, certificates and closed bounds shared by the',
         f'summand modules `{stem}_*` (see the generator\'s docstring). -/', '',
         *opts, f'namespace {ns}', '', *opens,
-        LEMMAS, '', *extra, *G.cert, *G.top,
+        LEMMAS, '' if SIGMA else LEMMAS_COLUMNS, '', *extra, *G.cert, *G.top,
         *(f'-- note: {x}' for x in G.notes), '',
         f'end {ns}', ''])
     files = {f'{outd}/{stem}_Pre.lean': pre}

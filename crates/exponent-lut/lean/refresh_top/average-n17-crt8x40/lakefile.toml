@@ -20,21 +20,21 @@ path = "../.."
 name = "RefreshTopGenerated"
 srcDir = "generated"
 moreLeanArgs = ["--tstack=1000000"]
-roots = ["Backend", "Claim", "Ideal", "Ideal_Facts", "Requirement_0", "Requirement_0_Facts", "Stage_decode", "Stage_decode_Facts", "Stage_encrypt", "Stage_encrypt_Facts", "Stage_mask", "Stage_mask_Facts", "Stage_online_eval", "Stage_online_eval_Facts", "Stage_payload", "Stage_payload_Facts", "Stage_preprocess", "Stage_preprocess_Facts"]
+roots = ["Backend", "Claim", "Ideal", "Ideal_Facts", "Requirement_0", "Requirement_0_Facts", "Stage_a_prime", "Stage_a_prime_Facts", "Stage_decode", "Stage_decode_Facts", "Stage_encrypt", "Stage_encrypt_Facts", "Stage_mask", "Stage_mask_Facts", "Stage_online_eval", "Stage_online_eval_Facts", "Stage_payload", "Stage_payload_Facts", "Stage_preprocess", "Stage_preprocess_Facts", "Stage_sigma_encrypt", "Stage_sigma_encrypt_Facts", "Stage_sigma_online_eval", "Stage_sigma_online_eval_Facts", "Stage_sigma_preprocess", "Stage_sigma_preprocess_Facts"]
 
 # The worst-case export of the same graph, renamed (written by `generator/gen_bridge.py`).
 [[lean_lib]]
 name = "RefreshTopWorst"
 srcDir = "worst"
 moreLeanArgs = ["--tstack=1000000"]
-roots = ["W_Claim", "W_Ideal", "W_Ideal_Facts", "W_Requirement_0", "W_Requirement_0_Facts", "W_Stage_decode", "W_Stage_decode_Facts", "W_Stage_encrypt", "W_Stage_encrypt_Facts", "W_Stage_mask", "W_Stage_mask_Facts", "W_Stage_online_eval", "W_Stage_online_eval_Facts", "W_Stage_payload", "W_Stage_payload_Facts", "W_Stage_preprocess", "W_Stage_preprocess_Facts"]
+roots = ["W_Claim", "W_Ideal", "W_Ideal_Facts", "W_Requirement_0", "W_Requirement_0_Facts", "W_Stage_a_prime", "W_Stage_a_prime_Facts", "W_Stage_decode", "W_Stage_decode_Facts", "W_Stage_encrypt", "W_Stage_encrypt_Facts", "W_Stage_mask", "W_Stage_mask_Facts", "W_Stage_online_eval", "W_Stage_online_eval_Facts", "W_Stage_payload", "W_Stage_payload_Facts", "W_Stage_preprocess", "W_Stage_preprocess_Facts", "W_Stage_sigma_encrypt", "W_Stage_sigma_encrypt_Facts", "W_Stage_sigma_online_eval", "W_Stage_sigma_online_eval_Facts", "W_Stage_sigma_preprocess", "W_Stage_sigma_preprocess_Facts"]
 
 # Every average-case run is a worst-case run (written by `generator/gen_bridge.py`).
 [[lean_lib]]
 name = "RefreshTopBridge"
 srcDir = "bridge"
 moreLeanArgs = ["--tstack=262144"]
-roots = ["BridgeRuns", "Bridge_Ideal", "Bridge_Requirement_0", "Bridge_Stage_decode", "Bridge_Stage_encrypt", "Bridge_Stage_mask", "Bridge_Stage_online_eval", "Bridge_Stage_payload", "Bridge_Stage_preprocess"]
+roots = ["BridgeRuns", "Bridge_Ideal", "Bridge_Requirement_0", "Bridge_Stage_a_prime", "Bridge_Stage_decode", "Bridge_Stage_encrypt", "Bridge_Stage_mask", "Bridge_Stage_online_eval", "Bridge_Stage_payload", "Bridge_Stage_preprocess", "Bridge_Stage_sigma_encrypt", "Bridge_Stage_sigma_online_eval", "Bridge_Stage_sigma_preprocess"]
 
 # The worst-case proof over the renamed export (written by `generator/gen_port.py`) and the
 # average-case certificate.
@@ -42,4 +42,4 @@ roots = ["BridgeRuns", "Bridge_Ideal", "Bridge_Requirement_0", "Bridge_Stage_dec
 name = "RefreshTopProof"
 srcDir = "proof"
 moreLeanArgs = ["--tstack=1000000"]
-roots = ["GenBridge_Enc", "GenBridge_Lut", "GenBridge_LutKey", "GenBridge_Prf", "GenDecode", "GenEnc", "GenFinal", "GenFinalFresh", "GenFinalLink", "GenFinalValues", "GenIface", "GenInstKeys", "GenInstLemmas", "GenInstSource", "GenKey", "GenKeyChain", "GenLabel", "GenLoop", "GenLut", "GenPbc", "GenRel", "GenRelLut", "GenReq", "GenSmudge", "Gen_Correct", "Gen_Final_Certs", "Gen_Final_Inst", "Gen_InstCerts", "Gen_Inst_Cx", "Gen_Inst_KeyEq", "Gen_Inst_KeyEq_FreshKeys", "Gen_Inst_KeyEq_MaskKeys", "Gen_Inst_Keys", "Gen_Inst_Stage_encrypt", "Gen_Inst_Stage_online_eval", "Gen_Inst_Stage_online_eval_KeyChain", "Gen_Inst_Stage_online_eval_Keys", "Gen_Inst_Stage_preprocess", "Gen_Inst_Stage_preprocess_Keys", "Gen_Online_Fresh", "Gen_Online_Smudge", "Gen_Online_Values", "Gen_Part", "Gen_Part_Ctx", "Gen_Requirement", "Gen_Stage_Links", "Gen_Stage_decode_Scopes", "Gen_Stage_encrypt_Scopes", "Gen_Stage_online_eval_Scopes", "Gen_Stage_preprocess_Scopes", "Gen_Summands", "Gen_Summands_FreshSummand", "Gen_Summands_HintSummand", "Gen_Summands_KeysSummand", "Gen_Summands_MaskSummand", "Gen_Summands_Pre", "Gen_Summands_PreSummand", "Gen_Summands_PreimageSummand", "Gen_Summands_SmudgeSummand", "Gen_Wiring", "ModularGlue", "RefreshTopCertificate", "TopCrtGeneric", "TopDecodeLoops"]
+roots = ["GenBridge_Enc", "GenBridge_Lut", "GenBridge_LutKey", "GenBridge_Prf", "GenDecode", "GenEnc", "GenFinal", "GenFinalFresh", "GenFinalLink", "GenFinalValues", "GenIface", "GenInstKeys", "GenInstLemmas", "GenInstSource", "GenKey", "GenKeyChain", "GenLabel", "GenLoop", "GenLut", "GenPbc", "GenRel", "GenRelLut", "GenReq", "GenSmudge", "Gen_Correct", "Gen_Final_Certs", "Gen_Final_Inst", "Gen_InstCerts", "Gen_Inst_Cx", "Gen_Inst_KeyEq", "Gen_Inst_KeyEqSigma", "Gen_Inst_KeyEqSigma_MaskKeys", "Gen_Inst_KeyEq_FreshKeys", "Gen_Inst_Keys", "Gen_Inst_Stage_encrypt", "Gen_Inst_Stage_online_eval", "Gen_Inst_Stage_online_eval_KeyChain", "Gen_Inst_Stage_online_eval_Keys", "Gen_Inst_Stage_preprocess", "Gen_Inst_Stage_preprocess_Keys", "Gen_Inst_Stage_sigma_encrypt", "Gen_Inst_Stage_sigma_online_eval", "Gen_Inst_Stage_sigma_online_eval_KeyChain", "Gen_Inst_Stage_sigma_online_eval_Keys", "Gen_Inst_Stage_sigma_preprocess", "Gen_Inst_Stage_sigma_preprocess_Keys", "Gen_Online_Fresh", "Gen_Online_Smudge", "Gen_Online_Values", "Gen_Part", "Gen_Part_Ctx", "Gen_Requirement", "Gen_Stage_Links", "Gen_Stage_decode_Scopes", "Gen_Stage_encrypt_Scopes", "Gen_Stage_online_eval_Scopes", "Gen_Stage_preprocess_Scopes", "Gen_Stage_sigma_encrypt_Scopes", "Gen_Stage_sigma_online_eval_Scopes", "Gen_Stage_sigma_preprocess_Scopes", "Gen_Summands", "Gen_Summands_FreshSummand", "Gen_Summands_HintSummand", "Gen_Summands_KeysSummand", "Gen_Summands_Pre", "Gen_Summands_PreSummand", "Gen_Summands_PreimageSummand", "Gen_Summands_Sigma", "Gen_Summands_Sigma_MaskSummand", "Gen_Summands_Sigma_Pre", "Gen_Summands_SmudgeSummand", "Gen_Wiring", "Gen_Wiring_Sigma", "ModularGlue", "RefreshTopCertificate", "TopCrtGeneric", "TopDecodeLoops"]

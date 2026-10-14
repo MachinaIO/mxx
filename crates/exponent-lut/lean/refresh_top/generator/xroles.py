@@ -18,7 +18,8 @@ import sys
 sys.path.insert(0, __file__.rsplit('/', 1)[0])
 import xmodel  # noqa: E402
 
-MODULES = ['Stage_preprocess', 'Stage_encrypt', 'Stage_online_eval', 'Stage_decode', 'Requirement_0']
+MODULES = ['Stage_preprocess', 'Stage_encrypt', 'Stage_online_eval', 'Stage_decode', 'Requirement_0',
+           'Stage_sigma_preprocess', 'Stage_sigma_encrypt', 'Stage_sigma_online_eval']
 
 
 def lets(s):

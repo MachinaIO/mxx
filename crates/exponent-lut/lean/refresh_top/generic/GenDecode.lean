@@ -14,7 +14,7 @@ lift to `Q = ∏ q_t` of the residue of `y_j + e'_j` modulo `q_t`, times the CRT
 * sums the members `j, R + j, 2 R + j, …` (a static read and a sequential loop over strided
   members),
 * subtracts the expected row `σ A'_0 + A'_1 - (Δ r) (c X^e) G'`, with `σ` built from its
-  coefficients and `A'` hash-sampled per component,
+  coefficients and `A'` component `j`'s column block of the caller's matrix (`colBlock`),
 * and runs a sequential loop over the `m` columns whose body exports the column's coefficients
   and runs an inner sequential loop adding `((2 v + ⌊Q/2⌋) / Q) mod 2` per coefficient `v`.
 
@@ -226,6 +226,25 @@ theorem slice_row_gen {q rows columns : Nat} {A : ExactMatrix q n rows columns}
   rw [hx 0 k (by simp [hr]) (by subst hc; simp)]
   subst hc
   simp
+
+/-- Columns `[s, s + m)` of `A` (zero past its columns): component `j`'s `A'` is the column block
+`m j` of the caller's `[A'_(0) | A'_(1)]`. -/
+noncomputable def colBlock {q rows columns : Nat} (m : Nat) (A : ExactMatrix q n rows columns) (s : Nat) :
+    ExactMatrix q n rows m :=
+  fun r k ↦ if h : s + k.val < columns then A r ⟨s + k.val, h⟩ else 0
+
+/-- A slice of every row of `A` is a column block. -/
+theorem slice_colBlock {q rows columns m : Nat} {A : ExactMatrix q n rows columns}
+    {x : ExactMatrix q n rows m} {r' c c' : Int}
+    (h : sliceMatrix A 0 r' c c' x) : x = colBlock m A c.toNat := by
+  obtain ⟨-, -, -, hc0, -, hc', -, hcols, hx⟩ := h
+  funext r k
+  have hk : c.toNat + k.val < columns := by
+    have := k.isLt
+    simp only [Int.ofNat_eq_coe] at hc' hcols
+    omega
+  rw [hx r k (by simp) hk]
+  simp [colBlock, hk]
 
 /-- σ imported from its coefficient values. -/
 theorem sigma_of_values {q : Nat} {bits : Fin n → Int} {σ : ExactMatrix q n 1 1}

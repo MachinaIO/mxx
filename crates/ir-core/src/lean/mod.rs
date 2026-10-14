@@ -3211,7 +3211,24 @@ impl<'a> Emitter<'a> {
                         format!("({} ⟨i.val + {}, by omega⟩)", wire_name(*wire), offset)
                     }
                     crate::node::LoopInputMode::ZipQuotient { divisor } => {
-                        format!("({} ⟨i.val / {}, by omega⟩)", wire_name(*wire), divisor)
+                        let member =
+                            format!("({} ⟨i.val / {}, by omega⟩)", wire_name(*wire), divisor);
+                        match &self.validated.scopes[scope_id].wire_types[wire] {
+                            // Members over different rings: the member's modulus, a table at
+                            // `i / divisor`, equals the instance's, a table at `i`, for every
+                            // `i` but not syntactically, so the member is cast (decided over
+                            // the instances).
+                            crate::types::ConcreteWireType::DependentFamily { members }
+                                if members.iter().all(|member| {
+                                    matches!(member, crate::types::ConcreteWireType::Matrix(_))
+                                }) =>
+                            {
+                                format!(
+                                    "(Mxx.Primitives.castModulus {member} (by revert i; decide +kernel))"
+                                )
+                            }
+                            _ => member,
+                        }
                     }
                     _ => wire_name(*wire),
                 }

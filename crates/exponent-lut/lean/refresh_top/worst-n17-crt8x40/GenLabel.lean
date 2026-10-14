@@ -9,6 +9,10 @@ exponent layout of stride `s` (`s Q' = 2 n`). Entry `ν` is the zero member, `c 
 `a = 0`. The per-entry arithmetic is the closed predicate `LabelEntry`, decidable entry by entry,
 and `label_value_gen` turns it into the payload equation for every member of a table of any
 length.
+
+A Program evaluated in its own stages (the caller's encoding of `σ_0 G`) samples the public key
+of every label member from the hash key and the member index in each stage (`labelKeyG`), where a
+part's child reads the keys from the part's preprocessing.
 -/
 
 namespace RefreshTopProof.Gen
@@ -49,5 +53,19 @@ theorem label_value_gen {q s ν : Nat} (c e : Fin (ν + 1) → Int) (a : Fin (ν
     multiplyMonomial (liftInteger (c i) : ExactMatrix q n 1 1) (e i) =
       fun _ _ ↦ reducePoly q n (Xe (n := n) (s * a i)) := by
   rw [multiplyMonomial_liftInteger, label_message_gen (h i)]
+
+/-- Component `c` of the public key of label member `k`, hash-sampled from `key` (a Program in
+its own stages samples it in each stage). -/
+noncomputable def labelKeyG (model : HashModel) (q n m : Nat) (key : ByteArray) (pre : Blob) (k c : Int) :
+    ExactMatrix q n 1 m :=
+  model.sample q n 1 m key (completeHashTag pre [.bytes [109, 101, 109, 98, 101, 114], .u64Le k,
+    .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le c])
+
+theorem labelKeyG_of {q m : Nat} {model : HashModel} {key : ByteArray} {pre : Blob} {k c : Int}
+    {x : ExactMatrix q n 1 m}
+    (h : hashSample model pre [.bytes [109, 101, 109, 98, 101, 114], .u64Le k,
+      .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le c] key x) :
+    x = labelKeyG model q n m key pre k c :=
+  h.2.2
 
 end RefreshTopProof.Gen

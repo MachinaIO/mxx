@@ -5,21 +5,21 @@ expected row of its component plus one small error row.
 The decode stage (`generated/Stage_decode.lean`) reads a family `T : Fin S → M_Q(1 × m)` of CRT
 terms (member `t R + j`: prime `t`, component `j`). Per component it reads member `j` and runs a
 strided sequential loop over members `(i + 1) R + j`; subtracts the expected row
-`σ A'_0 + A'_1 - (Δ r) (c X^e) G'` (σ from its coefficient values, `A'` hash-sampled with the
-component as tag, `G'` the centered rebase of the gadget); and runs a sequential loop over the
+`σ A'_0 + A'_1 - (Δ r) (c X^e) G'` (σ from its coefficient values, `A'` the component's column
+block of the caller's `A'` input, `G'` the centered rebase of the gadget); and runs a sequential loop over the
 columns whose body exports the column's coefficients and runs an inner loop of rounding bits.
 
 Every role is recognized by atom kinds, loop shapes and data flow, never by wire ids or scope
 numbers: the strided loops are the matrix-state loops whose initial state is a static family
 read; the column loops are the integer-state loops whose body slices a column and exports its
 values; a column loop's difference is `matrixSub s Y` for a strided loop's final `s`; `Y`'s rows
-come from the hash sample whose last tag component names the component. Nothing is enumerated
+are slices of the column block `m j` of the `A'` input. Nothing is enumerated
 over members, columns or coefficients: the slot count, column count and ring dimension only
 appear in types and in `decide` checks of `K R ≤ S`.
 
 The output has
 * per child scope an adapter to the step shapes `StrideStep`, `ColumnStep`, `RoundStep`;
-* `decodeTag`, `decodeR`, `decodeValue`: the target value of component `j`;
+* `decodeR`, `decodeValue`: the target value of component `j`;
 * `<name>_gen`: the theorem for any CRT tables `qN`, `KN` of the `K` primes (hypotheses: the
   primes exceed one, `KN` is a CRT basis, the primes are pairwise coprime, their product is `Q`);
 * when the online stage's CRT-term role is found in `generated/Stage_online_eval.lean` (the
@@ -394,13 +394,7 @@ for x in atoms:
     if kinds[x] == 'sliceMatrix':
         m = re.match(r'MxxRuntime\.sliceMatrix (\S+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (\S+)$', x)
         check(m, f'slice {x}')
-        slices[m.group(6)] = (m.group(1), int(m.group(2)), int(m.group(4)), x)
-hashes = {}
-for x in atoms:
-    if kinds[x] == 'hashSample':
-        m = re.match(r'MxxRuntime\.hashSample \(hashModel\) \((\[.*?\])\) \((\[.*\])\) \((\S+)\) (\S+)$', x)
-        check(m, f'hash sample {x}')
-        hashes[m.group(4)] = (m.group(1), m.group(2), m.group(3), x)
+        slices[m.group(6)] = (m.group(1), int(m.group(2)), int(m.group(4)), x, int(m.group(3)), int(m.group(5)))
 sigma_atoms = [x for x in atoms if kinds[x] == 'polynomialFromValues']
 check(len(sigma_atoms) == 1, 'one σ')
 bits, sigma = re.match(r'MxxRuntime\.polynomialFromValues false (\S+) (\S+)$', sigma_atoms[0]).groups()
@@ -427,12 +421,13 @@ for c in comps:
     sg, row0 = op(scaled, 'matrixMulScalarLeft')
     check(sg == sigma, f'component {c["j"]}: σ A0')
     check(row0 in slices and row1 in slices, f'component {c["j"]}: rows of A\'')
-    h0, r0i, c0i, _ = slices[row0]
-    h1, r1i, c1i, _ = slices[row1]
-    check(h0 == h1 and h0 in hashes and (r0i, r1i, c0i, c1i) == (0, 1, 0, 0), f'component {c["j"]}: A\' rows 0, 1')
-    pre, comps_, key, hatom = hashes[h0]
-    tag = re.fullmatch(r'\[(.*), \.u64Le \((\d+)\)\]', comps_)
-    check(tag and int(tag.group(2)) == c['j'], f'component {c["j"]}: A\' tagged by the component')
+    h0, r0i, c0i = slices[row0][:3]
+    h1, r1i, c1i = slices[row1][:3]
+    check(h0 == h1 and h0 in slices and (r0i, r1i, c0i, c1i) == (0, 1, 0, 0), f'component {c["j"]}: A\' rows 0, 1')
+    key, ar0, ac0, hatom, ar1, ac1 = slices[h0]
+    mj = mat(h0)[3]
+    check((ar0, ar1, ac0, ac1) == (0, 2, mj * c['j'], mj * c['j'] + mj),
+          f'component {c["j"]}: A\' is the column block {c["j"]} of the A\' input')
     drm, gp = op(M, 'matrixMulScalarLeft')
     check(gp == gprime, f'component {c["j"]}: times G\'')
     dr, mono = op(drm, 'matrixMulScalarLeft')
@@ -442,21 +437,21 @@ for c in comps:
     mm = re.fullmatch(r'MxxRuntime\.multiplyMonomial (w_\S+) (w_\S+)', lets[mono])
     lifted, expo = mm.groups()
     coef = re.fullmatch(r'MxxRuntime\.liftInteger (w_\S+)', lets[lifted]).group(1)
-    check(coef in input_wire and expo in input_wire and key in input_wire, 'c, e and the key are inputs')
+    check(coef in input_wire and expo in input_wire and key in input_wire, 'c, e and A\' are inputs')
     if rw in input_wire:
         r_text = input_expr[rw]
     else:
         rm = re.fullmatch(r'\((-?\d+) : (Mxx\.Primitives\.ExactMatrix .*)\)', lets[rw])
         check(rm, f'component {c["j"]}: r is an input or a literal')
         r_text = f'({rm.group(1)} : ExactMatrix {mat(Y)[0]} {mat(Y)[1]} 1 1)'
-    c.update(Y=Y, hash=h0, row0=row0, row1=row1, prefix=pre, tagc=tag.group(1), key=key,
+    c.update(Y=Y, row0=row0, row1=row1, key=key,
              delta=int(dm.group(1)), r=r_text, coef=coef, expo=expo)
     used_atoms[slices[row0][3]] = f'hr{c["j"]}0'
     used_atoms[slices[row1][3]] = f'hr{c["j"]}1'
     used_atoms[hatom] = f'hA{c["j"]}'
     used_atoms[statics[c['stride']['init']][2]] = f'hinit{c["j"]}'
-check(len({(c['prefix'], c['tagc'], c['key'], c['delta'], c['coef'], c['expo']) for c in comps}) == 1,
-      'the components share the tag prefix, key, Δ, c and e')
+check(len({(c['key'], c['delta'], c['coef'], c['expo']) for c in comps}) == 1,
+      'the components share A\', Δ, c and e')
 for x in atoms:
     if kinds[x] == 'iter':
         lp = iter_info(x)
@@ -611,8 +606,6 @@ Ldef = [
     f'/-! The stage\'s numbers: {R} components, {K} CRT terms per component, {S} family members,',
     f'{m} columns, ring dimension {N}, decoding modulus {Q}. -/', '',
     f'/-- The decode stage\'s inputs. -/\nabbrev Inputs := {unabbrev(inputs_ty)}', '',
-    f'/-- The hash tag of component `j`\'s `A\'`. -/\ndef decodeTag (j : Nat) : Blob :=\n'
-    f'  completeHashTag {c0["prefix"]} [{c0["tagc"]}, .u64Le (j : Int)]', '',
     f'/-- The factor `r` of component `j`\'s expected row. -/',
     f'noncomputable def decodeR (inputs : Inputs) : Nat → ExactMatrix {Q} {N} 1 1']
 for c in sorted(comps, key=lambda c: c['j']):
@@ -620,9 +613,9 @@ for c in sorted(comps, key=lambda c: c['j']):
 Ldef.append('  | _ => 0')
 Ldef += ['',
          '/-- The value whose CRT terms component `j` reads: its expected row plus the error row `E j`. -/',
-         f'noncomputable def decodeValue (model : HashModel) (inputs : Inputs) (G : ExactMatrix {Qg} {N} 1 {m})',
+         f'noncomputable def decodeValue (inputs : Inputs) (G : ExactMatrix {Qg} {N} 1 {m})',
          f'    (E : Nat → ErrorMatrix {N} 1 {m}) (j : Nat) : {MQ} :=',
-         f'  decodeExpected (model.sample {Q} {N} 2 {m} {input_expr[c0["key"]]} (decodeTag j))',
+         f'  decodeExpected (colBlock {m} {input_expr[c0["key"]]} ({m} * j))',
          f'    (fun _ _ ↦ polynomialOfCoefficients {input_expr[bits]}) {c0["delta"]} (decodeR inputs j)',
          f'    {input_expr[c0["coef"]]} {input_expr[c0["expo"]]} G + reduceMatrix {Q} {N} 1 {m} (E j)', '']
 
@@ -701,7 +694,7 @@ for k, (nm, ty) in enumerate(root_lead):
         nm = f'r{k}'
     binders.append(f'{{{nm} : {ty}}}')
     args.append(nm)
-check('backend' in args and 'model' in args, 'the root takes a backend and a hash model')
+check('backend' in args and 'model' not in args, 'the root takes a backend and no hash model')
 check(re.search(r'gadgetMatrixRuns backend ', gad[0]) and root_lead[args.index('backend')][0] == 'backend',
       'the gadget runs on the root backend')
 root_binders = ' '.join(binders)
@@ -710,7 +703,7 @@ hyps = (f'    (h : {NS}.generatedRoot {" ".join(args)} inputs out)\n'
         f'    (E : Nat → ErrorMatrix {N} 1 {m})\n'
         f'    (hE : ∀ j c i, 4 * |(E j 0 c).coeff i| + 4 < ({Q} : Int))')
 term = (f'    (hterm : ∀ i : Fin {S}, TermOf (qN (i / {R})) (KN (i / {R})) ({fam_expr} i)\n'
-        f'      (decodeValue model inputs G E (i % {R})))')
+        f'      (decodeValue inputs G E (i % {R})))')
 P = [f'/-- The decode stage outputs zero when every CRT term `T (t {R} + j)` it reads is the term of',
      f'`y_j + e\'_j` for the prime `qN t` and the basis element `KN t`, for the expected row `y_j` of',
      'component `j` and a small error row `e\'_j`. -/',
@@ -728,12 +721,12 @@ for c in sorted(comps, key=lambda c: c['j']):
     j = c['j']
     P += [f'  have z{j} := decode_component_zero (K := {K}) (Rn := {R}) (jn := {j}) (by decide) (by decide)',
           '    qN KN hq hK hcop hprod (by decide) (by decide)',
-          f'    {fam_expr} (decodeValue model inputs G E) hterm _ (E {j}) rfl (hE {j}) rfl rfl rfl rfl hinit{j}',
+          f'    {fam_expr} (decodeValue inputs G E) hterm _ (E {j}) rfl (hE {j}) rfl rfl rfl rfl hinit{j}',
           f'    (fun _ _ _ hb ↦ stride_step_{c["stride"]["scope"]} hb) hs{j} ?hD{j} (by decide) rfl',
           f'    (fun _ _ _ hb ↦ column_step_{c["col"]["scope"]} hb) hc{j}',
           f'  case hD{j} =>',
           f'    rw [slice_row_gen hr{j}0 rfl (by decide), slice_row_gen hr{j}1 rfl (by decide), '
-          f'hashSample_eq hA{j}, hσ\', hg]',
+          f'slice_colBlock hA{j}, hσ\', hg]',
           '    rfl']
 zs = ', '.join(f'z{c["j"]}' for c in sorted(comps, key=lambda c: c['j']))
 P += [f'  rw [hout, {zs}]',

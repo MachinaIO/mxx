@@ -24,11 +24,16 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 import xmodel  # noqa: E402
 import xsem  # noqa: E402
-from gen_inst_keys import Gen, St, base, qual_on, ON, PRE, ENC  # noqa: E402
+from gen_inst_keys import Gen, St, base, qual_on, ON, PRE, ENC, SIGMA  # noqa: E402
 
-OK_NS = 'RefreshTopProof.GenInst.OnlineEvalKeys'
-PK_NS = 'RefreshTopProof.GenInst.PreprocessKeys'
-OE_NS = 'RefreshTopProof.GenInst.OnlineEval'
+
+def stage_ns(M):
+    return M.replace('Stage_', '').title().replace('_', '')
+
+
+OK_NS = f'RefreshTopProof.GenInst.{stage_ns(ON)}Keys'
+PK_NS = f'RefreshTopProof.GenInst.{stage_ns(PRE)}Keys'
+OE_NS = f'RefreshTopProof.GenInst.{stage_ns(ON)}'
 
 
 def proj(c, k):
@@ -62,8 +67,8 @@ class KE(Gen):
     def __init__(self, gdir, pdir, roles):
         super().__init__(gdir, pdir, roles)
         self.gdir, self.pdir = gdir, pdir
-        self.ok = open(f'{pdir}/Gen_Inst_Stage_online_eval_Keys.lean').read()
-        self.kc = open(f'{pdir}/Gen_Inst_Stage_online_eval_KeyChain.lean').read()
+        self.ok = open(f'{pdir}/Gen_Inst_{ON}_Keys.lean').read()
+        self.kc = open(f'{pdir}/Gen_Inst_{ON}_KeyChain.lean').read()
         self.cnt = 0
         self.done = {}
 
@@ -162,7 +167,8 @@ class KE(Gen):
                 if S.role(c) == cell0:
                     return pairs[::-1]
                 assert S.role(c) == cell1, S.role(c)
-                x = c['loop']['args'][as_pos]
+                # a Program in its own stages (13 arguments) passes the state keys from position 4
+                x = c['loop']['args'][4 if as_pos == 7 and len(c['loop']['args']) == 13 else as_pos]
         on = walk(O, on_x, 'prf.cell1', 'prf.cell0', 7)
         pre = walk(P, pre_x, 'prf.key-cell1', 'prf.key-cell0', 2)
         assert len(on) == len(pre), (len(on), len(pre))
@@ -174,12 +180,13 @@ class KE(Gen):
         labs = {}
         for (c, _), (pc, _) in zip(on, pre):
             k = tuple(x[0] for x in c['loop']['gathered'])
-            if k not in labs:
+            # a Program in its own stages hash-samples the label keys in the cell (`labelKeysG`)
+            if k not in labs and len(c['loop']['args']) != 13:
                 labs[k] = self.fresh('hlab')
                 self.body.append(self.hlab(c, pc, labs[k]))
         prev = None
         for t, ((c, r), (pc, pr)) in enumerate(zip(on, pre)):
-            lab = labs[tuple(x[0] for x in c['loop']['gathered'])]
+            lab = labs.get(tuple(x[0] for x in c['loop']['gathered']))
             kc, er = self.fresh('kc'), self.fresh('er')
             self.body.append(self.cell_eq(kc, c, pc, 0 if t == 0 else 1, lab, prev))
             self.body.append(self.rowsum_eq(er, r, pr, kc))
@@ -521,22 +528,29 @@ class KE(Gen):
 
     # ------------------------------------------------------------------ the mask carrier
     def mask(self):
+        """`mask_keys` (the stages of `σ_0 G`): the mask row's keys (`mask_summand`'s named witness, the
+        online member sum's components 1 and 3 moved down) are the preprocessing's moved-down member
+        sum components 1 and 3, the keys the parts' preprocessing reads."""
         O, P = self.O, self.P
-        ms = open(f'{self.pdir}/Gen_Summands_MaskSummand.lean').read()
+        ms = open(f'{self.pdir}/Gen_Summands_Sigma_MaskSummand.lean').read()
         kt = re.search(r'∧\n      K = (fun k ↦ blockModSwitchG (\[[\d, ]*\]) 1 \(Enc\.A \((.*?)\) k 1\)) :=', ms, re.S)
         X = re.findall(r'(w_\d+_\d+) ctx', kt.group(3))
-        ps = open(f'{self.pdir}/Gen_Summands_PreSummand.lean').read()
-        tg = re.search(r'!\[\(\S+\.(w_\d+_\d+) cP\), \(\S+\.(w_\d+_\d+) cP\)\] k \* topRows', ps)
-        ta, tb = tg.groups()
-        ins = []
-        for t in (ta, tb):
-            b = stmt(self.P_keys, f'bms_h{t[2:]}')
-            ins.append(re.search(r'\(1\) \(\S+\.(w_\d+_\d+) ctx\) :=$', b).group(1))
         # the member sums
         lo, co = O.loop_of(X[1])
         assert lo is None
         lo = [a for a in O.loops if X[1] in a['wires'] and O.role(a) == 'sum.members.step'][0]
-        lp = [a for a in P.loops if ins[0] in a['wires'] and P.role(a) == 'sum.members.step'][0]
+        # the preprocessing's moved-down member sum components 1 and 3 (`bms_*`)
+        tgt = {}
+        for name in re.findall(r'^theorem (bms_h\d+_\d+) ', self.P_keys, re.M):
+            b = stmt(self.P_keys, name)
+            src = re.search(r'\(1\) \(\S+\.(w_\d+_\d+) ctx\) :=$', b).group(1)
+            for a in P.loops:
+                fin = xsem.tuple_wires(a['loop'].get('final') or '')
+                if P.role(a) == 'sum.members.step' and src in fin and fin.index(src) in (1, 3):
+                    tgt[fin.index(src)] = ('w_' + name[len('bms_h'):], src, a)
+        assert sorted(tgt) == [1, 3], f'preprocessing member sum keys {sorted(tgt)}'
+        (ta, ia, lp), (tb, ib, _) = tgt[1], tgt[3]
+        ins = [ia, ib]
         mseq = self.memsum_eq(lo, lp, X, ins)
         Kterm = qual_on(kt.group(1).replace('(Stage_online_eval.', '(Stage_online_eval.'))
         body_end = [f'  funext k', '  fin_cases k']
@@ -679,8 +693,10 @@ class KE(Gen):
         O, P = self.O, self.P
         self.P_keys = self.pre
         thms = []
-        for nm, fn, doc in (('mask_keys', self.mask, "The mask carrier's keys are the preprocessing's combination keys** (`hpre`'s `Kg`): the\nonline keys (`mask_summand`'s named witness) follow the data flow to the preprocessing key forms."),
-                            ('fresh_keys', self.fresh_row, "The fresh row's keys are the preprocessing's fresh keys** (`hpre`'s `Kf`): the online\nkeys (`fresh_summand`'s named witness) follow the data flow to the preprocessing slice rows.")):
+        todo = ((('mask_keys', self.mask, "The mask row's keys are the preprocessing's keys** (the parts' `hpre`'s `Kg`): the\nonline keys (`mask_summand`'s named witness) follow the data flow to the preprocessing key forms."),)
+                if SIGMA else
+                (('fresh_keys', self.fresh_row, "The fresh row's keys are the preprocessing's fresh keys** (`hpre`'s `Kf`): the online\nkeys (`fresh_summand`'s named witness) follow the data flow to the preprocessing slice rows."),))
+        for nm, fn, doc in todo:
             self.body, self.haves, self.hyps, self.haves_after = [], [], {}, []
             self.sec, self.secn = '', []
             self.done = {}
@@ -713,9 +729,10 @@ theorem {nm} {{hashModel : HashModel}}
 
     def module(self, thms):
         return f'''import GenKeyChain
-import Gen_Inst_Keys
-import Gen_Inst_Stage_online_eval_Keys
-import Gen_Inst_Stage_online_eval_KeyChain
+import {'Gen_Inst_' + PRE + '_Keys' if SIGMA else 'Gen_Inst_Keys'}
+import Gen_Inst_{ENC}
+import Gen_Inst_{ON}_Keys
+import Gen_Inst_{ON}_KeyChain
 import GenFinalFresh
 import GenInstLemmas
 
@@ -726,27 +743,31 @@ set_option maxHeartbeats 64000000
 set_option maxRecDepth 262144
 set_option linter.unusedVariables false
 
-namespace RefreshTopProof.GenInst.KeyEq
+namespace RefreshTopProof.GenInst.{NS}
 
 open RefreshTopProof.GenIface RefreshTopProof.GenIface.BrLut RefreshTopProof.GenIface.BrLutKey
-open RefreshTopProof.Gen RefreshTopProof.GenInst RefreshTopProof.GenInst.PreprocessKeys RefreshTopProof.GenFinal
+open RefreshTopProof.Gen RefreshTopProof.GenInst {PK_NS} RefreshTopProof.GenFinal
 open Mxx.Primitives MxxRuntime MxxExponentLut
 open scoped BigOperators
 
 {thms}
-end RefreshTopProof.GenInst.KeyEq
+end RefreshTopProof.GenInst.{NS}
 '''
 
 
+#: The namespace and module stem: the parts' `KeyEq`, or the sigma stages' `KeyEqSigma`.
+NS = 'KeyEqSigma' if SIGMA else 'KeyEq'
+
+
 if __name__ == '__main__':
-    gdir, pdir, rolesj = sys.argv[1], sys.argv[2], sys.argv[3]
+    gdir, pdir, rolesj = [a for a in sys.argv[1:] if not a.startswith('--')][:3]
     g = KE(gdir, pdir, json.load(open(rolesj)))
     # one module per theorem (one module of both exceeds the stack at n = 2^17), and an umbrella
     mods = []
     for nm, th in g.emit():
-        mod = 'Gen_Inst_KeyEq_' + ''.join(x.title() for x in nm.split('_'))
+        mod = f'Gen_Inst_{NS}_' + ''.join(x.title() for x in nm.split('_'))
         open(f'{pdir}/{mod}.lean', 'w').write(g.module(th))
         mods.append(mod)
-    open(f'{pdir}/Gen_Inst_KeyEq.lean', 'w').write(''.join(f'import {m}\n' for m in mods) +
+    open(f'{pdir}/Gen_Inst_{NS}.lean', 'w').write(''.join(f'import {m}\n' for m in mods) +
         '\n/-! Generated by `generator/gen_key_eq.py` (WP D): the key equalities of the final combination. -/\n')
-    print(f'{pdir}/Gen_Inst_KeyEq.lean: {", ".join(mods)}')
+    print(f'{pdir}/Gen_Inst_{NS}.lean: {", ".join(mods)}')

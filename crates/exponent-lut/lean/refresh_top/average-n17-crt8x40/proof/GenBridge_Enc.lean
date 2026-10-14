@@ -10,7 +10,8 @@ derives the `Rel`-level conclusions of `GenEnc` from those bundles:
 
 * `EncLabelEntry.rel`: a label-entry encryption (one member of the parallel over the label
   entries) encrypts `μ = c X^e` times the gadget, passes the public key through, and outputs `μ`
-  as a polynomial (`encLabel_gen`);
+  as a polynomial (`encLabel_gen`); `EncLabelEntry.rel_1` the same under the member's
+  hash-sampled public key (`labelKeyG`, a Program in its own stages);
 * `EncLutBranchKey.rel`: a LUT branch key under the
   mask `(s, 1)` at the working modulus (`encBranchKey_gen`);
 * `EncLutBranchKey.rel_1`: the same after reducing the mask from larger moduli
@@ -59,6 +60,31 @@ theorem EncLabelEntry.rel {q0 n d0 : Nat} {p0 p1 : Int} {p2 : Rat} {p3 : Int} {p
   obtain ⟨v0, v1, v2, a0, a1, a2, rfl⟩ := h
   obtain ⟨hr, hμ⟩ := encLabel_gen hsm hone _ _ _ _ v0 _ _ rfl a1 a2 rfl rfl
   exact ⟨v0, a0, rfl, rfl, rfl, rfl, hr, hμ⟩
+
+/-- **Label entry of a Program in its own stages** (`enc.label-entry`, variant 1): the public key
+of member `i` is hash-sampled from the key (`labelKeyG`, components `0, 2` the first row and `1, 3`
+the second), and the outputs `(c, μ)` encrypt `μ · G = c X^e · G` under it and `(s, 1)`. -/
+theorem EncLabelEntry.rel_1 {q0 n d0 : Nat} {p0 p1 : Blob} {p2 p3 : Int} {p4 : Rat} {p5 : Int}
+    {p6 p7 : Blob} {p8 : Rat} {p9 : Int} {backend : BackendContext} {hashModel : HashModel} {i : Nat}
+    {inputs : ExactMatrix q0 n 1 1 × ByteArray × ExactMatrix q0 n 1 1 × Int × Int × Unit}
+    {outputs : ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 1 × Unit}
+    (h : EncLabelEntry.Comp_1 q0 n d0 p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 backend hashModel i inputs outputs)
+    {sm : ErrorPoly n} (hsm : inputs.1 = fun _ _ ↦ reducePoly q0 n sm)
+    (hone : inputs.2.2.1 = 1) (hp8 : p8 = p4) (hp9 : p9 = p5) :
+    ∃ G : ExactMatrix q0 n 1 d0, gadgetMatrixRuns backend p2 p3 G ∧
+      Rel sm ![![labelKeyG hashModel q0 n d0 inputs.2.1 p0 (Int.ofNat i) 0,
+          labelKeyG hashModel q0 n d0 inputs.2.1 p6 (Int.ofNat i) 1],
+        ![labelKeyG hashModel q0 n d0 inputs.2.1 p1 (Int.ofNat i) 2,
+          labelKeyG hashModel q0 n d0 inputs.2.1 p7 (Int.ofNat i) 3]]
+        (fun j ↦ reducePoly q0 n
+          (message (n := n) inputs.2.2.2.1 inputs.2.2.2.2.1 * unitPair sm j) • G)
+        ![outputs.1, outputs.2.1] p5.toNat ∧
+      outputs.2.2.1 = fun _ _ ↦ reducePoly q0 n (message (n := n) inputs.2.2.2.1 inputs.2.2.2.2.1) := by
+  subst hp8 hp9
+  obtain ⟨v0, v1, v2, v3, v4, v5, v6, a0, a1, a2, a3, a4, a5, a6, rfl⟩ := h
+  rw [← labelKeyG_of a0, ← labelKeyG_of a1, ← labelKeyG_of a4, ← labelKeyG_of a5]
+  obtain ⟨hr, hμ⟩ := encLabel_gen hsm hone _ _ _ _ v2 _ _ rfl a3 a6 rfl rfl
+  exact ⟨v2, a2, hr, hμ⟩
 
 /-! ## LUT branch keys -/
 

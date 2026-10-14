@@ -2051,15 +2051,10 @@ impl<S: SessionStore> Executor<'_, S> {
                         let value = self.materialize_value(value)?;
                         self.value_for_placement(value, placement)?
                     }
-                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
-                        let offset = match mode {
-                            LoopInputMode::Zip => 0,
-                            LoopInputMode::ZipOffset { offset } => *offset,
-                            LoopInputMode::Broadcast | LoopInputMode::Gather { .. } => {
-                                unreachable!()
-                            }
-                        };
-                        let index = index.checked_add(offset).ok_or(
+                    LoopInputMode::Zip |
+                    LoopInputMode::ZipOffset { .. } |
+                    LoopInputMode::ZipQuotient { .. } => {
+                        let index = mode.zipped_member(index).ok_or(
                             ExecutionError::SelectIndexOutOfRange {
                                 node: node.id,
                                 index: BigInt::from(index),

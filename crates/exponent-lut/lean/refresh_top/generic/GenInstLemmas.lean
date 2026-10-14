@@ -17,6 +17,41 @@ open scoped BigOperators
 
 variable {n : Nat}
 
+/-- The steps of an iteration satisfy `P` when every body step does. -/
+theorem steps_of {σ : Type} {body : Nat → σ → σ → Prop} {count : Nat} {init final : σ}
+    (h : MxxIR.IterRuns body count init final) {P : Nat → σ → σ → Prop}
+    (hs : ∀ i cur next, body i cur next → P i cur next) : MxxIR.IterRuns P count init final :=
+  RefreshTopProof.GenIface.seq_forall P hs h
+
+/-- A six-family Gather loop whose child relation `P` implies `Q`: every iteration's `Q` holds at
+the table entry's members. -/
+theorem gather_sem {α : Type} {F K : Nat} {f0 f1 f2 f3 f4 f5 : Fin K → α} {t : Fin F → Int}
+    (P : Fin F → Int → α → α → α → α → α → α → Prop)
+    (h : ∀ i : Fin F, ∃ x0 x1 x2 x3 x4 x5 : α,
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f0 (t i) x0 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f1 (t i) x1 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f2 (t i) x2 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f3 (t i) x3 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f4 (t i) x4 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f5 (t i) x5 ∧
+      P i (t i) x0 x1 x2 x3 x4 x5)
+    {Q : Fin F → Int → α → α → α → α → α → α → Prop}
+    (hs : ∀ i ti x0 x1 x2 x3 x4 x5, P i ti x0 x1 x2 x3 x4 x5 → Q i ti x0 x1 x2 x3 x4 x5)
+    (i : Fin F) : ∃ k : Fin K, ((k : Nat) : Int) = t i ∧ Q i (t i) (f0 k) (f1 k) (f2 k) (f3 k) (f4 k) (f5 k) :=
+  (Gen.gather_loop6 P h i).imp fun _ hk ↦ ⟨hk.1, hs _ _ _ _ _ _ _ _ hk.2⟩
+
+/-- `gather_sem` for a three-family Gather loop (`Gen.gather_loop3`). -/
+theorem gather_sem3 {α β γ : Type} {F K : Nat} {f0 : Fin K → α} {f1 : Fin K → β} {f2 : Fin K → γ}
+    {t : Fin F → Int} (P : Fin F → Int → α → β → γ → Prop)
+    (h : ∀ i : Fin F, ∃ (x0 : α) (x1 : β) (x2 : γ),
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f0 (t i) x0 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f1 (t i) x1 ∧
+      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f2 (t i) x2 ∧
+      P i (t i) x0 x1 x2)
+    {Q : Fin F → Int → α → β → γ → Prop} (hs : ∀ i ti x0 x1 x2, P i ti x0 x1 x2 → Q i ti x0 x1 x2)
+    (i : Fin F) : ∃ k : Fin K, ((k : Nat) : Int) = t i ∧ Q i (t i) (f0 k) (f1 k) (f2 k) :=
+  (Gen.gather_loop3 P h i).imp fun _ hk ↦ ⟨hk.1, hs _ _ _ _ _ hk.2⟩
+
 /-- A row sum is the sum of the member's cells. -/
 theorem rowSum_get {α : Type} [AddCommMonoid α] {M W k : Nat} {fams : Tup (Fin (M * W) → α) k}
     {o : Fin M} {out : Tup α k} (h : RowSum.Spec fams W o out) (c : Fin k) :

@@ -45,33 +45,6 @@ set_option maxHeartbeats 4000000
 set_option maxRecDepth 16384
 set_option linter.unusedVariables false
 
-namespace RefreshTopProof.GenInst
-
-/-- The steps of an iteration satisfy `P` when every body step does. -/
-theorem steps_of {{σ : Type}} {{body : Nat → σ → σ → Prop}} {{count : Nat}} {{init final : σ}}
-    (h : MxxIR.IterRuns body count init final) {{P : Nat → σ → σ → Prop}}
-    (hs : ∀ i cur next, body i cur next → P i cur next) : MxxIR.IterRuns P count init final :=
-  RefreshTopProof.GenIface.seq_forall P hs h
-
-/-- A six-family Gather loop whose child relation `P` implies `Q`: every iteration's `Q` holds at
-the table entry's members. -/
-theorem gather_sem {{α : Type}} {{F K : Nat}} {{f0 f1 f2 f3 f4 f5 : Fin K → α}} {{t : Fin F → Int}}
-    (P : Fin F → Int → α → α → α → α → α → α → Prop)
-    (h : ∀ i : Fin F, ∃ x0 x1 x2 x3 x4 x5 : α,
-      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f0 (t i) x0 ∧
-      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f1 (t i) x1 ∧
-      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f2 (t i) x2 ∧
-      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f3 (t i) x3 ∧
-      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f4 (t i) x4 ∧
-      0 ≤ t i ∧ t i < K ∧ MxxRuntime.familyGetDynamic f5 (t i) x5 ∧
-      P i (t i) x0 x1 x2 x3 x4 x5)
-    {{Q : Fin F → Int → α → α → α → α → α → α → Prop}}
-    (hs : ∀ i ti x0 x1 x2 x3 x4 x5, P i ti x0 x1 x2 x3 x4 x5 → Q i ti x0 x1 x2 x3 x4 x5)
-    (i : Fin F) : ∃ k : Fin K, ((k : Nat) : Int) = t i ∧ Q i (t i) (f0 k) (f1 k) (f2 k) (f3 k) (f4 k) (f5 k) :=
-  (Gen.gather_loop6 P h i).imp fun _ hk ↦ ⟨hk.1, hs _ _ _ _ _ _ _ _ hk.2⟩
-
-end RefreshTopProof.GenInst
-
 namespace RefreshTopProof.GenInst.{ns}
 
 open {module} RefreshTopProof.GenInst RefreshTopProof.GenIface RefreshTopProof.GenIface.BrLut RefreshTopProof.Gen
@@ -97,7 +70,8 @@ def adapters(path):
 
 
 def gather_P(ftype, child):
-    """`P` of `Gen.gather_loop6` from a gather field `(∀ i : Fin F, ∃ x : T, …, conj ∧ child …)`."""
+    """`P` of `Gen.gather_loop6` (six families) or `Gen.gather_loop3` (three: a Program in its own
+    stages) from a gather field `(∀ i : Fin F, ∃ x : T, …, conj ∧ child …)`."""
     s = xmodel.strip_parens(ftype)
     m = re.match(r'^∀ (\w+) : Fin (\d+), ', s)
     var, body = m.group(1), s[m.end():]
@@ -111,7 +85,7 @@ def gather_P(ftype, child):
     conj = [c.strip() for c in xmodel.split_top(body, ' ∧ ')]
     t = conj[0].split('≤', 1)[1].strip()
     call = conj[-1]
-    if len(binders) != 6 or not call.startswith(child + ' '):
+    if len(binders) not in (3, 6) or not call.startswith(child + ' '):
         return None
     call = call.replace(t, 'ti')
     return f'(fun {var} ti {" ".join(binders)} ↦ {call})'
@@ -185,14 +159,18 @@ def gen_module(gdir, module, adir, roles):
             if P is None:
                 notes.append(f'-- {field}: gather of `{child}` ({role}) not of the six-family form')
                 continue
+            three = len(P.split(' ↦ ')[0].split()) == 6  # `(fun i ti x0 x1 x2`
+            sem = 'gather_sem3' if three else 'gather_sem'
+            under = '_ ' * (5 if three else 8)
             steps.append(f'  -- {role}: gather[{L["count"]}] {child}\n'
-                         f'  node_have {name} := gather_sem {P} {ref}\n'
-                         f'    (fun _ _ _ _ _ _ _ _ hc ↦ {child}.sem hc)')
+                         f'  node_have {name} := {sem} {P} {ref}\n'
+                         f'    (fun {under}hc ↦ {child}.sem hc)')
         elif L['kind'] == 'seq':
             steps.append(f'  -- {role}: seq[{L["count"]}] {child}\n'
                          f'  node_have {name} := steps_of {ref} (fun _ _ _ hb ↦ {child}.sem hb)')
     hyps = ''
-    if module == 'Stage_encrypt':
+    ba = bundle_adapters(f'{adir}/Gen_{module}_Scopes.lean')
+    if module.endswith('_encrypt'):
         I = xsem.Inst(ij, fields, inst)
         sec = secret_inputs(gdir, module, scopes, inst)
         names = {}
@@ -208,7 +186,6 @@ def gen_module(gdir, module, adir, roles):
             if mm:
                 return f'RefreshTopProof.GenInst.Certs.{module}.{mm.group(1)}_gt i_0'
             return 'by decide'
-        ba = bundle_adapters(f'{adir}/Gen_{module}_Scopes.lean')
         ssteps, snotes = xsem.enc_steps(I, M, roles, ba, gt)
         steps += M.haves + ssteps
         notes += ['-- ' + x for x in snotes]
@@ -237,17 +214,19 @@ abbrev S : Nat := {S}
                     keyths.append(kt)
             elif L['kind'] == 'gather' and role == 'prf.cell0':
                 P = gather_P(fields[a['field']][1], L['child'])
-                segs.append(xsem.emit_cell0(I, a, C, P, scopes[L['child']].to_json()['atoms'], f'seg_{a["field"]}'))
+                emit = xsem.emit_cell0_1 if ba.get(L['child'], '').endswith('_1') else xsem.emit_cell0
+                segs.append(emit(I, a, C, P, scopes[L['child']].to_json()['atoms'], f'seg_{a["field"]}'))
             elif L['kind'] == 'par' and role in xsem.MEMBER_BRIDGE:
                 s = xsem.emit_lut_member(I, a, C, role, scopes, f'seg_{a["field"]}')
                 if s:
                     segs.append(s)
             elif L['kind'] == 'gather' and role == 'prf.cell1':
                 P = gather_P(fields[a['field']][1], L['child'])
-                segs.append(xsem.emit_cell1(I, a, C, P, scopes[L['child']].to_json()['atoms'], f'seg_{a["field"]}'))
-        except (KeyError, StopIteration, AttributeError, IndexError) as e:
+                emit = xsem.emit_cell1_1 if ba.get(L['child'], '').endswith('_1') else xsem.emit_cell1
+                segs.append(emit(I, a, C, P, scopes[L['child']].to_json()['atoms'], f'seg_{a["field"]}'))
+        except (KeyError, StopIteration, AttributeError, IndexError, ValueError) as e:
             notes.append(f'-- segment {a["field"]} ({role}) not matched: {e!r}')
-    if module == 'Stage_online_eval':
+    if module.endswith('_online_eval'):
         for r in xsem.root_private_match(I):
             try:
                 segs.append(xsem.emit_root_private(I, r, C, f'seg_{r["both"]["field"]}'))
@@ -255,7 +234,7 @@ abbrev S : Nat := {S}
             except (KeyError, StopIteration, AttributeError, IndexError) as e:
                 notes.append(f'-- private multiplication {r["both"]["field"]} not matched: {e!r}')
     chains_text = ''
-    if module == 'Stage_online_eval':
+    if module.endswith('_online_eval'):
         segd = {}
         for s in segs:
             m = re.match(r'theorem (seg_\S+) ', s)

@@ -4,16 +4,25 @@
 //!
 //! The refresh ([`mxx_exponent_lut::refresh`]) of an exponent LUT output `x = X^(1 - b)` on
 //! the private input `X^b` ([`bit_flip_source`]) re-encrypts it as both rows of a level-0
-//! encoding under a new PRF-derived mask `sigma = (sigma_0, 1)`, in the format of a reference
-//! chain. It refreshes the first `SLOTS` CRT slots of `Q_0`: [`RnsBggRefresh::run`] evaluates the
-//! source Program on one chain per refreshed prime `q` and, on every chain, runs the two parts
-//! (one per component) through preprocessing, encryption and online evaluation (see
-//! [`mxx_exponent_lut::rns_bgg::RnsBggRefresh`]).
+//! encoding under a new mask `sigma = (sigma_0, 1)` and a public `A'`, both chosen here, in the
+//! format of a reference chain. It refreshes the first `SLOTS` CRT slots of `Q_0`:
+//! [`RnsBggRefresh::run`] evaluates the source Program on one chain per refreshed prime `q` and,
+//! on every chain, runs the two parts (one per component) through preprocessing, encryption and
+//! online evaluation (see [`mxx_exponent_lut::rns_bgg::RnsBggRefresh`]).
+//!
+//! The test provides the refresh's caller inputs (see
+//! [Caller inputs](mxx_exponent_lut::refresh#caller-inputs)): `A'` hash-sampled from the stage
+//! hash key under `MATRIX_TAG`, and, for every chain (shared by its two parts), the encoding of
+//! `sigma_0 G` under the run's secrets: the binary sparse-LWR PRF Program of `n` samples modulo the
+//! chain's output prime ([`FreshNoiseProgram`] with [`PrfDistribution::Binary`]) on its own keys
+//! (one key set, `n` keys, shared by every chain) and the invocation's label, preprocessed,
+//! encrypted and evaluated once per chain under a hash namespace derived from the chain's, on the
+//! chain's child chain with gadget outputs.
 //!
 //! The residues of every chain are recombined modulo the product `P` of the refreshed primes, and
 //! the round trip checks that `y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` modulo `P` is exactly
 //! the fresh CBD samples of component `j`'s PRF keys on the label, with `sigma_0` the bits of the
-//! mask keys, and that every refreshed coefficient decodes to zero.
+//! test's sigma keys, and that every refreshed coefficient decodes to zero.
 //!
 //! The reference has `PRIMES` primes of `CRT_BITS` bits (ring dimension `RING_DIMENSION`, base
 //! `2^BASE_BITS`) at level 0 and one fewer at level 1; the source chains have
@@ -50,11 +59,12 @@
 //!
 //! The noise and the graphs depend on the key shapes only. The digit search, `SIMULATE_ONLY` and an
 //! `EXPORT_ONLY` run without a recorded set generate no PRF keys: they declare each key set by a
-//! commitment derived from `KEY_SEED` and its role ([`PrfSettings::declared_shape`]). A round trip
-//! generates its keys (one layout per PRF member) and commits to their digests, as does the
-//! export of a recorded set, so that it is the claim its round trip exports. An export binds the
-//! children's selector plaintexts, tables and PRF inputs by shape only, and states the claim of
-//! the recorded graphs ([`RefreshRun::protocol`]).
+//! commitment derived from `KEY_SEED` and its role ([`PrfSettings::declared_shape`]; the sigma keys
+//! have the role `sigma`). A round trip generates its keys (one layout per PRF member) and commits
+//! to their digests, as does the export of a recorded set, so that it is the claim its round trip
+//! exports. An export binds the selector plaintexts, tables and PRF inputs of the children and of
+//! the sigma Programs by shape only, and states the claim of the recorded graphs
+//! ([`RefreshRun::protocol`]).
 mod common;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
@@ -74,14 +84,21 @@ use mxx_backends::{
 };
 use mxx_exponent_lut::{
     api,
-    program::{InputBinding, WireId},
-    refresh::{PrfSettings, RefreshDeclaration, TopReference, bit_flip_source},
-    rns_bgg::{RefreshRun, RnsBggRefresh, refresh_noise_accepted},
+    program::{InputBinding, ProgramData, WireId},
+    program_gadgets::{pbc::PbcGeneratedKeyLayout, prf::PrfKeyShape, prf_sampler::PrfDistribution},
+    refresh::{FreshNoiseProgram, PrfSettings, RefreshDeclaration, TopReference, bit_flip_source},
+    rns_bgg::{
+        REFRESH_MATRIX_INPUT, RefreshRun, RefreshSigma, RefreshSigmaRequest, RnsBggRefresh,
+        RnsEncryptBuild, RnsOnlineEvalBuild, RnsOutputUse, RnsPreprocessBuild,
+        refresh_noise_accepted,
+    },
     utils::env_usize,
 };
-use mxx_ir_core::ValidatedGraph;
+use mxx_ir_core::{IntExpr, ParamEnv, ValidatedGraph};
 use num_bigint::{BigInt, BigUint};
+use rand::{SeedableRng, rngs::StdRng};
 use serial_test::serial as sequential;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env};
 
 const PREFIX: &str = "MXX_EXPONENT_LUT_REFRESH_TOP_";
@@ -90,7 +107,7 @@ const PREFIX: &str = "MXX_EXPONENT_LUT_REFRESH_TOP_";
 const HASH_KEY: &[u8; 32] = b"refresh-top-rns-public-api-key-1";
 const CONTEXT: [u8; 32] = *b"refresh-top-rns-public-api-ctx-1";
 const LABEL_TAG: &[u8] = b"top-invocation-0";
-/// The tag of the refresh's hash-sampled matrix `A'`.
+/// The tag of the test's hash-sampled matrix `A'`.
 const MATRIX_TAG: &[u8] = b"top-refresh-round-trip";
 
 type ParameterRow = BTreeMap<String, String>;
@@ -214,9 +231,213 @@ impl api::StageExecution<api::StageStore> for GraphOnly {
     }
 }
 
-/// The accepted refresh of the settings (or of the recorded row `row`) and the source input
-/// `X^b`.
-fn setup(row: Option<&ParameterRow>) -> (RnsBggRefresh, WireId) {
+/// The test's sigma keys: `n` keys shared by every part, generated (from `KEY_SEED` under the role
+/// `sigma`) whenever the refresh's keys are, else only declared.
+struct SigmaKeys {
+    shape: PrfKeyShape,
+    layouts: Option<Vec<PbcGeneratedKeyLayout>>,
+}
+
+impl SigmaKeys {
+    fn new(prf: &PrfSettings, seed: u64, n: usize, generate: bool) -> Self {
+        if !generate {
+            let shape = prf.declared_shape(seed, "sigma", n).expect("declared sigma keys");
+            return Self { shape, layouts: None };
+        }
+        let digest = Sha256::new()
+            .chain_update(b"refresh-top-test/sigma-keys")
+            .chain_update(seed.to_le_bytes());
+        let mut rng = StdRng::from_seed(digest.finalize().into());
+        let layouts = prf.generate_keys(&mut rng, n).expect("sigma keys");
+        let public = layouts.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+        Self { shape: PrfKeyShape::new(&public).expect("sigma key shape"), layouts: Some(layouts) }
+    }
+
+    /// The binary PRF Program of `n` samples modulo chain `chain`'s output prime.
+    fn program(&self, top: &RefreshDeclaration, chain: usize) -> FreshNoiseProgram {
+        FreshNoiseProgram::with_distribution(
+            *top.profile(),
+            PrfDistribution::Binary { q_min: top.output_prime(chain).expect("output prime") },
+            1,
+            top.reference().ring_dimension as usize,
+            self.shape.clone(),
+        )
+        .expect("sigma Program")
+    }
+
+    /// The bits of `sigma_0` on the invocation's label, as a polynomial of the reference's level
+    /// 0: coefficient `k` is one exactly when the sample of key `k` is `+h`.
+    fn polynomial(&self, refresh: &RnsBggRefresh) -> DCRTPoly {
+        let layouts = self.layouts.as_ref().expect("a round trip generates the sigma keys");
+        let label = refresh.top.label(*HASH_KEY, LABEL_TAG).expect("label");
+        let bits = self
+            .program(&refresh.top, 0)
+            .samples(layouts, &label)
+            .expect("sigma samples")
+            .into_iter()
+            .map(|sample| BigUint::from(u8::from(sample > 0)))
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints(&refresh.reference.levels()[0], &bits)
+    }
+
+    /// Chain `request.chain`'s encoding of `sigma_0 G`: the binary PRF Program on the chain's
+    /// child chain, under a hash namespace derived from the chain's, preprocessed with gadget
+    /// outputs, encrypted on the label under the run's secrets and evaluated (by shape only for
+    /// a record-only run).
+    fn encode<E: api::StageExecution<api::StageStore>>(
+        &self,
+        top: &RefreshDeclaration,
+        source: &mxx_exponent_lut::ExponentLutProgram,
+        request: RefreshSigmaRequest<'_>,
+        execution: &mut E,
+        store: &mut api::StageStore,
+    ) -> Result<RefreshSigma, api::ApiError> {
+        let chain = request.chain;
+        let program = self.program(top, chain);
+        let chains = request.chains;
+        let parameters = chains
+            .source
+            .refresh_child_parameters(top, chain, source, &program, &chains.pool, 1)
+            .expect("sigma chain");
+        let namespace: [u8; 32] = Sha256::new()
+            .chain_update(b"refresh-top-test/sigma-namespace")
+            .chain_update(top.chain_namespace(chain))
+            .finalize()
+            .into();
+        let level = parameters.levels()[0].clone();
+        let payload = request.payload.at_level(&parameters, 0).expect("sigma payload secret");
+        let mask = request.mask.at_level(&parameters, 0).expect("sigma mask secret");
+        let env = ParamEnv::default();
+        let values = match (&self.layouts, request.record_only) {
+            (Some(layouts), false) => {
+                let label = top.label(*HASH_KEY, LABEL_TAG).expect("label");
+                let (rhs, data) =
+                    program.sampler().key_inputs::<DCRTPoly>(&level, layouts).expect("sigma keys");
+                let lhs = program
+                    .sampler()
+                    .plaintext_inputs::<DCRTPoly>(&level, &label)
+                    .expect("sigma label");
+                Some((rhs, data, lhs))
+            }
+            (None, false) => panic!("an executed refresh generates the sigma keys"),
+            (_, true) => None,
+        };
+        let context = request.context;
+        let mut preprocess = RnsPreprocessBuild::new(&parameters, context)
+            .with_hash_namespace(namespace)
+            .with_output_use(RnsOutputUse::Gadget);
+        let mut encrypt = RnsEncryptBuild::new(&parameters, context).with_hash_namespace(namespace);
+        let mut online = RnsOnlineEvalBuild::new(&parameters, context)
+            .with_hash_namespace(namespace)
+            .with_output_use(RnsOutputUse::Gadget);
+        let (rhs, lhs) = match values {
+            Some((rhs, data, lhs)) => {
+                preprocess = preprocess.with_data(data.clone());
+                online = online.with_data(data);
+                (rhs, lhs)
+            }
+            None => {
+                preprocess = preprocess.with_inputs_by_shape().with_data(ProgramData::new());
+                encrypt = encrypt.with_inputs_by_shape();
+                online = online.with_inputs_by_shape();
+                (BTreeMap::new(), BTreeMap::new())
+            }
+        };
+        let (prepared, prepared_online) = api::preprocess(
+            program.program(),
+            &env,
+            &rhs,
+            Some(&payload),
+            HASH_KEY,
+            preprocess,
+            execution,
+            store,
+            |_, outputs| Ok(outputs),
+            request.record("preprocess"),
+        )?;
+        let encrypted = api::encrypt(
+            &program.program().encryption_inputs(),
+            &env,
+            &lhs,
+            Some(&prepared),
+            &payload,
+            Some(&mask),
+            HASH_KEY,
+            encrypt,
+            execution,
+            store,
+            |_| Ok(()),
+            request.record("encrypt"),
+        )?;
+        let online_eval = api::online_eval(
+            program.program(),
+            &env,
+            &prepared_online,
+            &encrypted,
+            HASH_KEY,
+            online,
+            execution,
+            store,
+            |_, outputs| Ok(outputs),
+            request.record("online_eval"),
+        )?;
+        Ok(RefreshSigma {
+            program,
+            namespace,
+            preprocess: prepared_online,
+            encryption: encrypted.production().clone(),
+            online_eval,
+        })
+    }
+}
+
+/// The test's `A' = [A'_(0) | A'_(1)]`: `2 x 2 w_0` over the reference's level-0 ring, each half
+/// hash-sampled from the stage hash key under [`MATRIX_TAG`] and its component on `execution` (none
+/// from an execution that yields no outputs), and the graph that sampled it (the claim's stage
+/// `a_prime`, output [`REFRESH_MATRIX_INPUT`]).
+fn sample_a_prime<E: api::StageExecution<api::StageStore>>(
+    refresh: &RnsBggRefresh,
+    execution: &mut E,
+    store: &mut api::StageStore,
+) -> (Option<RuntimeValue>, mxx_ir_core::Graph) {
+    let reference = refresh.top.reference();
+    let ring = mxx_dsl::Ring::from_crt_moduli(
+        reference.top.iter().copied().map(IntExpr::from).collect(),
+        reference.ring_dimension,
+    );
+    let key = ring.bytes_input("refresh-top-test/a-prime-key", HASH_KEY.len());
+    // Two independent uniform halves `A'_(0)` and `A'_(1)`, side by side.
+    let half = |component: u8| {
+        ring.hash_matrix(key.clone(), [MATRIX_TAG, &[component]].concat(), (2, reference.columns()))
+    };
+    let a_prime =
+        mxx_dsl::Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![half(0), half(1)]);
+    let graph = mxx_dsl::DslContext::new("refresh-top-test-a-prime")
+        .output(REFRESH_MATRIX_INPUT, a_prime)
+        .and_then(mxx_dsl::DslContext::build)
+        .expect("A' graph");
+    let runtime = BTreeMap::from([(
+        "refresh-top-test/a-prime-key".to_owned(),
+        RuntimeValue::Bytes(HASH_KEY.as_slice().into()),
+    )]);
+    let mut recorded = None;
+    let mut outputs = api::execute_graph(
+        api::StageGraph::new(graph, runtime, BTreeMap::new()),
+        &ParamEnv::default(),
+        execution,
+        store,
+        |validated| {
+            recorded = Some(validated.source.clone());
+            Ok(())
+        },
+    )
+    .expect("A' sampling");
+    (outputs.outputs.remove(REFRESH_MATRIX_INPUT), recorded.expect("the A' graph is observed"))
+}
+
+/// The accepted refresh of the settings (or of the recorded row `row`), the source input `X^b`
+/// and the test's sigma keys.
+fn setup(row: Option<&ParameterRow>) -> (RnsBggRefresh, WireId, SigmaKeys) {
     let primes = row_setting(row, "primes", "PRIMES", 4);
     assert!(primes >= 3, "{PREFIX}PRIMES must be at least 3");
     let slots = row_setting(row, "slots", "SLOTS", 1);
@@ -259,12 +480,26 @@ fn setup(row: Option<&ParameterRow>) -> (RnsBggRefresh, WireId) {
             extension.clone(),
             digits,
             (seed, generate),
-            MATRIX_TAG.to_vec(),
         )
         .expect("top refresh declaration")
     };
+    // The noise and the graphs depend on the key shapes only: the digit search declares them,
+    // and only a run that executes the stages, or exports a recorded set (whose claim is then the
+    // one its round trip exports), generates the keys.
+    let generate = !simulate_only() && (!export_only() || row.is_some());
+    let sigma_keys = SigmaKeys::new(&prf, seed, ring_dimension, generate);
     let fits = |top: &RefreshDeclaration| {
-        refresh_noise_accepted(top, &source, &sigma, trapdoor, bits, failure_exponent)
+        // The error of every chain's encoding of `sigma_0 G`: the binary PRF Program's carrier.
+        let sigma_noise =
+            |chain: usize, chains: &mxx_exponent_lut::rns_bgg::RefreshChain, average: &_| {
+                let program = sigma_keys.program(top, chain);
+                chains
+                    .source
+                    .refresh_child_parameters(top, chain, &source, &program, &chains.pool, 1)
+                    .map_err(|error| api::ApiError::Input { message: error.to_string() })?
+                    .refresh_carrier_noise(&program, Some(average))
+            };
+        refresh_noise_accepted(top, &source, &sigma, trapdoor, bits, failure_exponent, sigma_noise)
             .expect("refresh noise")
     };
     // A recorded set or `DIGITS` fixes the digit count; otherwise the smallest one in
@@ -276,10 +511,7 @@ fn setup(row: Option<&ParameterRow>) -> (RnsBggRefresh, WireId) {
             .expect("a fitting and hiding digit count"),
         (None, digits) => digits,
     };
-    // The noise depends on the key shapes only: the digit search declares them, and only a run
-    // that executes the stages, or exports a recorded set (whose claim is then the one its round
-    // trip exports), generates the keys.
-    let (top, keys) = refresh(digits, !simulate_only() && (!export_only() || row.is_some()));
+    let (top, keys) = refresh(digits, generate);
     assert!(fits(&top), "the digit count {digits} fits and hides");
     let refresh =
         RnsBggRefresh::new(top, source, keys, &sigma, trapdoor_sigma).expect("refresh chains");
@@ -291,7 +523,7 @@ fn setup(row: Option<&ParameterRow>) -> (RnsBggRefresh, WireId) {
         reference.columns()
     );
     security_gate(&refresh, setting("SECURITY_BITS", 0) as u64);
-    (refresh, input)
+    (refresh, input, sigma_keys)
 }
 
 /// `SECURITY_BITS > 0`: the estimated security of the encodings and of the refreshed output
@@ -317,9 +549,9 @@ fn security_gate(refresh: &RnsBggRefresh, target: u64) {
 
 /// Every part's stages on `runtime`, the decode stage, and, for a recorded set, the export of
 /// the claim of the recorded graphs.
-fn round_trip(
-    (refresh, input): (RnsBggRefresh, WireId),
-    runtime: &mut impl api::StageExecution<api::StageStore>,
+fn round_trip<E: api::StageExecution<api::StageStore>>(
+    (refresh, input, sigma_keys): (RnsBggRefresh, WireId, SigmaKeys),
+    runtime: &mut E,
     mut store: api::StageStore,
     recorded: Option<(String, ParameterRow)>,
 ) {
@@ -327,19 +559,40 @@ fn round_trip(
     let lhs = |level: &DCRTPolyParams| {
         BTreeMap::from([(input, InputBinding::Scalar(DCRTPoly::const_rotate_poly(level, bit)))])
     };
+    let (a_prime, a_prime_graph) = sample_a_prime(&refresh, runtime, &mut store);
     let mut run = refresh
-        .run((CONTEXT, *HASH_KEY, LABEL_TAG), export_only(), lhs, runtime, &mut store)
+        .run(
+            (CONTEXT, *HASH_KEY, LABEL_TAG),
+            export_only(),
+            a_prime,
+            lhs,
+            |request, execution: &mut E, store| {
+                sigma_keys.encode(&refresh.top, &refresh.source, request, execution, store)
+            },
+            runtime,
+            &mut store,
+        )
         .expect("top refresh stages");
     let expected = DCRTPoly::const_rotate_poly(&refresh.reference.levels()[0], 1 - bit);
     if export_only() {
-        let decoded = run.decode(&refresh, &expected, runtime, &mut store);
+        // The graph does not depend on `sigma_0`.
+        let zero = DCRTPoly::const_zero(&refresh.reference.levels()[0]);
+        let decoded = run.decode(&refresh, &zero, &expected, runtime, &mut store);
         assert!(decoded.is_err(), "the export-only decode graph is not executed");
         let directory = export_directory(recorded.as_ref());
-        export_claim(&directory, recorded.as_ref().map(|(_, row)| row), &refresh, &run);
+        export_claim(
+            &directory,
+            recorded.as_ref().map(|(_, row)| row),
+            &refresh,
+            &run,
+            &a_prime_graph,
+        );
         return;
     }
     let keys = refresh.keys.as_ref().expect("a round trip generates the keys");
-    let errors = run.error(&refresh, &expected, runtime, &mut store).expect("top refresh error");
+    let sigma = sigma_keys.polynomial(&refresh);
+    let errors =
+        run.error(&refresh, &sigma, &expected, runtime, &mut store).expect("top refresh error");
     for (component, rows) in errors.iter().enumerate() {
         let fresh = keys
             .fresh_noise(&refresh.top, component, *HASH_KEY, LABEL_TAG)
@@ -349,7 +602,8 @@ fn round_trip(
             assert_eq!(coefficients, &expected, "component {component}, column {column}");
         }
     }
-    let decoded = run.decode(&refresh, &expected, runtime, &mut store).expect("top refresh decode");
+    let decoded =
+        run.decode(&refresh, &sigma, &expected, runtime, &mut store).expect("top refresh decode");
     assert_eq!(decoded, BigInt::from(0), "every refreshed coefficient decodes to zero");
     eprintln!(
         "top refresh round trip: X^{} re-encrypted over {} chains with fresh error at most 1",
@@ -358,7 +612,7 @@ fn round_trip(
     );
     if let Some(recorded) = &recorded {
         let directory = export_directory(Some(recorded));
-        export_claim(&directory, Some(&recorded.1), &refresh, &run);
+        export_claim(&directory, Some(&recorded.1), &refresh, &run, &a_prime_graph);
     }
 }
 
@@ -392,15 +646,18 @@ fn export_directory(recorded: Option<&(String, ParameterRow)>) -> std::path::Pat
     }
 }
 
-/// Export the claim of the recorded run `run` of `refresh` to `directory`.
+/// Export the claim of the recorded run `run` of `refresh`, whose `A'` the graph `a_prime`
+/// sampled, to `directory`.
 fn export_claim(
     directory: &std::path::Path,
     row: Option<&ParameterRow>,
     refresh: &RnsBggRefresh,
     run: &RefreshRun,
+    a_prime: &mxx_ir_core::Graph,
 ) {
-    let protocol =
-        run.protocol(refresh, claim_failure_exponent(row)).expect("valid top refresh protocol");
+    let protocol = run
+        .protocol(refresh, claim_failure_exponent(row), Some((a_prime, REFRESH_MATRIX_INPUT)))
+        .expect("valid top refresh protocol");
     mxx_ir_core::lean::protocol::export(&protocol, directory, lean_facts())
         .expect("top refresh claim export");
     eprintln!("exported the top refresh correctness claim to {}", directory.display());

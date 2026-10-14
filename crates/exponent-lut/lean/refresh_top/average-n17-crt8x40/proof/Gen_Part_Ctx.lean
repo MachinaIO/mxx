@@ -10,40 +10,76 @@ namespace RefreshTopProof.GenPartCtx
 
 open GeneratedClaim RefreshTopProof.StageLinks
 
+/-- The instance `i` of `W_Stage_sigma_preprocess` in a run: contexts, facts and the stage-link hypotheses. -/
+theorem inst_Stage_sigma_preprocess {model : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
+    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin 8) :
+    ∃ (rM : W_Stage_sigma_preprocess.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_3_params) (cM : W_Stage_sigma_preprocess.parallel_generatedRoot_172.Ctx Backend.backend model W_GeneratedClaim.stage_3_params (i : Nat)),
+      W_Stage_sigma_preprocess.parallel_generatedRoot_172.Facts cM (W_Stage_sigma_preprocess.rootOuts rM i) ∧ execution.«stage_3» = W_Stage_sigma_preprocess.generatedRoot.outs rM ∧
+      W_Stage_sigma_preprocess.rootOuts rM i = W_Stage_sigma_preprocess.parallel_generatedRoot_172.outs cM ∧ cM.inputs = W_Stage_sigma_preprocess.rootArgs rM i ∧
+      rM.inputs = W_Stage_sigma_preprocess.claimArgs external execution := by
+  obtain ⟨w, hb⟩ := hR.2.2.2.2.1
+  have FR := W_Stage_sigma_preprocess.generatedRoot.facts (⟨_, w⟩ : W_Stage_sigma_preprocess.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_3_params) hb
+  obtain ⟨wi, FI⟩ := W_Stage_sigma_preprocess.generatedRoot.h172_147_at FR i
+  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c68.hout, rfl, rfl⟩
+
+/-- The instance `i` of `W_Stage_sigma_encrypt` in a run: contexts, facts and the stage-link hypotheses. -/
+theorem inst_Stage_sigma_encrypt {model : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
+    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin 8) :
+    ∃ (rM : W_Stage_sigma_encrypt.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_4_params) (cM : W_Stage_sigma_encrypt.parallel_generatedRoot_7.Ctx Backend.backend model W_GeneratedClaim.stage_4_params (i : Nat)),
+      W_Stage_sigma_encrypt.parallel_generatedRoot_7.Facts cM (W_Stage_sigma_encrypt.rootOuts rM i) ∧ execution.«stage_4» = W_Stage_sigma_encrypt.generatedRoot.outs rM ∧
+      W_Stage_sigma_encrypt.rootOuts rM i = W_Stage_sigma_encrypt.parallel_generatedRoot_7.outs cM ∧ cM.inputs = W_Stage_sigma_encrypt.rootArgs rM i ∧
+      rM.inputs = W_Stage_sigma_encrypt.claimArgs external execution := by
+  obtain ⟨w, hb⟩ := hR.2.2.2.2.2.1
+  have FR := W_Stage_sigma_encrypt.generatedRoot.facts (⟨_, w⟩ : W_Stage_sigma_encrypt.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_4_params) hb
+  obtain ⟨wi, FI⟩ := W_Stage_sigma_encrypt.generatedRoot.h7_148_at FR i
+  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c4.hout, rfl, rfl⟩
+
+/-- The instance `i` of `W_Stage_sigma_online_eval` in a run: contexts, facts and the stage-link hypotheses. -/
+theorem inst_Stage_sigma_online_eval {model : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
+    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin 8) :
+    ∃ (rM : W_Stage_sigma_online_eval.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_5_params) (cM : W_Stage_sigma_online_eval.parallel_generatedRoot_188.Ctx Backend.backend model W_GeneratedClaim.stage_5_params (i : Nat)),
+      W_Stage_sigma_online_eval.parallel_generatedRoot_188.Facts cM (W_Stage_sigma_online_eval.rootOuts rM i) ∧ execution.«stage_5» = W_Stage_sigma_online_eval.generatedRoot.outs rM ∧
+      W_Stage_sigma_online_eval.rootOuts rM i = W_Stage_sigma_online_eval.parallel_generatedRoot_188.outs cM ∧ cM.inputs = W_Stage_sigma_online_eval.rootArgs rM i ∧
+      rM.inputs = W_Stage_sigma_online_eval.claimArgs external execution := by
+  obtain ⟨w, hb⟩ := hR.2.2.2.2.2.2.1
+  have FR := W_Stage_sigma_online_eval.generatedRoot.facts (⟨_, w⟩ : W_Stage_sigma_online_eval.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_5_params) hb
+  obtain ⟨wi, FI⟩ := W_Stage_sigma_online_eval.generatedRoot.h188_5_at FR i
+  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c87.hout, rfl, rfl⟩
+
 /-- The instance `i` of `W_Stage_preprocess` in a run: contexts, facts and the stage-link hypotheses. -/
 theorem inst_Stage_preprocess {model : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
-    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin S) :
-    ∃ (rM : W_Stage_preprocess.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_2_params) (cM : W_Stage_preprocess.parallel_generatedRoot_380.Ctx Backend.backend model W_GeneratedClaim.stage_2_params (i : Nat)),
-      W_Stage_preprocess.parallel_generatedRoot_380.Facts cM (W_Stage_preprocess.rootOuts rM i) ∧ execution.«stage_2» = W_Stage_preprocess.generatedRoot.outs rM ∧
-      W_Stage_preprocess.rootOuts rM i = W_Stage_preprocess.parallel_generatedRoot_380.outs cM ∧ cM.inputs = W_Stage_preprocess.rootArgs rM i ∧
+    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin 16) :
+    ∃ (rM : W_Stage_preprocess.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_6_params) (cM : W_Stage_preprocess.parallel_generatedRoot_211.Ctx Backend.backend model W_GeneratedClaim.stage_6_params (i : Nat)),
+      W_Stage_preprocess.parallel_generatedRoot_211.Facts cM (W_Stage_preprocess.rootOuts rM i) ∧ execution.«stage_6» = W_Stage_preprocess.generatedRoot.outs rM ∧
+      W_Stage_preprocess.rootOuts rM i = W_Stage_preprocess.parallel_generatedRoot_211.outs cM ∧ cM.inputs = W_Stage_preprocess.rootArgs rM i ∧
       rM.inputs = W_Stage_preprocess.claimArgs external execution := by
-  obtain ⟨w, hb⟩ := hR.2.2.2.1
-  have FR := W_Stage_preprocess.generatedRoot.facts (⟨_, w⟩ : W_Stage_preprocess.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_2_params) hb
-  obtain ⟨wi, FI⟩ := W_Stage_preprocess.generatedRoot.h380_427_at FR i
-  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c82.hout, rfl, rfl⟩
+  obtain ⟨w, hb⟩ := hR.2.2.2.2.2.2.2.1
+  have FR := W_Stage_preprocess.generatedRoot.facts (⟨_, w⟩ : W_Stage_preprocess.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_6_params) hb
+  obtain ⟨wi, FI⟩ := W_Stage_preprocess.generatedRoot.h211_241_at FR i
+  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c14.hout, rfl, rfl⟩
 
 /-- The instance `i` of `W_Stage_encrypt` in a run: contexts, facts and the stage-link hypotheses. -/
 theorem inst_Stage_encrypt {model : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
-    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin S) :
-    ∃ (rM : W_Stage_encrypt.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_3_params) (cM : W_Stage_encrypt.parallel_generatedRoot_45.Ctx Backend.backend model W_GeneratedClaim.stage_3_params (i : Nat)),
-      W_Stage_encrypt.parallel_generatedRoot_45.Facts cM (W_Stage_encrypt.rootOuts rM i) ∧ execution.«stage_3» = W_Stage_encrypt.generatedRoot.outs rM ∧
-      W_Stage_encrypt.rootOuts rM i = W_Stage_encrypt.parallel_generatedRoot_45.outs cM ∧ cM.inputs = W_Stage_encrypt.rootArgs rM i ∧
+    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin 16) :
+    ∃ (rM : W_Stage_encrypt.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_7_params) (cM : W_Stage_encrypt.parallel_generatedRoot_32.Ctx Backend.backend model W_GeneratedClaim.stage_7_params (i : Nat)),
+      W_Stage_encrypt.parallel_generatedRoot_32.Facts cM (W_Stage_encrypt.rootOuts rM i) ∧ execution.«stage_7» = W_Stage_encrypt.generatedRoot.outs rM ∧
+      W_Stage_encrypt.rootOuts rM i = W_Stage_encrypt.parallel_generatedRoot_32.outs cM ∧ cM.inputs = W_Stage_encrypt.rootArgs rM i ∧
       rM.inputs = W_Stage_encrypt.claimArgs external execution := by
-  obtain ⟨w, hb⟩ := hR.2.2.2.2.1
-  have FR := W_Stage_encrypt.generatedRoot.facts (⟨_, w⟩ : W_Stage_encrypt.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_3_params) hb
-  obtain ⟨wi, FI⟩ := W_Stage_encrypt.generatedRoot.h45_405_at FR i
-  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c13.hout, rfl, rfl⟩
+  obtain ⟨w, hb⟩ := hR.2.2.2.2.2.2.2.2.1
+  have FR := W_Stage_encrypt.generatedRoot.facts (⟨_, w⟩ : W_Stage_encrypt.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_7_params) hb
+  obtain ⟨wi, FI⟩ := W_Stage_encrypt.generatedRoot.h32_248_at FR i
+  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c8.hout, rfl, rfl⟩
 
 /-- The instance `i` of `W_Stage_online_eval` in a run: contexts, facts and the stage-link hypotheses. -/
 theorem inst_Stage_online_eval {model : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
-    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin S) :
-    ∃ (rM : W_Stage_online_eval.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_4_params) (cM : W_Stage_online_eval.parallel_generatedRoot_456.Ctx Backend.backend model W_GeneratedClaim.stage_4_params (i : Nat)),
-      W_Stage_online_eval.parallel_generatedRoot_456.Facts cM (W_Stage_online_eval.rootOuts rM i) ∧ execution.«stage_4» = W_Stage_online_eval.generatedRoot.outs rM ∧
-      W_Stage_online_eval.rootOuts rM i = W_Stage_online_eval.parallel_generatedRoot_456.outs cM ∧ cM.inputs = W_Stage_online_eval.rootArgs rM i ∧
+    (hR : W_GeneratedClaim.Runs model external execution) (i : Fin 16) :
+    ∃ (rM : W_Stage_online_eval.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_8_params) (cM : W_Stage_online_eval.parallel_generatedRoot_262.Ctx Backend.backend model W_GeneratedClaim.stage_8_params (i : Nat)),
+      W_Stage_online_eval.parallel_generatedRoot_262.Facts cM (W_Stage_online_eval.rootOuts rM i) ∧ execution.«stage_8» = W_Stage_online_eval.generatedRoot.outs rM ∧
+      W_Stage_online_eval.rootOuts rM i = W_Stage_online_eval.parallel_generatedRoot_262.outs cM ∧ cM.inputs = W_Stage_online_eval.rootArgs rM i ∧
       rM.inputs = W_Stage_online_eval.claimArgs external execution := by
-  obtain ⟨w, hb⟩ := hR.2.2.2.2.2.1
-  have FR := W_Stage_online_eval.generatedRoot.facts (⟨_, w⟩ : W_Stage_online_eval.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_4_params) hb
-  obtain ⟨wi, FI⟩ := W_Stage_online_eval.generatedRoot.h456_6_at FR i
-  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c105.hout, rfl, rfl⟩
+  obtain ⟨w, hb⟩ := hR.2.2.2.2.2.2.2.2.2.1
+  have FR := W_Stage_online_eval.generatedRoot.facts (⟨_, w⟩ : W_Stage_online_eval.generatedRoot.Ctx Backend.backend model W_GeneratedClaim.stage_8_params) hb
+  obtain ⟨wi, FI⟩ := W_Stage_online_eval.generatedRoot.h262_6_at FR i
+  exact ⟨⟨_, w⟩, ⟨_, wi⟩, FI, FR.c0.hout, FI.c18.hout, rfl, rfl⟩
 
 end RefreshTopProof.GenPartCtx

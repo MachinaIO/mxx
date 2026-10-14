@@ -6,7 +6,8 @@ Recognizes, by atom kind and data flow only (never by wire ids or `sel_`/`mod_` 
 the online instance body: starting from the final `modulusSwitchRuns` of a `matrixSub`, its
 centered rebase and the CRT term `· matrixPolynomial [K]`, the half row (a `concatColumns` chain of
 one `allCoefficients h`), `hint × preimage`, the smudge and fresh loop outputs, the combination
-`[g | c₁] D - cₓ Y`, the decomposition of `Q_q · A'` (with `A'` the reduction of a `hashSample`),
+`[g | c₁] D - cₓ Y`, the decomposition of `Q_q · A'` (with `A'` the reduction of the instance's
+column block of the caller's `A'`, a `sliceMatrix` of an instance input),
 and the action chain `gadget -> rebase -> reduce -> ·s₁ -> ·s₂ -> rebase -> ·c' -> digits -> rebase`.
 The instance constants (`Q_q`, `c'`, `s₁`, `s₂`, `K`, `h`) and moduli are copied as terms from the
 export (abbreviations are qualified, `i_0` becomes `i0`), so inline `selectInt` tables work alike.
@@ -16,7 +17,7 @@ Writes:
   e.g. `R = R / q * q`, `Q_q = R / q`, `(R / M_x) c' = Q_q k`, `k s₂ ≡ 1`, `s₁ ≡ Δ (mod q)`, layouts.
 * `Gen_Final_Inst.lean`: theorem `GenFinalInst.final_inst`: from the export's atoms of the segment
   (named by their record fields) and the role facts of PART_IFACE.md "Final combination (G)", the
-  CRT term `TermOf q K term (DecodeLoops.decodeValue model inputs G E j)`.
+  CRT term `TermOf q K term (DecodeLoops.decodeValue inputs G E j)`.
 
 Usage: gen_final.py <parameter dir> [--out DIR] [--decode FILE] [--text-only]
 (`<parameter dir>/generated` is the export; `--decode` the `TopDecodeLoops.lean` for `Δ` and the
@@ -154,8 +155,8 @@ def recognize(gdir):
     R['QqW'], R['Qq'] = QqW, poly_const(S, QqW)
     a, R['h_A1'] = producer(S, R['A1'], 'modulusReduceRuns')
     R['A0'] = a[0]
-    a, R['h_hash'] = producer(S, R['A0'], 'hashSample')
-    R['hash_args'] = a
+    a, R['h_slice'] = producer(S, R['A0'], 'sliceMatrix')
+    R['slice_args'] = a
     a, R['h_Y'] = producer(S, R['Y'], 'compactCenteredRebaseRuns')
     R['Y_bound'], R['Yz'] = a[0], a[1]
     a, R['h_Yz'] = producer(S, R['Yz'], 'gadgetDecomposeRuns')
@@ -206,7 +207,8 @@ def recognize_full(gdir):
 # --------------------------------------------------------------------------- the preprocess decompositions
 
 def comb_chain(S, D):
-    """`D` = compact digits of `matrixMulScalarLeft (poly Qq) A1`, `A1` the reduction of a hash sample."""
+    """`D` = compact digits of `matrixMulScalarLeft (poly Qq) A1`, `A1` the reduction of a column
+    block of the caller's `A'`."""
     a, hD = producer(S, D, 'compactCenteredRebaseRuns')
     Dz = a[1]
     a, hDz = producer(S, Dz, 'gadgetDecomposeRuns')
@@ -215,9 +217,9 @@ def comb_chain(S, D):
     Qq = poly_const(S, QqW)
     a, hA1 = producer(S, A1, 'modulusReduceRuns')
     A0 = a[0]
-    a, hhash = producer(S, A0, 'hashSample')
+    a, hslice = producer(S, A0, 'sliceMatrix')
     return dict(D=D, h_D=hD, Dz=Dz, h_Dz=hDz, base=base, digits=digits, z=z, Qq=Qq, A1=A1, h_A1=hA1,
-                A0=A0, h_hash=hhash, hash_args=a, D_bound=producer(S, D, 'compactCenteredRebaseRuns')[0][0])
+                A0=A0, h_slice=hslice, slice_args=a, D_bound=producer(S, D, 'compactCenteredRebaseRuns')[0][0])
 
 
 def action_chain(S, Y):
@@ -580,38 +582,35 @@ def decode_info(path):
     g = re.search(r'\(G : ExactMatrix (\d+) (\d+) 1 (\d+)\)', t)
     qd = re.search(r'\) : ExactMatrix (\d+) (\d+) 1 (\d+) :=\n  decodeExpected', t)
     rc = re.search(r'hterm : ∀ i : Fin (\d+), TermOf \(qN \(i / (\d+)\)\)', t)
-    tag = re.search(r'def decodeTag \(j : Nat\) : Blob :=\n  completeHashTag (\[[^\]]*\]) \[(.*), \.u64Le \(j : Int\)\]', t)
-    if not (m and g and qd and rc and tag):
-        raise Fail('decodeValue / decodeTag not found in ' + path)
-    return dict(delta=m.group(1), Qg=g.group(1), Q=qd.group(1), Rc=int(rc.group(2)), tag_prefix=tag.group(1),
-                tag_comp=tag.group(2))
+    if not (m and g and qd and rc):
+        raise Fail('decodeValue not found in ' + path)
+    return dict(delta=m.group(1), Qg=g.group(1), Q=qd.group(1), Rc=int(rc.group(2)))
 
 
-def hash_parts(args, module):
-    """(prefix, component bytes, index term, key wire) of a `hashSample` atom."""
-    prefix = strip_parens(args[1])
-    comps = strip_parens(args[2])
-    mm = re.match(r'^\[(\.bytes \[[^\]]*\]), \.u64Le (.*)\]$', comps)
-    if not mm:
-        raise Fail('hash components ' + comps[:80])
-    return prefix, mm.group(1), strip_parens(mm.group(2)), strip_parens(args[3])
+def slice_parts(args):
+    """(source wire, first row, last row, first column, last column) of a `sliceMatrix` atom."""
+    return tuple(strip_parens(x) for x in args[:5])
 
 
-def mask_params(gdir, roles_path, req_path, R, dec):
-    """The mask sampler: P (online sampler-offset LUT width), n' (requirement period), the binary
-    table value h (preprocess key table of the mask, odd entries), checked against the requirement."""
+#: The stages of the caller's encoding of `σ_0 G` (the mask), one instance per chain.
+SIGMA_ON, SIGMA_PRE = 'Stage_sigma_online_eval', 'Stage_sigma_preprocess'
+
+
+def mask_params(gdir, roles_path, req_path, n):
+    """The mask sampler of the sigma stages: P (online sampler-offset LUT width), n' (requirement
+    period), the binary table value h (the sigma preprocessing's key table, odd entries; a term at
+    the sigma instance `i_0`), checked against the requirement."""
     roles = json.load(open(roles_path))
-    _, on, pre = load_all(gdir)
-    n = R['n']
+    on, pre = Stage(gdir, SIGMA_ON), Stage(gdir, SIGMA_PRE)
     ms = [a for a in on.inst.atoms if a.loop and a.loop.count == n and
-          roles['Stage_online_eval'].get(a.loop.child, {}).get('role') == 'lut.member.sampler-offset']
+          roles[SIGMA_ON].get(a.loop.child, {}).get('role') == 'lut.member.sampler-offset']
     if len(ms) != 1:
         raise Fail('mask sampler')
     P = branch_width(on.sc, ms[0].loop.child)
     rt = open(req_path).read()
     per = re.search(r'\) % (\d+)\) / (\d+)\)', rt)
     nprime = int(per.group(2))
-    rp = roles['Stage_preprocess']
+    rp = roles[SIGMA_PRE]
     car = [a for a in pre.inst.atoms if a.loop and a.loop.count == n and
            rp.get(a.loop.child, {}).get('role') == 'lut.key-member.sampler']
     if len(car) != 1:
@@ -666,13 +665,13 @@ def emit(R, S, dec, P=None, pc=None, pa=None, mk=None):
     cert('s_delta', f'{s9} ≡ {delta} [ZMOD ({qt} : Int)]')
     cert('half_two', f'2 * {half} = ({Rt} : Int) + 1')
     Rc = dec['Rc']
-    hp_on = hash_parts(R['hash_args'], 'Stage_online_eval')
-    cert('tag_index', f'({q(hp_on[2])}) = (((i0 % {Rc} : Nat)) : Int)')
+    sp_on = slice_parts(R['slice_args'])
+    cert('slice_index', f'({q(sp_on[3])}).toNat = {m} * (i0 % {Rc})')
     if mk is not None:
-        cert('mask_half', f'2 * ({q(mk["h"], "Stage_preprocess")}) ≡ 1 [ZMOD ({qt} : Int)]')
+        cert('mask_half', f'2 * {mask_h(mk, Rc)} ≡ 1 [ZMOD ({qt} : Int)]')
     if pc is not None:
-        hp_pre = hash_parts(pc['hash_args'], 'Stage_preprocess')
-        cert('tag_index_p', f'({q(hp_pre[2], "Stage_preprocess")}) = (((i0 % {Rc} : Nat)) : Int)')
+        sp_pre = slice_parts(pc['slice_args'])
+        cert('slice_index_p', f'({q(sp_pre[3], "Stage_preprocess")}).toNat = {m} * (i0 % {Rc})')
         qp = lambda t: f'({q(t, "Stage_preprocess")})'
         cert('Qq_link', f'{Qq} = {qp(pc["Qq"])}')
         cert('s1_link', f'{s9} = {qp(pa["factors"][0][2])}')
@@ -683,6 +682,7 @@ def emit(R, S, dec, P=None, pc=None, pa=None, mk=None):
     cert('Mx_layout', f'∃ L : MxxRuntime.RegularLayout {Mt},\n      Backend.backend.regularLayout {Mt} {n} = some L ∧ L.droppedModuli = 0', lay)
     certs_txt = f"""import Stage_online_eval
 import Stage_preprocess
+import {SIGMA_PRE}
 import Backend
 import Mathlib.Tactic.IntervalCases
 
@@ -713,7 +713,7 @@ import TopDecodeLoops
 `{R['inst']}` at a symbolic instance `i0 < {SS}`, from the export's atoms of the segment (named
 by their record fields) and the role facts of PART_IFACE.md "Final combination (G)".
 Recognized: switch `{R['h_switch']}`, lift `{R['h_lift']}`, half `{R['h_half']}`, combination
-`{R['h_gc']}`/`{R['h_Dz']}`/`{R['h_D']}`, `A'` `{R['h_A1']}` of the hash sample `{R['h_hash']}`,
+`{R['h_gc']}`/`{R['h_Dz']}`/`{R['h_D']}`, `A'` `{R['h_A1']}` of the column block `{R['h_slice']}`,
 action `{R['h_Gg']}`/`{R['h_Gp']}`/`{R['h_w0']}`/`{R['h_wr']}`/`{R['h_Yz']}`/`{R['h_Y']}`, fresh loop
 `{fz}`, smudge loop `{fz_i}`. -/
 
@@ -724,7 +724,7 @@ open Mxx.Primitives MxxRuntime MxxExponentLut Mxx.ExponentLut.Refresh RefreshTop
 set_option maxHeartbeats 4000000 in
 /-- **The online final combination of one instance**: its CRT term is the term of the decode
 stage's value of component `j` modulo the instance's CRT prime. -/
-theorem final_inst {I} {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
+theorem final_inst {I} {{inputs : DecodeLoops.Inputs}}
     {{E : Nat → ErrorMatrix {n} 1 {m}}} (j : Nat)
     -- gadgets (role facts)
     {{G : ExactMatrix {Qg} {n} 1 {m}}} (hG : gadgetMatrixRuns Backend.backend {R['gbase']} {R['gdigits']} G)
@@ -742,7 +742,7 @@ theorem final_inst {I} {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
     {{YI : ErrorMatrix {n} {mx} {m}}} (hYI : {R['Y']} = reduceMatrix _ {n} {mx} {m} YI) {{BY : Nat}} (hYb : CoeffBound YI BY)
     -- atoms of the combination
     {{{R['A0']} : {T(R['A0'])}}}
-    (hhash : {R['A0']} = model.sample {Qd} {n} 2 {m} inputs.2.2.1 (DecodeLoops.decodeTag j))
+    (hhash : {R['A0']} = colBlock {m} inputs.2.2.1 ({m} * j))
     {{{R['A1']} : {T(R['A1'])}}} ({R['h_A1']} : modulusReduceRuns {R['A0']} {R['A1']})
     {{{R['Dz']} {R['D']} : {T(R['D'])}}}
     ({R['h_Dz']} : gadgetDecomposeRuns Backend.backend {R['base']} {R['digits']} {E(R['z'])} {R['Dz']})
@@ -787,7 +787,7 @@ theorem final_inst {I} {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
     -- atoms of the switch and the lift
     {{{R['r']} : {T(R['r'])}}} ({R['h_switch']} : modulusSwitchRuns {E(R['zeta'])} {R['r']})
     {{{R['l']} : {T(R['l'])}}} ({R['h_lift']} : centeredRebaseRuns {R['r']} {R['l']}) :
-    TermOf {qt} {K} {E(R['term'])} (DecodeLoops.decodeValue model inputs G E j) := by
+    TermOf {qt} {K} {E(R['term'])} (DecodeLoops.decodeValue inputs G E j) := by
   have hn : (0 : Nat) < {n} := by norm_num
   have hR : 1 < {Rt} := {ns}.R_gt i0
   have hq : 1 < {qt} := {ns}.q_gt i0
@@ -808,7 +808,7 @@ theorem final_inst {I} {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
   have hG' : {R['Gg']} = G := gadgetMatrixRuns_unique {R['h_Gg']} hG
   subst hG'
   have hyv := link_gen hn hq hR hqR hQ hqQ (β := β) (A' := {R['A1']})
-    (A := model.sample {Qd} {n} 2 {m} inputs.2.2.1 (DecodeLoops.decodeTag j))
+    (A := colBlock {m} inputs.2.2.1 ({m} * j))
     (σ := fun _ _ ↦ polynomialOfCoefficients inputs.2.1) (Δ := {delta}) (r := DecodeLoops.decodeR inputs j)
     (c := inputs.2.2.2.2.1) (e := inputs.2.2.2.2.2.1) (G := {R['Gg']})
     (fun i col ↦ by rw [modulusReduce_rho hn {R['h_A1']}, rho_rho hn hq hR hqR, hhash])
@@ -821,9 +821,9 @@ theorem final_inst {I} {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
     hb heb hP hPd hpre hcomb hec hf hef hs hes hTH hM hnoise rfl {R['h_switch']} {R['h_lift']} rfl hyv
 
 """
-    thm += hash_text(R, S, R['hash_args'], 'Stage_online_eval', 'hash_online', 'tag_index', dec)
+    thm += slice_text(R, S, R['slice_args'], 'Stage_online_eval', 'slice_online', 'slice_index', dec)
     if pc is not None:
-        thm += hash_text(R, P, pc['hash_args'], 'Stage_preprocess', 'hash_pre', 'tag_index_p', dec)
+        thm += slice_text(R, P, pc['slice_args'], 'Stage_preprocess', 'slice_pre', 'slice_index_p', dec)
         thm += pre_link_text(R, S, P, pc, pa, dec)
     if mk is not None:
         thm += mask_text(R, mk, dec)
@@ -831,36 +831,40 @@ theorem final_inst {I} {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
     return certs_txt, thm
 
 
-def hash_text(R, S, args, module, name, cert, dec):
-    """The hash link: the stage's `hashSample` is the decode stage's `A'` of component `i0 mod R`."""
+def slice_text(R, S, args, module, name, cert, dec):
+    """The `A'` link: the stage's column block of its `A'` input is the decode stage's `A'` of component
+    `i0 mod R` when the input is the decode stage's `A'`."""
     n, m = R['n'], R['m']
-    prefix, comp, idx, keyw = hash_parts(args, module)
-    if prefix != dec['tag_prefix'] or comp != dec['tag_comp']:
-        raise Fail(f'{module}: hash tag differs from the decode tag')
+    src, r0, r1, c0, c1 = slice_parts(args)
     out = strip_parens(args[-1])
     ns = 'RefreshTopProof.GenFinalInst.Certs'
     return f"""
-/-- **The hash link** ({module}): the hash sample `{out}` (atom of `{S.name}`, key `{keyw}`) is
-the decode stage's `A'` of component `i0 % {dec['Rc']}` when the key is the decode stage's key. -/
-theorem {name} (i0 : Nat) [h : Fact (i0 < {R['S']})] {{model : HashModel}} {{inputs : DecodeLoops.Inputs}}
-    {{key : ByteArray}} {{w : {q(S.wires[out].type, module)}}}
-    (hw : hashSample model {prefix} [{comp}, .u64Le ({q(idx, module)})] key w)
-    (hkey : key = inputs.2.2.1) :
-    w = model.sample {dec['Q']} {n} 2 {m} inputs.2.2.1 (DecodeLoops.decodeTag (i0 % {dec['Rc']})) := by
-  rw [hashSample_eq hw, hkey, {ns}.{cert} i0]
-  rfl
+/-- **The `A'` link** ({module}): the column block `{out}` (atom of `{S.name}`, of the input `{src}`) is
+the decode stage's `A'` of component `i0 % {dec['Rc']}` when the input is the decode stage's `A'`. -/
+theorem {name} (i0 : Nat) [h : Fact (i0 < {R['S']})] {{inputs : DecodeLoops.Inputs}}
+    {{A : {q(S.wires[src].type, module)}}} {{w : {q(S.wires[out].type, module)}}}
+    (hw : sliceMatrix A ({q(r0, module)}) ({q(r1, module)}) ({q(c0, module)}) ({q(c1, module)}) w)
+    (hA : A = inputs.2.2.1) :
+    w = colBlock {m} inputs.2.2.1 ({m} * (i0 % {dec['Rc']})) := by
+  rw [slice_colBlock hw, {ns}.{cert} i0, hA]
 
 """
+
+
+def mask_h(mk, Rc):
+    """The mask's table value at the chain `i0 / Rc` of part instance `i0`."""
+    return '(' + q(mk['h'], SIGMA_PRE).replace('i0', f'(i0 / {Rc})') + ')'
 
 
 def mask_text(R, mk, dec):
     n, Rt, qt, Qd = R['n'], f"({q(R['Rm'])})", f"({q(R['qm'])})", dec['Q']
     P, W = mk['P'], mk['nprime']
-    h = f"({q(mk['h'], 'Stage_preprocess')})"
+    h = mask_h(mk, dec['Rc'])
     ns = 'RefreshTopProof.GenFinalInst.Certs'
     return f"""
 /-- **The mask residue** (`hβ` of `final_inst`): the mask payload `β`, a binary sampler of table
-`{h}` (preprocess key table, `2 h ≡ 1`, `Certs.mask_half`) on the PRF outputs `zN`, has modulo the
+`{h}` (the sigma preprocessing's key table of the instance's chain, `2 h ≡ 1`, `Certs.mask_half`)
+on the PRF outputs `zN`, has modulo the
 CRT prime the residue of the decode stage's `σ` (`inputs.2.1`), by the requirement's mask formula
 `hσ` (period `{2 * W}`) and `zN = zR` (the PRF outputs are the requirement's sums). -/
 theorem mask_inst (i0 : Nat) [h : Fact (i0 < {R['S']})] {{inputs : DecodeLoops.Inputs}}
@@ -903,7 +907,7 @@ def pre_link_text(R, S, P, pc, pa, dec):
         hh = 'hhash_p' if pre else 'hhash'
         c, a = r
         return f"""    {{{W(c['A0'])} : {T(c['A0'])}}}
-    ({hh} : {W(c['A0'])} = model.sample {Qd} {n} 2 {m} inputs.2.2.1 (DecodeLoops.decodeTag j))
+    ({hh} : {W(c['A0'])} = colBlock {m} inputs.2.2.1 ({m} * j))
     {{{W(c['A1'])} : {T(c['A1'])}}} ({H(c['h_A1'])} : modulusReduceRuns {W(c['A0'])} {W(c['A1'])})
     {{{W(c['Dz'])} {W(c['D'])} : {T(c['D'])}}}
     ({H(c['h_Dz'])} : gadgetDecomposeRuns Backend.backend {c['base']} {c['digits']} {Eq(c['z'])} {W(c['Dz'])})
@@ -921,9 +925,9 @@ def pre_link_text(R, S, P, pc, pa, dec):
     p = 'p_'
     return f"""
 /-- **The online decompositions are the preprocess ones** (combination digits `{R['D']}` =
-`{pc['D']}`, action digits `{R['Y']}` = `{pa['Y']}` of `{P.name}`): the same hash sample, gadget
+`{pc['D']}`, action digits `{R['Y']}` = `{pa['Y']}` of `{P.name}`): the same column block of `A'`, gadget
 and chain with equal instance constants (`Certs.Qq_link`, `s1_link`, `s2_link`, `c_link`). -/
-theorem pre_link (i0 : Nat) [h : Fact (i0 < {R['S']})] {{model : HashModel}} {{inputs : DecodeLoops.Inputs}} (j : Nat)
+theorem pre_link (i0 : Nat) [h : Fact (i0 < {R['S']})] {{inputs : DecodeLoops.Inputs}} (j : Nat)
 {side(S, ron, 'Stage_online_eval', '')}{side(P, (pc, pa), 'Stage_preprocess', p)}    :
     {R['D']} = {p}{pc['D']} ∧ {R['Y']} = {p}{pa['Y']} :=
   ⟨comb_digits_link (hhash.trans hhash_p.symm) ({ns}.Qq_link i0) {R['h_A1']} {p}{pc['h_A1']}
@@ -950,7 +954,7 @@ def main():
     P, pc, pa = preprocess_links(gdir, R)
     mk = None
     if a.roles:
-        mk = mask_params(gdir, a.roles, a.requirement or os.path.join(a.d, 'Gen_Requirement.lean'), R, dec)
+        mk = mask_params(gdir, a.roles, a.requirement or os.path.join(a.d, 'Gen_Requirement.lean'), R['n'])
         print('mask:', mk)
     certs, thm = emit(R, S, dec, P, pc, pa, mk)
     open(os.path.join(out, 'Gen_Final_Certs.lean'), 'w').write(certs)

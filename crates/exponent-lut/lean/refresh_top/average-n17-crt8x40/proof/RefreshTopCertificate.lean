@@ -15,7 +15,7 @@ namespace RefreshTopProof
 theorem certificate : GeneratedClaim.CorrectnessClaim := by
   intro model external
   have hempty : {tape | ∃ execution, GeneratedClaim.Runs model external tape execution ∧
-      ¬ execution.«stage_5» = execution.«ideal»} = ∅ := by
+      ¬ execution.«stage_9» = execution.«ideal»} = ∅ := by
     ext tape
     simp only [Set.mem_setOf_eq, Set.mem_empty_iff_false, iff_false]
     rintro ⟨execution, hruns, hne⟩

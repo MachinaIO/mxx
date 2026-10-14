@@ -28,7 +28,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 import xmodel  # noqa: E402
 from gen_instance import facts_fields  # noqa: E402
 
-ON, PRE, ENC = 'Stage_online_eval', 'Stage_preprocess', 'Stage_encrypt'
+#: The stage triple: the parts', or with `--sigma` the stages of the caller's encoding of `σ_0 G`
+#: (`gen_key_eq.py --sigma`).
+SIGMA = '--sigma' in sys.argv
+ON, PRE, ENC = (('Stage_sigma_online_eval', 'Stage_sigma_preprocess', 'Stage_sigma_encrypt') if SIGMA
+                else ('Stage_online_eval', 'Stage_preprocess', 'Stage_encrypt'))
 CTX = {ON: 'octx', PRE: 'pctx', ENC: 'ectx'}
 FAC = {ON: 'FO', PRE: 'FP', ENC: 'FE'}
 
@@ -109,8 +113,8 @@ class Gen:
     def __init__(self, gdir, pdir, roles):
         self.O, self.P, self.E = (St(gdir, M, roles) for M in (ON, PRE, ENC))
         self.links = parse_links(f'{pdir}/Gen_Stage_Links.lean')
-        self.seg = open(f'{pdir}/Gen_Inst_Stage_online_eval.lean').read()
-        self.pre = open(f'{pdir}/Gen_Inst_Stage_preprocess_Keys.lean').read()
+        self.seg = open(f'{pdir}/Gen_Inst_{ON}.lean').read()
+        self.pre = open(f'{pdir}/Gen_Inst_{PRE}_Keys.lean').read()
         self.hyps = {}  # name -> statement
         self.haves = []
 
@@ -214,12 +218,14 @@ class Gen:
         """The `PrfCell*.keys` application from the segment theorem of `cell`."""
         t = seg_text(self.seg, cell['field'])
         obt = re.findall(r"^  (obtain ⟨L[\w']*, .*?⟩ := RefreshTopProof\.GenInst\.Certs\.\S+)$", t, re.M)
-        m = re.search(r'(PrfCell[01])\.rel (.*?\(h := [^\n]*?\.sem hc\))', t, re.S)
-        call = f'{m.group(1)}.keys (p\' := 1) {m.group(2)} k hk.symm'
+        m = re.search(r'(PrfCell[01])\.rel(_1)? (.*?\(h := [^\n]*?\.sem hc\))', t, re.S)
+        # variant 1 (a Program in its own stages): no payload family index
+        v1 = bool(m.group(2))
+        call = f'{m.group(1)}.keys{m.group(2) or ""} (p\' := 1) {m.group(3)}' + ('' if v1 else ' k hk.symm')
         if kind == 1:
             call += (' (gadgetOf_runs (gadget_exists ⟨_, by simp [Backend.backend]; rfl, rfl, rfl, rfl⟩))'
                      ' (rebasedGadget_runs (by decide))')
-        gat = re.search(r'^  (obtain ⟨k, hk, hc⟩ := Gen\.gather_loop6 .*?)$', t, re.M).group(1)
+        gat = re.search(r'^  (obtain ⟨k, hk, hc⟩ := Gen\.gather_loop[36] .*?)$', t, re.M).group(1)
         call = re.sub(r'\n\s*', '\n      ', call)
         return qual_on(gat), [qual_on(o) for o in obt], qual_on(call)
 
@@ -232,14 +238,25 @@ class Gen:
         gat, obt, call = self.keys_call(cell, kind)
         args = [base(x) for x in cell['loop']['args']]
         pargs = [base(x) for x in pcell['loop']['args']]
-        rw = [lab + ' k', 'hk'] + self.to_pre(args[0])[0]
+        v1 = len(args) == 13
+        # a Program in its own stages: the cell's label keys `labelKeysG key … (t i)` (its key and
+        # table are the preprocessing's through the links), state keys at 4, 5, 8, 9, then the key
+        # (the selector tops' seed) and the bottoms at 11, 12
+        rw = (self.to_pre(args[2])[0] if v1 else [lab + ' k', 'hk']) + self.to_pre(args[0])[0]
         if kind == 0:
-            # online As (positions 7, 8, 11, 12) -> preprocessing As (2, 3, 4, 5: A00, A10, A01, A11)
-            for oi, pi in ((7, 2), (11, 4), (8, 3), (12, 5)):
-                rw += self.root_chain(args[oi], pargs[pi])
+            # online As -> preprocessing As (2, 3, 4, 5: A00, A10, A01, A11)
+            pos = ((4, 2), (8, 4), (5, 3), (9, 5)) if v1 else ((7, 2), (11, 4), (8, 3), (12, 5))
+            for oi, pi in pos:
+                if v1:
+                    # hash-sampled in the online instance: equal samples (`gen_key_eq.sample_eq`)
+                    rw.append(self.sample_eq(args[oi], pargs[pi]))
+                else:
+                    rw += self.root_chain(args[oi], pargs[pi])
         else:
             rw += [f'({prev} o).1', f'({prev} o).2.1', f'({prev} o).2.2.1', f'({prev} o).2.2.2']
-        rw += self.to_pre(args[14])[0] + self.to_pre(args[15])[0] + self.to_pre(args[16])[0]
+        tail = (args[11], args[12]) if v1 else (args[14], args[15], args[16])
+        for w in tail:
+            rw += self.to_pre(w)[0]
         pk = f'keys_{pcell["field"]} FP rfl SECARGS i'
         s = [f'  have {name} : ∀ i : Fin {n}, {concl} := by', '    intro i', '    ' + gat]
         s += ['    ' + o for o in obt]

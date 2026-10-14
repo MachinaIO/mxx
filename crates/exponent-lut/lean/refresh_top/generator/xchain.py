@@ -64,8 +64,10 @@ class Online:
         r = self.role(a)
         args = [base(x) for x in a['loop']['args']]
         if r in ('prf.cell0', 'prf.cell1'):
-            rest = args[7:]
-            q, q2 = mat_type(self.I.wires[rest[0]]['type'])[1], mat_type(self.I.wires[rest[8]]['type'])[1]
+            # the state's ring (`As00`) and the output's (`bot0`); a Program in its own stages (13
+            # arguments) passes its key instead of six label families
+            st, bt = (4, 11) if len(args) == 13 else (7, 15)
+            q, q2 = mat_type(self.I.wires[args[st]]['type'])[1], mat_type(self.I.wires[args[bt]]['type'])[1]
         else:
             q, q2 = mat_type(self.I.wires[args[7]]['type'])[1], mat_type(self.I.wires[args[0]]['type'])[1]
         return f'({qterm(q)} / {qterm(q2)})'

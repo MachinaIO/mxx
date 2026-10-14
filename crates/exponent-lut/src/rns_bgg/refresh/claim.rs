@@ -1,13 +1,13 @@
 //! The claim of a recorded refresh run ([`RefreshRun::protocol`]).
 
-use super::run::{RefreshRun, RnsBggRefresh};
+use super::run::{RefreshRun, RnsBggRefresh, SIGMA_ROW_OUTPUT};
 use crate::{
     api::ApiError,
     claim::{external, inputs_ending_with, stage, to_stage},
     program::{RhsId, WireId},
     program_gadgets::prf::SparseLwrPrf,
     refresh::{RefreshDeclaration, bit_flip_source},
-    rns_bgg::{REFRESH_TERMS_INPUT, data_input_name, plaintext_input_prefix},
+    rns_bgg::{REFRESH_MATRIX_INPUT, REFRESH_TERMS_INPUT, data_input_name, plaintext_input_prefix},
 };
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_ir_core::{
@@ -29,46 +29,82 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-/// The phases every part runs, each merged into one stage of the claim.
-const PHASES: [&str; 3] = ["preprocess", "encrypt", "online_eval"];
+/// The phases of the caller's encoding of `sigma_0 G`, one instance per chain (stage
+/// `<phase>_<chain>`), each merged into one stage of the claim over the chains; both parts of a
+/// chain read it (the part's preprocessing its key, its online evaluation its row).
+const CHAIN_PHASES: [&str; 3] = ["sigma_preprocess", "sigma_encrypt", "sigma_online_eval"];
+
+/// The phases every part runs (stage `<phase>_<chain>_<component>`), each merged into one stage
+/// of the claim over the parts.
+const PART_PHASES: [&str; 3] = ["preprocess", "encrypt", "online_eval"];
+
+/// The phase of a merged stage name, its instance and the phase's instance count, for a refresh
+/// of `chains` chains: chain `c` of a chain phase, part `(c, j)` at `2 c + j` of a part phase.
+fn stage_instance(stage: &str, chains: usize) -> Option<(&'static str, usize, usize)> {
+    let rest = |phase: &str| stage.strip_prefix(phase)?.strip_prefix('_');
+    for phase in CHAIN_PHASES {
+        if let Some(chain) = rest(phase).and_then(|rest| rest.parse::<usize>().ok()) {
+            return (chain < chains).then_some((phase, chain, chains));
+        }
+    }
+    PART_PHASES.iter().find_map(|phase| {
+        let (chain, component) = rest(phase)?.split_once('_')?;
+        let (chain, component) = (chain.parse::<usize>().ok()?, component.parse::<usize>().ok()?);
+        (chain < chains && component < 2).then_some((*phase, 2 * chain + component, 2 * chains))
+    })
+}
 
 impl RefreshRun {
     /// The recorded run of `refresh` as a closed protocol, with failure probability
-    /// `2^failure_probability_log2` (`None` for a worst-case claim). The run must be complete
-    /// (its decode graph recorded by [`Self::decode`]) and the refresh's source must be
-    /// [`bit_flip_source`].
+    /// `2^failure_probability_log2` (`None` for a worst-case claim). `a_prime` is the recorded
+    /// graph of the caller's stage that produced `A'` and its output name: the protocol then has
+    /// it as stage `a_prime` (its byte inputs external) and the claim is about that `A'`;
+    /// without it `A'` is an external matrix of the reference ring (any `A'`), which the
+    /// protocol states but [`mxx_ir_core::lean::protocol::export`] does not support. The run must
+    /// be complete (its decode graph recorded by [`Self::decode`]) and the refresh's source
+    /// must be [`bit_flip_source`].
     ///
-    /// The protocol has the payload and mask sampling, every part's preprocessing, encryption
-    /// and online evaluation on its chain, and the decode stage, which counts the coefficients
-    /// of `y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` that decode to one (an error of at least
+    /// The protocol has the payload and mask sampling, every part's stages of the caller's
+    /// encoding of `sigma_0 G` (recorded through [`super::RefreshSigmaRequest::record`]; the
+    /// claim needs them, and their Program must be a binary [`crate::refresh::FreshNoiseProgram`]
+    /// on the invocation's label), every part's preprocessing, encryption and online evaluation
+    /// on its chain, and the decode stage, which counts the coefficients of
+    /// `y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` that decode to one (an error of at least
     /// `P / 4`, `P` the product of the refreshed primes); the ideal count is zero. External
-    /// inputs are the hash keys, the source input `X^b` and the expected `X^(1 - b)`, the label
-    /// `a` and its monomials, the selector bits and the coordinate tables (the cell coordinates
-    /// of the key layouts, one per PBC bucket, which every preprocessing stage receives and its
-    /// online evaluation reads from it) of every PRF (the mask keys shared by every part, the
-    /// fresh-noise keys of component `j` by every chain, each decoder's own), the unit offsets,
-    /// and the mask polynomial `sigma_0`. The requirement ties the monomials to `a`, makes every
-    /// selector row one-hot, the expected exponent the LUT of the input, `sigma_0` the bits of
-    /// the mask keys on `a` read through the mask tables, and `a` the invocation's label.
+    /// inputs are the hash keys, the caller's `A'` (any matrix), the source input `X^b` and the
+    /// expected `X^(1 - b)`, the label `a` and its monomials, the selector bits and the
+    /// coordinate tables (the cell coordinates of the key layouts, one per PBC bucket, which
+    /// every preprocessing stage receives and its online evaluation reads) of every PRF (the
+    /// sigma keys, the fresh-noise keys of component `j` shared by every chain, each decoder's
+    /// own), the unit offsets, and the mask polynomial `sigma_0`. The requirement ties the
+    /// monomials to `a`, makes every selector row one-hot, the expected exponent the LUT of the
+    /// input, `sigma_0` the bits of the sigma keys on `a` read through the sigma tables, and `a`
+    /// the invocation's label.
     ///
     /// The phases of the parts are merged into one stage each (by `merge_instances`), and every
     /// per-part input is a member of a family external over the parts (e.g. one family of each
     /// bucket's smudge selector rows over the parts); the requirement checks these families in
-    /// loops over the parts, ties the members of parts that read one key set (the mask keys, a
-    /// component's fresh keys, the label and the source input) and reads the mask keys of part
+    /// loops over the parts, ties the members of parts that read one key set (the sigma keys, a
+    /// component's fresh keys, the label and the source input) and reads the sigma keys of part
     /// 0. The decode stage reads the family of the parts' residue terms. The stages and the claim
     /// thus do not grow with the number of parts or columns.
     pub fn protocol(
         &self,
         refresh: &RnsBggRefresh,
         failure_probability_log2: Option<u32>,
+        a_prime: Option<(&Graph, &str)>,
     ) -> Result<ProtocolDecl, ApiError> {
         let (source, input, _) = bit_flip_source().map_err(ApiError::scheme)?;
         if refresh.source.id() != source.id() {
             return Err(ApiError::input("the refresh claim is stated for the bit-flip source"));
         }
         let top = &refresh.top;
-        let graphs = &self.graphs;
+        // The stage that produced the caller's `A'`, if given.
+        let mut graphs = self.graphs.clone();
+        if let Some((producer, _)) = a_prime {
+            graphs.insert("a_prime".to_owned(), producer.clone());
+        }
+        let graphs = &graphs;
         let graph = |name: &str| {
             graphs
                 .get(name)
@@ -90,6 +126,19 @@ impl RefreshRun {
         ]);
         let parts =
             (0..top.chains()).flat_map(|chain| [(chain, 0), (chain, 1)]).collect::<Vec<_>>();
+        if self.sigmas.len() != top.chains() {
+            return Err(ApiError::input("the run has no sigma encoding per chain"));
+        }
+        // Each part's online evaluation reads the row of its chain's sigma encoding.
+        for &(chain, component) in &parts {
+            let part = top
+                .part((chain, component))
+                .ok_or_else(|| ApiError::input("the refresh has no such part"))?;
+            links.insert(
+                super::refresh_sigma_input_name(*part.spec()),
+                (id(&format!("sigma_online_eval_{chain}")), SIGMA_ROW_OUTPUT.to_owned()),
+            );
+        }
         // The decode stage reads the family of the parts' residue terms: the merged online
         // evaluation's output family `refresh` (part `(chain, j)` at `2 chain + j`).
         links.insert(REFRESH_TERMS_INPUT.to_owned(), (id("online_eval_0_0"), "refresh".to_owned()));
@@ -105,8 +154,16 @@ impl RefreshRun {
             }
         }
         let mut names = vec!["payload".to_owned(), "mask".to_owned()];
+        if a_prime.is_some() {
+            names.push("a_prime".to_owned());
+        }
+        for chain in 0..top.chains() {
+            for stage in CHAIN_PHASES {
+                names.push(format!("{stage}_{chain}"));
+            }
+        }
         for &(chain, component) in &parts {
-            for stage in PHASES {
+            for stage in PART_PHASES {
                 names.push(format!("{stage}_{chain}_{component}"));
             }
         }
@@ -125,6 +182,51 @@ impl RefreshRun {
             input: input.into(),
         };
         let mut externals = Vec::new();
+
+        // The caller's `A'`, read by the parts and the decode stage: the output of its producer
+        // stage `a_prime`, whose byte inputs are externals, or else any matrix of the reference
+        // ring (an external the Lean export does not support).
+        match a_prime {
+            Some((producer, output)) => {
+                links.insert(REFRESH_MATRIX_INPUT.to_owned(), (id("a_prime"), output.to_owned()));
+                for node in producer.root_scope().nodes() {
+                    let NodeKind::Input { name, wire_type, artifact: None } = node.kind() else {
+                        continue;
+                    };
+                    let mxx_ir_core::types::WireType::Bytes { length } = wire_type else {
+                        return Err(ApiError::input("the A' stage reads a non-byte input"));
+                    };
+                    if !name.starts_with("rns-bgg/hash-key") {
+                        externals.push(external(
+                            &format!("a_prime_{name}"),
+                            InputValueContract::Bytes { length: length.clone() },
+                            vec![to_stage("a_prime", name)],
+                        ));
+                    }
+                }
+            }
+            None => {
+                let destinations = names
+                    .iter()
+                    .map(|name| {
+                        Ok(inputs_ending_with(graph(name)?, REFRESH_MATRIX_INPUT)
+                            .iter()
+                            .filter(|input| input.as_str() == REFRESH_MATRIX_INPUT)
+                            .map(|input| to_stage(name, input))
+                            .collect::<Vec<_>>())
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()?
+                    .concat();
+                externals.push(external(
+                    "a_prime",
+                    InputValueContract::MatrixLarge {
+                        matrix_type: super::top_reference_ring(top.reference())
+                            .matrix_type((2, 2 * top.reference().columns())),
+                    },
+                    destinations,
+                ));
+            }
+        }
 
         // Hash keys: one external per derived key name.
         let mut hash_keys = BTreeMap::<String, Vec<ProtocolInputDestination>>::new();
@@ -200,9 +302,14 @@ impl RefreshRun {
         let mut zero_exponents = BTreeMap::<usize, Vec<ProtocolInputDestination>>::new();
         let mismatch = || ApiError::input("the parts' PRF children differ in shape");
         for &(chain, component) in &parts {
-            let encrypt = format!("encrypt_{chain}_{component}");
-            let preprocess = format!("preprocess_{chain}_{component}");
-            for child in children(top, (chain, component))? {
+            // The chain's sigma Program is read once, with the chain's first part.
+            let sigma = (component == 0).then(|| &self.sigmas[chain]);
+            for child in children(top, (chain, component), sigma)? {
+                let stage = |phase: &str| match child.per_chain {
+                    true => format!("sigma_{phase}_{chain}"),
+                    false => format!("{phase}_{chain}_{component}"),
+                };
+                let (encrypt, preprocess) = (stage("encrypt"), stage("preprocess"));
                 let prefix = plaintext_input_prefix(Some(&child.namespace), "input");
                 let wire = |wire: WireId, field: &str| {
                     to_stage(&encrypt, &format!("{prefix}/input/{wire:?}.{field}"))
@@ -243,10 +350,13 @@ impl RefreshRun {
                     if entry.0 != families[bucket].members {
                         return Err(mismatch());
                     }
-                    entry.1.push(to_stage(
-                        &preprocess,
-                        &data_input_name(Some(&child.namespace), *table),
-                    ));
+                    let name = data_input_name(Some(&child.namespace), *table);
+                    entry.1.push(to_stage(&preprocess, &name));
+                    // A Program evaluated on its own reads its tables as plain inputs of its
+                    // online evaluation (a child reads them from the part's preprocessing).
+                    if child.per_chain {
+                        entry.1.push(to_stage(&stage("online_eval"), &name));
+                    }
                 }
             }
         }
@@ -287,8 +397,8 @@ impl RefreshRun {
             .iter()
             .map(|name| stage(name, graph(name)?, &productions, &links))
             .collect::<Result<Vec<_>, _>>()?;
-        let (stages, merged) = merged_stages(stages, &parts, &productions, &links)?;
-        let (mut externals, families) = pack_externals(externals, &merged, parts.len())?;
+        let (stages, merged) = merged_stages(stages, top.chains(), &productions, &links)?;
+        let (mut externals, families) = pack_externals(externals, &merged, top.chains())?;
 
         // The requirement.
         let dsl = |error: mxx_dsl::DslError| ApiError::scheme(error);
@@ -347,13 +457,13 @@ impl RefreshRun {
             ("a_exponent", a_exponent.clone()),
         ]);
         let unknown_tie = || ApiError::input("a part family is tied to an unknown external");
-        let parts_count = parts.len();
         let mut part_families = BTreeMap::new();
         for part_family in &families {
             let selector = selectors.get(&part_family.originals[0]).map(|(_, row, _)| *row);
             let tied = part_family.representatives.iter().enumerate().any(|(k, r)| *r != k) ||
                 !part_family.ties.is_empty();
-            let read = part_family.name.starts_with("parts_mask_");
+            let read = part_family.originals[0].starts_with("mask_");
+            let parts_count = part_family.count;
             let bytes = matches!(part_family.element, InputValueContract::Bytes { .. });
             if bytes || pinned(&part_family.element) || (!tied && selector.is_none() && !read) {
                 continue;
@@ -447,18 +557,31 @@ impl RefreshRun {
                 .1;
             binding.destinations.push(requirement_input(&part_family.name));
         }
-        // `sigma_k` is the bit of mask member `k`: one exactly when `z_k mod Q < Q / 2` for
+        // `sigma_k` is the bit of sigma member `k`: one exactly when `z_k mod Q < Q / 2` for
         // `z_k = sum_b a[coordinate of the selected cell of bucket b]`; slot `f` of bucket `b`'s
         // selector row `k` selects cell `f` of member `k`, whose coordinate is entry `k W + f` of
-        // bucket `b`'s mask table (the zero member `v` for a dummy or padding cell). Every part
-        // reads the same mask keys (its members are tied), so part 0's stand for all.
+        // bucket `b`'s sigma table (the zero member `v` for a dummy or padding cell). Every part
+        // reads the same sigma keys (its members are tied), so part 0's stand for all.
         let sigma = requirement.input::<Family<Int>>("sigma", family(n as usize)).map_err(dsl)?;
-        let mask_prf = top.mask(0).ok_or_else(|| ApiError::input("no mask child"))?.sampler().prf();
-        let mask_family = |name: String| {
-            part_families
+        let mask_prf = self.sigmas[0].0.sampler().prf();
+        // A sigma input over several chains is a family external (chain 0's member read); with
+        // one chain it stays the original external, read as is.
+        let mut mask_family = |name: String| -> Result<Family<Int>, ApiError> {
+            if let Some(family) = part_families.get(&name) {
+                return Ok(family.at(Int::constant(0)));
+            }
+            let count = selectors
                 .get(&name)
-                .map(|family| family.at(Int::constant(0)))
-                .ok_or_else(|| ApiError::input(format!("the requirement does not read {name}")))
+                .map(|(count, _, _)| *count)
+                .or_else(|| tables.get(&name).map(|(count, _)| *count))
+                .ok_or_else(|| ApiError::input(format!("the requirement does not read {name}")))?;
+            let binding = &mut externals
+                .iter_mut()
+                .find(|(contract, _)| contract.name == name)
+                .ok_or_else(|| ApiError::input(format!("{name} has no external")))?
+                .1;
+            binding.destinations.push(requirement_input(&name));
+            requirement.input::<Family<Int>>(name, family(count)).map_err(dsl)
         };
         let mask_buckets = (0..mask_prf.tables().len())
             .map(|bucket| {
@@ -537,115 +660,172 @@ impl RefreshRun {
     }
 }
 
-/// One PRF child of a part: its hash namespace, its PRF, its offset RHS (bound to one), and the
-/// external name of its selector families.
+/// One PRF Program of a part: its hash namespace, its PRF, its offset RHS (bound to one), the
+/// external name of its selector families, and whether it runs in its own stages once per chain
+/// (`sigma_<phase>_<chain>`, the caller's encoding of `sigma_0 G`) rather than in the part's.
 struct Child<'a> {
     namespace: [u8; 32],
     prf: &'a SparseLwrPrf,
     offsets: &'a [RhsId],
     selectors: String,
+    per_chain: bool,
 }
 
-/// The mask, fresh-noise and smudge children of part `(chain, component)` of `top`.
-fn children(
-    top: &RefreshDeclaration,
+/// The PRF Programs of part `(chain, component)` of `top`: the chain's encoding of `sigma_0 G`
+/// when given (`sigma`, its Program and namespace), the fresh-noise child and the decoder's
+/// smudge child.
+fn children<'a>(
+    top: &'a RefreshDeclaration,
     (chain, component): (usize, usize),
-) -> Result<[Child<'_>; 3], ApiError> {
+    sigma: Option<&'a (crate::refresh::FreshNoiseProgram, [u8; 32])>,
+) -> Result<Vec<Child<'a>>, ApiError> {
     let part = (chain, component);
     let missing = || ApiError::input("the refresh has no such part");
-    let (mask, fresh) =
-        (top.mask(chain).ok_or_else(missing)?, top.fresh(part).ok_or_else(missing)?);
+    let fresh = top.fresh(part).ok_or_else(missing)?;
     let decoder = top.decoder(part).ok_or_else(missing)?;
-    Ok([
-        Child {
-            namespace: top.mask_namespace(part).ok_or_else(missing)?,
-            prf: mask.sampler().prf(),
-            offsets: mask.sampler().offset_rhs(),
-            selectors: "mask".to_owned(),
-        },
-        Child {
-            namespace: top.fresh_namespace(part).ok_or_else(missing)?,
-            prf: fresh.sampler().prf(),
-            offsets: fresh.sampler().offset_rhs(),
-            selectors: format!("fresh_{component}"),
-        },
-        Child {
-            namespace: *decoder.commitment(),
-            prf: decoder.smudge().prf(),
-            offsets: &[],
-            selectors: format!("smudge_{chain}_{component}"),
-        },
-    ])
+    let sigma = sigma.map(|(program, namespace)| Child {
+        namespace: *namespace,
+        prf: program.sampler().prf(),
+        offsets: program.sampler().offset_rhs(),
+        selectors: "mask".to_owned(),
+        per_chain: true,
+    });
+    Ok(sigma
+        .into_iter()
+        .chain([
+            Child {
+                namespace: top.fresh_namespace(part).ok_or_else(missing)?,
+                prf: fresh.sampler().prf(),
+                offsets: fresh.sampler().offset_rhs(),
+                selectors: format!("fresh_{component}"),
+                per_chain: false,
+            },
+            Child {
+                namespace: *decoder.commitment(),
+                prf: decoder.smudge().prf(),
+                offsets: &[],
+                selectors: format!("smudge_{chain}_{component}"),
+                per_chain: false,
+            },
+        ])
+        .collect())
 }
 
-/// Where the merged stages read each per-part stage input: per-part `(stage, input)` to the
-/// merged `(stage, input)`, and the merged inputs that are families over the parts (member `k`
-/// the input of part `k`).
+/// Where the merged stages read each per-instance stage input: per-instance `(stage, input)` to
+/// the merged `(stage, input)`, and the merged inputs that are families over the instances.
 #[derive(Default)]
 struct MergedInputs {
     targets: BTreeMap<(String, String), (String, String)>,
     families: BTreeSet<(String, String)>,
 }
 
-/// The protocol's stages with the per-part stages of each phase (`preprocess`, `encrypt`,
-/// `online_eval`) replaced by one stage running every part in a parallel loop
-/// ([`merge_instances`], part `(chain, component)` the instance at its position in `parts`), and
-/// where the merged stages read the per-part inputs. Every input that differs between the parts
-/// is one family input over the parts: instance `k` reading an artifact of the producer's
-/// instance `k` reads member `k` of the producer's output family, and a plain input is member
-/// `k` of a family input (fed by a family external, or, for a linked input, the producer's
-/// output family). Stages outside the merged phases read whole output families, so no stage's
-/// interface grows with the number of parts.
+/// The protocol's stages with the per-instance stages of each phase replaced by one stage running
+/// every instance in a parallel loop ([`merge_instances`]): the chain phases ([`CHAIN_PHASES`])
+/// over the chains, the part phases ([`PART_PHASES`]) over the parts (part `(chain, component)`
+/// at `2 chain + component`), and where the merged stages read the per-instance inputs. Every
+/// input that differs between the instances is one family input over the producer's instances:
+/// instance `k` reading an artifact (or a linked output) of instance `floor(k / d)` of a producer
+/// merged over `1 / d` as many instances reads that member of the producer's output family (`d =
+/// 2` for a part reading its chain's sigma encoding, else `1`), and a plain input is member `k`
+/// of a family input fed by a family external. Stages outside the merged phases read whole output
+/// families, so no stage's interface grows with the number of chains.
 fn merged_stages(
     stages: Vec<ProtocolStage>,
-    parts: &[(usize, usize)],
+    chains: usize,
     productions: &BTreeMap<ProductionId, StageId>,
     links: &BTreeMap<String, (StageId, String)>,
 ) -> Result<(Vec<ProtocolStage>, MergedInputs), ApiError> {
-    // A per-part stage name: its phase and instance.
-    let instance_of = |stage: &str| {
-        PHASES.iter().find_map(|phase| {
-            let rest = stage.strip_prefix(phase)?.strip_prefix('_')?;
-            let (chain, component) = rest.split_once('_')?;
-            let part = (chain.parse::<usize>().ok()?, component.parse::<usize>().ok()?);
-            Some((*phase, parts.iter().position(|candidate| *candidate == part)?))
-        })
+    let instance_of = |stage: &str| stage_instance(stage, chains);
+    let instance_names = |phase: &str| -> Vec<String> {
+        match CHAIN_PHASES.contains(&phase) {
+            true => (0..chains).map(|chain| format!("{phase}_{chain}")).collect(),
+            false => (0..chains)
+                .flat_map(|chain| [0, 1].map(|component| format!("{phase}_{chain}_{component}")))
+                .collect(),
+        }
     };
     let graphs = stages
         .iter()
         .map(|stage| (stage.id.0.clone(), stage.graph.clone()))
         .collect::<BTreeMap<_, _>>();
-    // Phases are merged in order; instance `k` reading output `o` of instance `k` of a merged
-    // producer reads member `k` of the producer's family named `merged[..].outputs[k][o]`.
+    // Phases are merged in order; instance `k` reading output `o` of instance `k / d` of a merged
+    // producer reads that member of the producer's family named `merged[..].outputs[k / d][o]`.
     let mut merged: BTreeMap<&str, (Graph, MergeNames)> = BTreeMap::new();
     // The family inputs of the merged stages, by phase and name.
     let family_inputs = RefCell::new(BTreeSet::new());
-    for phase in PHASES {
-        let instances = parts
+    for phase in CHAIN_PHASES.into_iter().chain(PART_PHASES) {
+        let stage_names = instance_names(phase);
+        let count = stage_names.len();
+        let instances = stage_names
             .iter()
-            .map(|(chain, component)| {
-                graphs.get(&format!("{phase}_{chain}_{component}")).cloned().ok_or_else(|| {
-                    ApiError::input(format!("no recorded stage {phase}_{chain}_{component}"))
-                })
+            .map(|name| {
+                graphs
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| ApiError::input(format!("no recorded stage {name}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // The producer instance every consumer instance reads (from a merged phase), and the
+        // group size `d` with `instance = k / d`, the same for every `k`.
+        let grouped = |producers: Vec<Option<(&'static str, usize, usize)>>| {
+            let (phase, _, producer_count) = producers[0]?;
+            (count % producer_count == 0).then_some(())?;
+            let group = count / producer_count;
+            producers
+                .iter()
+                .enumerate()
+                .all(|(k, producer)| {
+                    matches!(producer, Some((other, instance, _))
+                        if *other == phase && *instance == k / group)
+                })
+                .then_some((phase, group))
+        };
         let family_input = |kinds: &[&NodeKind]| {
             let NodeKind::Input { name, artifact, .. } = kinds[0] else {
                 return None;
             };
+            // An input equal in every instance is passed once unless it reads a merged
+            // producer (whose output is a family).
+            let equal = kinds.iter().all(|kind| *kind == kinds[0]);
             let Some(artifact) = artifact else {
-                // A plain input: member `k` is part `k`'s input.
+                // A plain input linked to a merged producer's output (a part reading its
+                // chain's sigma row) reads its member; another differing one is member `k` of a
+                // family external.
+                let producers = kinds
+                    .iter()
+                    .map(|kind| match kind {
+                        NodeKind::Input { name, artifact: None, .. } => {
+                            links.get(name).and_then(|(stage, _)| instance_of(&stage.0))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let group = match producers[0] {
+                    Some(_) => grouped(producers)?.1,
+                    None if equal => return None,
+                    None => 1,
+                };
                 family_inputs.borrow_mut().insert((phase, name.clone()));
-                return Some((name.clone(), None));
+                return Some((name.clone(), None, group));
             };
-            let mut families = kinds.iter().enumerate().map(|(index, kind)| {
+            let producers = kinds
+                .iter()
+                .map(|kind| match kind {
+                    NodeKind::Input { artifact: Some(artifact), .. } => {
+                        instance_of(&productions.get(&artifact.production_id)?.0)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let (producer_phase, group) = grouped(producers.clone())?;
+            let mut families = kinds.iter().zip(&producers).map(|(kind, producer)| {
                 let NodeKind::Input { artifact: Some(artifact), .. } = kind else {
                     return None;
                 };
-                let (producer_phase, instance) =
-                    instance_of(&productions.get(&artifact.production_id)?.0)?;
-                (instance == index).then_some(())?;
-                merged.get(producer_phase)?.1.outputs[index].get(&artifact.artifact_name).cloned()
+                let (_, instance, _) = (*producer)?;
+                merged.get(producer_phase)?.1.outputs[instance]
+                    .get(&artifact.artifact_name)
+                    .cloned()
             });
             let family = families.next()??;
             for other in families {
@@ -654,16 +834,20 @@ fn merged_stages(
                 }
             }
             family_inputs.borrow_mut().insert((phase, name.clone()));
-            Some((name.clone(), Some(ArtifactInput { artifact_name: family, ..artifact.clone() })))
+            Some((
+                name.clone(),
+                Some(ArtifactInput { artifact_name: family, ..artifact.clone() }),
+                group,
+            ))
         };
         let interface = MergeInterface { family_input: &family_input, unpacked: &|_| false };
         let result = merge_instances(phase, &instances, &interface)
             .map_err(|error| ApiError::input(format!("merging the {phase} stages: {error}")))?;
         merged.insert(phase, result);
     }
-    // A producer (per-part stage, output) as a merged stage and its output family.
+    // A producer (per-instance stage, output) as a merged stage and its output family.
     let producer = |stage: &StageId, output: &str| match instance_of(&stage.0) {
-        Some((phase, instance)) => (
+        Some((phase, instance, _)) => (
             StageId(phase.to_owned()),
             merged[phase].1.outputs[instance]
                 .get(output)
@@ -674,12 +858,11 @@ fn merged_stages(
     };
     let mut inputs = MergedInputs::default();
     for (&phase, (_, names)) in &merged {
-        for (instance, (chain, component)) in parts.iter().enumerate() {
+        for (instance, stage) in instance_names(phase).into_iter().enumerate() {
             for (original, name) in &names.inputs[instance] {
-                inputs.targets.insert(
-                    (format!("{phase}_{chain}_{component}"), original.clone()),
-                    (phase.to_owned(), name.clone()),
-                );
+                inputs
+                    .targets
+                    .insert((stage.clone(), original.clone()), (phase.to_owned(), name.clone()));
             }
         }
     }
@@ -703,7 +886,7 @@ fn merged_stages(
             let (stage, output) = match artifact {
                 // A family input reads the producer's output family itself.
                 Some(artifact) if inputs.families.contains(&(phase.to_owned(), name.clone())) => {
-                    let Some((producer_phase, _)) = instance_of(&production(artifact)?.0) else {
+                    let Some((producer_phase, _, _)) = instance_of(&production(artifact)?.0) else {
                         continue;
                     };
                     (StageId(producer_phase.to_owned()), artifact.artifact_name.clone())
@@ -739,8 +922,8 @@ fn merged_stages(
     let mut result = Vec::new();
     for stage in stages {
         match instance_of(&stage.id.0) {
-            // The merged stage takes the place of its first part.
-            Some((phase, 0)) => result.push(merged_stage(phase)?),
+            // The merged stage takes the place of its first instance.
+            Some((phase, 0, _)) => result.push(merged_stage(phase)?),
             Some(_) => {}
             None => {
                 let bindings = stage
@@ -763,14 +946,17 @@ fn merged_stages(
     Ok((result, inputs))
 }
 
-/// A family external over the parts: member `k` feeds member `k` of every family input in
-/// `inputs` and stands for the external `originals[k]` the per-part input of part `k` read.
+/// A family external over the instances of a merged phase (the parts, or the chains): member `k`
+/// feeds member `k` of every family input in `inputs` and stands for the external `originals[k]`
+/// the per-instance input of instance `k` read.
 /// Parts that read one original external read equal members (`representatives[k]` the first
 /// part reading `originals[k]`), and a member standing for an original external that other
 /// destinations still read equals it; [`RefreshRun::protocol`]'s requirement ties both (byte
 /// strings excepted: every part may use its own hash keys).
 struct PartFamily {
     name: String,
+    /// The number of instances.
+    count: usize,
     element: InputValueContract,
     originals: Vec<String>,
     representatives: Vec<usize>,
@@ -780,20 +966,14 @@ struct PartFamily {
 
 /// The externals of the merged protocol: each external's destinations in the merged stages
 /// (deduplicated), with the per-part inputs merged into family inputs fed by one [`PartFamily`]
-/// per pattern of original externals over the parts; an original external whose every
+/// per pattern of original externals over a phase's instances; an original external whose every
 /// destination was such a member is dropped.
 #[allow(clippy::type_complexity)]
 fn pack_externals(
     externals: Vec<(InputContractEntry, ProtocolInputBinding)>,
     merged: &MergedInputs,
-    parts: usize,
+    chains: usize,
 ) -> Result<(Vec<(InputContractEntry, ProtocolInputBinding)>, Vec<PartFamily>), ApiError> {
-    let instance = |stage: &str| {
-        let mut fields = stage.rsplitn(3, '_');
-        let component = fields.next()?.parse::<usize>().ok()?;
-        let chain = fields.next()?.parse::<usize>().ok()?;
-        Some(2 * chain + component)
-    };
     // For every family input, the original external feeding each member.
     let mut feeds = BTreeMap::<(String, String), Vec<Option<usize>>>::new();
     let mut kept = Vec::new();
@@ -810,12 +990,12 @@ fn pack_externals(
                 continue;
             };
             if merged.families.contains(&(phase.clone(), name.clone())) {
-                let member = instance(&stage.0)
-                    .filter(|member| *member < parts)
-                    .ok_or_else(|| ApiError::input(format!("{} is not a part stage", stage.0)))?;
+                let (_, member, count) = stage_instance(&stage.0, chains).ok_or_else(|| {
+                    ApiError::input(format!("{} is not a merged instance stage", stage.0))
+                })?;
                 let slot = &mut feeds
                     .entry((phase.clone(), name.clone()))
-                    .or_insert_with(|| vec![None; parts])[member];
+                    .or_insert_with(|| vec![None; count])[member];
                 if slot.replace(index).is_some() {
                     return Err(ApiError::input(format!("{phase}/{name}: one external per member")));
                 }
@@ -850,23 +1030,26 @@ fn pack_externals(
         }
         let originals =
             members.iter().map(|member| externals[*member].0.name.clone()).collect::<Vec<_>>();
-        let representatives = (0..parts)
+        // A family over the parts, or over the chains (a chain phase's input).
+        let count = members.len();
+        let representatives = (0..count)
             .map(|k| members.iter().position(|member| *member == members[k]).unwrap_or(k))
             .collect::<Vec<_>>();
-        let ties = (0..parts)
+        let ties = (0..count)
             .filter(|k| representatives[*k] == *k && kept_names.contains(&originals[*k]))
             .map(|k| (k, originals[k].clone()))
             .collect();
-        let name = format!("parts_{}", originals[0]);
+        let prefix = if count == 2 * chains { "parts" } else { "chains" };
+        let name = format!("{prefix}_{}", originals[0]);
         kept.push(external(
             &name,
             InputValueContract::Family {
-                count: IntExpr::constant(parts),
+                count: IntExpr::constant(count),
                 element: Box::new(element.clone()),
             },
             destinations,
         ));
-        families.push(PartFamily { name, element, originals, representatives, ties });
+        families.push(PartFamily { name, count, element, originals, representatives, ties });
     }
     Ok((kept, families))
 }

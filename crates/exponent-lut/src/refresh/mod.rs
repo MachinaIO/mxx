@@ -7,9 +7,13 @@
 //! `y_j = sigma A'_(j) - Delta_0 r_j x G^st_0 + e'_j      (j = 0, 1)`
 //!
 //! in the format of a reference chain ([`TopReference`]: its level-0 primes `Q_0` and level-1
-//! primes `Q_1`, `Delta_0 = Q_0 / Q_1`, `G^st_0` the gadget of `Q_1`), with `sigma_0` a uniform
-//! binary polynomial and `e'_j` CBD vectors, both computed by the sparse-LWR PRF
-//! ([`FreshNoiseProgram`]), and hash-sampled public `A'_(j) in R_(Q_0)^(2 x w_0)`.
+//! primes `Q_1`, `Delta_0 = Q_0 / Q_1`, `G^st_0` the gadget of `Q_1`), with `e'_j` CBD vectors
+//! computed by the sparse-LWR PRF ([`FreshNoiseProgram`]). The caller provides both the new mask
+//! and the public matrices:
+//!
+//! - `sigma_0` arrives as an encoding of `sigma_0 G` under the caller's mask secret (see [Caller
+//!   inputs](#caller-inputs)); the refresh never sees `sigma_0` itself.
+//! - `A' = [A'_(0) | A'_(1)]` is a public matrix of the reference's level-0 ring.
 //!
 //! # Chains
 //!
@@ -20,22 +24,49 @@
 //! `L + 1` (the plaintext modulus of level `L`). Every ring lists its towers in the canonical
 //! order, so a modulus has one tower order on every chain. On chain `q` the part `(q, j)` decodes
 //! `y_j mod q` (the per-chain decoding step, see `part`): it combines the one encoding
-//! `[g | c_one]`, with `g` the mask child's carrier of payload `(M + 1) sigma_0 G`
-//! (`= sigma_0 G` modulo `q`), the target's component `j` and the fresh-noise carriers into a row
-//! that one smudged trapdoor decoder rounds to `y_j mod q`; the target action maps
-//! `Delta_L r_j x G^st_L` to `Q_q (Delta_0 r_j x G^st_0 mod q)`. [`crate::rns_bgg`] recombines
-//! the residues of every chain modulo the product `P` of the refreshed slots' primes (`Q_0` when
-//! every slot is refreshed); refreshing a subset of the slots yields `y_j mod P` only.
+//! `[g | c_one]`, with `g` the caller's encoding of `sigma_0 G`, the target's component `j` and
+//! the fresh-noise carriers into a row that one smudged trapdoor decoder rounds to `y_j mod q`;
+//! the target action maps `Delta_L r_j x G^st_L` to `Q_q (Delta_0 r_j x G^st_0 mod q)`.
+//! [`crate::rns_bgg`] recombines the residues of every chain modulo the product `P` of the
+//! refreshed slots' primes (`Q_0` when every slot is refreshed); refreshing a subset of the
+//! slots yields `y_j mod P` only.
+//!
+//! # Caller inputs
+//!
+//! - **`A'`.** One matrix `[A'_(0) | A'_(1)]` of shape `2 x 2 w_0` over the reference's level-0
+//!   ring `R_(Q_0)` (the primes of [`TopReference::top`] in canonical order, ring dimension
+//!   [`TopReference::ring_dimension`]), `A'_(j)` its columns `j w_0 .. (j + 1) w_0`. Every part
+//!   reads the whole matrix and reduces it modulo the primes of its decoding level (a CRT sub-basis
+//!   of `Q_0` in the same tower order), so all chains use the residues of one `A'`; the decode
+//!   stage reads it modulo `Q_0` (modulo `P` for a refresh of some slots). Then `sigma A' = [sigma
+//!   A'_(0) | sigma A'_(1)]` is the mask part of the two output rows side by side. The two halves
+//!   must be independent and uniform: with `A'_(0) = A'_(1)`, `y_0 - y_1 = -Delta_0 (r_0 - 1) x
+//!   G^st_0 + e'_0 - e'_1` reveals the payload.
+//! - **The encoding of `sigma_0 G`, per chain.** Chain `q` takes one encoding, shared by its two
+//!   parts `(chain, 0)` and `(chain, 1)`, which both read its public key `K_g` and its row `g`: an
+//!   encoding under the caller's mask secret `s = (s_0, 1)` (the mask secret of the target's
+//!   stages) in the ring of the chain's decoding level `L` (the ring of `Q`, the level's primes in
+//!   canonical order, the same for both parts), with `m` columns (the digits of `Q`): `g = s K_g -
+//!   v G_Q + e_g`, `K_g in R_Q^(2 x m)`, `G_Q` the public gadget of that ring, and `v = sigma_0
+//!   (mod q)` for the chain's output prime `q` (only `v mod q` matters: a PRF output with payload
+//!   `(M +
+//!   1) sigma_0 G_Q` may be passed as is). `sigma_0` must be binary (the security of the refreshed
+//!   output, [`crate::rns_bgg::RnsBggRefresh::security`], assumes a uniform binary mask), the same
+//!   on every chain and component, and the error `e_g` must be bounded as the noise simulation is
+//!   told ([`crate::rns_bgg::RefreshSigmaNoise`]: `||e_g||_inf` and its average-case moments),
+//!   since it enters the decoded row through `(I_2 ⊗ G_Q)^-1`. This is exactly the finished
+//!   [`crate::rns_bgg::RnsOutputUse::Gadget`] output of a raw coefficient Program evaluated on
+//!   [`crate::rns_bgg::RnsBggParameters::refresh_child_parameters`] (its key and its row component
+//!   1), e.g. the binary [`FreshNoiseProgram`] of `n` samples.
 //!
 //! # Shared and chain-specific material
 //!
-//! The mask and the CBD children of every chain use the same keys (one mask key set, one CBD key
-//! set per component) and the same label, so all chains compute the same `sigma_0` and `e'_j`;
-//! every decoder has its own smudge keys, one key set per column (one family over the columns).
-//! The stages of chain `q` run under the hash namespace [`RefreshDeclaration::chain_namespace`],
-//! so no two chains share a hash-derived public matrix (with a shared mask, two input rows under
-//! one key would cancel it). `A'_(j)` and the label are sampled under the refresh's own
-//! namespaces, identical for every chain.
+//! The CBD children of every chain use the same keys (one CBD key set per component) and the
+//! same label, so all chains compute the same `e'_j`; every decoder has its own smudge keys, one
+//! key set per column (one family over the columns). The stages of chain `q` run under the hash
+//! namespace [`RefreshDeclaration::chain_namespace`], so no two chains share a hash-derived
+//! public matrix. The label is sampled under the refresh's own namespace, identical for every
+//! chain.
 //!
 //! # Declaring and running a refresh
 //!
@@ -49,12 +80,10 @@
 //! - The target must be the output of an exponent LUT, whose plaintext is one signed table monomial
 //!   (`||x||_1 = 1`) under the crate's LUT input contract (every LUT input is one signed monomial);
 //!   a Program that sums before its last LUT is outside the claim.
-//! - `A'` is fixed by the declaration's matrix tag and reused across encryptions (each with a fresh
-//!   mask). Refreshing two encodings under the same secret and the same `A'` reveals the difference
-//!   of their payloads; the refresh does not track it.
+//! - Refreshing two encodings under the same secret and the same `A'` reveals the difference of
+//!   their payloads unless each has a fresh `sigma_0`; the refresh does not track it.
 //! - Every invocation uses a fresh label tag ([`RefreshDeclaration::label`]); a repeated label with
-//!   the same keys repeats `sigma_0`, `e'` and every smudge, and two refreshes of `x` and `x~` then
-//!   differ by `-Delta_0 r_j (x - x~) G^st_0` exactly.
+//!   the same keys repeats `e'` and every smudge.
 //! - Label encodings of another label under the right artifact names are outside the contract.
 //!
 //! The smudges hide the decoders' noise under the heuristic of the existing decoder, which
@@ -129,8 +158,9 @@ impl FreshNoiseProgram {
     }
 
     /// The `columns` polynomials of `coefficients` samples of `distribution`
-    /// (see [`Self::new`]); the refresh's mask child is one polynomial of
-    /// [`PrfDistribution::Binary`] samples.
+    /// (see [`Self::new`]); one polynomial of [`PrfDistribution::Binary`] samples modulo a
+    /// chain's output prime is an encoding of `sigma_0 G` a refresh accepts (see
+    /// [Caller inputs](crate::refresh#caller-inputs)).
     pub fn with_distribution(
         profile: SparseLwrPrfProfile,
         distribution: PrfDistribution,
@@ -198,6 +228,30 @@ impl FreshNoiseProgram {
     pub const fn columns(&self) -> usize {
         self.columns
     }
+
+    /// The samples of the members on the generated keys `keys` (member `k` on key `k`) for the
+    /// PRF label `label` ([`RefreshDeclaration::label`]): the values the Program's sampler reads
+    /// before it places them (`+-h` for [`PrfDistribution::Binary`], the CBD value for
+    /// [`PrfDistribution::Cbd`]).
+    pub fn samples(
+        &self,
+        keys: &[crate::program_gadgets::pbc::PbcGeneratedKeyLayout],
+        label: &[usize],
+    ) -> Result<Vec<i64>, RefreshError> {
+        let q = self.sampler.prf().profile().q()?;
+        let label = label.iter().map(|value| *value as u64).collect::<Vec<_>>();
+        keys.iter()
+            .map(|key| {
+                let z = crate::program_gadgets::pbc::clear_pbc_inner_product(
+                    &key.public_layout,
+                    key.private_schedule(),
+                    &label,
+                    q as u64,
+                )?;
+                Ok(self.sampler.sample_at(&self.program, z as usize)?)
+            })
+            .collect()
+    }
 }
 
 /// The output format of a refresh to the top level: the level-0 private
@@ -230,8 +284,6 @@ impl TopReference {
 /// [`PrfKeyShape`]); the keys' layouts are the stages' integer data (coordinate tables, see
 /// [`crate::program::ProgramData`]).
 pub struct RefreshKeys<'a> {
-    /// The mask child's `n` keys, shared by every chain and component.
-    pub mask: PrfKeyShape,
     /// Component `j`'s CBD child keys (`w_0 n`), shared by every chain.
     pub fresh: [PrfKeyShape; 2],
     /// The `w_0 n d` smudge keys of the decoder of part `(chain, component)`, column `j` the keys
@@ -243,8 +295,8 @@ pub struct RefreshKeys<'a> {
 ///
 /// Its parts `(chain, component)`, one per refreshed slot and component, each run their own
 /// preprocessing, encryption and online evaluation (the `rns_bgg` stage builders take the part
-/// as `(chain, component)`); [`Self::fresh`], [`Self::decoder`], [`Self::mask_namespace`] and
-/// [`Self::fresh_namespace`] give the children of a part.
+/// as `(chain, component)`); [`Self::fresh`], [`Self::decoder`] and [`Self::fresh_namespace`]
+/// give the children of a part.
 #[derive(Clone, Debug)]
 pub struct RefreshDeclaration {
     profile: SparseLwrPrfProfile,
@@ -266,8 +318,9 @@ impl RefreshDeclaration {
     /// the children extend them with primes of `extension`, the fresh noise is CBD(`eta`) and
     /// every decoder smudges with `digits` digits, on the keys of `keys`. `slots` lists the
     /// refreshed primes of `reference.top` by increasing index, one chain each. The
-    /// specification commits to the mask and CBD key sets, and every part's to its smudge key
-    /// sets, so refreshes of distinct key sets share no hash namespace.
+    /// specification commits to the CBD key sets, and every part's to its smudge key sets, so
+    /// refreshes of distinct key sets share no hash namespace. The new mask and `A'` are the
+    /// caller's inputs of the stages (see [Caller inputs](crate::refresh#caller-inputs)).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_program: &ExponentLutProgram,
@@ -280,7 +333,6 @@ impl RefreshDeclaration {
         extension: Vec<u64>,
         digits: usize,
         keys: RefreshKeys<'_>,
-        matrix_tag: Vec<u8>,
     ) -> Result<Self, RefreshError> {
         let invalid = RefreshError::InvalidDeclaration;
         let level = depths.len().checked_sub(2).ok_or(RefreshError::InvalidDeclaration)?;
@@ -302,7 +354,7 @@ impl RefreshDeclaration {
         }
         target_admission(source_program, target_output)?;
         let spec = commitment(&(
-            b"mxx-exponent-lut/refresh-top/spec/v2".as_slice(),
+            b"mxx-exponent-lut/refresh-top/spec/v3".as_slice(),
             source_program.id(),
             target_output,
             &profile,
@@ -312,8 +364,6 @@ impl RefreshDeclaration {
             &slots,
             &extension,
             digits,
-            &matrix_tag,
-            &keys.mask,
             &keys.fresh,
         ))?;
         let primes = depths[level];
@@ -342,10 +392,8 @@ impl RefreshDeclaration {
                     component,
                     digits,
                     reference.clone(),
-                    keys.mask.clone(),
                     keys.fresh[component].clone(),
                     (keys.smudge)(chain, component),
-                    matrix_tag.clone(),
                     spec,
                 )?);
             }
@@ -417,12 +465,6 @@ impl RefreshDeclaration {
         (component < 2).then(|| self.parts.get(2 * chain + component)).flatten()
     }
 
-    /// Chain `chain`'s mask child: one polynomial of `n` bits modulo its output prime, the same
-    /// bits on every chain.
-    pub fn mask(&self, chain: usize) -> Option<&FreshNoiseProgram> {
-        self.part((chain, 0)).map(RefreshPartDeclaration::mask)
-    }
-
     /// The fresh-noise child of part `(chain, component)`: the CBD noise `e'_j` of the
     /// component.
     pub fn fresh(&self, part: (usize, usize)) -> Option<&FreshNoiseProgram> {
@@ -435,14 +477,8 @@ impl RefreshDeclaration {
         self.part(part).map(RefreshPartDeclaration::decoder)
     }
 
-    /// The hash namespace of the mask child of part `(chain, component)`: a refresh child's
-    /// stage builders take it through `with_hash_namespace`.
-    pub fn mask_namespace(&self, part: (usize, usize)) -> Option<[u8; 32]> {
-        self.part(part).map(RefreshPartDeclaration::mask_namespace)
-    }
-
-    /// The hash namespace of the fresh-noise child of part `(chain, component)` (see
-    /// [`Self::mask_namespace`]).
+    /// The hash namespace of the fresh-noise child of part `(chain, component)`: its stage
+    /// builders take it through `with_hash_namespace`.
     pub fn fresh_namespace(&self, part: (usize, usize)) -> Option<[u8; 32]> {
         self.part(part).map(RefreshPartDeclaration::fresh_namespace)
     }
@@ -453,14 +489,6 @@ impl RefreshDeclaration {
         digest.update(b"mxx-exponent-lut/refresh-top/chain-namespace/v1");
         digest.update(self.spec);
         digest.update((chain as u64).to_le_bytes());
-        digest.finalize().into()
-    }
-
-    /// The hash namespace of `A'_(0)` and `A'_(1)`, shared by every chain.
-    pub fn matrix_namespace(&self) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(b"mxx-exponent-lut/refresh-top/matrix-namespace/v1");
-        digest.update(self.spec);
         digest.finalize().into()
     }
 

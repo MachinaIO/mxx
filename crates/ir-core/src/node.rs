@@ -26,11 +26,11 @@
 //! for a runtime `k` of any sign taken modulo `2n`.
 //!
 //! Control nodes carry their own metadata. A [`ParallelLoop`] runs independent instances over
-//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`, or
-//! `Gather` by another argument's instance value), and returns indexed families. In a
-//! [`SequentialLoop`] the first `carried_count` arguments are the carried state and the rest are
-//! captures. `Select` eagerly selects one candidate by a runtime selector; both candidates are part
-//! of the graph, so selection is not lazy branching.
+//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`,
+//! `ZipQuotient`, or `Gather` by another argument's instance value), and returns indexed families.
+//! In a [`SequentialLoop`] the first `carried_count` arguments are the carried state and the rest
+//! are captures. `Select` eagerly selects one candidate by a runtime selector; both candidates are
+//! part of the graph, so selection is not lazy branching.
 
 use crate::{
     artifact::{ArtifactAvailability, ProductionId},
@@ -417,4 +417,23 @@ pub enum LoopInputMode {
     Gather {
         index_argument: usize,
     },
+    /// Instance `i` receives member `floor(i / divisor)` (`divisor >= 1`): consecutive groups of
+    /// `divisor` instances share one member, e.g. the parts of one chain reading the chain's
+    /// value.
+    ZipQuotient {
+        divisor: usize,
+    },
+}
+
+impl LoopInputMode {
+    /// The member a zipped mode (`Zip`, `ZipOffset`, `ZipQuotient`) gives instance `instance`;
+    /// `None` for `Broadcast` and `Gather` (or a zero divisor).
+    pub fn zipped_member(self, instance: usize) -> Option<usize> {
+        match self {
+            Self::Zip => Some(instance),
+            Self::ZipOffset { offset } => instance.checked_add(offset),
+            Self::ZipQuotient { divisor } => instance.checked_div(divisor),
+            Self::Broadcast | Self::Gather { .. } => None,
+        }
+    }
 }

@@ -14,11 +14,7 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof GenDecode
 28 columns, ring dimension 131072, decoding modulus 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289. -/
 
 /-- The decode stage's inputs. -/
-abbrev Inputs := (Fin 16 → Mxx.Primitives.ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 28) × (Fin 131072 → Int) × ByteArray × Mxx.Primitives.ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 1 × Int × Int × Unit
-
-/-- The hash tag of component `j`'s `A'`. -/
-def decodeTag (j : Nat) : Blob :=
-  completeHashTag [114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 65, 116, 111, 112, 45, 114, 101, 102, 114, 101, 115, 104, 45, 114, 111, 117, 110, 100, 45, 116, 114, 105, 112] [.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (j : Int)]
+abbrev Inputs := (Fin 16 → Mxx.Primitives.ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 28) × (Fin 131072 → Int) × Mxx.Primitives.ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 2 56 × Mxx.Primitives.ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 1 × Int × Int × Unit
 
 /-- The factor `r` of component `j`'s expected row. -/
 noncomputable def decodeR (inputs : Inputs) : Nat → ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 1
@@ -27,45 +23,45 @@ noncomputable def decodeR (inputs : Inputs) : Nat → ExactMatrix 21358317166384
   | _ => 0
 
 /-- The value whose CRT terms component `j` reads: its expected row plus the error row `E j`. -/
-noncomputable def decodeValue (model : HashModel) (inputs : Inputs) (G : ExactMatrix 1942566534251559791942281995946931586214205534210157066971588917963081260105189818369 131072 1 28)
+noncomputable def decodeValue (inputs : Inputs) (G : ExactMatrix 1942566534251559791942281995946931586214205534210157066971588917963081260105189818369 131072 1 28)
     (E : Nat → ErrorMatrix 131072 1 28) (j : Nat) : ExactMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 28 :=
-  decodeExpected (model.sample 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 2 28 inputs.2.2.1 (decodeTag j))
+  decodeExpected (colBlock 28 inputs.2.2.1 (28 * j))
     (fun _ _ ↦ polynomialOfCoefficients inputs.2.1) 1099489607681 (decodeR inputs j)
     inputs.2.2.2.2.1 inputs.2.2.2.2.2.1 G + reduceMatrix 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 131072 1 28 (E j)
 
-theorem stride_step_sequential_generatedRoot_4 {a0 a1 a2} {i : Nat} {cur next} {fam}
-    (h : W_Stage_decode.sequential_generatedRoot_4 a0 a1 a2 i (cur, (fam, ())) next) :
+theorem stride_step_sequential_generatedRoot_4 {a0 a1} {i : Nat} {cur next} {fam}
+    (h : W_Stage_decode.sequential_generatedRoot_4 a0 a1 i (cur, (fam, ())) next) :
     StrideStep fam 2 0 i cur next := by
   obtain ⟨x, -, -, hx, rfl⟩ := h
   exact ⟨x, hx, rfl⟩
 
-theorem stride_step_sequential_generatedRoot_32 {a0 a1 a2} {i : Nat} {cur next} {fam}
-    (h : W_Stage_decode.sequential_generatedRoot_32 a0 a1 a2 i (cur, (fam, ())) next) :
+theorem stride_step_sequential_generatedRoot_32 {a0 a1} {i : Nat} {cur next} {fam}
+    (h : W_Stage_decode.sequential_generatedRoot_32 a0 a1 i (cur, (fam, ())) next) :
     StrideStep fam 2 1 i cur next := by
   obtain ⟨x, -, -, hx, rfl⟩ := h
   exact ⟨x, hx, rfl⟩
 
-theorem round_step_sequential_sequential_generatedRoot_28_6 {a0 a1 a2 a3} {k : Nat} {c c' : Int} {vals half qc}
-    (h : W_Stage_decode.sequential_sequential_generatedRoot_28_6 a0 a1 a2 a3 k (c, (vals, (half, (qc, ())))) c') :
+theorem round_step_sequential_sequential_generatedRoot_28_6 {a0 a1 a2} {k : Nat} {c c' : Int} {vals half qc}
+    (h : W_Stage_decode.sequential_sequential_generatedRoot_28_6 a0 a1 a2 k (c, (vals, (half, (qc, ())))) c') :
     RoundStep vals half qc k c c' := by
   obtain ⟨v, -, -, hv, -, -, rfl⟩ := h
   exact ⟨v, hv, rfl⟩
 
-theorem column_step_sequential_generatedRoot_28 {a0 a1 a2} {i : Nat} {cur next : Int} {D half qc}
-    (h : W_Stage_decode.sequential_generatedRoot_28 a0 a1 a2 i (cur, (D, (half, (qc, ())))) next) :
+theorem column_step_sequential_generatedRoot_28 {a0 a1} {i : Nat} {cur next : Int} {D half qc}
+    (h : W_Stage_decode.sequential_generatedRoot_28 a0 a1 i (cur, (D, (half, (qc, ())))) next) :
     ColumnStep D half qc i cur next := by
   obtain ⟨w, -, -, -, -, -, -, hs, hv, -, hrun, rfl⟩ := h
   refine ⟨_, _, _, _, hs, hv, ?_, hrun⟩
   exact fun _ _ _ hb ↦ round_step_sequential_sequential_generatedRoot_28_6 hb
 
-theorem round_step_sequential_sequential_generatedRoot_46_6 {a0 a1 a2 a3} {k : Nat} {c c' : Int} {vals half qc}
-    (h : W_Stage_decode.sequential_sequential_generatedRoot_46_6 a0 a1 a2 a3 k (c, (vals, (half, (qc, ())))) c') :
+theorem round_step_sequential_sequential_generatedRoot_46_6 {a0 a1 a2} {k : Nat} {c c' : Int} {vals half qc}
+    (h : W_Stage_decode.sequential_sequential_generatedRoot_46_6 a0 a1 a2 k (c, (vals, (half, (qc, ())))) c') :
     RoundStep vals half qc k c c' := by
   obtain ⟨v, -, -, hv, -, -, rfl⟩ := h
   exact ⟨v, hv, rfl⟩
 
-theorem column_step_sequential_generatedRoot_46 {a0 a1 a2} {i : Nat} {cur next : Int} {D half qc}
-    (h : W_Stage_decode.sequential_generatedRoot_46 a0 a1 a2 i (cur, (D, (half, (qc, ())))) next) :
+theorem column_step_sequential_generatedRoot_46 {a0 a1} {i : Nat} {cur next : Int} {D half qc}
+    (h : W_Stage_decode.sequential_generatedRoot_46 a0 a1 i (cur, (D, (half, (qc, ())))) next) :
     ColumnStep D half qc i cur next := by
   obtain ⟨w, -, -, -, -, -, -, hs, hv, -, hrun, rfl⟩ := h
   refine ⟨_, _, _, _, hs, hv, ?_, hrun⟩
@@ -77,34 +73,34 @@ component `j` and a small error row `e'_j`. -/
 theorem decode_zero_loops_gen (qN : Nat → Nat) (KN : Nat → Int) (hq : ∀ i : Fin 8, 1 < qN i)
     (hK : ∀ i j : Fin 8, KN i ≡ (if i = j then 1 else 0) [ZMOD (qN j : Int)])
     (hcop : ∀ i j : Fin 8, i ≠ j → Nat.Coprime (qN i) (qN j)) (hprod : 2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 = ∏ i : Fin 8, qN i)
-    {backend : MxxRuntime.BackendContext} {model : MxxRuntime.HashModel} {params : W_Stage_decode.Params}
+    {backend : MxxRuntime.BackendContext} {params : W_Stage_decode.Params}
     {inputs : Inputs} {out : Int}
-    (h : W_Stage_decode.generatedRoot backend model params inputs out)
+    (h : W_Stage_decode.generatedRoot backend params inputs out)
     {G : ExactMatrix 1942566534251559791942281995946931586214205534210157066971588917963081260105189818369 131072 1 28} (hG : gadgetMatrixRuns backend 1024 28 G)
     (E : Nat → ErrorMatrix 131072 1 28)
     (hE : ∀ j c i, 4 * |(E j 0 c).coeff i| + 4 < (2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 : Int))
     (hterm : ∀ i : Fin 16, TermOf (qN (i / 2)) (KN (i / 2)) (inputs.1 i)
-      (decodeValue model inputs G E (i % 2))) :
+      (decodeValue inputs G E (i % 2))) :
     out = 0 := by
-  obtain ⟨w, ⟨hinit0, -, hs0, hσ, hA0, -, -, -, -, -, -, hr00, -, -, -, -, -, -, hr01, hgad, hreb, -, hc0, hinit1, -, hs1, hA1, -, -, -, -, -⟩, ⟨-, hr10, -, -, -, -, -, -, hr11, -, hc1, hout⟩⟩ := h
+  obtain ⟨w, ⟨hinit0, -, hs0, hσ, -, -, -, -, -, -, hA0, -, -, -, -, -, -, hr00, -, -, -, -, -, -, hr01, hgad, hreb, -, hc0, hinit1, -, hs1⟩, ⟨-, -, -, -, -, -, hA1, -, -, -, -, -, -, hr10, -, -, -, -, -, -, hr11, -, hc1, hout⟩⟩ := h
   have hσ' := sigma_of_values hσ
   have hg := hreb.2
   rw [gadgetMatrixRuns_unique hgad hG] at hg
   have z0 := decode_component_zero (K := 8) (Rn := 2) (jn := 0) (by decide) (by decide)
     qN KN hq hK hcop hprod (by decide) (by decide)
-    inputs.1 (decodeValue model inputs G E) hterm _ (E 0) rfl (hE 0) rfl rfl rfl rfl hinit0
+    inputs.1 (decodeValue inputs G E) hterm _ (E 0) rfl (hE 0) rfl rfl rfl rfl hinit0
     (fun _ _ _ hb ↦ stride_step_sequential_generatedRoot_4 hb) hs0 ?hD0 (by decide) rfl
     (fun _ _ _ hb ↦ column_step_sequential_generatedRoot_28 hb) hc0
   case hD0 =>
-    rw [slice_row_gen hr00 rfl (by decide), slice_row_gen hr01 rfl (by decide), hashSample_eq hA0, hσ', hg]
+    rw [slice_row_gen hr00 rfl (by decide), slice_row_gen hr01 rfl (by decide), slice_colBlock hA0, hσ', hg]
     rfl
   have z1 := decode_component_zero (K := 8) (Rn := 2) (jn := 1) (by decide) (by decide)
     qN KN hq hK hcop hprod (by decide) (by decide)
-    inputs.1 (decodeValue model inputs G E) hterm _ (E 1) rfl (hE 1) rfl rfl rfl rfl hinit1
+    inputs.1 (decodeValue inputs G E) hterm _ (E 1) rfl (hE 1) rfl rfl rfl rfl hinit1
     (fun _ _ _ hb ↦ stride_step_sequential_generatedRoot_32 hb) hs1 ?hD1 (by decide) rfl
     (fun _ _ _ hb ↦ column_step_sequential_generatedRoot_46 hb) hc1
   case hD1 =>
-    rw [slice_row_gen hr10 rfl (by decide), slice_row_gen hr11 rfl (by decide), hashSample_eq hA1, hσ', hg]
+    rw [slice_row_gen hr10 rfl (by decide), slice_row_gen hr11 rfl (by decide), slice_colBlock hA1, hσ', hg]
     rfl
   rw [hout, z0, z1]
   try rfl
@@ -122,14 +118,14 @@ theorem decode_prod : 2135831716638487324604933616719561441822403870837824617769
   decide
 
 /-- `decode_zero_loops_gen` for the online stage's CRT tables. -/
-theorem decode_zero_loops {backend : MxxRuntime.BackendContext} {model : MxxRuntime.HashModel} {params : W_Stage_decode.Params}
+theorem decode_zero_loops {backend : MxxRuntime.BackendContext} {params : W_Stage_decode.Params}
     {inputs : Inputs} {out : Int}
-    (h : W_Stage_decode.generatedRoot backend model params inputs out)
+    (h : W_Stage_decode.generatedRoot backend params inputs out)
     {G : ExactMatrix 1942566534251559791942281995946931586214205534210157066971588917963081260105189818369 131072 1 28} (hG : gadgetMatrixRuns backend 1024 28 G)
     (E : Nat → ErrorMatrix 131072 1 28)
     (hE : ∀ j c i, 4 * |(E j 0 c).coeff i| + 4 < (2135831716638487324604933616719561441822403870837824617769981942184435508314978270190567457292289 : Int))
     (hterm : ∀ i : Fin 16, TermOf (decode_qN (i / 2)) (decode_KN (i / 2)) (inputs.1 i)
-      (decodeValue model inputs G E (i % 2))) :
+      (decodeValue inputs G E (i % 2))) :
     out = 0 :=
   decode_zero_loops_gen decode_qN decode_KN decode_gt decode_basis decode_coprime decode_prod h hG E hE hterm
 

@@ -7381,7 +7381,7 @@ pub(super) fn is_vectorized_scalar_loop(
                     input_node.output_types().first().is_some_and(|ty| match mode {
                         LoopInputMode::Broadcast => scalar_or_family(ty),
                         LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => scalar(ty),
-                        LoopInputMode::Gather { .. } => false,
+                        LoopInputMode::ZipQuotient { .. } | LoopInputMode::Gather { .. } => false,
                     })
             })
         }) &&
@@ -7480,6 +7480,9 @@ fn lower_vectorized_parallel_loop(
             LoopInputMode::ZipOffset { offset } => *offset,
             LoopInputMode::Gather { .. } => {
                 return Err("GPU vectorized loop cannot gather an artifact family".into());
+            }
+            LoopInputMode::ZipQuotient { .. } => {
+                return Err("GPU vectorized loop cannot read a quotient-zipped family".into());
             }
         };
         // Lane `i` reads member `offset + i` of the source family.
@@ -8054,6 +8057,9 @@ fn lower_parallel_loop(
                 LoopInputMode::Zip => 0,
                 LoopInputMode::ZipOffset { offset } => *offset,
                 LoopInputMode::Gather { .. } => 0,
+                LoopInputMode::ZipQuotient { .. } => {
+                    return Err("GPU parallel loops do not read quotient-zipped families".into());
+                }
             };
             // A gathered member's index is its lane's entry of a resident
             // integer family, known only when the loop starts.

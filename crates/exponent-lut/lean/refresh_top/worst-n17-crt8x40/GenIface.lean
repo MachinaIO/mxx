@@ -481,6 +481,18 @@ def EncLabelEntry.Comp (q0 : Nat) (n : Nat) (d0 : Nat) (p0 : _) (p1 : _) (p2 : _
     MxxRuntime.gaussianSample (p4) (p5) v2 ∧
     outputs = (inputs.1, (inputs.2.1, (inputs.2.2.1, (inputs.2.2.2.1, (((MxxRuntime.matrixAdd ((MxxRuntime.matrixSub ((MxxRuntime.matrixAdd ((MxxRuntime.matrixMulScalarLeft inputs.2.2.2.2.1 inputs.1 : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.2.2.2.1 inputs.2.2.1 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.2.2.1 ((MxxRuntime.matrixMulScalarLeft ((MxxRuntime.multiplyMonomial ((MxxRuntime.liftInteger inputs.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 1)) inputs.2.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 1)) v0 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) v1 : ExactMatrix q0 n 1 d0)), (((MxxRuntime.matrixAdd ((MxxRuntime.matrixSub ((MxxRuntime.matrixAdd ((MxxRuntime.matrixMulScalarLeft inputs.2.2.2.2.1 inputs.2.1 : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.2.2.2.1 inputs.2.2.2.1 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.2.2.2.1 ((MxxRuntime.matrixMulScalarLeft ((MxxRuntime.multiplyMonomial ((MxxRuntime.liftInteger inputs.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 1)) inputs.2.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 1)) v0 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) v2 : ExactMatrix q0 n 1 d0)), (((MxxRuntime.multiplyMonomial ((MxxRuntime.liftInteger inputs.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 1)) inputs.2.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 1)), ())))))))
 
+/-- Computation bundle of role `enc.label-entry` (variant 1): the scope relation with dimensions, moduli and constants as parameters. -/
+def EncLabelEntry.Comp_1 (q0 : Nat) (n : Nat) (d0 : Nat) (p0 : _) (p1 : _) (p2 : _) (p3 : _) (p4 : _) (p5 : _) (p6 : _) (p7 : _) (p8 : _) (p9 : _) (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i : Nat) (inputs : ExactMatrix q0 n 1 1 × ByteArray × ExactMatrix q0 n 1 1 × Int × Int × Unit) (outputs : ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 1 × Unit) :=
+  ∃ (v0 : ExactMatrix q0 n 1 d0) (v1 : ExactMatrix q0 n 1 d0) (v2 : ExactMatrix q0 n 1 d0) (v3 : ExactMatrix q0 n 1 d0) (v4 : ExactMatrix q0 n 1 d0) (v5 : ExactMatrix q0 n 1 d0) (v6 : ExactMatrix q0 n 1 d0),
+    MxxRuntime.hashSample (hashModel) p0 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (inputs.2.1) v0 ∧
+    MxxRuntime.hashSample (hashModel) p1 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (2)]) (inputs.2.1) v1 ∧
+    MxxRuntime.gadgetMatrixRuns backend p2 p3 v2 ∧
+    MxxRuntime.gaussianSample (p4) (p5) v3 ∧
+    MxxRuntime.hashSample (hashModel) p6 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) (inputs.2.1) v4 ∧
+    MxxRuntime.hashSample (hashModel) p7 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (inputs.2.1) v5 ∧
+    MxxRuntime.gaussianSample (p8) (p9) v6 ∧
+    outputs = (((MxxRuntime.matrixAdd ((MxxRuntime.matrixSub ((MxxRuntime.matrixAdd ((MxxRuntime.matrixMulScalarLeft inputs.1 v0 : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.1 v1 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.1 ((MxxRuntime.matrixMulScalarLeft ((MxxRuntime.multiplyMonomial ((MxxRuntime.liftInteger inputs.2.2.2.1 : ExactMatrix q0 n 1 1)) inputs.2.2.2.2.1 : ExactMatrix q0 n 1 1)) v2 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) v3 : ExactMatrix q0 n 1 d0)), (((MxxRuntime.matrixAdd ((MxxRuntime.matrixSub ((MxxRuntime.matrixAdd ((MxxRuntime.matrixMulScalarLeft inputs.1 v4 : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.1 v5 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) ((MxxRuntime.matrixMulScalarLeft inputs.2.2.1 ((MxxRuntime.matrixMulScalarLeft ((MxxRuntime.multiplyMonomial ((MxxRuntime.liftInteger inputs.2.2.2.1 : ExactMatrix q0 n 1 1)) inputs.2.2.2.2.1 : ExactMatrix q0 n 1 1)) v2 : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) : ExactMatrix q0 n 1 d0)) v6 : ExactMatrix q0 n 1 d0)), (((MxxRuntime.multiplyMonomial ((MxxRuntime.liftInteger inputs.2.2.2.1 : ExactMatrix q0 n 1 1)) inputs.2.2.2.2.1 : ExactMatrix q0 n 1 1)), ())))
+
 /-- Computation bundle of role `enc.lut-branch-key` (variant 0): the scope relation with dimensions, moduli and constants as parameters. -/
 def EncLutBranchKey.Comp (q0 : Nat) (n : Nat) (d0 : Nat) (q1 : Nat) (p0 : _) (p1 : _) (p2 : _) (p3 : _) (p4 : _) (p5 : _) (p6 : _) (p7 : _) (p8 : _) (p9 : _) (p10 : _) (p11 : _) (p12 : _) (p13 : _) (p14 : _) (p15 : _) (p16 : _) (p17 : _) (p18 : _) (p19 : _) (p20 : _) (p21 : _) (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i : Nat) (inputs : ExactMatrix q0 n 1 1 × ByteArray × ExactMatrix q0 n 1 1 × Unit) (outputs : ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 d0 × Unit) :=
   ∃ (v0 : ExactMatrix q0 n 1 d0) (v1 : ExactMatrix q0 n 1 d0) (v2 : ExactMatrix q0 n 1 1) (v3 : ExactMatrix q1 n 1 d0) (v4 : ExactMatrix q0 n 1 d0) (v5 : ExactMatrix q0 n 1 d0) (v6 : ExactMatrix q0 n 1 d0) (v7 : ExactMatrix q0 n 1 d0) (v8 : ExactMatrix q0 n 1 1) (v9 : ExactMatrix q0 n 1 d0),
@@ -952,6 +964,65 @@ def PrfCell0.Comp (q0 : Nat) (n : Nat) (d0 : Nat) (d1 : Nat) (d2 : Nat) (d3 : Na
     MxxRuntime.blockModSwitchRuns p37 (1) v41 v42 ∧
     outputs = (v28, (v34, (v36, (v38, (v40, (v42, ()))))))
 
+/-- Computation bundle of role `prf.cell0` (variant 1): the scope relation with dimensions, moduli and constants as parameters. -/
+def PrfCell0.Comp_1 (q0 : Nat) (n : Nat) (d0 : Nat) (d1 : Nat) (d2 : Nat) (d3 : Nat) (d4 : Nat) (d5 : Nat) (d6 : Nat) (d7 : Nat) (q1 : Nat) (q2 : Nat) (q3 : Nat) (q4 : Nat) (q5 : Nat) (d8 : Nat) (q6 : Nat) (d9 : Nat) (q7 : Nat) (d10 : Nat) (q8 : Nat) (d11 : Nat) (q9 : Nat) (d12 : Nat) (q10 : Nat) (d13 : Nat) (p0 : _) (p1 : _) (p2 : _) (p3 : _) (p4 : _) (p5 : _) (p6 : _) (p7 : _) (p8 : _) (p9 : _) (p10 : _) (p11 : _) (p12 : _) (p13 : _) (p14 : _) (p15 : _) (p16 : _) (p17 : _) (p18 : _) (p19 : _) (p20 : _) (p21 : _) (p22 : _) (p23 : _) (p24 : _) (p25 : _) (p26 : _) (p27 : _) (p28 : _) (p29 : _) (p30 : _) (p31 : _) (p32 : _) (p33 : _) (p34 : _) (p35 : _) (p36 : _) (p37 : _) (p38 : _) (p39 : _) (p40 : _) (p41 : _) (p42 : _) (p43 : _) (p44 : _) (p45 : _) (p46 : _) (p47 : _) (p48 : _) (p49 : _) (p50 : _) (p51 : _) (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i : Nat) (inputs : Int × ExactMatrix q0 n 1 d6 × ByteArray × ExactMatrix q0 n 1 d7 × ExactMatrix q1 n 1 d0 × ExactMatrix q1 n 1 d0 × ExactMatrix q0 n 1 d1 × ExactMatrix q0 n 1 1 × ExactMatrix q2 n 1 d2 × ExactMatrix q2 n 1 d2 × ExactMatrix q0 n 1 d3 × ExactMatrix q3 n 1 d4 × ExactMatrix q4 n 1 d5 × Unit) (outputs : ExactMatrix q5 n 1 d8 × ExactMatrix q6 n 1 d9 × ExactMatrix q7 n 1 d10 × ExactMatrix q8 n 1 d11 × ExactMatrix q9 n 1 d12 × ExactMatrix q10 n 1 d13 × Unit) :=
+  ∃ (v0 : ExactMatrix q0 n 1 d6) (v1 : ExactMatrix q0 n 1 d6) (v2 : ExactMatrix q0 n ((1 + 1) + 1) d6) (v3 : ExactMatrix q0 n (1 + 1) d6) (v4 : ExactMatrix q0 n 1 d7) (v5 : ExactMatrix q0 n 1 d7) (v6 : ExactMatrix q0 n ((1 + 1) + 1) d7) (v7 : ExactMatrix q0 n (1 + 1) d7) (v8 : ExactMatrix q0 n ((1 + 1) + 1) (d6 + d7)) (v9 : ExactMatrix q1 n (1 + 1) d0) (v10 : ExactMatrix q1 n (d6 + d7) d0) (v11 : ExactMatrix q0 n (d6 + d7) d0) (v12 : ExactMatrix q0 n 1 d1) (v13 : ExactMatrix q0 n 1 d1) (v14 : ExactMatrix q0 n 1 d1) (v15 : ExactMatrix q0 n ((1 + 1) + 1) d1) (v16 : ExactMatrix q0 n (1 + 1) d1) (v17 : ExactMatrix q2 n (1 + 1) d2) (v18 : ExactMatrix q2 n (d6 + d7) d2) (v19 : ExactMatrix q0 n (d6 + d7) d2) (v20 : ExactMatrix q0 n 1 d3) (v21 : ExactMatrix q0 n 1 d3) (v22 : ExactMatrix q0 n 1 d3) (v23 : ExactMatrix q0 n ((1 + 1) + 1) d3) (v24 : ExactMatrix q0 n (1 + 1) d3) (v25 : ExactMatrix q0 n ((1 + 1) + 1) (d1 + d3)) (v26 : ExactMatrix q3 n 1 d4) (v27 : ExactMatrix q3 n (1 + 1) d4) (v28 : ExactMatrix q3 n (d1 + d3) d4) (v29 : ExactMatrix q0 n (d1 + d3) d4) (v30 : ExactMatrix q0 n 1 d8) (v31 : ExactMatrix q5 n 1 d8) (v32 : ExactMatrix q4 n 1 d5) (v33 : ExactMatrix q4 n (1 + 1) d5) (v34 : ExactMatrix q4 n (d1 + d3) d5) (v35 : ExactMatrix q0 n (d1 + d3) d5) (v36 : ExactMatrix q0 n 1 d9) (v37 : ExactMatrix q6 n 1 d9) (v38 : ExactMatrix q0 n 1 d10) (v39 : ExactMatrix q7 n 1 d10) (v40 : ExactMatrix q0 n 1 d11) (v41 : ExactMatrix q8 n 1 d11) (v42 : ExactMatrix q0 n 1 d12) (v43 : ExactMatrix q9 n 1 d12) (v44 : ExactMatrix q0 n 1 d13) (v45 : ExactMatrix q10 n 1 d13),
+    p0 ≤ inputs.1 ∧
+    inputs.1 < p1 ^ p2 ∧
+    MxxRuntime.hashSample (hashModel) p3 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (inputs.2.2.1) v0 ∧
+    p4 ≤ inputs.1 ∧
+    inputs.1 < p5 ^ p6 ∧
+    MxxRuntime.hashSample (hashModel) p7 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (2)]) (inputs.2.2.1) v1 ∧
+    MxxRuntime.concatRows inputs.2.1 v0 v3 ∧
+    MxxRuntime.concatRows v3 v1 v2 ∧
+    p8 ≤ inputs.1 ∧
+    inputs.1 < p9 ^ p10 ∧
+    MxxRuntime.hashSample (hashModel) p11 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) (inputs.2.2.1) v4 ∧
+    p12 ≤ inputs.1 ∧
+    inputs.1 < p13 ^ p14 ∧
+    MxxRuntime.hashSample (hashModel) p15 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (inputs.2.2.1) v5 ∧
+    MxxRuntime.concatRows inputs.2.2.2.1 v4 v7 ∧
+    MxxRuntime.concatRows v7 v5 v6 ∧
+    MxxRuntime.concatColumns v2 v6 v8 ∧
+    MxxRuntime.concatRows inputs.2.2.2.2.1 inputs.2.2.2.2.2.1 v9 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p16 p17 v9 v10 ∧
+    MxxRuntime.compactCenteredRebaseRuns p18 v10 v11 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v8 v11 : ExactMatrix q0 n ((1 + 1) + 1) d0)) 0 1 0 p19 v12 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v8 v11 : ExactMatrix q0 n ((1 + 1) + 1) d0)) 1 2 0 p20 v13 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v8 v11 : ExactMatrix q0 n ((1 + 1) + 1) d0)) 2 3 0 p21 v14 ∧
+    MxxRuntime.concatRows ((MxxRuntime.matrixAdd v12 ((MxxRuntime.matrixMulScalarRight inputs.2.2.2.2.2.2.1 inputs.2.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 d1)) : ExactMatrix q0 n 1 d1)) v13 v16 ∧
+    MxxRuntime.concatRows v16 v14 v15 ∧
+    MxxRuntime.concatRows inputs.2.2.2.2.2.2.2.2.1 inputs.2.2.2.2.2.2.2.2.2.1 v17 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p22 p23 v17 v18 ∧
+    MxxRuntime.compactCenteredRebaseRuns p24 v18 v19 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v8 v19 : ExactMatrix q0 n ((1 + 1) + 1) d2)) 0 1 0 p25 v20 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v8 v19 : ExactMatrix q0 n ((1 + 1) + 1) d2)) 1 2 0 p26 v21 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v8 v19 : ExactMatrix q0 n ((1 + 1) + 1) d2)) 2 3 0 p27 v22 ∧
+    MxxRuntime.concatRows ((MxxRuntime.matrixAdd v20 ((MxxRuntime.matrixMulScalarRight inputs.2.2.2.2.2.2.2.2.2.2.1 inputs.2.2.2.2.2.2.2.1 : ExactMatrix q0 n 1 d3)) : ExactMatrix q0 n 1 d3)) v21 v24 ∧
+    MxxRuntime.concatRows v24 v22 v23 ∧
+    MxxRuntime.concatColumns v15 v23 v25 ∧
+    MxxRuntime.hashSample (hashModel) p30 ([.bytes [112, 97, 114, 97, 109, 101, 116, 101, 114, 115], .decimal (p28), .bytes [112, 114, 111, 103, 114, 97, 109], .decimal (p29), .bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (inputs.2.2.1) v26 ∧
+    MxxRuntime.concatRows v26 inputs.2.2.2.2.2.2.2.2.2.2.2.1 v27 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p31 p32 v27 v28 ∧
+    MxxRuntime.compactCenteredRebaseRuns p33 v28 v29 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v25 v29 : ExactMatrix q0 n ((1 + 1) + 1) d4)) 1 2 0 p34 v30 ∧
+    MxxRuntime.blockModSwitchRuns p35 (1) v30 v31 ∧
+    MxxRuntime.hashSample (hashModel) p38 ([.bytes [112, 97, 114, 97, 109, 101, 116, 101, 114, 115], .decimal (p36), .bytes [112, 114, 111, 103, 114, 97, 109], .decimal (p37), .bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) (inputs.2.2.1) v32 ∧
+    MxxRuntime.concatRows v32 inputs.2.2.2.2.2.2.2.2.2.2.2.2.1 v33 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p39 p40 v33 v34 ∧
+    MxxRuntime.compactCenteredRebaseRuns p41 v34 v35 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v25 v35 : ExactMatrix q0 n ((1 + 1) + 1) d5)) 1 2 0 p42 v36 ∧
+    MxxRuntime.blockModSwitchRuns p43 (1) v36 v37 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v25 v29 : ExactMatrix q0 n ((1 + 1) + 1) d4)) 2 3 0 p44 v38 ∧
+    MxxRuntime.blockModSwitchRuns p45 (1) v38 v39 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v25 v35 : ExactMatrix q0 n ((1 + 1) + 1) d5)) 2 3 0 p46 v40 ∧
+    MxxRuntime.blockModSwitchRuns p47 (1) v40 v41 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v25 v29 : ExactMatrix q0 n ((1 + 1) + 1) d4)) 0 1 0 p48 v42 ∧
+    MxxRuntime.blockModSwitchRuns p49 (1) v42 v43 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v25 v35 : ExactMatrix q0 n ((1 + 1) + 1) d5)) 0 1 0 p50 v44 ∧
+    MxxRuntime.blockModSwitchRuns p51 (1) v44 v45 ∧
+    outputs = (v31, (v37, (v39, (v41, (v43, (v45, ()))))))
+
 /-- Computation bundle of role `prf.cell1` (variant 0): the scope relation with dimensions, moduli and constants as parameters. -/
 def PrfCell1.Comp (q0 : Nat) (n : Nat) (d0 : Nat) (q1 : Nat) (q2 : Nat) (d1 : Nat) (d2 : Nat) (d3 : Nat) (d4 : Nat) (d5 : Nat) (d6 : Nat) (d7 : Nat) (d8 : Nat) (d9 : Nat) (q3 : Nat) (d10 : Nat) (d11 : Nat) (d12 : Nat) (q4 : Nat) (d13 : Nat) (q5 : Nat) (d14 : Nat) (d15 : Nat) (q6 : Nat) (q7 : Nat) (q8 : Nat) (d16 : Nat) (q9 : Nat) (d17 : Nat) (q10 : Nat) (d18 : Nat) (q11 : Nat) (d19 : Nat) (q12 : Nat) (d20 : Nat) (q13 : Nat) (d21 : Nat) (q14 : Nat) (q15 : Nat) (p0 : _) (p1 : _) (p2 : _) (p3 : _) (p4 : _) (p5 : _) (p6 : _) (p7 : _) (p8 : _) (p9 : _) (p10 : _) (p11 : _) (p12 : _) (p13 : _) (p14 : _) (p15 : _) (p16 : _) (p17 : _) (p18 : _) (p19 : _) (p20 : _) (p21 : _) (p22 : _) (p23 : _) (p24 : _) (p25 : _) (p26 : _) (p27 : _) (p28 : _) (p29 : _) (p30 : _) (p31 : _) (p32 : _) (p33 : _) (p34 : _) (p35 : _) (p36 : _) (p37 : _) (p38 : _) (p39 : _) (p40 : _) (p41 : _) (p42 : _) (p43 : _) (p44 : _) (p45 : _) (p46 : _) (p47 : _) (p48 : _) (p49 : _) (p50 : _) (p51 : _) (p52 : _) (p53 : _) (p54 : _) (p55 : _) (p56 : _) (p57 : _) (p58 : _) (p59 : _) (p60 : _) (p61 : _) (p62 : _) (p63 : _) (p64 : _) (p65 : _) (p66 : _) (p67 : _) (p68 : _) (p69 : _) (p70 : _) (p71 : _) (p72 : _) (p73 : _) (p74 : _) (p75 : _) (p76 : _) (p77 : _) (p78 : _) (p79 : _) (p80 : _) (p81 : _) (p82 : _) (p83 : _) (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i : Nat) (inputs : Int × ExactMatrix q0 n 1 d7 × ExactMatrix q1 n 1 d8 × ExactMatrix q1 n 1 d8 × ExactMatrix q0 n 1 d7 × ExactMatrix q1 n 1 d8 × ExactMatrix q1 n 1 d8 × (Fin d9 → ExactMatrix q3 n 1 d1) × (Fin d10 → ExactMatrix q3 n 1 d1) × (Fin d11 → ExactMatrix q2 n 1 d2) × (Fin d12 → ExactMatrix q4 n 1 1) × (Fin d13 → ExactMatrix q5 n 1 d3) × (Fin d14 → ExactMatrix q5 n 1 d3) × (Fin d15 → ExactMatrix q2 n 1 d4) × ByteArray × ExactMatrix q6 n 1 d5 × ExactMatrix q7 n 1 d6 × Unit) (outputs : ExactMatrix q8 n 1 d16 × ExactMatrix q9 n 1 d17 × ExactMatrix q10 n 1 d18 × ExactMatrix q11 n 1 d19 × ExactMatrix q12 n 1 d20 × ExactMatrix q13 n 1 d21 × Unit) :=
   ∃ (v0 : ExactMatrix q14 n 1 d0) (v1 : ExactMatrix q0 n 1 d0) (v2 : ExactMatrix q0 n d7 d0) (v3 : ExactMatrix q2 n 1 d0) (v4 : ExactMatrix q15 n 1 d0) (v5 : ExactMatrix q1 n 1 d0) (v6 : ExactMatrix q1 n d8 d0) (v7 : ExactMatrix q2 n 1 d0) (v8 : ExactMatrix q2 n 1 d0) (v9 : ExactMatrix q2 n ((1 + 1) + 1) d0) (v10 : ExactMatrix q2 n (1 + 1) d0) (v11 : ExactMatrix q2 n 1 d0) (v12 : ExactMatrix q2 n 1 d0) (v13 : ExactMatrix q2 n 1 d0) (v14 : ExactMatrix q2 n ((1 + 1) + 1) d0) (v15 : ExactMatrix q2 n (1 + 1) d0) (v16 : ExactMatrix q2 n ((1 + 1) + 1) (d0 + d0)) (v17 : ExactMatrix q3 n 1 d1) (v18 : ExactMatrix q3 n 1 d1) (v19 : ExactMatrix q3 n (1 + 1) d1) (v20 : ExactMatrix q3 n (d0 + d0) d1) (v21 : ExactMatrix q2 n (d0 + d0) d1) (v22 : ExactMatrix q2 n 1 d2) (v23 : ExactMatrix q2 n 1 d2) (v24 : ExactMatrix q4 n 1 1) (v25 : ExactMatrix q2 n 1 1) (v26 : ExactMatrix q2 n 1 d2) (v27 : ExactMatrix q2 n 1 d2) (v28 : ExactMatrix q2 n ((1 + 1) + 1) d2) (v29 : ExactMatrix q2 n (1 + 1) d2) (v30 : ExactMatrix q5 n 1 d3) (v31 : ExactMatrix q5 n 1 d3) (v32 : ExactMatrix q5 n (1 + 1) d3) (v33 : ExactMatrix q5 n (d0 + d0) d3) (v34 : ExactMatrix q2 n (d0 + d0) d3) (v35 : ExactMatrix q2 n 1 d4) (v36 : ExactMatrix q2 n 1 d4) (v37 : ExactMatrix q2 n 1 d4) (v38 : ExactMatrix q2 n 1 d4) (v39 : ExactMatrix q2 n ((1 + 1) + 1) d4) (v40 : ExactMatrix q2 n (1 + 1) d4) (v41 : ExactMatrix q2 n ((1 + 1) + 1) (d2 + d4)) (v42 : ExactMatrix q6 n 1 d5) (v43 : ExactMatrix q6 n (1 + 1) d5) (v44 : ExactMatrix q6 n (d2 + d4) d5) (v45 : ExactMatrix q2 n (d2 + d4) d5) (v46 : ExactMatrix q2 n 1 d16) (v47 : ExactMatrix q8 n 1 d16) (v48 : ExactMatrix q7 n 1 d6) (v49 : ExactMatrix q7 n (1 + 1) d6) (v50 : ExactMatrix q7 n (d2 + d4) d6) (v51 : ExactMatrix q2 n (d2 + d4) d6) (v52 : ExactMatrix q2 n 1 d17) (v53 : ExactMatrix q9 n 1 d17) (v54 : ExactMatrix q2 n 1 d18) (v55 : ExactMatrix q10 n 1 d18) (v56 : ExactMatrix q2 n 1 d19) (v57 : ExactMatrix q11 n 1 d19) (v58 : ExactMatrix q2 n 1 d20) (v59 : ExactMatrix q12 n 1 d20) (v60 : ExactMatrix q2 n 1 d21) (v61 : ExactMatrix q13 n 1 d21),
@@ -1032,6 +1103,96 @@ def PrfCell1.Comp (q0 : Nat) (n : Nat) (d0 : Nat) (q1 : Nat) (q2 : Nat) (d1 : Na
     MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v41 v51 : ExactMatrix q2 n ((1 + 1) + 1) d6)) 0 1 0 p82 v60 ∧
     MxxRuntime.blockModSwitchRuns p83 (1) v60 v61 ∧
     outputs = (v47, (v53, (v55, (v57, (v59, (v61, ()))))))
+
+/-- Computation bundle of role `prf.cell1` (variant 1): the scope relation with dimensions, moduli and constants as parameters. -/
+def PrfCell1.Comp_1 (q0 : Nat) (n : Nat) (d0 : Nat) (q1 : Nat) (q2 : Nat) (d1 : Nat) (d2 : Nat) (d3 : Nat) (d4 : Nat) (d5 : Nat) (d6 : Nat) (d7 : Nat) (d8 : Nat) (q3 : Nat) (d9 : Nat) (d10 : Nat) (q4 : Nat) (d11 : Nat) (q5 : Nat) (d12 : Nat) (d13 : Nat) (q6 : Nat) (q7 : Nat) (q8 : Nat) (d14 : Nat) (q9 : Nat) (d15 : Nat) (q10 : Nat) (d16 : Nat) (q11 : Nat) (d17 : Nat) (q12 : Nat) (d18 : Nat) (q13 : Nat) (d19 : Nat) (q14 : Nat) (d20 : Nat) (q15 : Nat) (p0 : _) (p1 : _) (p2 : _) (p3 : _) (p4 : _) (p5 : _) (p6 : _) (p7 : _) (p8 : _) (p9 : _) (p10 : _) (p11 : _) (p12 : _) (p13 : _) (p14 : _) (p15 : _) (p16 : _) (p17 : _) (p18 : _) (p19 : _) (p20 : _) (p21 : _) (p22 : _) (p23 : _) (p24 : _) (p25 : _) (p26 : _) (p27 : _) (p28 : _) (p29 : _) (p30 : _) (p31 : _) (p32 : _) (p33 : _) (p34 : _) (p35 : _) (p36 : _) (p37 : _) (p38 : _) (p39 : _) (p40 : _) (p41 : _) (p42 : _) (p43 : _) (p44 : _) (p45 : _) (p46 : _) (p47 : _) (p48 : _) (p49 : _) (p50 : _) (p51 : _) (p52 : _) (p53 : _) (p54 : _) (p55 : _) (p56 : _) (p57 : _) (p58 : _) (p59 : _) (p60 : _) (p61 : _) (p62 : _) (p63 : _) (p64 : _) (p65 : _) (p66 : _) (p67 : _) (p68 : _) (p69 : _) (p70 : _) (p71 : _) (p72 : _) (p73 : _) (p74 : _) (p75 : _) (p76 : _) (p77 : _) (p78 : _) (p79 : _) (p80 : _) (p81 : _) (p82 : _) (p83 : _) (p84 : _) (p85 : _) (p86 : _) (p87 : _) (p88 : _) (p89 : _) (p90 : _) (p91 : _) (p92 : _) (p93 : _) (p94 : _) (p95 : _) (p96 : _) (p97 : _) (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i : Nat) (inputs : Int × ExactMatrix q0 n 1 d7 × ByteArray × ExactMatrix q0 n 1 d7 × (Fin d8 → ExactMatrix q3 n 1 d1) × (Fin d9 → ExactMatrix q3 n 1 d1) × (Fin d10 → ExactMatrix q2 n 1 d2) × ExactMatrix q4 n 1 1 × (Fin d11 → ExactMatrix q5 n 1 d3) × (Fin d12 → ExactMatrix q5 n 1 d3) × (Fin d13 → ExactMatrix q2 n 1 d4) × ExactMatrix q6 n 1 d5 × ExactMatrix q7 n 1 d6 × Unit) (outputs : ExactMatrix q8 n 1 d14 × ExactMatrix q9 n 1 d15 × ExactMatrix q10 n 1 d16 × ExactMatrix q11 n 1 d17 × ExactMatrix q12 n 1 d18 × ExactMatrix q13 n 1 d19 × Unit) :=
+  ∃ (v0 : ExactMatrix q14 n 1 d0) (v1 : ExactMatrix q0 n 1 d0) (v2 : ExactMatrix q0 n d7 d0) (v3 : ExactMatrix q2 n 1 d0) (v4 : ExactMatrix q1 n 1 d20) (v5 : ExactMatrix q15 n 1 d0) (v6 : ExactMatrix q1 n 1 d0) (v7 : ExactMatrix q1 n d20 d0) (v8 : ExactMatrix q2 n 1 d0) (v9 : ExactMatrix q1 n 1 d20) (v10 : ExactMatrix q2 n 1 d0) (v11 : ExactMatrix q2 n ((1 + 1) + 1) d0) (v12 : ExactMatrix q2 n (1 + 1) d0) (v13 : ExactMatrix q2 n 1 d0) (v14 : ExactMatrix q1 n 1 d20) (v15 : ExactMatrix q2 n 1 d0) (v16 : ExactMatrix q1 n 1 d20) (v17 : ExactMatrix q2 n 1 d0) (v18 : ExactMatrix q2 n ((1 + 1) + 1) d0) (v19 : ExactMatrix q2 n (1 + 1) d0) (v20 : ExactMatrix q2 n ((1 + 1) + 1) (d0 + d0)) (v21 : ExactMatrix q3 n 1 d1) (v22 : ExactMatrix q3 n 1 d1) (v23 : ExactMatrix q3 n (1 + 1) d1) (v24 : ExactMatrix q3 n (d0 + d0) d1) (v25 : ExactMatrix q2 n (d0 + d0) d1) (v26 : ExactMatrix q2 n 1 d2) (v27 : ExactMatrix q2 n 1 d2) (v28 : ExactMatrix q2 n 1 1) (v29 : ExactMatrix q2 n 1 d2) (v30 : ExactMatrix q2 n 1 d2) (v31 : ExactMatrix q2 n ((1 + 1) + 1) d2) (v32 : ExactMatrix q2 n (1 + 1) d2) (v33 : ExactMatrix q5 n 1 d3) (v34 : ExactMatrix q5 n 1 d3) (v35 : ExactMatrix q5 n (1 + 1) d3) (v36 : ExactMatrix q5 n (d0 + d0) d3) (v37 : ExactMatrix q2 n (d0 + d0) d3) (v38 : ExactMatrix q2 n 1 d4) (v39 : ExactMatrix q2 n 1 d4) (v40 : ExactMatrix q2 n 1 d4) (v41 : ExactMatrix q2 n 1 d4) (v42 : ExactMatrix q2 n ((1 + 1) + 1) d4) (v43 : ExactMatrix q2 n (1 + 1) d4) (v44 : ExactMatrix q2 n ((1 + 1) + 1) (d2 + d4)) (v45 : ExactMatrix q6 n 1 d5) (v46 : ExactMatrix q6 n (1 + 1) d5) (v47 : ExactMatrix q6 n (d2 + d4) d5) (v48 : ExactMatrix q2 n (d2 + d4) d5) (v49 : ExactMatrix q2 n 1 d14) (v50 : ExactMatrix q8 n 1 d14) (v51 : ExactMatrix q7 n 1 d6) (v52 : ExactMatrix q7 n (1 + 1) d6) (v53 : ExactMatrix q7 n (d2 + d4) d6) (v54 : ExactMatrix q2 n (d2 + d4) d6) (v55 : ExactMatrix q2 n 1 d15) (v56 : ExactMatrix q9 n 1 d15) (v57 : ExactMatrix q2 n 1 d16) (v58 : ExactMatrix q10 n 1 d16) (v59 : ExactMatrix q2 n 1 d17) (v60 : ExactMatrix q11 n 1 d17) (v61 : ExactMatrix q2 n 1 d18) (v62 : ExactMatrix q12 n 1 d18) (v63 : ExactMatrix q2 n 1 d19) (v64 : ExactMatrix q13 n 1 d19),
+    MxxRuntime.gadgetMatrixRuns backend p0 p1 v0 ∧
+    MxxRuntime.centeredRebaseRuns v0 v1 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p2 p3 ((MxxRuntime.matrixMulScalarLeft ((MxxRuntime.matrixPolynomial p4 : ExactMatrix q0 n 1 1)) v1 : ExactMatrix q0 n 1 d0)) v2 ∧
+    MxxRuntime.blockModSwitchRuns p5 (1) ((MxxRuntime.matrixMul inputs.2.1 v2 : ExactMatrix q0 n 1 d0)) v3 ∧
+    p6 ≤ inputs.1 ∧
+    inputs.1 < p7 ^ p8 ∧
+    MxxRuntime.hashSample (hashModel) p9 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (inputs.2.2.1) v4 ∧
+    MxxRuntime.gadgetMatrixRuns backend p10 p11 v5 ∧
+    MxxRuntime.centeredRebaseRuns v5 v6 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p12 p13 ((MxxRuntime.matrixMulScalarLeft ((MxxRuntime.matrixPolynomial p14 : ExactMatrix q1 n 1 1)) v6 : ExactMatrix q1 n 1 d0)) v7 ∧
+    MxxRuntime.blockModSwitchRuns p15 (1) ((MxxRuntime.matrixMul v4 v7 : ExactMatrix q1 n 1 d0)) v8 ∧
+    p16 ≤ inputs.1 ∧
+    inputs.1 < p17 ^ p18 ∧
+    MxxRuntime.hashSample (hashModel) p19 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (2)]) (inputs.2.2.1) v9 ∧
+    MxxRuntime.blockModSwitchRuns p20 (1) ((MxxRuntime.matrixMul v9 v7 : ExactMatrix q1 n 1 d0)) v10 ∧
+    MxxRuntime.concatRows v3 v8 v12 ∧
+    MxxRuntime.concatRows v12 v10 v11 ∧
+    MxxRuntime.blockModSwitchRuns p21 (1) ((MxxRuntime.matrixMul inputs.2.2.2.1 v2 : ExactMatrix q0 n 1 d0)) v13 ∧
+    p22 ≤ inputs.1 ∧
+    inputs.1 < p23 ^ p24 ∧
+    MxxRuntime.hashSample (hashModel) p25 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) (inputs.2.2.1) v14 ∧
+    MxxRuntime.blockModSwitchRuns p26 (1) ((MxxRuntime.matrixMul v14 v7 : ExactMatrix q1 n 1 d0)) v15 ∧
+    p27 ≤ inputs.1 ∧
+    inputs.1 < p28 ^ p29 ∧
+    MxxRuntime.hashSample (hashModel) p30 ([.bytes [109, 101, 109, 98, 101, 114], .u64Le inputs.1, .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (inputs.2.2.1) v16 ∧
+    MxxRuntime.blockModSwitchRuns p31 (1) ((MxxRuntime.matrixMul v16 v7 : ExactMatrix q1 n 1 d0)) v17 ∧
+    MxxRuntime.concatRows v13 v15 v19 ∧
+    MxxRuntime.concatRows v19 v17 v18 ∧
+    MxxRuntime.concatColumns v11 v18 v20 ∧
+    p32 ≤ ((Int.fdiv ((Int.ofNat i)) (p33))) ∧
+    ((Int.fdiv ((Int.ofNat i)) (p35))) < p34 ∧
+    MxxRuntime.familyGetDynamic inputs.2.2.2.2.1 ((Int.fdiv ((Int.ofNat i)) (p36))) v21 ∧
+    p37 ≤ ((Int.fdiv ((Int.ofNat i)) (p38))) ∧
+    ((Int.fdiv ((Int.ofNat i)) (p40))) < p39 ∧
+    MxxRuntime.familyGetDynamic inputs.2.2.2.2.2.1 ((Int.fdiv ((Int.ofNat i)) (p41))) v22 ∧
+    MxxRuntime.concatRows v21 v22 v23 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p42 p43 v23 v24 ∧
+    MxxRuntime.compactCenteredRebaseRuns p44 v24 v25 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v20 v25 : ExactMatrix q2 n ((1 + 1) + 1) d1)) 0 1 0 p45 v26 ∧
+    p46 ≤ ((Int.fdiv ((Int.ofNat i)) (p47))) ∧
+    ((Int.fdiv ((Int.ofNat i)) (p49))) < p48 ∧
+    MxxRuntime.familyGetDynamic inputs.2.2.2.2.2.2.1 ((Int.fdiv ((Int.ofNat i)) (p50))) v27 ∧
+    MxxRuntime.modulusReduceRuns inputs.2.2.2.2.2.2.2.1 v28 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v20 v25 : ExactMatrix q2 n ((1 + 1) + 1) d1)) 1 2 0 p51 v29 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v20 v25 : ExactMatrix q2 n ((1 + 1) + 1) d1)) 2 3 0 p52 v30 ∧
+    MxxRuntime.concatRows ((MxxRuntime.matrixAdd v26 ((MxxRuntime.matrixMulScalarRight v27 v28 : ExactMatrix q2 n 1 d2)) : ExactMatrix q2 n 1 d2)) v29 v32 ∧
+    MxxRuntime.concatRows v32 v30 v31 ∧
+    p53 ≤ ((Int.fdiv ((Int.ofNat i)) (p54))) ∧
+    ((Int.fdiv ((Int.ofNat i)) (p56))) < p55 ∧
+    MxxRuntime.familyGetDynamic inputs.2.2.2.2.2.2.2.2.1 ((Int.fdiv ((Int.ofNat i)) (p57))) v33 ∧
+    p58 ≤ ((Int.fdiv ((Int.ofNat i)) (p59))) ∧
+    ((Int.fdiv ((Int.ofNat i)) (p61))) < p60 ∧
+    MxxRuntime.familyGetDynamic inputs.2.2.2.2.2.2.2.2.2.1 ((Int.fdiv ((Int.ofNat i)) (p62))) v34 ∧
+    MxxRuntime.concatRows v33 v34 v35 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p63 p64 v35 v36 ∧
+    MxxRuntime.compactCenteredRebaseRuns p65 v36 v37 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v20 v37 : ExactMatrix q2 n ((1 + 1) + 1) d3)) 0 1 0 p66 v38 ∧
+    p67 ≤ ((Int.fdiv ((Int.ofNat i)) (p68))) ∧
+    ((Int.fdiv ((Int.ofNat i)) (p70))) < p69 ∧
+    MxxRuntime.familyGetDynamic inputs.2.2.2.2.2.2.2.2.2.2.1 ((Int.fdiv ((Int.ofNat i)) (p71))) v39 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v20 v37 : ExactMatrix q2 n ((1 + 1) + 1) d3)) 1 2 0 p72 v40 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v20 v37 : ExactMatrix q2 n ((1 + 1) + 1) d3)) 2 3 0 p73 v41 ∧
+    MxxRuntime.concatRows ((MxxRuntime.matrixAdd v38 ((MxxRuntime.matrixMulScalarRight v39 v28 : ExactMatrix q2 n 1 d4)) : ExactMatrix q2 n 1 d4)) v40 v43 ∧
+    MxxRuntime.concatRows v43 v41 v42 ∧
+    MxxRuntime.concatColumns v31 v42 v44 ∧
+    MxxRuntime.hashSample (hashModel) p76 ([.bytes [112, 97, 114, 97, 109, 101, 116, 101, 114, 115], .decimal (p74), .bytes [112, 114, 111, 103, 114, 97, 109], .decimal (p75), .bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (inputs.2.2.1) v45 ∧
+    MxxRuntime.concatRows v45 inputs.2.2.2.2.2.2.2.2.2.2.2.1 v46 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p77 p78 v46 v47 ∧
+    MxxRuntime.compactCenteredRebaseRuns p79 v47 v48 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v44 v48 : ExactMatrix q2 n ((1 + 1) + 1) d5)) 1 2 0 p80 v49 ∧
+    MxxRuntime.blockModSwitchRuns p81 (1) v49 v50 ∧
+    MxxRuntime.hashSample (hashModel) p84 ([.bytes [112, 97, 114, 97, 109, 101, 116, 101, 114, 115], .decimal (p82), .bytes [112, 114, 111, 103, 114, 97, 109], .decimal (p83), .bytes [109, 101, 109, 98, 101, 114], .u64Le ((Int.ofNat i)), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) (inputs.2.2.1) v51 ∧
+    MxxRuntime.concatRows v51 inputs.2.2.2.2.2.2.2.2.2.2.2.2.1 v52 ∧
+    MxxRuntime.gadgetDecomposeRuns backend p85 p86 v52 v53 ∧
+    MxxRuntime.compactCenteredRebaseRuns p87 v53 v54 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v44 v54 : ExactMatrix q2 n ((1 + 1) + 1) d6)) 1 2 0 p88 v55 ∧
+    MxxRuntime.blockModSwitchRuns p89 (1) v55 v56 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v44 v48 : ExactMatrix q2 n ((1 + 1) + 1) d5)) 2 3 0 p90 v57 ∧
+    MxxRuntime.blockModSwitchRuns p91 (1) v57 v58 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v44 v54 : ExactMatrix q2 n ((1 + 1) + 1) d6)) 2 3 0 p92 v59 ∧
+    MxxRuntime.blockModSwitchRuns p93 (1) v59 v60 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v44 v48 : ExactMatrix q2 n ((1 + 1) + 1) d5)) 0 1 0 p94 v61 ∧
+    MxxRuntime.blockModSwitchRuns p95 (1) v61 v62 ∧
+    MxxRuntime.sliceMatrix ((MxxRuntime.matrixMul v44 v54 : ExactMatrix q2 n ((1 + 1) + 1) d6)) 0 1 0 p96 v63 ∧
+    MxxRuntime.blockModSwitchRuns p97 (1) v63 v64 ∧
+    outputs = (v50, (v56, (v58, (v60, (v62, (v64, ()))))))
 
 /-- Computation bundle of role `prf.key-cell0` (variant 0): the scope relation with dimensions, moduli and constants as parameters. -/
 def PrfKeyCell0.Comp (q0 : Nat) (n : Nat) (d0 : Nat) (d1 : Nat) (q1 : Nat) (q2 : Nat) (d2 : Nat) (q3 : Nat) (q4 : Nat) (q5 : Nat) (d3 : Nat) (q6 : Nat) (d4 : Nat) (q7 : Nat) (d5 : Nat) (q8 : Nat) (d6 : Nat) (d7 : Nat) (d8 : Nat) (d9 : Nat) (d10 : Nat) (q9 : Nat) (p0 : _) (p1 : _) (p2 : _) (p3 : _) (p4 : _) (p5 : _) (p6 : _) (p7 : _) (p8 : _) (p9 : _) (p10 : _) (p11 : _) (p12 : _) (p13 : _) (p14 : _) (p15 : _) (p16 : _) (p17 : _) (p18 : _) (p19 : _) (p20 : _) (p21 : _) (p22 : _) (p23 : _) (p24 : _) (p25 : _) (p26 : _) (p27 : _) (p28 : _) (p29 : _) (p30 : _) (p31 : _) (p32 : _) (p33 : _) (p34 : _) (p35 : _) (p36 : _) (p37 : _) (p38 : _) (p39 : _) (p40 : _) (p41 : _) (p42 : _) (p43 : _) (p44 : _) (p45 : _) (p46 : _) (p47 : _) (p48 : _) (p49 : _) (p50 : _) (p51 : _) (p52 : _) (p53 : _) (p54 : _) (p55 : _) (p56 : _) (p57 : _) (p58 : _) (p59 : _) (p60 : _) (p61 : _) (p62 : _) (p63 : _) (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i : Nat) (inputs : ByteArray × Int × ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 d0 × ExactMatrix q0 n 1 d1 × ExactMatrix q0 n 1 d1 × ExactMatrix q3 n 1 1 × Int × Int × ExactMatrix q4 n 1 1 × Unit) (outputs : ExactMatrix q5 n 1 d3 × ExactMatrix q6 n 1 d4 × ExactMatrix q7 n 1 d5 × ExactMatrix q8 n 1 d6 × ExactMatrix q2 n 1 d2 × ExactMatrix q2 n 1 d2 × ExactMatrix q2 n 1 d2 × ExactMatrix q2 n 1 d2 × Unit) :=

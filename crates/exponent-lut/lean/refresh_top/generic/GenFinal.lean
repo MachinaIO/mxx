@@ -363,4 +363,19 @@ theorem freshErr_bound (hn : 1 < n) {m Q : Nat} {val : Int → Int} {B : Nat}
   rw [Int.abs_eq_natAbs]
   omega
 
+/-- **The mask row on a part's ring.** A part reads its chain's row of the caller's encoding of
+`σ_0 G` cast to its own ring (`castModulus`, equal moduli): the cast row is the same encoding with
+the cast keys `K'` and gadget `G'`. -/
+theorem castModulus_maskRow {a b n m : Nat} (hq : a = b) {x : ExactMatrix a n 1 m} {s : ErrorPoly n}
+    {K : Fin 2 → ExactMatrix a n 1 m} {K' : Fin 2 → ExactMatrix b n 1 m}
+    (hK : ∀ k, castModulus (K k) hq = K' k) {S : ErrorPoly n} {G : ExactMatrix a n 1 m}
+    {G' : ExactMatrix b n 1 m} (hG : castModulus G hq = G') {e : ErrorMatrix n 1 m}
+    (hx : x = maskPart (reducePoly a n s) K - reducePoly a n S • G + reduceMatrix a n 1 m e) :
+    castModulus x hq = maskPart (reducePoly b n s) K' - reducePoly b n S • G' +
+      reduceMatrix b n 1 m e := by
+  subst hq
+  have hK' : K = K' := funext hK
+  subst hK' hG
+  exact hx
+
 end RefreshTopProof.GenFinal

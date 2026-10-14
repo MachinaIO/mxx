@@ -81,17 +81,15 @@ pub(crate) fn declaration_of(
         primes()[3..].to_vec(),
         digits,
         RefreshKeys {
-            mask: key_shape(n),
             fresh: [key_shape(columns * n), key_shape(columns * n)],
             smudge: &mut smudge,
         },
-        b"top".to_vec(),
     )
 }
 
 /// One chain per prime of `Q_0`, two parts per chain decoding only their
 /// output prime over the reference's `w_0` columns, one label for every part,
-/// distinct chain namespaces and child namespaces per component, pool orders that
+/// distinct chain namespaces and fresh-noise namespaces per component, pool orders that
 /// put the output prime first, and the output prime's position in the
 /// canonical tower order of the decoding level.
 #[test]
@@ -126,12 +124,10 @@ fn top_refresh_lays_out_one_chain_per_prime() {
             );
             assert_eq!(part.label([3; 32], b"nu").unwrap(), top.label([3; 32], b"nu").unwrap());
         }
-        assert_ne!(top.mask_namespace((chain, 0)), top.mask_namespace((chain, 1)));
-        assert_ne!(top.fresh_namespace((chain, 0)), top.mask_namespace((chain, 0)));
+        assert_ne!(top.fresh_namespace((chain, 0)), top.fresh_namespace((chain, 1)));
     }
     let namespaces = (0..3).map(|chain| top.chain_namespace(chain)).collect::<BTreeSet<_>>();
     assert_eq!(namespaces.len(), 3);
-    assert!(!namespaces.contains(&top.matrix_namespace()));
 }
 
 /// A refresh of some slots has one chain per refreshed slot, each decoding its slot's prime at
@@ -179,14 +175,25 @@ fn top_refresh_rejects_unsupported_targets_and_depths() {
     }
 }
 
-/// The mask samplers of two chains read the same PRF bit: each returns
-/// `+-h` for `h = 2^-1 mod q` of its own output prime `q` (the offset `h`
-/// is added in the Program), so `h (1 +- 1) mod q` is the same bit.
+/// Binary PRF Programs of `n` samples for two chains' output primes (the encodings of
+/// `sigma_0 G` a refresh accepts, see [Caller inputs](super#caller-inputs)) read the same PRF
+/// bit: each returns `+-h` for `h = 2^-1 mod q` of its own output prime `q` (the offset `h` is
+/// added in the Program), so `h (1 +- 1) mod q` is the same bit.
 #[test]
-fn chains_mask_samplers_agree_modulo_their_primes() {
+fn chains_binary_samplers_agree_modulo_their_primes() {
     let (source, output) = lut_source(false);
     let top = declaration(&source, output, vec![3, 2, 2]).unwrap();
-    let mask = |chain: usize| top.mask(chain).unwrap().clone();
+    let n = profile().ring_dimension().unwrap();
+    let mask = |chain: usize| {
+        FreshNoiseProgram::with_distribution(
+            profile(),
+            PrfDistribution::Binary { q_min: top.output_prime(chain).unwrap() },
+            1,
+            n,
+            key_shape(n),
+        )
+        .unwrap()
+    };
     let (first, second) = (mask(0), mask(1));
     let primes = [top.output_prime(0).unwrap(), top.output_prime(1).unwrap()];
     let q = profile().q().unwrap();

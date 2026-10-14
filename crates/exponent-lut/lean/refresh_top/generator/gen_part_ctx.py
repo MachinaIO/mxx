@@ -52,7 +52,7 @@ def gen(gdir):
         ctx = f'{s.M}.generatedRoot.Ctx Backend.backend model {s.params}'
         out.append(f'''/-- The instance `i` of `{s.M}` in a run: contexts, facts and the stage-link hypotheses. -/
 theorem inst_{s.M} {{model : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}
-    (hR : Runs model external execution) (i : Fin S) :
+    (hR : Runs model external execution) (i : Fin {s.S}) :
     ∃ (rM : {ctx}) (cM : {s.M}.{s.inst}.Ctx Backend.backend model {s.params} (i : Nat)),
       {s.M}.{s.inst}.Facts cM ({s.M}.rootOuts rM i) ∧ {s.stage_out} = {s.M}.generatedRoot.outs rM ∧
       {s.M}.rootOuts rM i = {s.M}.{s.inst}.outs cM ∧ cM.inputs = {s.M}.rootArgs rM i ∧

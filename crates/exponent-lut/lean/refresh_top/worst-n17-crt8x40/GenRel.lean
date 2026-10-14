@@ -103,6 +103,24 @@ theorem gather_loop6 {α : Type} {F K : Nat} {f0 f1 f2 f3 f4 f5 : Fin K → α} 
   rw [e r1, e r2, e r3, e r4, e r5] at hP
   exact ⟨k, hk, hP⟩
 
+/-- **A gather loop over three families** (the input encoding rows and the payload of a Program in
+its own stages, which hash-samples the keys itself): as `gather_loop6`, the families of any types. -/
+theorem gather_loop3 {α β γ : Type} {F K : Nat} {f0 : Fin K → α} {f1 : Fin K → β} {f2 : Fin K → γ}
+    {t : Fin F → Int} (P : Fin F → Int → α → β → γ → Prop)
+    (h : ∀ i : Fin F, ∃ (x0 : α) (x1 : β) (x2 : γ),
+      0 ≤ t i ∧ t i < K ∧ familyGetDynamic f0 (t i) x0 ∧
+      0 ≤ t i ∧ t i < K ∧ familyGetDynamic f1 (t i) x1 ∧
+      0 ≤ t i ∧ t i < K ∧ familyGetDynamic f2 (t i) x2 ∧
+      P i (t i) x0 x1 x2) (i : Fin F) :
+    ∃ k : Fin K, ((k : Nat) : Int) = t i ∧ P i (t i) (f0 k) (f1 k) (f2 k) := by
+  obtain ⟨x0, x1, x2, -, -, r0, -, -, r1, -, -, r2, hP⟩ := h i
+  obtain ⟨k, hk, rfl⟩ := r0
+  obtain ⟨k1, hk1, rfl⟩ := r1
+  obtain ⟨k2, hk2, rfl⟩ := r2
+  obtain rfl : k1 = k := Fin.ext (by omega)
+  obtain rfl : k2 = k1 := Fin.ext (by omega)
+  exact ⟨k2, hk, hP⟩
+
 /-- The table of a gather loop as `Fin K`-valued, given the loop (`gather_loop6`). -/
 theorem gather_table_fin {F K : Nat} {t : Fin F → Int} (h : ∀ i, ∃ k : Fin K, ((k : Nat) : Int) = t i) :
     ∃ tab : Fin F → Fin K, ∀ i, ((tab i : Nat) : Int) = t i :=

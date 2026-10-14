@@ -48,7 +48,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             data: crate::program::ProgramData::new(),
             hash_namespace: None,
             refresh: None,
-            refresh_matrix_key: None,
+            inputs_by_shape: false,
         }
     }
 
@@ -81,6 +81,14 @@ impl<'a> RnsPreprocessBuild<'a> {
         }
         self.dynamic = Some((Arc::new(setup.clone()), binding));
         Ok(self)
+    }
+
+    /// This builder binding the Program's RHS plaintexts and data by their declared shapes only,
+    /// whatever the stage ([`crate::api::preprocess`]) is given, as [`Self::bind_rhs_inputs`]
+    /// with `None` does: the stage graph is recorded and exported but cannot be executed.
+    pub fn with_inputs_by_shape(mut self) -> Self {
+        self.inputs_by_shape = true;
+        self
     }
 
     /// This builder with the output use `output_use` (see [`RnsOutputUse`]).
@@ -214,14 +222,23 @@ impl<'a> RnsPreprocessBuild<'a> {
     }
 
     /// Prepare part `part` (`(chain, component)`) of `declaration`'s refresh of output
-    /// `target_index`, whose lowered public key is `target`: lower the bound mask child `mask`,
-    /// fresh-noise child `fresh` and decoder's smudge child `smudge` once, compute the decoded
-    /// key `K = A_1 X - K_x Y + K_f Z` with the same homomorphic steps as the online rows (see
-    /// [`crate::refresh`]), its one key the mask carrier's key next to the public one key's
-    /// second block and its target key the part's component, add the smudge key, and sample the
-    /// preimage under an unmask trapdoor (sigma `trapdoor_sigma`). `A'_(j)` is sampled under the
-    /// key set by [`Self::with_refresh_matrix_key`]. The graph publishes the children's public
-    /// material, `B` and the preimage; the trapdoor never leaves it.
+    /// `target_index`, whose lowered public key is `target`: lower the bound fresh-noise child
+    /// `fresh` and decoder's smudge child `smudge` once, compute the decoded key
+    /// `K = A_1 X - K_x Y + K_f Z` with the same homomorphic steps as the online rows (see
+    /// [`crate::refresh`]), its one key the key `K_g` of the caller's encoding of `sigma_0 G`
+    /// next to the public one key's second block and its target key the part's component, add
+    /// the smudge key, and sample the preimage under an unmask trapdoor (sigma
+    /// `trapdoor_sigma`). The graph publishes the children's public material, `B` and the
+    /// preimage; the trapdoor never leaves it.
+    ///
+    /// `sigma` is the caller's encoding of `sigma_0 G` of the part's chain, which both parts of
+    /// the chain read (see [Caller inputs](crate::refresh#caller-inputs)): the preprocessing
+    /// artifacts of its
+    /// Program, whose first output is the encoding, preprocessed with the output use
+    /// [`RnsOutputUse::Gadget`] on [`RnsBggParameters::refresh_child_parameters`] (or any chain
+    /// whose output carrier is a carrier of the decoding ring); the graph reads its key
+    /// `public-key/<wire>` (component 1). `A'` is the graph input
+    /// [`crate::rns_bgg::REFRESH_MATRIX_INPUT`] (see [`Self::with_refresh_matrix`]).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_refresh(
         &mut self,
@@ -229,24 +246,33 @@ impl<'a> RnsPreprocessBuild<'a> {
         declaration: &crate::refresh::RefreshDeclaration,
         part: (usize, usize),
         target: RnsBggPublicKey,
-        mask: RnsPreprocessBuild<'a>,
+        sigma: (
+            &crate::api::StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
+            &ExponentLutProgram,
+        ),
         fresh: RnsPreprocessBuild<'a>,
         smudge: RnsPreprocessBuild<'a>,
         trapdoor_sigma: &bigdecimal::BigDecimal,
     ) -> Result<(), ApiError> {
         let declaration =
             crate::rns_bgg::refresh::refresh_part(declaration, part).map_err(ApiError::scheme)?;
-        self.prepare_refresh(target_index, declaration, target, mask, fresh, smudge, trapdoor_sigma)
+        self.prepare_refresh(
+            target_index,
+            declaration,
+            target,
+            sigma,
+            fresh,
+            smudge,
+            trapdoor_sigma,
+        )
     }
 
-    /// Sample a refresh's `A'` from the stage key `hash_key` derived
-    /// under `namespace` ([`crate::refresh::RefreshDeclaration::matrix_namespace`]),
-    /// the same for every chain.
-    pub fn with_refresh_matrix_key(mut self, namespace: [u8; 32], hash_key: &[u8]) -> Self {
-        let name = crate::rns_bgg::refresh::hash_key_input_name(Some(&namespace));
-        let key = crate::rns_bgg::refresh::child_hash_key(hash_key, &namespace);
-        self.runtime.insert(name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
-        self.refresh_matrix_key = Some((name, key.len()));
+    /// The value of the caller's `A' = [A'_(0) | A'_(1)]` of a refresh, the graph input
+    /// [`crate::rns_bgg::REFRESH_MATRIX_INPUT`] (`2 x 2 w_0` over the reference's level-0 ring,
+    /// see [Caller inputs](crate::refresh#caller-inputs)). A stage built without it can be
+    /// recorded but not executed.
+    pub fn with_refresh_matrix(mut self, a_prime: RuntimeValue) -> Self {
+        self.runtime.insert(crate::rns_bgg::REFRESH_MATRIX_INPUT.to_owned(), a_prime);
         self
     }
 
@@ -255,7 +281,10 @@ impl<'a> RnsPreprocessBuild<'a> {
         target_index: usize,
         declaration: &crate::refresh::RefreshPartDeclaration,
         target: RnsBggPublicKey,
-        mut mask: RnsPreprocessBuild<'a>,
+        (sigma, sigma_program): (
+            &crate::api::StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
+            &ExponentLutProgram,
+        ),
         mut fresh: RnsPreprocessBuild<'a>,
         mut smudge: RnsPreprocessBuild<'a>,
         trapdoor_sigma: &bigdecimal::BigDecimal,
@@ -275,16 +304,22 @@ impl<'a> RnsPreprocessBuild<'a> {
             .validate_refresh_children(
                 declaration,
                 &evaluator.program,
-                mask.parameters,
                 fresh.parameters,
                 smudge.parameters,
             )
             .map_err(ApiError::scheme)?;
-        if child_program(&mask) != Some(declaration.mask().id()) ||
-            mask.hash_namespace != Some(declaration.mask_namespace()) ||
-            mask.evaluator.as_ref().is_some_and(|child| child.decoder_smudge.is_some())
+        // The caller's encoding of `sigma_0 G`: the preprocessing of its Program, whose first
+        // output is a gadget carrier.
+        let sigma_binding = sigma.descriptor().binding();
+        let Some(Operand::Scalar(sigma_wire)) = sigma_program.outputs().first().cloned() else {
+            return Err(ApiError::input("the sigma Program's first output is not a scalar"));
+        };
+        if sigma_binding.program() != Some(sigma_program.id()) ||
+            sigma_binding.output_use() != RnsOutputUse::Gadget
         {
-            return Err(mismatch());
+            return Err(ApiError::input(
+                "the sigma artifacts are not a gadget-output preprocessing of the sigma Program",
+            ));
         }
         if evaluator.program.outputs().get(target_index) !=
             Some(&Operand::Scalar(declaration.target_output())) ||
@@ -307,10 +342,7 @@ impl<'a> RnsPreprocessBuild<'a> {
                 }
             }
         };
-        if check(declaration.mask().sampler().prf(), &mask)
-            .and(check(declaration.fresh().sampler().prf(), &fresh))
-            .is_err()
-        {
+        if check(declaration.fresh().sampler().prf(), &fresh).is_err() {
             return Err(ApiError::input("the refresh tables are not those of its key sets"));
         }
         let decoder = declaration.decoder();
@@ -343,28 +375,27 @@ impl<'a> RnsPreprocessBuild<'a> {
             .map(|key| super::mod_down_public(key.matrix, &ring))
             .ok_or_else(mismatch)?;
         let hash_key = evaluator.hash_key.clone();
-        let matrix_key = match &self.refresh_matrix_key {
-            Some((name, length)) => ring.bytes_input(name.clone(), *length),
-            None => return Err(ApiError::input("a refresh needs with_refresh_matrix_key")),
-        };
-        let a_prime = self
-            .parameters
-            .refresh_matrix(level, matrix_key, declaration)
-            .map_err(ApiError::scheme)?;
+        let a_prime =
+            self.parameters.refresh_matrix(level, declaration).map_err(ApiError::scheme)?;
         let one = self
             .parameters
             .refresh_one_key(level, hash_key, declaration)
             .map_err(ApiError::scheme)?;
-        // The one key: the mask carrier's key (component 1, moved down once like the fresh
-        // carriers) for the first block.
+        // The one key: the key `K_g` of the caller's encoding of `sigma_0 G` (component 1, a
+        // carrier of the decoding ring with its `m` columns) for the first block.
         let one = {
-            let key = lower(&mut mask)
-                .map_err(ApiError::scheme)?
-                .into_iter()
-                .next()
-                .ok_or_else(mismatch)?;
-            let key = super::mod_down_public(key.matrix, &ring);
-            ((key.0.1, one.0.1), (key.1.1, one.1.1))
+            let columns = self.parameters.level(level).map_err(ApiError::scheme)?.modulus_digits();
+            let availability = preprocess_output_availability(sigma_program, sigma_wire)
+                .map_err(ApiError::scheme)?;
+            let port = |port: usize| {
+                ring.artifact_input(
+                    sigma.production().clone(),
+                    format!("public-key/{sigma_wire:?}.{port}"),
+                    (1, columns),
+                    availability,
+                )
+            };
+            ((port(1), one.0.1), (port(3), one.1.1))
         };
         let component = declaration.component();
         let target_top = if component == 0 { &target.matrix.0.0 } else { &target.matrix.0.1 };
@@ -405,7 +436,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             checked_modulus_convert(smudge_key.matrix.1.1, &ring).map_err(ApiError::scheme)?;
         let key = Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, vec![key_top, key_bottom]);
         let preimage = crate::decoder::unmask::preimage(&trapdoor, key);
-        for child in [&mut fresh, &mut mask, &mut smudge] {
+        for child in [&mut fresh, &mut smudge] {
             merge_runtime(&mut self.runtime, std::mem::take(&mut child.runtime))
                 .map_err(ApiError::scheme)?;
         }
@@ -414,7 +445,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         };
         self.refresh = Some(PreparedRefresh {
             declaration: declaration.clone(),
-            mask: take(mask)?,
+            sigma: (sigma.production().clone(), sigma.manifest().clone()),
             fresh: take(fresh)?,
             smudge: take(smudge)?,
             preimage,
@@ -451,9 +482,6 @@ impl RnsPreprocessBuild<'_> {
             let spec = *refresh.declaration.spec();
             add(&refresh.fresh, &|role| {
                 crate::rns_bgg::refresh::refresh_fresh_artifact_name(spec, role)
-            });
-            add(&refresh.mask, &|role| {
-                crate::rns_bgg::refresh::refresh_mask_artifact_name(spec, role)
             });
             let key = refresh.declaration.decoder().artifact_key();
             add(&refresh.smudge, &|role| decoder_smudge_artifact_name(&key, role));
@@ -820,7 +848,8 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         payload: Option<&Self::PayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        self.bind_program_inputs(program, parameters, Some(rhs), payload, hash_key)
+        let rhs = (!self.inputs_by_shape).then_some(rhs);
+        self.bind_program_inputs(program, parameters, rhs, payload, hash_key)
     }
     fn artifact_identities(&self) -> ([u8; 32], [u8; 32]) {
         let Some(evaluator) = self.evaluator.as_ref() else {
@@ -832,6 +861,12 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         digest.update(self.hash_key_commitment);
         if let Some(declaration) = &self.decoder_declaration {
             digest.update(declaration.commitment());
+        }
+        // A Program preprocessed under a hash namespace samples its public matrices from the key
+        // derived under it, so two namespaces are two stages (none keeps the identity unchanged).
+        if let Some(namespace) = &self.hash_namespace {
+            digest.update(b"hash-namespace");
+            digest.update(namespace);
         }
         // A compiled Program is bound to its output use and, for Dynamic
         // parameters, to its setup and its mapping to the setup coordinates.
@@ -936,14 +971,6 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                     crate::rns_bgg::refresh::refresh_fresh_input_key_artifact_name(spec, wire, port)
                 },
             )?;
-            graph = publish_child(
-                graph,
-                &refresh.mask,
-                |role| crate::rns_bgg::refresh::refresh_mask_artifact_name(spec, role),
-                |wire, port| {
-                    crate::rns_bgg::refresh::refresh_mask_input_key_artifact_name(spec, wire, port)
-                },
-            )?;
             let key = refresh.declaration.decoder().artifact_key();
             graph = publish_child(
                 graph,
@@ -1042,10 +1069,9 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_eval_binding = RnsBggPreprocessOnlineEvalDescriptor::from_binding(binding);
         let runtime = super::encoding::declared_runtime_inputs(&graph, self.runtime);
-        Ok((
-            StageGraph::new(graph, runtime, BTreeMap::new()),
-            (encrypt_binding, online_eval_binding),
-        ))
+        // A refresh reads the key of the caller's encoding of `sigma_0 G` from its production.
+        let manifests = self.refresh.map(|refresh| refresh.sigma).into_iter().collect();
+        Ok((StageGraph::new(graph, runtime, manifests), (encrypt_binding, online_eval_binding)))
     }
 }
 

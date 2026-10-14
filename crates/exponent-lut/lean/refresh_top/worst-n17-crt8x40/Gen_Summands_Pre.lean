@@ -123,6 +123,13 @@ theorem binTable_of {q n P : Nat} (tv : Fin P → Int) (g : Nat → Int) (h0 : �
   rw [h0 k]
   split_ifs <;> simp
 
+theorem Xe_mul_Xe {n : Nat} (a b : Nat) : Xe (n := n) a * Xe (n := n) b = Xe (n := n) (a + b) := by
+  simp only [Xe, pow_add]
+
+/-- Equal exponents give equal monomials (used instead of `congr`/`rfl`, which unfold `X ^ k` at large `n`). -/
+theorem Xe_congr_nat {n a b : Nat} (h : a = b) : Xe (n := n) a = Xe (n := n) b := h ▸ rfl
+
+
 theorem blk_colPlace {n q C m i : Nat} (y : ExactMatrix q n 1 m) (cc : Fin C) :
     blk (colPlace q n C m i y) cc = if (cc : Nat) = i then y else 0 := by
   rw [colPlace_eq_place]
@@ -153,18 +160,13 @@ theorem column_rel_of_colsum {n q m C F W : Nat} (hF : W * C ≤ F) {sm : ErrorP
   rw [enc_sum_A _ _ hg, enc_sum_c _ _ hg]
   exact hsum.mono (le_of_eq (by simp))
 
-theorem Xe_mul_Xe {n : Nat} (a b : Nat) : Xe (n := n) a * Xe (n := n) b = Xe (n := n) (a + b) := by
-  simp only [Xe, pow_add]
-
-/-- Equal exponents give equal monomials (used instead of `congr`/`rfl`, which unfold `X ^ k` at large `n`). -/
-theorem Xe_congr_nat {n a b : Nat} (h : a = b) : Xe (n := n) a = Xe (n := n) b := h ▸ rfl
 
 
 /-- Closed per-instance value of `bound_fresh_Bf` (probed by the generator; checked per instance by `decide`). -/
 def bound_fresh_Bf (i : Nat) : Nat := [8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200539637965834377686714230505472, 8200475116868024654946592421314560, 8200475116868024654946592421314560].getD i 0
 
 /-- Closed per-instance value of `bound_mask_Beg` (probed by the generator; checked per instance by `decide`). -/
-def bound_mask_Beg (i : Nat) : Nat := [4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364164342256223027863573, 4364164342256223027863573].getD i 0
+def bound_mask_Beg (i : Nat) : Nat := [4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364198679373325459984719, 4364164342256223027863573].getD i 0
 
 /-- Closed per-instance value of `bound_smudge_BM` (probed by the generator; checked per instance by `decide`). -/
 def bound_smudge_BM (i : Nat) : Nat := [822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512, 822752278660603021077484591278675252491367932816789931674304512].getD i 0
@@ -392,99 +394,33 @@ theorem scale_71 (i_0 : Nat) [h : Fact (i_0 < S)] :
   have := h.out
   interval_cases i_0 <;> decide
 
-theorem scale_72 : ((((modulus_2 / modulus_3) : Nat) : Int) : Int) = (1099381866497) := by decide
-
-theorem scale_73 : ((((modulus_3 / modulus_4) : Nat) : Int) : Int) = (1099385798657) := by decide
-
-theorem scale_74 : ((((modulus_4 / modulus_5) : Nat) : Int) : Int) = (1099388157953) := by decide
-
-theorem scale_75 : ((((modulus_5 / modulus_6) : Nat) : Int) : Int) = (1099388682241) := by decide
-
-theorem scale_76 : ((((modulus_6 / modulus_7) : Nat) : Int) : Int) = (1099391827969) := by decide
-
-theorem scale_77 : ((((modulus_7 / modulus_8) : Nat) : Int) : Int) = (1099394449409) := by decide
-
-theorem scale_78 : ((((modulus_8 / modulus_9) : Nat) : Int) : Int) = (1099396546561) := by decide
-
-theorem scale_79 : ((((modulus_9 / modulus_10) : Nat) : Int) : Int) = (1099403100161) := by decide
-
-theorem scale_80 : ((((modulus_10 / modulus_11) : Nat) : Int) : Int) = (1099405197313) := by decide
-
-theorem scale_81 : ((((modulus_11 / modulus_12) : Nat) : Int) : Int) = (1099412275201) := by decide
-
-theorem scale_82 : ((((modulus_12 / modulus_13) : Nat) : Int) : Int) = (1099413323777) := by decide
-
-theorem scale_83 : ((((modulus_13 / modulus_14) : Nat) : Int) : Int) = (1099416993793) := by decide
-
-theorem scale_84 : ((((modulus_14 / modulus_15) : Nat) : Int) : Int) = (1099418042369) := by decide
-
-theorem scale_85 : ((((modulus_15 / modulus_16) : Nat) : Int) : Int) = (1099418828801) := by decide
-
-theorem scale_86 : ((((modulus_16 / modulus_17) : Nat) : Int) : Int) = (1099419353089) := by decide
-
-theorem scale_87 : ((((modulus_17 / modulus_18) : Nat) : Int) : Int) = (1099425120257) := by decide
-
-theorem scale_88 : ((((modulus_18 / modulus_19) : Nat) : Int) : Int) = (1099426693121) := by decide
-
-theorem scale_89 : ((((modulus_19 / modulus_20) : Nat) : Int) : Int) = (1099427217409) := by decide
-
-theorem scale_90 : ((((modulus_20 / modulus_21) : Nat) : Int) : Int) = (1099431149569) := by decide
-
-theorem scale_91 : ((((modulus_21 / modulus_22) : Nat) : Int) : Int) = (1099438227457) := by decide
-
-theorem scale_92 : ((((modulus_22 / modulus_23) : Nat) : Int) : Int) = (1099439800321) := by decide
-
-theorem scale_93 : ((((modulus_23 / modulus_24) : Nat) : Int) : Int) = (1099442159617) := by decide
-
-theorem scale_94 : ((((modulus_24 / modulus_25) : Nat) : Int) : Int) = (1099443732481) := by decide
-
-theorem scale_95 : ((((modulus_25 / modulus_26) : Nat) : Int) : Int) = (1099450023937) := by decide
-
-theorem scale_96 : ((((modulus_26 / modulus_27) : Nat) : Int) : Int) = (1099450810369) := by decide
-
-theorem scale_97 : ((((modulus_27 / modulus_28) : Nat) : Int) : Int) = (1099451072513) := by decide
-
-theorem scale_98 : ((((modulus_28 / modulus_29) : Nat) : Int) : Int) = (1099453431809) := by decide
-
-theorem scale_99 : ((((modulus_29 / modulus_30) : Nat) : Int) : Int) = (1099454218241) := by decide
-
-theorem scale_100 : ((((modulus_30 / modulus_31) : Nat) : Int) : Int) = (1099455004673) := by decide
-
-theorem scale_101 : ((((modulus_31 / modulus_32) : Nat) : Int) : Int) = (1099461820417) := by decide
-
-theorem scale_102 : ((((modulus_32 / modulus_33) : Nat) : Int) : Int) = (1099469684737) := by decide
-
-theorem scale_103 : ((((modulus_33 / modulus_34) : Nat) : Int) : Int) = (1099479121921) := by decide
-
-theorem scale_104 : ((((modulus_34 / modulus_35) : Nat) : Int) : Int) = (1099480956929) := by decide
-
-theorem gex_105 (i_0 : Nat) [h : Fact (i_0 < S)] :
+theorem gex_72 (i_0 : Nat) [h : Fact (i_0 < S)] :
     ∃ G : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28, gadgetMatrixRuns Backend.backend 1024 28 G := by
   have := h.out
   interval_cases i_0 <;> exact gadget_exists ⟨_, by simp [Backend.backend]; rfl, rfl, rfl, rfl⟩
 
-theorem scale_106 (i_0 : Nat) [h : Fact (i_0 < S)] :
+theorem scale_73 (i_0 : Nat) [h : Fact (i_0 < S)] :
     ((((modulus_0 / (mod_0 ((Int.ofNat i_0)))) : Nat) : Int) : Int) = (Stage_encrypt.sel_1 ((Int.ofNat i_0))) := by
   have := h.out
   interval_cases i_0 <;> decide
 
-theorem rd_107_nonneg : 0 ≤ ((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)) := by
+theorem rd_74_nonneg : 0 ≤ ((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)) := by
   decide
 
 set_option maxRecDepth 65536 in
-theorem rd_107_inv : (((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)).toNat * 2 ^ 7) % (Stage_preprocess.modulus_34) = 1 := by
+theorem rd_74_inv : (((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)).toNat * 2 ^ 7) % (Stage_preprocess.modulus_34) = 1 := by
   decide
 
-theorem rd_107_hinv :
+theorem rd_74_hinv :
     ((((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.modulus_34) 131072) * ((2 ^ 7 : Nat) : ExactPoly (Stage_preprocess.modulus_34) 131072) = 1 :=
-  cast_inverse (by decide) (rd_107_inv)
+  cast_inverse (by decide) (rd_74_inv)
 
-theorem rd_107_hC (i : Fin (2 ^ 7)) :
+theorem rd_74_hC (i : Fin (2 ^ 7)) :
     (fun (i : Fin 128) ↦ ((keyTableG (([(1)]) : List Int) (([(2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193)]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermE (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) ((4096) : Int) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (Stage_preprocess.modulus_34) (131072) 1 1) 0 0)) i =
       lutFourierCoefficient (2 ^ 7) (X (Stage_preprocess.modulus_34) ^ 1024) ((((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.modulus_34) 131072)
         (fun k : Fin (2 ^ 7) ↦ reducePoly (Stage_preprocess.modulus_34) 131072 (Xe (n := 131072) (4096 * readoutVal (32 / 2) (2 ^ 7) k))) ((fun i : Fin (2 ^ 7) ↦ ((MxxIR.selectInt (Int.ofNat ((i : Fin (2 ^ 7)) : Nat)) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))).toNat) i) := by
   have hb : ((((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.modulus_34) 131072) = ((2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193 : Int) : ExactPoly (Stage_preprocess.modulus_34) 131072) := by
-    rw [← Int.cast_natCast, Int.toNat_of_nonneg (rd_107_nonneg)]
+    rw [← Int.cast_natCast, Int.toNat_of_nonneg (rd_74_nonneg)]
   refine (RefreshTopProof.Wiring.keyTableE_walsh_int (q := (Stage_preprocess.modulus_34)) (n := 131072) (s := 1024) (W := 128) (o := 4096)
     (by decide) (by norm_num) (σ := (MxxIR.selectInt (Int.ofNat (i : Nat)) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) (by revert i; decide) (by norm_num) 1 (2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (by decide)).trans ?_
   rw [Int.cast_one, one_mul, hb]
@@ -494,84 +430,55 @@ theorem rd_107_hC (i : Fin (2 ^ 7)) :
   revert k
   decide
 
-theorem sm_108_tab (i_0 : Nat) [h : Fact (i_0 < S)] :
-    ∀ k : Fin 32, (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0))))]) : List Int) + ((0) : Int)) k = if k.val % 2 = 1 then (Stage_preprocess.sel_6 ((Int.ofNat i_0))) else 0 := by
-  have := h.out
-  interval_cases i_0 <;> decide
-
-theorem sm_108_nonneg (i_0 : Nat) [h : Fact (i_0 < S)] : 0 ≤ ((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)) := by
-  have := h.out
-  interval_cases i_0 <;> decide
-
-set_option maxRecDepth 65536 in
-theorem sm_108_inv (i_0 : Nat) [h : Fact (i_0 < S)] : (((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat * 2 ^ 5) % (Stage_preprocess.mod_0 ((Int.ofNat i_0))) = 1 := by
-  have := h.out
-  interval_cases i_0 <;> decide
-
-theorem sm_108_hinv (i_0 : Nat) [Fact (i_0 < S)] :
-    ((((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) * ((2 ^ 5 : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) = 1 :=
-  cast_inverse (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (sm_108_inv i_0)
-
-theorem sm_108_hC (i_0 : Nat) [Fact (i_0 < S)] (i : Fin (2 ^ 5)) :
-    (fun (i : Fin 32) ↦ ((keyTableG (([(1)]) : List Int) (([((Stage_preprocess.sel_7 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((32) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int)) (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0))))]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((4096) : Int)) k)) : ExactMatrix (Stage_preprocess.mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) i =
-      lutFourierCoefficient (2 ^ 5) (X (Stage_preprocess.mod_0 ((Int.ofNat i_0))) ^ 4096) ((((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072)
-        (fun k ↦ reducePoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072 (Gen.binTable (n := 131072) (2 ^ 5) (fun _ ↦ (Stage_preprocess.sel_6 ((Int.ofNat i_0)))) k)) ((fun i : Fin (2 ^ 5) ↦ ((MxxIR.selectInt (Int.ofNat ((i : Fin (2 ^ 5)) : Nat)) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int))).toNat) i) := by
-  have hb : ((((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) = ((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) := by
-    rw [← Int.cast_natCast, Int.toNat_of_nonneg (sm_108_nonneg i_0)]
-  refine (RefreshTopProof.Wiring.keyTableC_walsh' (q := (Stage_preprocess.mod_0 ((Int.ofNat i_0)))) (n := 131072) (s := 4096) (W := 32) (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (by norm_num)
-    (σ := (MxxIR.selectInt (Int.ofNat (i : Nat)) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int))) (by revert i; decide) (by norm_num) 1 _ (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0))))]) : List Int) + ((0) : Int))).trans ?_
-  rw [Int.cast_one, one_mul, hb, binTable_const (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0)))), (0), ((Stage_preprocess.sel_6 ((Int.ofNat i_0))))]) : List Int) + ((0) : Int)) _ (sm_108_tab i_0)]
-  rfl
-
-theorem fs_109_tab :
+theorem fs_75_tab :
     ∀ k : Fin 32, (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int)) k = if k.val % 2 = 1 then (GenFinal.listTable [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]) (k.val / 2) else 0 := by
   decide
 
-theorem fs_109_nonneg (i_0 : Nat) [h : Fact (i_0 < S)] : 0 ≤ ((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)) := by
+theorem fs_75_nonneg (i_0 : Nat) [h : Fact (i_0 < S)] : 0 ≤ ((Stage_preprocess.sel_8 ((Int.ofNat i_0)) : Int)) := by
   have := h.out
   interval_cases i_0 <;> decide
 
 set_option maxRecDepth 65536 in
-theorem fs_109_inv (i_0 : Nat) [h : Fact (i_0 < S)] : (((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat * 2 ^ 5) % (Stage_preprocess.mod_0 ((Int.ofNat i_0))) = 1 := by
+theorem fs_75_inv (i_0 : Nat) [h : Fact (i_0 < S)] : (((Stage_preprocess.sel_8 ((Int.ofNat i_0)) : Int)).toNat * 2 ^ 5) % (Stage_preprocess.mod_0 ((Int.ofNat i_0))) = 1 := by
   have := h.out
   interval_cases i_0 <;> decide
 
-theorem fs_109_hinv (i_0 : Nat) [Fact (i_0 < S)] :
-    ((((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) * ((2 ^ 5 : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) = 1 :=
-  cast_inverse (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (fs_109_inv i_0)
+theorem fs_75_hinv (i_0 : Nat) [Fact (i_0 < S)] :
+    ((((Stage_preprocess.sel_8 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) * ((2 ^ 5 : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) = 1 :=
+  cast_inverse (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (fs_75_inv i_0)
 
-theorem fs_109_hC (i_0 : Nat) [Fact (i_0 < S)] (i : Fin (2 ^ 5)) :
-    (fun (i : Fin 32) ↦ ((keyTableG (([(1)]) : List Int) (([((Stage_preprocess.sel_7 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((32) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int)) (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((4096) : Int)) k)) : ExactMatrix (Stage_preprocess.mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) i =
-      lutFourierCoefficient (2 ^ 5) (X (Stage_preprocess.mod_0 ((Int.ofNat i_0))) ^ 4096) ((((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072)
+theorem fs_75_hC (i_0 : Nat) [Fact (i_0 < S)] (i : Fin (2 ^ 5)) :
+    (fun (i : Fin 32) ↦ ((keyTableG (([(1)]) : List Int) (([((Stage_preprocess.sel_8 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((32) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int)) (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((4096) : Int)) k)) : ExactMatrix (Stage_preprocess.mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) i =
+      lutFourierCoefficient (2 ^ 5) (X (Stage_preprocess.mod_0 ((Int.ofNat i_0))) ^ 4096) ((((Stage_preprocess.sel_8 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072)
         (fun k ↦ reducePoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072 (Gen.binTable (n := 131072) (2 ^ 5) (GenFinal.listTable [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]) k)) ((fun i : Fin (2 ^ 5) ↦ ((MxxIR.selectInt (Int.ofNat ((i : Fin (2 ^ 5)) : Nat)) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int))).toNat) i) := by
-  have hb : ((((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) = ((Stage_preprocess.sel_7 ((Int.ofNat i_0)) : Int) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) := by
-    rw [← Int.cast_natCast, Int.toNat_of_nonneg (fs_109_nonneg i_0)]
+  have hb : ((((Stage_preprocess.sel_8 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) = ((Stage_preprocess.sel_8 ((Int.ofNat i_0)) : Int) : ExactPoly (Stage_preprocess.mod_0 ((Int.ofNat i_0))) 131072) := by
+    rw [← Int.cast_natCast, Int.toNat_of_nonneg (fs_75_nonneg i_0)]
   refine (RefreshTopProof.Wiring.keyTableC_walsh' (q := (Stage_preprocess.mod_0 ((Int.ofNat i_0)))) (n := 131072) (s := 4096) (W := 32) (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (by norm_num)
     (σ := (MxxIR.selectInt (Int.ofNat (i : Nat)) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int))) (by revert i; decide) (by norm_num) 1 _ (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int))).trans ?_
-  rw [Int.cast_one, one_mul, hb, binTable_of (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int)) _ (fs_109_tab)]
+  rw [Int.cast_one, one_mul, hb, binTable_of (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int)) _ (fs_75_tab)]
   rfl
 
-theorem scale_110 (i_0 : Nat) [h : Fact (i_0 < S)] :
+theorem scale_76 (i_0 : Nat) [h : Fact (i_0 < S)] :
     (((((modulus_0 / (mod_0 ((Int.ofNat i_0)))) : Nat)) : Int) : Int) = (Stage_preprocess.sel_3 ((Int.ofNat i_0))) := by
   have := h.out
   interval_cases i_0 <;> decide
 
 /-- The encrypt label payloads `c X^e` (members `j`) are `X^(s₀ a_k)` (the requirement's label relation
-`loop_6`, broadcast `loop_27`/`loop_31`, pinned `loop_29`/`loop_33`). -/
-theorem label_payload {external : ExternalInputs} (hv : ValidExternals external) (hreq : GenRequirement.Facts (external.input_7) (external.input_5) (external.input_6) (external.input_3) (external.input_1) (external.input_13) (external.input_16) (external.input_17) (external.input_18) (external.input_19) (external.input_20) (external.input_21) (external.input_22) (external.input_23) (external.input_24) (external.input_25) (external.input_26) (external.input_27) (external.input_28) (external.input_29) (external.input_30) (external.input_31) (external.input_32) (external.input_33) (external.input_34) (external.input_35) (external.input_36) (external.input_37) (external.input_38) (external.input_39) (external.input_40) (external.input_41) (external.input_42) (external.input_43) (external.input_44) (external.input_45) (external.input_46) (external.input_47) (external.input_48) (external.input_49) (external.input_50) (external.input_51) (external.input_52) (external.input_53) (external.input_54) (external.input_55) (external.input_56) (external.input_57) (external.input_58) (external.input_59) (external.input_60) (external.input_61) (external.input_62) (external.input_63) (external.input_64) (external.input_65) (external.input_66) (external.input_67) (external.input_68) (external.input_69) (external.input_70) (external.input_71) (external.input_72) (external.input_73) (external.input_74) (external.input_75) (external.input_76) (external.input_77) (external.input_78) (external.input_79) (external.input_80) (external.input_81) (external.input_82) (external.input_83) (external.input_84) (external.input_85) (external.input_86) (external.input_87) (external.input_88) (external.input_89) (external.input_90) (external.input_91) (external.input_92) (external.input_93) (external.input_94) (external.input_95) (external.input_96) (external.input_97) (external.input_98) (external.input_99) (external.input_100) (external.input_101) (external.input_102) (external.input_103) (external.input_104) (external.input_105) (external.input_106) (external.input_107) (external.input_108) (external.input_109) (external.input_110) (external.input_111) (external.input_112) (external.input_113) (external.input_114) (external.input_115) (external.input_116) (external.input_117) (external.input_118) (external.input_119) (external.input_121) (external.input_122) (external.input_123) (external.input_124) (external.input_125) (external.input_126) (external.input_127) (external.input_128) (external.input_129) (external.input_130) (external.input_131) (external.input_132) (external.input_133) (external.input_134) (external.input_135) (external.input_136) (external.input_137) (external.input_138) (external.input_139) (external.input_140) (external.input_141) (external.input_142) (external.input_143) (external.input_144) (external.input_145) (external.input_146) (external.input_147) (external.input_148) (external.input_149) (external.input_150) (external.input_151) (external.input_152) (external.input_153) (external.input_154) (external.input_155) (external.input_156) (external.input_157) (external.input_158) (external.input_159) (external.input_160) (external.input_161) (external.input_162) (external.input_163) (external.input_164) (external.input_165) (external.input_166) (external.input_167) (external.input_168) (external.input_169) (external.input_170) (external.input_171) (external.input_172) (external.input_173) (external.input_174) (external.input_175) (external.input_176) (external.input_177) (external.input_178) (external.input_179) (external.input_180) (external.input_181) (external.input_182) (external.input_183) (external.input_184) (external.input_185) (external.input_186) (external.input_187) (external.input_188) (external.input_4))
+`loop_6`, broadcast `loop_31`/`loop_39`, pinned `loop_33`/`loop_41`). -/
+theorem label_payload {external : ExternalInputs} (hv : ValidExternals external) (hreq : GenRequirement.Facts (external.input_7) (external.input_5) (external.input_6) (external.input_3) (external.input_1) (external.input_13) (external.input_18) (external.input_19) (external.input_20) (external.input_21) (external.input_22) (external.input_23) (external.input_24) (external.input_25) (external.input_26) (external.input_27) (external.input_28) (external.input_29) (external.input_30) (external.input_31) (external.input_32) (external.input_33) (external.input_34) (external.input_35) (external.input_36) (external.input_37) (external.input_38) (external.input_39) (external.input_40) (external.input_41) (external.input_42) (external.input_43) (external.input_44) (external.input_45) (external.input_46) (external.input_47) (external.input_48) (external.input_49) (external.input_50) (external.input_51) (external.input_52) (external.input_53) (external.input_54) (external.input_55) (external.input_56) (external.input_57) (external.input_58) (external.input_59) (external.input_60) (external.input_61) (external.input_62) (external.input_63) (external.input_64) (external.input_65) (external.input_66) (external.input_67) (external.input_68) (external.input_69) (external.input_70) (external.input_71) (external.input_72) (external.input_73) (external.input_74) (external.input_75) (external.input_76) (external.input_77) (external.input_78) (external.input_79) (external.input_80) (external.input_81) (external.input_82) (external.input_83) (external.input_84) (external.input_85) (external.input_86) (external.input_87) (external.input_88) (external.input_89) (external.input_90) (external.input_91) (external.input_92) (external.input_93) (external.input_94) (external.input_95) (external.input_96) (external.input_97) (external.input_98) (external.input_99) (external.input_100) (external.input_101) (external.input_102) (external.input_103) (external.input_104) (external.input_105) (external.input_106) (external.input_107) (external.input_108) (external.input_109) (external.input_110) (external.input_111) (external.input_112) (external.input_113) (external.input_114) (external.input_115) (external.input_116) (external.input_117) (external.input_118) (external.input_119) (external.input_120) (external.input_121) (external.input_122) (external.input_123) (external.input_125) (external.input_126) (external.input_127) (external.input_128) (external.input_129) (external.input_130) (external.input_131) (external.input_132) (external.input_133) (external.input_134) (external.input_135) (external.input_136) (external.input_137) (external.input_138) (external.input_139) (external.input_140) (external.input_141) (external.input_142) (external.input_143) (external.input_144) (external.input_145) (external.input_146) (external.input_147) (external.input_148) (external.input_149) (external.input_150) (external.input_151) (external.input_152) (external.input_153) (external.input_154) (external.input_155) (external.input_156) (external.input_157) (external.input_158) (external.input_159) (external.input_160) (external.input_161) (external.input_162) (external.input_163) (external.input_164) (external.input_165) (external.input_166) (external.input_167) (external.input_168) (external.input_169) (external.input_170) (external.input_171) (external.input_172) (external.input_173) (external.input_174) (external.input_175) (external.input_176) (external.input_177) (external.input_178) (external.input_179) (external.input_180) (external.input_181) (external.input_182) (external.input_183) (external.input_184) (external.input_185) (external.input_186) (external.input_187) (external.input_188) (external.input_189) (external.input_190) (external.input_191) (external.input_192) (external.input_4))
     (j : Fin S) (k : Fin 1025) :
-    message (n := 131072) (external.input_16 j k) (external.input_17 j k) = Xe (n := 131072) (1024 * (famAt external.input_7 k).toNat) := by
-  have ec := hreq.loop_27 j j.2 k k.2
-  have ee := hreq.loop_31 j j.2 k k.2
+    message (n := 131072) (external.input_19 j k) (external.input_21 j k) = Xe (n := 131072) (1024 * (famAt external.input_7 k).toNat) := by
+  have ec := hreq.loop_31 j j.2 k k.2
+  have ee := hreq.loop_39 j j.2 k k.2
   have z : ∀ j : Fin S, (MxxIR.selectInt (Int.ofNat (j : Nat)) [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).toNat = 0 := by decide
   have z' : ∀ j : Fin S, (MxxIR.selectInt (Int.ofNat (j : Nat)) [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).toNat = 0 := by decide
-  rw [z j, hreq.loop_29 k k.2, famAt_of_lt _ j.2, famAt_of_lt _ k.2] at ec
-  rw [z' j, hreq.loop_33 k k.2, famAt_of_lt _ j.2, famAt_of_lt _ k.2] at ee
+  rw [z j, hreq.loop_33 k k.2, famAt_of_lt _ j.2, famAt_of_lt _ k.2] at ec
+  rw [z' j, hreq.loop_41 k k.2, famAt_of_lt _ j.2, famAt_of_lt _ k.2] at ee
   obtain ⟨-, h1, h2⟩ := hreq.loop_6 k k.2
-  have ec' : external.input_16 j k = famAt external.input_5 k := ec
-  have ee' : external.input_17 j k = famAt external.input_6 k := ee
+  have ec' : external.input_19 j k = famAt external.input_5 k := ec
+  have ee' : external.input_21 j k = famAt external.input_6 k := ee
   have ba : 0 ≤ famAt external.input_7 (k : Nat) := by rw [famAt_of_lt _ k.2]; exact (hv.2.2.2.2.2.2.2.1 k).1
-  have be := hv.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 j k
+  have be := hv.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 j k
   rw [ee'] at be
   rw [ec', ee']
   exact label_msg 1024 h1 (by push_cast; linarith) ba be.1 (by have := be.2; push_cast; omega)

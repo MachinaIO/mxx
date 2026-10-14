@@ -23,6 +23,7 @@ local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 131072 1 28
 local notation "mxxMat1" => Mxx.Primitives.ExactMatrix modulus_0 131072 1 1
 local notation "mxxMat2" => Mxx.Primitives.ExactMatrix modulus_0 131072 2 28
 local notation "mxxMat3" => Mxx.Primitives.ExactMatrix modulus_1 131072 1 28
+local notation "mxxMat4" => Mxx.Primitives.ExactMatrix modulus_0 131072 2 56
 
 abbrev sequential_generatedRoot_4.constraints_0 (w_1_0 : Fin 16 → mxxMat0) (w_8_0 : Int) (w_9_0 : mxxMat0) (w_10_0 : mxxMat0) (outputs : mxxMat0) : Prop :=
   0 ≤ w_8_0 ∧
@@ -30,7 +31,7 @@ abbrev sequential_generatedRoot_4.constraints_0 (w_1_0 : Fin 16 → mxxMat0) (w_
   MxxRuntime.familyGetDynamic w_1_0 w_8_0 w_9_0 ∧
   outputs = w_10_0
 
-def sequential_generatedRoot_4 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × (Fin 16 → mxxMat0) × Unit) (outputs : mxxMat0) : Prop :=
+def sequential_generatedRoot_4 (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × (Fin 16 → mxxMat0) × Unit) (outputs : mxxMat0) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -54,7 +55,7 @@ abbrev sequential_sequential_generatedRoot_28_6.constraints_0 (w_1_0 : Fin 13107
   w_10_0 ≠ 0 ∧
   outputs = w_12_0
 
-def sequential_sequential_generatedRoot_28_6 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : Int × (Fin 131072 → Int) × Int × Int × Unit) (outputs : Int) : Prop :=
+def sequential_sequential_generatedRoot_28_6 (backend : MxxRuntime.BackendContext) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : Int × (Fin 131072 → Int) × Int × Int × Unit) (outputs : Int) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : Int := inputs.1
@@ -79,7 +80,7 @@ structure sequential_generatedRoot_28.Witness where
   w_3_0 : Fin 131072 → Int
   w_6_0 : Int
 
-abbrev sequential_generatedRoot_28.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (w_0_0 : Int) (w_1_0 : mxxMat0) (w_4_0 : Int) (w_5_0 : Int) (w_2_0 : mxxMat1) (w_3_0 : Fin 131072 → Int) (w_6_0 : Int) (outputs : Int) : Prop :=
+abbrev sequential_generatedRoot_28.constraints_0 (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (w_0_0 : Int) (w_1_0 : mxxMat0) (w_4_0 : Int) (w_5_0 : Int) (w_2_0 : mxxMat1) (w_3_0 : Fin 131072 → Int) (w_6_0 : Int) (outputs : Int) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -89,10 +90,10 @@ abbrev sequential_generatedRoot_28.constraints_0 (backend : MxxRuntime.BackendCo
   MxxRuntime.sliceMatrix w_1_0 0 1 (Int.ofNat i_0) (1 + (Int.ofNat i_0)) w_2_0 ∧
   MxxRuntime.polynomialValues false w_2_0 w_3_0 ∧
   0 ≤ (131072) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_sequential_generatedRoot_28_6 backend hashModel params i_0 i (current, (w_3_0, (w_4_0, (w_5_0, ())))) next) (Int.toNat (131072)) w_0_0 w_6_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_sequential_generatedRoot_28_6 backend params i_0 i (current, (w_3_0, (w_4_0, (w_5_0, ())))) next) (Int.toNat (131072)) w_0_0 w_6_0 ∧
   outputs = w_6_0
 
-abbrev sequential_generatedRoot_28.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) (witness : sequential_generatedRoot_28.Witness) : Prop :=
+abbrev sequential_generatedRoot_28.body (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) (witness : sequential_generatedRoot_28.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : Int := inputs.1
@@ -102,11 +103,11 @@ abbrev sequential_generatedRoot_28.body (backend : MxxRuntime.BackendContext) (h
   let w_2_0 := witness.w_2_0
   let w_3_0 := witness.w_3_0
   let w_6_0 := witness.w_6_0
-  sequential_generatedRoot_28.constraints_0 backend hashModel params i_0 w_0_0 w_1_0 w_4_0 w_5_0 w_2_0 w_3_0 w_6_0 outputs
+  sequential_generatedRoot_28.constraints_0 backend params i_0 w_0_0 w_1_0 w_4_0 w_5_0 w_2_0 w_3_0 w_6_0 outputs
 
-def sequential_generatedRoot_28 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) : Prop :=
+def sequential_generatedRoot_28 (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) : Prop :=
   ∃ witness : sequential_generatedRoot_28.Witness,
-    sequential_generatedRoot_28.body backend hashModel params i_0 inputs outputs witness
+    sequential_generatedRoot_28.body backend params i_0 inputs outputs witness
 
 abbrev sequential_generatedRoot_32.constraints_0 (w_1_0 : Fin 16 → mxxMat0) (w_8_0 : Int) (w_9_0 : mxxMat0) (w_10_0 : mxxMat0) (outputs : mxxMat0) : Prop :=
   0 ≤ w_8_0 ∧
@@ -114,7 +115,7 @@ abbrev sequential_generatedRoot_32.constraints_0 (w_1_0 : Fin 16 → mxxMat0) (w
   MxxRuntime.familyGetDynamic w_1_0 w_8_0 w_9_0 ∧
   outputs = w_10_0
 
-def sequential_generatedRoot_32 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × (Fin 16 → mxxMat0) × Unit) (outputs : mxxMat0) : Prop :=
+def sequential_generatedRoot_32 (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × (Fin 16 → mxxMat0) × Unit) (outputs : mxxMat0) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -138,7 +139,7 @@ abbrev sequential_sequential_generatedRoot_46_6.constraints_0 (w_1_0 : Fin 13107
   w_10_0 ≠ 0 ∧
   outputs = w_12_0
 
-def sequential_sequential_generatedRoot_46_6 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : Int × (Fin 131072 → Int) × Int × Int × Unit) (outputs : Int) : Prop :=
+def sequential_sequential_generatedRoot_46_6 (backend : MxxRuntime.BackendContext) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : Int × (Fin 131072 → Int) × Int × Int × Unit) (outputs : Int) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : Int := inputs.1
@@ -163,7 +164,7 @@ structure sequential_generatedRoot_46.Witness where
   w_3_0 : Fin 131072 → Int
   w_6_0 : Int
 
-abbrev sequential_generatedRoot_46.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (w_0_0 : Int) (w_1_0 : mxxMat0) (w_4_0 : Int) (w_5_0 : Int) (w_2_0 : mxxMat1) (w_3_0 : Fin 131072 → Int) (w_6_0 : Int) (outputs : Int) : Prop :=
+abbrev sequential_generatedRoot_46.constraints_0 (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (w_0_0 : Int) (w_1_0 : mxxMat0) (w_4_0 : Int) (w_5_0 : Int) (w_2_0 : mxxMat1) (w_3_0 : Fin 131072 → Int) (w_6_0 : Int) (outputs : Int) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -173,10 +174,10 @@ abbrev sequential_generatedRoot_46.constraints_0 (backend : MxxRuntime.BackendCo
   MxxRuntime.sliceMatrix w_1_0 0 1 (Int.ofNat i_0) (1 + (Int.ofNat i_0)) w_2_0 ∧
   MxxRuntime.polynomialValues false w_2_0 w_3_0 ∧
   0 ≤ (131072) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_sequential_generatedRoot_46_6 backend hashModel params i_0 i (current, (w_3_0, (w_4_0, (w_5_0, ())))) next) (Int.toNat (131072)) w_0_0 w_6_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_sequential_generatedRoot_46_6 backend params i_0 i (current, (w_3_0, (w_4_0, (w_5_0, ())))) next) (Int.toNat (131072)) w_0_0 w_6_0 ∧
   outputs = w_6_0
 
-abbrev sequential_generatedRoot_46.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) (witness : sequential_generatedRoot_46.Witness) : Prop :=
+abbrev sequential_generatedRoot_46.body (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) (witness : sequential_generatedRoot_46.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : Int := inputs.1
@@ -186,11 +187,11 @@ abbrev sequential_generatedRoot_46.body (backend : MxxRuntime.BackendContext) (h
   let w_2_0 := witness.w_2_0
   let w_3_0 := witness.w_3_0
   let w_6_0 := witness.w_6_0
-  sequential_generatedRoot_46.constraints_0 backend hashModel params i_0 w_0_0 w_1_0 w_4_0 w_5_0 w_2_0 w_3_0 w_6_0 outputs
+  sequential_generatedRoot_46.constraints_0 backend params i_0 w_0_0 w_1_0 w_4_0 w_5_0 w_2_0 w_3_0 w_6_0 outputs
 
-def sequential_generatedRoot_46 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) : Prop :=
+def sequential_generatedRoot_46 (backend : MxxRuntime.BackendContext) (params : Params) (i_0 : Nat) (inputs : Int × mxxMat0 × Int × Int × Unit) (outputs : Int) : Prop :=
   ∃ witness : sequential_generatedRoot_46.Witness,
-    sequential_generatedRoot_46.body backend hashModel params i_0 inputs outputs witness
+    sequential_generatedRoot_46.body backend params i_0 inputs outputs witness
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -211,7 +212,19 @@ structure generatedRoot.Witness where
   w_36_0 : mxxMat0
   w_46_0 : Int
 
-abbrev generatedRoot.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (w_30_0 : Int) (w_33_0 : mxxMat2) (w_34_0 : mxxMat0) (w_36_0 : mxxMat0) (w_43_0 : mxxMat0) (w_44_0 : Int) (w_45_0 : Int) (w_46_0 : Int) (w_47_0 : Int) (outputs : Int) : Prop :=
+abbrev generatedRoot.constraints_1 (backend : MxxRuntime.BackendContext) (params : Params) (w_7_0 : mxxMat4) (w_30_0 : Int) (w_33_0 : mxxMat2) (w_34_0 : mxxMat0) (w_36_0 : mxxMat0) (w_43_0 : mxxMat0) (w_44_0 : Int) (w_45_0 : Int) (w_46_0 : Int) (w_47_0 : Int) (outputs : Int) : Prop :=
+  0 ≤ 0 ∧
+  0 < 2 ∧
+  2 ≤ 2 ∧
+  0 ≤ 28 ∧
+  28 < 56 ∧
+  56 ≤ 56 ∧
+  MxxRuntime.sliceMatrix w_7_0 0 2 28 56 w_33_0 ∧
+  0 ≤ 0 ∧
+  0 < 1 ∧
+  1 ≤ 2 ∧
+  0 ≤ 0 ∧
+  0 < 28 ∧
   28 ≤ 28 ∧
   MxxRuntime.sliceMatrix w_33_0 0 1 0 28 w_34_0 ∧
   0 ≤ 1 ∧
@@ -222,15 +235,21 @@ abbrev generatedRoot.constraints_1 (backend : MxxRuntime.BackendContext) (hashMo
   28 ≤ 28 ∧
   MxxRuntime.sliceMatrix w_33_0 1 2 0 28 w_36_0 ∧
   0 ≤ (28) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_46 backend hashModel params i (current, (w_43_0, (w_44_0, (w_45_0, ())))) next) (Int.toNat (28)) w_30_0 w_46_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_46 backend params i (current, (w_43_0, (w_44_0, (w_45_0, ())))) next) (Int.toNat (28)) w_30_0 w_46_0 ∧
   outputs = w_47_0
 
-abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (w_2_0 : Fin 16 → mxxMat0) (w_5_0 : Fin 131072 → Int) (w_7_0 : ByteArray) (w_1_0 : Int) (w_3_0 : mxxMat0) (w_4_0 : mxxMat0) (w_6_0 : mxxMat1) (w_8_0 : mxxMat2) (w_9_0 : mxxMat0) (w_11_0 : mxxMat0) (w_21_0 : mxxMat3) (w_22_0 : mxxMat0) (w_25_0 : mxxMat0) (w_26_0 : Int) (w_27_0 : Int) (w_28_0 : Int) (w_31_0 : mxxMat0) (w_32_0 : mxxMat0) (w_33_0 : mxxMat2) : Prop :=
+abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (params : Params) (w_2_0 : Fin 16 → mxxMat0) (w_5_0 : Fin 131072 → Int) (w_7_0 : mxxMat4) (w_1_0 : Int) (w_3_0 : mxxMat0) (w_4_0 : mxxMat0) (w_6_0 : mxxMat1) (w_8_0 : mxxMat2) (w_9_0 : mxxMat0) (w_11_0 : mxxMat0) (w_21_0 : mxxMat3) (w_22_0 : mxxMat0) (w_25_0 : mxxMat0) (w_26_0 : Int) (w_27_0 : Int) (w_28_0 : Int) (w_31_0 : mxxMat0) (w_32_0 : mxxMat0) : Prop :=
   MxxRuntime.familyGetStatic w_2_0 (0) w_3_0 ∧
   0 ≤ (7) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0) => sequential_generatedRoot_4 backend hashModel params i (current, (w_2_0, ())) next) (Int.toNat (7)) w_3_0 w_4_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0) => sequential_generatedRoot_4 backend params i (current, (w_2_0, ())) next) (Int.toNat (7)) w_3_0 w_4_0 ∧
   MxxRuntime.polynomialFromValues false w_5_0 w_6_0 ∧
-  MxxRuntime.hashSample (hashModel) ([114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 65, 116, 111, 112, 45, 114, 101, 102, 114, 101, 115, 104, 45, 114, 111, 117, 110, 100, 45, 116, 114, 105, 112]) ([.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_7_0) w_8_0 ∧
+  0 ≤ 0 ∧
+  0 < 2 ∧
+  2 ≤ 2 ∧
+  0 ≤ 0 ∧
+  0 < 28 ∧
+  28 ≤ 56 ∧
+  MxxRuntime.sliceMatrix w_7_0 0 2 0 28 w_8_0 ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 2 ∧
@@ -248,23 +267,17 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   MxxRuntime.gadgetMatrixRuns backend 1024 28 w_21_0 ∧
   MxxRuntime.centeredRebaseRuns w_21_0 w_22_0 ∧
   0 ≤ (28) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_28 backend hashModel params i (current, (w_25_0, (w_26_0, (w_27_0, ())))) next) (Int.toNat (28)) w_1_0 w_28_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_28 backend params i (current, (w_25_0, (w_26_0, (w_27_0, ())))) next) (Int.toNat (28)) w_1_0 w_28_0 ∧
   MxxRuntime.familyGetStatic w_2_0 (1) w_31_0 ∧
   0 ≤ (7) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0) => sequential_generatedRoot_32 backend hashModel params i (current, (w_2_0, ())) next) (Int.toNat (7)) w_31_0 w_32_0 ∧
-  MxxRuntime.hashSample (hashModel) ([114, 101, 102, 114, 101, 115, 104, 47, 118, 49, 47, 65, 116, 111, 112, 45, 114, 101, 102, 114, 101, 115, 104, 45, 114, 111, 117, 110, 100, 45, 116, 114, 105, 112]) ([.bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (1)]) (w_7_0) w_33_0 ∧
-  0 ≤ 0 ∧
-  0 < 1 ∧
-  1 ≤ 2 ∧
-  0 ≤ 0 ∧
-  0 < 28
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0) => sequential_generatedRoot_32 backend params i (current, (w_2_0, ())) next) (Int.toNat (7)) w_31_0 w_32_0
 
-abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (inputs : (Fin 16 → mxxMat0) × (Fin 131072 → Int) × ByteArray × mxxMat1 × Int × Int × Unit) (outputs : Int) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (params : Params) (inputs : (Fin 16 → mxxMat0) × (Fin 131072 → Int) × mxxMat4 × mxxMat1 × Int × Int × Unit) (outputs : Int) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_2_0 : Fin 16 → mxxMat0 := inputs.1
   let w_5_0 : Fin 131072 → Int := inputs.2.1
-  let w_7_0 : ByteArray := inputs.2.2.1
+  let w_7_0 : mxxMat4 := inputs.2.2.1
   let w_14_0 : mxxMat1 := inputs.2.2.2.1
   let w_16_0 : Int := inputs.2.2.2.2.1
   let w_18_0 : Int := inputs.2.2.2.2.2.1
@@ -310,12 +323,12 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   let w_45_0 : Int := mxxNat0
   let w_46_0 := witness.w_46_0
   let w_47_0 : Int := (w_29_0 + w_46_0)
-  generatedRoot.constraints_0 backend hashModel params w_2_0 w_5_0 w_7_0 w_1_0 w_3_0 w_4_0 w_6_0 w_8_0 w_9_0 w_11_0 w_21_0 w_22_0 w_25_0 w_26_0 w_27_0 w_28_0 w_31_0 w_32_0 w_33_0 ∧
-    generatedRoot.constraints_1 backend hashModel params w_30_0 w_33_0 w_34_0 w_36_0 w_43_0 w_44_0 w_45_0 w_46_0 w_47_0 outputs
+  generatedRoot.constraints_0 backend params w_2_0 w_5_0 w_7_0 w_1_0 w_3_0 w_4_0 w_6_0 w_8_0 w_9_0 w_11_0 w_21_0 w_22_0 w_25_0 w_26_0 w_27_0 w_28_0 w_31_0 w_32_0 ∧
+    generatedRoot.constraints_1 backend params w_7_0 w_30_0 w_33_0 w_34_0 w_36_0 w_43_0 w_44_0 w_45_0 w_46_0 w_47_0 outputs
 
-def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (inputs : (Fin 16 → mxxMat0) × (Fin 131072 → Int) × ByteArray × mxxMat1 × Int × Int × Unit) (outputs : Int) : Prop :=
+def generatedRoot (backend : MxxRuntime.BackendContext) (params : Params) (inputs : (Fin 16 → mxxMat0) × (Fin 131072 → Int) × mxxMat4 × mxxMat1 × Int × Int × Unit) (outputs : Int) : Prop :=
   ∃ witness : generatedRoot.Witness,
-    generatedRoot.body backend hashModel params inputs outputs witness
+    generatedRoot.body backend params inputs outputs witness
 
 
 end W_Stage_decode

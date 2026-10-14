@@ -3335,10 +3335,11 @@ extern "C++" {
 
 #endif
 
-    int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder,
+    int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder, const GpuContext *control_context,
         const uint64_t *predicate, uint32_t predicate_binding)
     {
 #if !defined(MXX_GPU_BACKEND_HIP) && defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+        (void)control_context; // CUDA records the current context in its native conditional node.
         if (!builder || !builder->operation_active ||
             (builder->conditional_body_active && !builder->generic_body_mode) ||
             !predicate) return set_error("invalid direct IF body");
@@ -3357,20 +3358,21 @@ extern "C++" {
         return mxx_gpu_graph_builder_enter_generic_body(
             builder, handle, cudaGraphCondTypeIf, nullptr);
 #elif defined(MXX_GPU_BACKEND_HIP)
-        return hip_graph_begin_control(builder, predicate, predicate_binding,
+        return hip_graph_begin_control(builder, control_context, predicate, predicate_binding,
             nullptr, nullptr, 0, nullptr, 0, 0, 0);
 #else
-        (void)builder; (void)predicate; (void)predicate_binding;
+        (void)builder; (void)control_context; (void)predicate; (void)predicate_binding;
         return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
 #endif
     }
 
-    int mxx_gpu_graph_builder_begin_while(MxxGpuGraphBuilder *builder,
+    int mxx_gpu_graph_builder_begin_while(MxxGpuGraphBuilder *builder, const GpuContext *control_context,
         uint64_t *index, const uint64_t *limit, uint64_t max_iterations,
         uint32_t *status_word, uint32_t index_binding, uint32_t limit_binding,
         uint32_t status_binding)
     {
 #if !defined(MXX_GPU_BACKEND_HIP) && defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+        (void)control_context; // CUDA records the current context in its native conditional node.
         if (!builder || !builder->operation_active ||
             (builder->conditional_body_active && !builder->generic_body_mode) ||
             !index || !limit || !status_word || !max_iterations)
@@ -3404,10 +3406,10 @@ extern "C++" {
         return mxx_gpu_graph_builder_enter_generic_body(
             builder, handle, cudaGraphCondTypeWhile, &loop);
 #elif defined(MXX_GPU_BACKEND_HIP)
-        return hip_graph_begin_control(builder, nullptr, 0, index, limit,
+        return hip_graph_begin_control(builder, control_context, nullptr, 0, index, limit,
             max_iterations, status_word, index_binding, limit_binding, status_binding);
 #else
-        (void)builder; (void)index; (void)limit; (void)max_iterations;
+        (void)builder; (void)control_context; (void)index; (void)limit; (void)max_iterations;
         (void)status_word; (void)index_binding; (void)limit_binding; (void)status_binding;
         return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
 #endif
@@ -4062,7 +4064,14 @@ extern "C++" {
                 // unknown state.  Never terminate the host process here: the
                 // caller must receive a distinct status so it can retain the
                 // bound owners and perform its deferred-reclamation policy.
+                // HIP bodies can still be running on independent peer queues
+                // when a later submission fails before their parent join.
+#if defined(MXX_GPU_BACKEND_HIP)
+                const gpuError_t drain = exec->schedule ?
+                    exec->schedule->drain() : gpuStreamSynchronize(stream);
+#else
                 const gpuError_t drain = gpuStreamSynchronize(stream);
+#endif
                 if (drain != gpuSuccess)
                 {
                     if (event->event) (void)gpuEventDestroy(event->event);

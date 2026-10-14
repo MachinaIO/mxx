@@ -1721,11 +1721,13 @@ unsafe extern "C" {
     ) -> c_int;
     fn mxx_gpu_graph_builder_begin_if(
         builder: *mut MxxGpuGraphBuilderOpaque,
+        control_context: *const GpuContextOpaque,
         predicate: *const u64,
         predicate_binding: u32,
     ) -> c_int;
     fn mxx_gpu_graph_builder_begin_while(
         builder: *mut MxxGpuGraphBuilderOpaque,
+        control_context: *const GpuContextOpaque,
         index: *mut u64,
         limit: *const u64,
         max_iterations: u64,
@@ -7090,6 +7092,8 @@ impl GpuNativeGraphBuilder {
     /// a reusable HIP region selected at a D2H control boundary. The callback
     /// uses this builder's ordinary begin/finish operation API with body-local
     /// predecessor tokens.
+    /// Each control retains the context of the selected launch stream; HIP
+    /// schedules its predicate and nested body on that context's device.
     pub fn add_if_with_body(
         &mut self,
         predicate_address: u64,
@@ -7104,6 +7108,7 @@ impl GpuNativeGraphBuilder {
         let status = unsafe {
             mxx_gpu_graph_builder_begin_if(
                 self.raw,
+                self.stream._context.raw_ptr(),
                 predicate_address as *const u64,
                 predicate_binding,
             )
@@ -7131,7 +7136,8 @@ impl GpuNativeGraphBuilder {
     /// `status_word` after the previous execute has joined; the body reads the
     /// current index without modifying it; the tail advances it before the
     /// next predicate check. CUDA uses a conditional child graph; HIP reuses
-    /// the body region after each targeted D2H predicate read.
+    /// the body region after each targeted D2H predicate read, using the
+    /// selected stream's owning device and execution resources.
     pub fn add_while_with_body(
         &mut self,
         index_address: u64,
@@ -7151,6 +7157,7 @@ impl GpuNativeGraphBuilder {
         let status = unsafe {
             mxx_gpu_graph_builder_begin_while(
                 self.raw,
+                self.stream._context.raw_ptr(),
                 index_address as *mut u64,
                 limit_address as *const u64,
                 max_iterations,
@@ -9504,6 +9511,118 @@ mod tests {
                     let mut bytes = [0u8; 8];
                     lane[field].download(0, &mut bytes).unwrap();
                     assert_eq!(u64::from_le_bytes(bytes), value, "nested control field {field}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[sequential(gpu_context)]
+    fn test_gpu_graph_control_scopes_use_each_device_context() {
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let cpu = DCRTPolyParams::new(dimension, 1, bits, base_bits, None, None);
+        let ids = available_gpu_ids();
+        let devices = if ids.len() == 1 { vec![ids[0], ids[0]] } else { ids };
+        let params = devices
+            .iter()
+            .map(|&device| {
+                GpuDCRTPolyParams::new_with_gpu(
+                    dimension,
+                    cpu.to_crt().0,
+                    base_bits,
+                    vec![device],
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let streams = params
+            .iter()
+            .zip(&devices)
+            .map(|(params, &device)| params.native_launch_stream(device).unwrap())
+            .collect::<Vec<_>>();
+        let lanes = streams
+            .iter()
+            .map(|stream| {
+                (0..6).map(|_| GpuDeviceBuffer::allocate(stream, 8).unwrap()).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let addresses = lanes
+            .iter()
+            .map(|lane| lane.iter().map(|buffer| buffer.as_ptr() as u64).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let maximum = u64::from(dimension).clamp(2, 8);
+        let register = |builder: &mut GpuNativeGraphBuilder, lane: usize| {
+            for (field, &address) in addresses[lane].iter().enumerate() {
+                builder.bind_resident_address(address, 8, (lane * 6 + field) as u32).unwrap();
+            }
+        };
+        let mut builder = streams[0].begin_graph().unwrap();
+        let mut terminals = Vec::new();
+        for (lane, stream) in streams.iter().enumerate() {
+            let previous = builder.replace_launch_stream(stream.clone());
+            let base = (lane * 6) as u32;
+            let a = &addresses[lane];
+            builder.begin_operation(lane as u32, &[]).unwrap();
+            register(&mut builder, lane);
+            builder
+                .add_while_with_body(a[0], a[1], maximum, a[2], base, base + 1, base + 2, |outer| {
+                    outer.begin_operation(0, &[])?;
+                    register(outer, lane);
+                    outer.add_if_with_body(a[3], base + 3, |inner| {
+                        inner.begin_operation(0, &[])?;
+                        register(inner, lane);
+                        inner.add_device_copy(
+                            a[5],
+                            devices[lane],
+                            a[4],
+                            devices[lane],
+                            8,
+                            &[
+                                GpuGraphPatch::memcpy_source(base + 4),
+                                GpuGraphPatch::memcpy_destination(base + 5),
+                            ],
+                        )?;
+                        inner.finish_operation()?;
+                        Ok(())
+                    })?;
+                    outer.finish_operation()?;
+                    Ok(())
+                })
+                .unwrap();
+            terminals.push(builder.finish_operation().unwrap());
+            builder.replace_launch_stream(previous);
+        }
+        builder.begin_operation(devices.len() as u32, &terminals).unwrap();
+        builder.finish_operation().unwrap();
+        let mut graph = builder.finish().unwrap();
+        let bindings = addresses
+            .iter()
+            .flatten()
+            .map(|&address| GpuGraphBindingValue::DeviceAddress(address))
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            let mut expected = Vec::new();
+            for lane in &lanes {
+                let limit = 1 + rand::random::<u64>() % maximum;
+                let selected = u64::from(rand::random::<bool>());
+                let value = rand::random::<u64>();
+                for (field, initial) in [0, limit, 0, selected, value, 0].into_iter().enumerate() {
+                    lane[field].upload_initial(0, &initial.to_le_bytes()).unwrap();
+                }
+                expected.push([limit, if selected == 1 { value } else { 0 }]);
+            }
+            graph.bind(&bindings).unwrap();
+            graph.upload(&streams[0]).unwrap();
+            streams[0].record_event().unwrap().wait().unwrap();
+            graph.launch(&streams[0]).unwrap().wait().unwrap();
+            for (lane, expected) in lanes.iter().zip(expected) {
+                for (field, value) in [(0, expected[0]), (2, 0), (5, expected[1])] {
+                    let mut bytes = [0u8; 8];
+                    lane[field].download(0, &mut bytes).unwrap();
+                    assert_eq!(u64::from_le_bytes(bytes), value, "control device field {field}");
                 }
             }
         }

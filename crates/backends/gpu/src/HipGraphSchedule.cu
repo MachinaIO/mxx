@@ -169,7 +169,7 @@ __global__ void mxx_hip_control_kernel(const HipControlDescriptor *descriptors,
     records[lane] = *control.index < *control.limit && *control.status == 0U;
 }
 
-static int hip_graph_begin_control(MxxGpuGraphBuilder *builder,
+static int hip_graph_begin_control(MxxGpuGraphBuilder *builder, const GpuContext *control_context,
     const uint64_t *predicate, uint32_t predicate_binding,
     uint64_t *index, const uint64_t *limit, uint64_t maximum,
     uint32_t *status, uint32_t index_binding, uint32_t limit_binding,
@@ -180,6 +180,9 @@ static int hip_graph_begin_control(MxxGpuGraphBuilder *builder,
         (!predicate && (!index || !limit || !maximum || !status)))
         return set_error("invalid HIP control body");
     HipGraphControl control;
+    auto device_error = mxx_get_device(&control.device);
+    if (device_error != gpuSuccess) return set_error(device_error);
+    control.execution = control_context->execution;
     control.predicate = predicate;
     control.index = index;
     control.limit = limit;
@@ -225,8 +228,8 @@ static int hip_graph_begin_control(MxxGpuGraphBuilder *builder,
     builder->operation_active = false;
     builder->conditional_body_active = true;
     builder->generic_body_mode = true;
-    error = gpuGetDevice(&builder->body_device);
-    return error == gpuSuccess ? 0 : set_error(error);
+    builder->body_device = mxx_physical_device(control.device);
+    return 0;
 }
 
 static int hip_graph_finish_control(MxxGpuGraphBuilder *builder)
@@ -253,72 +256,88 @@ static int hip_graph_finish_control(MxxGpuGraphBuilder *builder)
 
 HipGraphSchedule::~HipGraphSchedule()
 {
-    (void)mxx_set_device(device);
     for (auto &scope : scopes)
-        for (auto &region : scope.second)
+    {
+        (void)mxx_set_device(scope.second.device);
+        for (auto &region : scope.second.regions)
         {
             if (region.exec) (void)gpuGraphExecDestroy(region.exec);
             if (region.graph) (void)gpuGraphDestroy(region.graph);
-            if (region.control_complete) (void)gpuEventDestroy(region.control_complete);
+            for (auto &batch : region.batches)
+            {
+                (void)mxx_set_device(batch.device);
+                if (batch.control_complete) (void)gpuEventDestroy(batch.control_complete);
+            }
+            (void)mxx_set_device(scope.second.device);
         }
-    for (auto graph : source_bodies) (void)gpuGraphDestroy(graph);
-    if (device_record) (void)gpuFreeAsync(device_record, allocation_stream);
-
-    for (const auto &entry : scope_complete) (void)gpuEventDestroy(entry.second);
-    if (device_descriptors) (void)gpuFreeAsync(device_descriptors, allocation_stream);
-
-    if (descriptors_ready) (void)gpuEventDestroy(descriptors_ready);
-    // Even an unsuccessful bind may have queued a descriptor upload. Retire
-    // its pinned owners behind the allocation stream rather than waiting in
-    // this non-D2H destructor or freeing pending transfer operands.
-    std::vector<void *> pinned;
-    if (host_record) pinned.push_back(host_record);
-    if (host_descriptors) pinned.push_back(host_descriptors);
-    if (!pinned.empty())
+        if (scope.second.complete) (void)gpuEventDestroy(scope.second.complete);
+    }
+    for (auto graph : source_bodies)
     {
-        gpuEvent_t retired = nullptr;
-        auto error = gpuEventCreateWithFlags(&retired, gpuEventDisableTiming);
-        if (error == gpuSuccess) error = gpuEventRecord(retired, allocation_stream);
-        if (error != gpuSuccess || !execution_owner || !execution_owner->pinned_host_reclaimer ||
-            execution_owner->pinned_host_reclaimer->enqueue(device, retired, std::move(pinned)) != 0)
+        (void)mxx_set_device(scopes.at(graph).device);
+        (void)gpuGraphDestroy(graph);
+    }
+    for (auto &entry : storage)
+    {
+        (void)mxx_set_device(entry.first);
+        auto &owned = entry.second;
+        if (owned.device_record) (void)gpuFreeAsync(owned.device_record, owned.allocation_stream);
+        if (owned.device_descriptors) (void)gpuFreeAsync(owned.device_descriptors, owned.allocation_stream);
+        if (owned.descriptors_ready) (void)gpuEventDestroy(owned.descriptors_ready);
+        // A failed bind may still have queued uploads on this device. Its
+        // execution's reclaimer retains pinned operands behind those copies.
+        std::vector<void *> pinned;
+        if (owned.host_record) pinned.push_back(owned.host_record);
+        if (owned.host_descriptors) pinned.push_back(owned.host_descriptors);
+        if (!pinned.empty())
         {
-            // Fail closed: unknown completion retains pointers and event.
-            if (execution_owner && execution_owner->pinned_host_reclaimer)
-                execution_owner->pinned_host_reclaimer->record_uncertain("HIP control owner retirement failed");
+            gpuEvent_t retired = nullptr;
+            auto error = gpuEventCreateWithFlags(&retired, gpuEventDisableTiming);
+            if (error == gpuSuccess) error = gpuEventRecord(retired, owned.allocation_stream);
+            if (error != gpuSuccess ||
+                owned.execution->pinned_host_reclaimer->enqueue(entry.first, retired, std::move(pinned)) != 0)
+                owned.execution->pinned_host_reclaimer->record_uncertain("HIP control owner retirement failed");
         }
     }
+    (void)mxx_set_device(device);
 }
 
 int HipGraphSchedule::compile(MxxGpuGraphBuilder *builder)
 {
     device = builder->device;
     execution_owner = builder->context->execution;
-    allocation_stream = builder->stream;
     root = builder->root_graph;
     controls = builder->hip_controls;
-    if (compile_scope(root) != 0) return 1;
-    gpuError_t error = gpuMallocAsync(reinterpret_cast<void **>(&device_record),
-        record_capacity * sizeof(uint64_t), allocation_stream);
-    if (error == gpuSuccess)
-        error = gpuMallocHost(reinterpret_cast<void **>(&host_record), record_capacity * sizeof(uint64_t));
-    if (error == gpuSuccess)
-        error = gpuMallocAsync(reinterpret_cast<void **>(&device_descriptors),
-            descriptor_nodes.size() * sizeof(HipControlDescriptor), allocation_stream);
-    if (error == gpuSuccess)
-        error = gpuMallocHost(reinterpret_cast<void **>(&host_descriptors),
-            descriptor_nodes.size() * sizeof(HipControlDescriptor));
-    if (error == gpuSuccess)
-        error = gpuEventCreateWithFlags(&descriptors_ready, gpuEventDisableTiming);
-    if (error != gpuSuccess) return set_error(error);
+    if (compile_scope(root, device, execution_owner) != 0) return 1;
+    for (auto &entry : storage)
+    {
+        auto &owned = entry.second;
+        const auto &ids = owned.execution->gpu_ids;
+        const auto partition = static_cast<size_t>(std::find(ids.begin(), ids.end(), entry.first) - ids.begin());
+        owned.allocation_stream = owned.execution->transfer_streams_by_partition[partition];
+        const size_t count = owned.descriptor_nodes.size();
+        auto error = mxx_set_device(entry.first);
+        if (error == gpuSuccess) error = gpuMallocAsync(reinterpret_cast<void **>(&owned.device_record),
+            count * sizeof(uint64_t), owned.allocation_stream);
+        if (error == gpuSuccess) error = gpuMallocHost(reinterpret_cast<void **>(&owned.host_record), count * sizeof(uint64_t));
+        if (error == gpuSuccess) error = gpuMallocAsync(reinterpret_cast<void **>(&owned.device_descriptors),
+            count * sizeof(HipControlDescriptor), owned.allocation_stream);
+        if (error == gpuSuccess) error = gpuMallocHost(reinterpret_cast<void **>(&owned.host_descriptors), count * sizeof(HipControlDescriptor));
+        if (error == gpuSuccess) error = gpuEventCreateWithFlags(&owned.descriptors_ready, gpuEventDisableTiming);
+        if (error != gpuSuccess) return set_error(error);
+    }
     source_bodies = std::move(builder->hip_body_graphs);
     builder->hip_body_graphs.clear();
-    return 0;
+    const auto error = mxx_set_device(device);
+    return error == gpuSuccess ? 0 : set_error(error);
 }
 
-int HipGraphSchedule::compile_scope(gpuGraph_t graph)
+int HipGraphSchedule::compile_scope(gpuGraph_t graph, int scope_device,
+    const std::shared_ptr<GpuExecutionOwner> &execution)
 {
     size_t count = 0;
-    gpuError_t error = gpuGraphGetNodes(graph, nullptr, &count);
+    auto error = mxx_set_device(scope_device);
+    if (error == gpuSuccess) error = gpuGraphGetNodes(graph, nullptr, &count);
     if (error != gpuSuccess) return set_error(error);
     std::vector<gpuGraphNode_t> all(count);
     error = gpuGraphGetNodes(graph, all.data(), &count);
@@ -337,8 +356,11 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph)
         ++remaining[to[edge]];
         followers[from[edge]].push_back(to[edge]);
     }
-    auto &regions = scopes[graph];
-    error = gpuEventCreateWithFlags(&scope_complete[graph], gpuEventDisableTiming);
+    auto &scope = scopes[graph];
+    scope.device = scope_device;
+    scope.execution = execution;
+    auto &regions = scope.regions;
+    error = gpuEventCreateWithFlags(&scope.complete, gpuEventDisableTiming);
     if (error != gpuSuccess) return set_error(error);
     // Consume every ready ordinary node before a control boundary. Independent
     // work keeps graph parallelism within each region. Removed cross-region
@@ -349,6 +371,8 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph)
     };
     while (!remaining.empty())
     {
+        error = mxx_set_device(scope_device);
+        if (error != gpuSuccess) return set_error(error);
         std::set<gpuGraphNode_t> segment;
         bool progress = true;
         while (progress)
@@ -406,22 +430,35 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph)
             break;
         }
         HipGraphRegion boundary;
-        // All currently ready control nodes are independent lanes. Their GPU
-        // records are copied in one bounded D2H and observed by one event.
+        // Batch independent lanes on their owning device. A boundary's batches
+        // are submitted together, preserving independence across physical GPUs.
+        std::map<int, std::vector<gpuGraphNode_t>> groups;
+        std::vector<gpuGraphNode_t> ready;
         for (const auto &entry : remaining)
             if (entry.second == 0 && controls.count(entry.first))
-                boundary.controls.push_back(entry.first);
-        boundary.record_offset = record_capacity;
-        boundary.descriptor_offset = descriptor_nodes.size();
-        record_capacity += boundary.controls.size();
-        error = gpuEventCreateWithFlags(&boundary.control_complete, gpuEventDisableTiming);
-        if (error != gpuSuccess) return set_error(error);
-        descriptor_nodes.insert(descriptor_nodes.end(), boundary.controls.begin(), boundary.controls.end());
-        const auto ready = boundary.controls;
+            {
+                ready.push_back(entry.first);
+                groups[controls.at(entry.first).device].push_back(entry.first);
+            }
+        for (auto &group : groups)
+        {
+            HipControlBatch batch;
+            batch.device = group.first;
+            batch.controls = std::move(group.second);
+            auto &owned = storage[batch.device];
+            owned.execution = controls.at(batch.controls.front()).execution;
+            batch.record_offset = owned.descriptor_nodes.size();
+            owned.descriptor_nodes.insert(owned.descriptor_nodes.end(), batch.controls.begin(), batch.controls.end());
+            error = mxx_set_device(batch.device);
+            if (error == gpuSuccess) error = gpuEventCreateWithFlags(&batch.control_complete, gpuEventDisableTiming);
+            if (error != gpuSuccess) return set_error(error);
+            boundary.batches.push_back(std::move(batch));
+        }
         regions.push_back(std::move(boundary));
         for (auto control : ready)
         {
-            if (compile_scope(controls.at(control).body) != 0) return 1;
+            const auto &owned = controls.at(control);
+            if (compile_scope(owned.body, owned.device, owned.execution) != 0) return 1;
             consume(control);
         }
     }
@@ -449,17 +486,23 @@ int HipGraphSchedule::bind(const MxxGraphBindingValue *values, size_t count)
     // Bind is called only after the previous execute has joined. The pinned
     // descriptor table remains owned until its async upload and all consumers
     // complete; this is one table refresh per bind, never per loop iteration.
-    for (size_t lane = 0; lane < descriptor_nodes.size(); ++lane)
+    for (auto &entry : storage)
     {
-        const auto &control = controls.at(descriptor_nodes[lane]);
-        host_descriptors[lane] = HipControlDescriptor{control.predicate, control.index,
-            control.limit, control.status, control.maximum};
+        auto &owned = entry.second;
+        for (size_t lane = 0; lane < owned.descriptor_nodes.size(); ++lane)
+        {
+            const auto &control = controls.at(owned.descriptor_nodes[lane]);
+            owned.host_descriptors[lane] = HipControlDescriptor{control.predicate, control.index,
+                control.limit, control.status, control.maximum};
+        }
+        auto error = mxx_set_device(entry.first);
+        if (error == gpuSuccess) error = gpuMemcpyAsync(owned.device_descriptors, owned.host_descriptors,
+            owned.descriptor_nodes.size() * sizeof(HipControlDescriptor), gpuMemcpyHostToDevice, owned.allocation_stream);
+        if (error == gpuSuccess) error = gpuEventRecord(owned.descriptors_ready, owned.allocation_stream);
+        if (error != gpuSuccess) return set_error(error);
     }
-    auto error = gpuMemcpyAsync(device_descriptors, host_descriptors,
-        descriptor_nodes.size() * sizeof(HipControlDescriptor), gpuMemcpyHostToDevice, allocation_stream);
-    if (error == gpuSuccess) error = gpuEventRecord(descriptors_ready, allocation_stream);
-    if (error != gpuSuccess) return set_error(error);
-    return 0;
+    const auto error = mxx_set_device(device);
+    return error == gpuSuccess ? 0 : set_error(error);
 }
 
 gpuGraphExec_t HipGraphSchedule::executable(gpuGraphNode_t original) const
@@ -477,31 +520,67 @@ gpuGraphNode_t HipGraphSchedule::node(gpuGraphNode_t original) const
 gpuError_t HipGraphSchedule::upload(gpuStream_t stream)
 {
     for (auto &scope : scopes)
-        for (auto &region : scope.second)
+    {
+        const auto &owned = scope.second;
+        auto error = mxx_set_device(owned.device);
+        if (error != gpuSuccess) return error;
+        const auto &ids = owned.execution->gpu_ids;
+        const auto partition = static_cast<size_t>(std::find(ids.begin(), ids.end(), owned.device) - ids.begin());
+        const auto upload_stream = owned.device == device ? stream :
+            owned.execution->transfer_streams_by_partition[partition];
+        for (auto &region : owned.regions)
             if (region.exec)
             {
-                const auto error = gpuGraphUpload(region.exec, stream);
+                error = gpuGraphUpload(region.exec, upload_stream);
                 if (error != gpuSuccess) return error;
             }
-    return gpuSuccess;
+        if (owned.device != device)
+        {
+            error = gpuEventRecord(owned.complete, upload_stream);
+            if (error == gpuSuccess) error = mxx_set_device(device);
+            if (error == gpuSuccess) error = gpuStreamWaitEvent(stream, owned.complete, 0);
+            if (error != gpuSuccess) return error;
+        }
+    }
+    return mxx_set_device(device);
 }
 
-gpuError_t HipGraphSchedule::submit_controls(const HipGraphRegion &region,
+// Error-only recovery may synchronize devices under the user's exception.
+// Every body device must finish even if its parent join was never submitted.
+gpuError_t HipGraphSchedule::drain()
+{
+    std::set<int> drained;
+    gpuError_t error = gpuSuccess;
+    for (const auto &scope : scopes)
+    {
+        const int selected = scope.second.device;
+        if (!drained.insert(mxx_physical_device(selected)).second) continue;
+        error = mxx_set_device(selected);
+        if (error == gpuSuccess) error = gpuDeviceSynchronize();
+        if (error != gpuSuccess) break;
+    }
+    const auto restored = mxx_set_device(device);
+    return error == gpuSuccess ? restored : error;
+}
+
+gpuError_t HipGraphSchedule::submit_controls(const HipControlBatch &batch,
     bool advance, gpuStream_t stream)
 {
     const auto started = std::chrono::steady_clock::now();
     ++control_reads;
-    const size_t count = region.controls.size();
+    const size_t count = batch.controls.size();
     control_bytes += count * sizeof(uint64_t);
-    const auto *descriptors = device_descriptors + region.descriptor_offset;
-    auto *records = device_record + region.record_offset;
+    const auto &owned = storage.at(batch.device);
+    const auto *descriptors = owned.device_descriptors + batch.record_offset;
+    auto *records = owned.device_record + batch.record_offset;
     void *arguments[] = {&descriptors, &records, const_cast<size_t *>(&count), &advance};
-    auto error = gpuLaunchKernel(reinterpret_cast<const void *>(mxx_hip_control_kernel),
+    auto error = mxx_set_device(batch.device);
+    if (error == gpuSuccess) error = gpuLaunchKernel(reinterpret_cast<const void *>(mxx_hip_control_kernel),
         dim3(static_cast<unsigned>((count + 127) / 128)), dim3(128), arguments, 0, stream);
     if (error == gpuSuccess)
-        error = gpuMemcpyAsync(host_record + region.record_offset, records,
+        error = gpuMemcpyAsync(owned.host_record + batch.record_offset, records,
             count * sizeof(uint64_t), gpuMemcpyDeviceToHost, stream);
-    if (error == gpuSuccess) error = gpuEventRecord(region.control_complete, stream);
+    if (error == gpuSuccess) error = gpuEventRecord(batch.control_complete, stream);
     control_wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return error;
 }
@@ -523,31 +602,86 @@ gpuError_t HipGraphSchedule::launch(gpuStream_t root_stream)
         const HipGraphRegion *boundary = nullptr;
         size_t region = 0;
         size_t children = 0;
+        size_t awaiting = 0;
+        bool executed_body = false;
         bool active = false;
     };
+    struct PendingControl
+    {
+        ScopeRun *run;
+        const HipControlBatch *batch;
+    };
     std::map<gpuGraph_t, ScopeRun> runs;
-    std::deque<ScopeRun *> ready, pending;
-    const auto found = std::find(execution_owner->gpu_ids.begin(), execution_owner->gpu_ids.end(), device);
-    if (found == execution_owner->gpu_ids.end()) return gpuErrorInvalidDevice;
-    const auto partition = static_cast<size_t>(found - execution_owner->gpu_ids.begin());
-    std::vector<gpuStream_t> body_streams;
-    for (auto stream : execution_owner->compute_streams_by_partition[partition])
-        if (stream != root_stream) body_streams.push_back(stream);
-    // A pool with one stream is an explicitly configured concurrency limit.
-    if (body_streams.empty()) body_streams.push_back(root_stream);
-    size_t next_stream = 0;
+    std::deque<ScopeRun *> ready;
+    std::deque<PendingControl> pending;
+    std::map<int, size_t> next_stream;
+    std::set<std::pair<int, gpuStream_t>> prepared;
+    const auto prepare_stream = [&](int selected, gpuStream_t stream) {
+        auto status = mxx_set_device(selected);
+        const auto owned = storage.find(selected);
+        if (status == gpuSuccess && owned != storage.end() && prepared.emplace(selected, stream).second)
+            status = gpuStreamWaitEvent(stream, owned->second.descriptors_ready, 0);
+        return status;
+    };
+    const auto pick_stream = [&](int selected, const std::shared_ptr<GpuExecutionOwner> &owner) {
+        const auto &ids = owner->gpu_ids;
+        const auto partition = static_cast<size_t>(std::find(ids.begin(), ids.end(), selected) - ids.begin());
+        const auto &pool = owner->compute_streams_by_partition[partition];
+        auto stream = pool[next_stream[selected]++ % pool.size()];
+        // Preserve independent lanes unless the pool explicitly limits them
+        // to one stream. The root may belong to a different execution owner.
+        if (stream == root_stream && pool.size() > 1)
+            stream = pool[next_stream[selected]++ % pool.size()];
+        return stream;
+    };
     const auto begin = [&](gpuGraph_t graph, ScopeRun *parent) {
+        const auto &scope = scopes.at(graph);
         auto &run = runs[graph];
         if (run.active) return gpuErrorInvalidValue;
         run = ScopeRun{};
         run.graph = graph;
         run.parent = parent;
-        run.stream = parent ? body_streams[next_stream++ % body_streams.size()] : root_stream;
+        run.stream = parent ? pick_stream(scope.device, scope.execution) : root_stream;
+        const auto status = prepare_stream(scope.device, run.stream);
+        if (status != gpuSuccess) return status;
         run.active = true;
         ready.push_back(&run);
         return gpuSuccess;
     };
-    auto error = gpuStreamWaitEvent(root_stream, descriptors_ready, 0);
+    const auto submit_boundary = [&](ScopeRun *run, bool advance) {
+        const auto &scope = scopes.at(run->graph);
+        const auto &batches = run->boundary->batches;
+        const bool peers = std::any_of(batches.begin(), batches.end(),
+            [&](const auto &batch) { return batch.device != scope.device; });
+        auto status = mxx_set_device(scope.device);
+        if (status == gpuSuccess && peers) status = gpuEventRecord(scope.complete, run->stream);
+        if (status != gpuSuccess) return status;
+        run->awaiting = batches.size();
+        run->executed_body = false;
+        for (const auto &batch : batches)
+        {
+            auto stream = run->stream;
+            if (batch.device != scope.device)
+            {
+                stream = pick_stream(batch.device, storage.at(batch.device).execution);
+                status = prepare_stream(batch.device, stream);
+                if (status == gpuSuccess) status = gpuStreamWaitEvent(stream, scope.complete, 0);
+                if (status != gpuSuccess) return status;
+            }
+            status = submit_controls(batch, advance, stream);
+            if (status != gpuSuccess) return status;
+            pending.push_back(PendingControl{run, &batch});
+        }
+        return gpuSuccess;
+    };
+    const auto advance_or_resume = [&](ScopeRun *run) {
+        if (run->awaiting || run->children) return gpuSuccess;
+        if (run->executed_body) return submit_boundary(run, true);
+        run->boundary = nullptr;
+        ready.push_back(run);
+        return gpuSuccess;
+    };
+    auto error = mxx_set_device(device);
     if (error == gpuSuccess) error = begin(root, nullptr);
     while (error == gpuSuccess && (!ready.empty() || !pending.empty()))
     {
@@ -555,36 +689,37 @@ gpuError_t HipGraphSchedule::launch(gpuStream_t root_stream)
         {
             auto *run = ready.front();
             ready.pop_front();
-            const auto &regions = scopes.at(run->graph);
+            const auto &scope = scopes.at(run->graph);
+            const auto &regions = scope.regions;
             while (run->region < regions.size())
             {
                 const auto &region = regions[run->region++];
                 if (!region.exec)
                 {
                     run->boundary = &region;
-                    error = submit_controls(region, false, run->stream);
-                    if (error == gpuSuccess) pending.push_back(run);
+                    error = submit_boundary(run, false);
                     break;
                 }
                 ++region_launches;
-                error = gpuGraphLaunch(region.exec, run->stream);
+                error = mxx_set_device(scope.device);
+                if (error == gpuSuccess) error = gpuGraphLaunch(region.exec, run->stream);
                 if (error != gpuSuccess) break;
             }
             if (error != gpuSuccess) break;
             if (run->boundary) continue;
-            error = gpuEventRecord(scope_complete.at(run->graph), run->stream);
+            error = mxx_set_device(scope.device);
+            if (error == gpuSuccess) error = gpuEventRecord(scope.complete, run->stream);
             if (error != gpuSuccess) break;
             run->active = false;
             if (run->parent)
             {
                 auto *parent = run->parent;
-                error = gpuStreamWaitEvent(parent->stream, scope_complete.at(run->graph), 0);
+                error = mxx_set_device(scopes.at(parent->graph).device);
+                if (error == gpuSuccess) error = gpuStreamWaitEvent(parent->stream, scope.complete, 0);
                 if (error != gpuSuccess) break;
-                if (--parent->children == 0)
-                {
-                    error = submit_controls(*parent->boundary, true, parent->stream);
-                    if (error == gpuSuccess) pending.push_back(parent);
-                }
+                --parent->children;
+                error = advance_or_resume(parent);
+                if (error != gpuSuccess) break;
             }
         }
         if (error != gpuSuccess || pending.empty()) continue;
@@ -593,33 +728,36 @@ gpuError_t HipGraphSchedule::launch(gpuStream_t root_stream)
         auto selected = pending.begin();
         for (auto candidate = pending.begin(); candidate != pending.end(); ++candidate)
         {
-            const auto status = gpuEventQuery((*candidate)->boundary->control_complete);
+            auto status = mxx_set_device(candidate->batch->device);
+            if (status == gpuSuccess) status = gpuEventQuery(candidate->batch->control_complete);
             if (status == gpuSuccess) { selected = candidate; break; }
             if (status != gpuErrorNotReady) { error = status; break; }
         }
         if (error != gpuSuccess) break;
-        auto *run = *selected;
+        const auto control = *selected;
+        auto *run = control.run;
         pending.erase(selected);
+        error = mxx_set_device(control.batch->device);
+        if (error != gpuSuccess) break;
         const auto waited = std::chrono::steady_clock::now();
-        error = gpuEventSynchronize(run->boundary->control_complete);
+        error = gpuEventSynchronize(control.batch->control_complete);
         control_wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - waited).count();
         if (error != gpuSuccess) break;
-        const auto &boundary = *run->boundary;
-        for (size_t lane = 0; lane < boundary.controls.size(); ++lane)
-            if (host_record[boundary.record_offset + lane]) ++run->children;
-        if (!run->children)
-        {
-            run->boundary = nullptr;
-            ready.push_back(run);
-            continue;
-        }
-        for (size_t lane = 0; lane < boundary.controls.size(); ++lane)
-            if (host_record[boundary.record_offset + lane])
+        --run->awaiting;
+        const auto &batch = *control.batch;
+        const auto *records = storage.at(batch.device).host_record + batch.record_offset;
+        for (size_t lane = 0; lane < batch.controls.size(); ++lane)
+            if (records[lane])
             {
-                error = begin(controls.at(boundary.controls[lane]).body, run);
+                ++run->children;
+                run->executed_body = true;
+                error = begin(controls.at(batch.controls[lane]).body, run);
                 if (error != gpuSuccess) break;
             }
+        if (error == gpuSuccess) error = advance_or_resume(run);
     }
+    const auto restored = mxx_set_device(device);
+    if (error == gpuSuccess) error = restored;
     host_schedule_seconds = std::max(0.0,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() - control_wait_seconds);
     return error;

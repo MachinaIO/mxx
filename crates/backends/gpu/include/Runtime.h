@@ -607,9 +607,9 @@ int mxx_gpu_graph_builder_add_export_publish(MxxGpuGraphBuilder *builder,
     uint64_t payload_bytes, uint32_t site, uint32_t flags,
     uint32_t header_binding, const void *gate, uint32_t gate_binding);
 
-int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder,
+int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder, const GpuContext *control_context,
     const uint64_t *predicate, uint32_t predicate_binding);
-int mxx_gpu_graph_builder_begin_while(MxxGpuGraphBuilder *builder,
+int mxx_gpu_graph_builder_begin_while(MxxGpuGraphBuilder *builder, const GpuContext *control_context,
     uint64_t *index, const uint64_t *limit, uint64_t max_iterations,
     uint32_t *status_word, uint32_t index_binding, uint32_t limit_binding,
     uint32_t status_binding);

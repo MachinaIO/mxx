@@ -1,8 +1,67 @@
 # AMD GPU implementation validation
 
-## Current AMD runtime and GPU.md corrections, 2026-10-14
+## Posted PR review follow-up, 2026-10-15
 
-The current implementation is based on PR #174 head
+This follow-up addresses the HIP launch-recovery and device-affinity reviews posted
+on PR #174 after `f1f5446437026a8f647a3140e1e2704d14c6268c`. Evidence is under
+`logs/pr174-posted-review-20261015/`; `source-manifest.json` identifies the five
+changed code files and `binaries.json` identifies the seven built unit-test binaries.
+
+- HIP controls retain their creation device and the selected stream's execution
+  owner. Each scope uses that device's existing bounded stream pool. Control
+  descriptors and records are allocated on their owning GPU and uploaded once per
+  bind. Independent batches on different devices are submitted together; all
+  outstanding reads and bodies join before the parent's next predicate update.
+  Upload, replay, completion events and cleanup also select the owning device.
+- If a HIP scheduled launch fails after submitting independent bodies, recovery
+  drains each physical scope device once before returning an ordinary error.
+  Failed recovery still returns `GPU_STATUS_LAUNCH_UNCERTAIN`. This device-wide
+  synchronization is error-only and uses the maintainer's explicit exception;
+  successful arithmetic and transfer wrappers remain asynchronous.
+- The additional CUDA 300-run request is omitted at the maintainer's explicit
+  direction. This follow-up provides no new CUDA execution evidence. HIP tests
+  and logical duplicate mappings are not substitutes for CUDA validation.
+
+Validation uses the same single gfx942 wave64 AMD GPU and HIP 7.14.60850 environment
+as the preceding checkpoint. Identity leaves `MXX_GPU_LOGICAL_DEVICES` unset;
+`0,0` and `0,0,0` exercise logical aliases, not multiple physical GPUs.
+
+| Gate | Evidence | Result |
+| --- | --- | --- |
+| Warning-free CPU/HIP workspace lib compilation | `cpu-build.exit`, `hip-build.exit`, corresponding logs/JSONL | Both exit 0 |
+| Ordinary units in HIP binaries | `host-summary.json` | 652 passed, zero failures; a KHE-only runner timeout at 180 s was retried with a 600 s limit after checking its recorded 205 s baseline |
+| GPU short-unit smoke | `smoke-summary.json`, `smoke.exit` | 85 cases, 762 executions across three repetitions in three logical modes, zero failures |
+| Partial-launch error recovery | `launch_error_probe.cpp`, `launch-error-summary.json`, `launch-error-*.log` | Three external API fault probes passed: a successful device drain precedes the expected ordinary launch error and owner release |
+| Seven affected control/synchronization cases, 300 repetitions per mode | `repeat.commands.json`, `repeat-results.jsonl`, `repeat-summary.json`, `repeat.exit` | 6,300 case executions in 2,700 invocations; all 21 case/mode pairs completed 300 repetitions; zero failures, exit 0 |
+| Whole-unit timing comparison with the recorded `f1f54464` run | `timing-results.json`, `timing-summary.json`, `timing.exit` | Nine runs passed; three samples per case; historical comparison, not a fresh paired or controlled kernel benchmark |
+
+`verified-evidence.json` records the independent terminal check of all 2,700
+invocation logs, exact test counts, all 21 repetition pairs, five source hashes
+and seven binary hashes. After device validation and timing, `post-idle-gpu.json`
+records VRAM returning to 299,687,936 bytes used, the prior idle baseline.
+
+The new `test_gpu_graph_control_scopes_use_each_device_context` builds independent
+WHILE loops and nested IFs from separate parameter/context/stream owners, then checks
+loop counts, status and every copied scalar after replay. The external diagnostic
+injects one API error after two body submissions; its expected libtest exit 101 is
+recorded separately from normal test failures. No fault-injection scaffolding is
+linked into production or enabled in the normal repetition gate.
+
+Whole-test medians (previous/current) were 0.765/0.665 s for matrix rebind,
+0.264/0.264 s for integer permutation, and 1.366/1.416 s for short-slot BGV.
+The BGV median is approximately 3.7% higher than the recorded `f1f54464` run;
+both sets span approximately 1.266–1.416 s. These small, randomized, historical
+sample sets overlap and do not establish a change caused by this correction.
+No controlled speedup or new kernel-count profile is claimed. Raw values and
+the comparison limits are retained in the timing artifacts.
+
+Multiple physical GPUs, peer/staging transfers, wave32, CUDA reruns, sanitizers,
+integration tests and long Ring-GSW remain unverified. The evidence below belongs
+to earlier source snapshots and is not attributed to this follow-up.
+
+## Validated AMD runtime and GPU.md corrections, f1f54464, 2026-10-14
+
+The `f1f54464` correction checkpoint was based on PR #174 head
 `a18fa7101b1f424ce95bb14069edc99ee9e042ce`. The 21 changed source files (including the
 backend README) and seven optimized unit-test binaries matched
 `compliance-source-manifest.json` and `compliance-binaries.json` at validation completion

@@ -69,6 +69,9 @@ backend and device; canonical artifacts remain independent of GPU plan identity.
 HIP control scheduling adds device-to-host control transfers, event waits, and region launches.
 These costs belong in planning and execution measurements. Logical duplicate device mappings
 are scheduling checks, not evidence of multiple physical GPUs or peer transfer support.
+Control scopes retain the device and execution owner of their selected launch context;
+their metadata and bounded body streams belong to that device. Independent control
+batches join all reads and bodies before advancing their parent.
 Before HIP instantiation, executable DAGs bypass empty nodes and remove redundant ancestor
 dependencies while preserving independent work and replay bindings. Compact imports retain
 their writer stream through the context-owned transfer stream.
@@ -76,14 +79,15 @@ their writer stream through the context-owned transfer stream.
 | Validation target | Current evidence for this change |
 | --- | --- |
 | CPU lib compile/test | Current CPU compile passed; 652 ordinary tests in HIP binaries passed |
-| CUDA lib compile and device regression | Historical evidence is recorded in the validation notes; not rerun for the local AMD correction |
-| HIP lib compile and BGV/device execution | gfx942 / ROCm 7.14 pre3 compile passed; 84 selected GPU units passed 753 executions across three logical modes; nine synchronization cases passed 8,100 executions with zero failures |
+| CUDA lib compile and device regression | Historical evidence is recorded in the validation notes; the additional CUDA run is omitted at the maintainer's direction and remains unverified |
+| HIP lib compile and BGV/device execution | gfx942 / ROCm 7.14 pre3 compile passed; 85 selected GPU units passed 762 executions across three logical modes; seven affected synchronization cases passed 6,300 executions with zero failures |
 | AMD wave32, wave64, and multiple physical GPUs | gfx942 wave64 device checks passed; wave32 and multiple physical GPUs remain unverified |
 | TFHE native GPU kernel on AMD | Deferred; the HIP accessor returns `None` |
 
-These gates apply to the runtime and GPU.md compliance corrections recorded by
-`compliance-source-manifest.json`. Error-only recovery may synchronize under the user
-exception; successful device transfers return completion events without host waits.
+These gates apply to the posted-review follow-up recorded by
+`logs/pr174-posted-review-20261015/source-manifest.json`. Error-only recovery drains
+each physical scope device under the maintainer's exception; successful device
+transfers return completion events without host waits.
 
 Detailed logs, source evidence, and incomplete hardware gates are recorded in
 [`AMD_GPU_VALIDATION.md`](../../AMD_GPU_VALIDATION.md). Compilation does not establish AMD

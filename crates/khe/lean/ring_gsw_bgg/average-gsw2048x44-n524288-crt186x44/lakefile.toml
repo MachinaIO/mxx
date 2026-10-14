@@ -1,4 +1,4 @@
-name = "MxxKheRingGswBggAverageGsw2048x40N1048576Crt215x60"
+name = "MxxKheRingGswBggAverageGsw2048x44N524288Crt186x44"
 version = "0.1.0"
 defaultTargets = ["RingGswBggGenerated", "RingGswBggProof"]
 

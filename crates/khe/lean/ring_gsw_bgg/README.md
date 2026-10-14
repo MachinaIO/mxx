@@ -11,9 +11,10 @@ Montgomery entries, lowered to layers by `mxx_khe::circuit::lower_to_boolean_lay
 
 ## What is proved
 
-For the row `average-gsw2048x40-n1048576-crt215x60`, the Ring-GSW ring has dimension 2048 and one
-40-bit prime, which gives a circuit of 361 layers over 26,214,400 input bits; the BGG+ ring has
-dimension `2^20` and 215 primes of 60 bits, the gadget base is 4, and encoding errors are discrete
+For the row `average-gsw2048x44-n524288-crt186x44`, the Ring-GSW ring has dimension 2048 and one
+44-bit prime, the first prime of the BGG+ basis, which gives a circuit of 240 layers over
+31,719,424 input bits; the BGG+ ring has dimension `2^19` and 186 primes of 44 bits, the gadget
+base is 4, and encoding errors are discrete
 Gaussians of width 3.19 truncated at 20. The generated statement `GeneratedClaim.CorrectnessClaim`
 bounds by `2^-128` the measure of the sampling tapes on which some execution meeting the input
 contracts and the circuit's validity predicate decrypts a bit other than the ideal circuit's output.
@@ -47,7 +48,7 @@ Build `crates/ir-core/lean`, `crates/khe/lean`, and `crates/exponent-lut/lean` f
 in each), then:
 
 ```bash
-cd crates/khe/lean/ring_gsw_bgg/average-gsw2048x40-n1048576-crt215x60 && lake build
+cd crates/khe/lean/ring_gsw_bgg/average-gsw2048x44-n524288-crt186x44 && lake build
 ```
 
 The generated modules and the proof build in about a minute.

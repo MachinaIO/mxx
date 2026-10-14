@@ -301,12 +301,15 @@ impl<P: Poly + 'static> CarryArithPolyContext<P> {
     ///
     /// Each compressor replaces several digits of one column by one digit of that column and one
     /// carry of the next column, so the represented integer is preserved exactly and carries may
-    /// open new columns. For bits the compressor is a full adder of AND and XOR gates.
+    /// open new columns. Bits are reduced by [`Self::compress_bit_columns`].
     pub(crate) fn compress_columns(
         &self,
         circuit: &mut PolyCircuit<P>,
         mut columns: Columns,
     ) -> Columns {
+        if self.luts.is_none() {
+            return Self::compress_bit_columns(circuit, columns);
+        }
         let base = 1usize << self.limb_bit_size;
         let comp_rate = if base == 2 { 3 } else { base - 1 };
         while columns.iter().any(|column| column.len() > 2) {
@@ -320,30 +323,13 @@ impl<P: Poly + 'static> CarryArithPolyContext<P> {
                     if group_len <= 2 {
                         next[k].extend_from_slice(&col[idx..idx + group_len]);
                     } else {
-                        let (digit, carry) = match self.luts {
-                            None => {
-                                let (a, b, c) = (col[idx], col[idx + 1], col[idx + 2]);
-                                let and_ab = single_wire(circuit.and_gate(a, b));
-                                let xor_ab = Self::xor_with_and(circuit, a, b, and_ab);
-                                let and_c = single_wire(circuit.and_gate(xor_ab, c));
-                                let digit = Self::xor_with_and(circuit, xor_ab, c, and_c);
-                                // `a b` and `c (a XOR b)` are never both one, so their OR is
-                                // their XOR.
-                                let carry = single_wire(circuit.xor_gate(and_ab, and_c));
-                                (digit, carry)
-                            }
-                            Some(luts) => {
-                                let mut sum = col[idx];
-                                for item in &col[(idx + 1)..(idx + group_len)] {
-                                    sum = single_wire(circuit.add_gate(sum, *item));
-                                }
-                                let digit =
-                                    single_wire(circuit.public_lookup_gate(sum, luts.add_mod));
-                                let carry =
-                                    single_wire(circuit.public_lookup_gate(sum, luts.add_floor));
-                                (digit, carry)
-                            }
-                        };
+                        let luts = self.luts.expect("bit columns are compressed by Dadda");
+                        let mut sum = col[idx];
+                        for item in &col[(idx + 1)..(idx + group_len)] {
+                            sum = single_wire(circuit.add_gate(sum, *item));
+                        }
+                        let digit = single_wire(circuit.public_lookup_gate(sum, luts.add_mod));
+                        let carry = single_wire(circuit.public_lookup_gate(sum, luts.add_floor));
                         next[k].push(digit);
                         next[k + 1].push(carry);
                     }
@@ -355,6 +341,61 @@ impl<P: Poly + 'static> CarryArithPolyContext<P> {
             }
             columns = next;
         }
+        columns
+    }
+
+    /// Dadda's reduction of bit columns to at most two bits each.
+    ///
+    /// Stage `j` lowers every column to the height `d_j` of the sequence `2, 3, 4, 6, 9, ...`
+    /// (`d_(j+1) = floor(3 d_j / 2)`), counting the carries the stage sends into the column, with
+    /// full adders (three bits to a bit and a carry) and half adders (two bits to a bit and a
+    /// carry). Every adder reads bits of the previous stage only, so a stage has the depth of one
+    /// full adder and `h` bits per column need `O(log h)` stages; a carry never ripples through a
+    /// stage.
+    fn compress_bit_columns(circuit: &mut PolyCircuit<P>, mut columns: Columns) -> Columns {
+        let max_height = columns.iter().map(Vec::len).max().unwrap_or(0);
+        let mut targets = vec![2usize];
+        while let Some(&target) = targets.last().filter(|&&target| target < max_height) {
+            targets.push(target * 3 / 2);
+        }
+        for &target in targets.iter().rev().filter(|&&target| target < max_height) {
+            let mut next: Columns = vec![vec![]; columns.len() + 1];
+            let mut carries_in = 0;
+            for (k, column) in columns.iter().enumerate() {
+                let mut height = column.len() + carries_in;
+                let mut idx = 0;
+                let mut carries_out = 0;
+                while height > target {
+                    let (digit, carry) = if height - target >= 2 {
+                        let (a, b, c) = (column[idx], column[idx + 1], column[idx + 2]);
+                        idx += 3;
+                        height -= 2;
+                        let and_ab = single_wire(circuit.and_gate(a, b));
+                        let xor_ab = Self::xor_with_and(circuit, a, b, and_ab);
+                        let and_c = single_wire(circuit.and_gate(xor_ab, c));
+                        let digit = Self::xor_with_and(circuit, xor_ab, c, and_c);
+                        // `a b` and `c (a XOR b)` are never both one, so their OR is their XOR.
+                        (digit, single_wire(circuit.xor_gate(and_ab, and_c)))
+                    } else {
+                        let (a, b) = (column[idx], column[idx + 1]);
+                        idx += 2;
+                        height -= 1;
+                        let and_ab = single_wire(circuit.and_gate(a, b));
+                        (Self::xor_with_and(circuit, a, b, and_ab), and_ab)
+                    };
+                    next[k].push(digit);
+                    next[k + 1].push(carry);
+                    carries_out += 1;
+                }
+                next[k].extend_from_slice(&column[idx..]);
+                carries_in = carries_out;
+            }
+            if next.last().is_some_and(|v| v.is_empty()) {
+                next.pop();
+            }
+            columns = next;
+        }
+        debug_assert!(columns.iter().all(|column| column.len() <= 2));
         columns
     }
 }

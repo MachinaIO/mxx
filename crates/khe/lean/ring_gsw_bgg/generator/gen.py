@@ -24,7 +24,12 @@ def constants(generated: pathlib.Path) -> dict:
     q = re.search(r"MxxRuntime\.RegularLayout (\d+)", backend).group(1)
     n = re.search(r"n = (\d+) then", backend).group(1)
     base, digits = re.search(r"gadgetDecomposeRuns backend (\d+) (\d+) ", evaluate).groups()
-    m = re.search(rf"→ Mxx\.Primitives\.ExactMatrix {q} {n} 2 (\d+)", evaluate).group(1)
+    # The modulus appears literally or through a local notation `"mxxNat<k>" => Q`; the encoding
+    # width `M > 1` is the column count of both the `2 x M` and the `1 x M` matrices.
+    modulus = "|".join([q, *re.findall(rf'local notation "(mxxNat\d+)" => {q}\b', evaluate)])
+    shape = rf"Mxx\.Primitives\.ExactMatrix (?:{modulus}) {n} (\d+) (\d+)"
+    shapes = set(re.findall(shape, evaluate))
+    (m,) = {columns for rows, columns in shapes if rows == "2" and columns != "1" and ("1", columns) in shapes}
     cutoff = re.search(
         r"gaussianSampleAt tape \(path \+\+ \[\d+\]\) \(\([0-9/]+\)\) \((\d+)\)", encrypt
     ).group(1)

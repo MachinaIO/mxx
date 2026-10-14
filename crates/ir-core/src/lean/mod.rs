@@ -3210,6 +3210,9 @@ impl<'a> Emitter<'a> {
                     crate::node::LoopInputMode::ZipOffset { offset } => {
                         format!("({} ⟨i.val + {}, by omega⟩)", wire_name(*wire), offset)
                     }
+                    crate::node::LoopInputMode::ZipQuotient { divisor } => {
+                        format!("({} ⟨i.val / {}, by omega⟩)", wire_name(*wire), divisor)
+                    }
                     _ => wire_name(*wire),
                 }
             };

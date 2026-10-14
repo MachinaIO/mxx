@@ -7,11 +7,12 @@
 //! any stage runs, given the error of the caller's encodings of `sigma_0 G`, and
 //! [`RnsBggRefresh::security`] estimates the security of its encodings and of its output.
 //!
-//! [`RnsBggRefresh::run`] samples the payload and mask secrets on the reference chain and runs,
-//! on every chain, the two parts (one per component). Each part first asks the caller for its
-//! encoding of `sigma_0 G` under those secrets ([`RefreshSigmaRequest`], [`RefreshSigma`]: the
-//! caller runs and records its own preprocessing, encryption and online evaluation, see
-//! [Caller inputs](crate::refresh#caller-inputs)), then runs the three artifact stages:
+//! [`RnsBggRefresh::run`] samples the payload and mask secrets on the reference chain and, on
+//! every chain, first asks the caller for the chain's encoding of `sigma_0 G` under those secrets
+//! ([`RefreshSigmaRequest`], [`RefreshSigma`]: the caller runs and records its own
+//! preprocessing, encryption and online evaluation, see
+//! [Caller inputs](crate::refresh#caller-inputs)), then runs the chain's two parts (one per
+//! component, both reading that encoding), each through the three artifact stages:
 //!
 //! - preprocessing prepares the source Program on the chain (under the chain's hash namespace), the
 //!   fresh-noise child, one smudge child per decoder, the decoded keys (with the caller's `K_g` and
@@ -237,8 +238,9 @@ impl RnsBggRefresh {
     /// the stage hash key `hash_key` and the invocation's label tag `label_tag`
     /// ([`RefreshDeclaration::label`]). `lhs` gives the source Program's inputs on a chain's
     /// level 0. `a_prime` is the caller's `A'` (see
-    /// [Caller inputs](crate::refresh#caller-inputs)), and `sigma` gives each part's encoding of
-    /// `sigma_0 G` (see [`RefreshSigmaRequest`]) before the part's stages run. With
+    /// [Caller inputs](crate::refresh#caller-inputs)), and `sigma` gives each chain's encoding of
+    /// `sigma_0 G` (see [`RefreshSigmaRequest`]) before the chain's parts run; both parts read
+    /// it. With
     /// `record_only`, the children bind their plaintexts and tables by shape only, so the stages
     /// can be recorded but not executed (as for an export; `a_prime` and the encodings' rows may
     /// then be absent); otherwise they bind the generated keys, which `self.keys` must hold.
@@ -278,45 +280,46 @@ impl RnsBggRefresh {
         let invocation = Invocation { context, hash_key, label_tag, a_prime: a_prime.as_ref() };
         let mut outputs = Vec::with_capacity(self.chains.len());
         let mut productions = BTreeMap::new();
-        let mut sigmas = Vec::with_capacity(2 * self.chains.len());
+        let mut sigmas = Vec::with_capacity(self.chains.len());
         for (chain, chains) in self.chains.iter().enumerate() {
             let lhs = lhs(&chains.source.levels()[0]);
+            // The chain's encoding of `sigma_0 G`, in its own session (byte 31 two).
+            let mut sigma_context = context;
+            sigma_context[30] = chain as u8;
+            sigma_context[31] = 2;
+            let request = RefreshSigmaRequest {
+                chain,
+                chains,
+                context: sigma_context,
+                payload: &payload,
+                mask: &mask,
+                record_only,
+                graphs: &graphs,
+            };
+            let provided = sigma(request, execution, store)?;
+            if provided.preprocess.descriptor().binding().program() != Some(provided.program.id()) {
+                return Err(ApiError::input("the sigma artifacts are not of its Program"));
+            }
+            let row = provided.online_eval.outputs.get(SIGMA_ROW_OUTPUT).cloned();
+            if row.is_none() && !record_only {
+                return Err(ApiError::input("an executed refresh needs every sigma row"));
+            }
+            productions.insert(
+                provided.preprocess.production().clone(),
+                format!("sigma_preprocess_{chain}"),
+            );
+            productions.insert(provided.encryption.clone(), format!("sigma_encrypt_{chain}"));
             let mut parts = Vec::with_capacity(2);
             for component in 0..2 {
                 let part = (chain, component);
                 let name = |stage: &str| format!("{stage}_{chain}_{component}");
-                let mut part_context = context;
-                part_context[30] = chain as u8;
-                part_context[31] = component as u8;
-                let request = RefreshSigmaRequest {
-                    part,
-                    chains,
-                    context: part_context,
-                    payload: &payload,
-                    mask: &mask,
-                    record_only,
-                    graphs: &graphs,
-                };
-                let provided = sigma(request, execution, store)?;
-                if provided.preprocess.descriptor().binding().program() !=
-                    Some(provided.program.id())
-                {
-                    return Err(ApiError::input("the sigma artifacts are not of its Program"));
-                }
-                let row = provided.online_eval.outputs.get(SIGMA_ROW_OUTPUT).cloned();
-                if row.is_none() && !record_only {
-                    return Err(ApiError::input("an executed refresh needs every sigma row"));
-                }
-                productions
-                    .insert(provided.preprocess.production().clone(), name("sigma_preprocess"));
-                productions.insert(provided.encryption.clone(), name("sigma_encrypt"));
                 let (outputs, [preprocess, encrypt]) = self.run_part(
                     keys,
                     chains,
                     &lhs,
                     (&payload, &mask),
                     part,
-                    (&provided, row),
+                    (&provided, row.clone()),
                     &invocation,
                     execution,
                     store,
@@ -325,8 +328,8 @@ impl RnsBggRefresh {
                 productions.insert(preprocess, name("preprocess"));
                 productions.insert(encrypt, name("encrypt"));
                 parts.push(outputs);
-                sigmas.push((provided.program, provided.namespace));
             }
+            sigmas.push((provided.program, provided.namespace));
             tracing::info!(chain, "top refresh chain evaluated");
             let [first, second] = <[StageOutputs; 2]>::try_from(parts)
                 .map_err(|_| ApiError::input("a chain has two parts"))?;
@@ -346,7 +349,7 @@ impl RnsBggRefresh {
     }
 
     /// One part's preprocessing, encryption and online evaluation on its chain `chains`, with
-    /// the caller's encoding of `sigma_0 G` `sigma` (its artifacts and its row), its outputs and
+    /// the chain's encoding of `sigma_0 G` `sigma` (its artifacts and its row), its outputs and
     /// the productions of its preprocessing and encryption. Without `keys`, the children bind
     /// their plaintexts and tables by shape only.
     #[allow(clippy::too_many_arguments)]
@@ -530,9 +533,10 @@ impl RnsBggRefresh {
     }
 }
 
-/// What the caller's `sigma` of [`RnsBggRefresh::run`] receives for one part: the part
-/// `(chain, component)`, its chain's parameters, the part's session context and the run's
-/// secrets. The caller returns the part's encoding of `sigma_0 G` under these secrets (see
+/// What the caller's `sigma` of [`RnsBggRefresh::run`] receives for one chain: the chain, its
+/// parameters, the session context of its encoding of `sigma_0 G` and the run's secrets. The
+/// caller returns the chain's encoding of `sigma_0 G` under these secrets, which both parts of
+/// the chain read (see
 /// [Caller inputs](crate::refresh#caller-inputs)) as a [`RefreshSigma`]: typically it
 /// preprocesses, encrypts and evaluates a binary [`FreshNoiseProgram`] of `n` samples modulo the
 /// chain's output prime on [`RnsBggParameters::refresh_child_parameters`] of `chains.source`,
@@ -541,7 +545,7 @@ impl RnsBggRefresh {
 /// ([`RefreshRun::protocol`]) includes them. With `record_only`, the stages are recorded but not
 /// executed (bind the plaintexts and data by shape, see `with_inputs_by_shape`).
 pub struct RefreshSigmaRequest<'a> {
-    pub part: (usize, usize),
+    pub chain: usize,
     pub chains: &'a RefreshChain,
     pub context: [u8; 32],
     pub payload: &'a RnsBggPayloadSecret,
@@ -551,23 +555,22 @@ pub struct RefreshSigmaRequest<'a> {
 }
 
 impl<'a> RefreshSigmaRequest<'a> {
-    /// The stage observer recording the graph of the part's sigma stage `phase` (`preprocess`,
-    /// `encrypt` or `online_eval`) as stage `sigma_<phase>_<chain>_<component>` of the run.
+    /// The stage observer recording the graph of the chain's sigma stage `phase`
+    /// (`preprocess`, `encrypt` or `online_eval`) as stage `sigma_<phase>_<chain>` of the run.
     pub fn record(
         &self,
         phase: &str,
     ) -> impl FnOnce(&ValidatedGraph) -> Result<(), ApiError> + 'a + use<'a> {
-        let (chain, component) = self.part;
-        record(self.graphs, format!("sigma_{phase}_{chain}_{component}"))
+        record(self.graphs, format!("sigma_{phase}_{}", self.chain))
     }
 }
 
-/// The caller's encoding of `sigma_0 G` for one part (see [`RefreshSigmaRequest`]): the Program
+/// The caller's encoding of `sigma_0 G` for one chain (see [`RefreshSigmaRequest`]): the Program
 /// that computes it (its first output, a binary [`FreshNoiseProgram`] for the claim's tie of
 /// `sigma_0` to its PRF bits) and the hash namespace its stages ran under, its preprocessing
-/// artifacts (the part's preprocessing reads its key), its encryption production, and its online
-/// evaluation's outputs (the part's online evaluation reads [`SIGMA_ROW_OUTPUT`]; empty for a
-/// record-only run).
+/// artifacts (the chain's parts' preprocessing reads its key), its encryption production, and its
+/// online evaluation's outputs (the parts' online evaluation reads [`SIGMA_ROW_OUTPUT`]; empty
+/// for a record-only run).
 pub struct RefreshSigma {
     pub program: FreshNoiseProgram,
     pub namespace: [u8; 32],
@@ -662,7 +665,7 @@ fn record<'a>(
 /// One run of a refresh ([`RnsBggRefresh::run`]): its secrets, every part's outputs and the
 /// recorded stage graphs. Stage `payload` and `mask` sample the secrets, stage
 /// `<phase>_<chain>_<component>` is a part's phase (`preprocess`, `encrypt`, `online_eval`),
-/// stage `sigma_<phase>_<chain>_<component>` the phase of the caller's encoding of `sigma_0 G`
+/// stage `sigma_<phase>_<chain>` the phase of the chain's encoding of `sigma_0 G`
 /// it recorded, and [`Self::decode`] records stage `decode`.
 pub struct RefreshRun {
     pub payload: RnsBggPayloadSecret,
@@ -673,7 +676,7 @@ pub struct RefreshRun {
     pub(super) graphs: BTreeMap<String, Graph>,
     /// The stage name of every preprocessing and encryption production.
     pub(super) productions: BTreeMap<ProductionId, String>,
-    /// Every part's sigma Program and hash namespace, part `(chain, j)` at `2 chain + j`.
+    /// Every chain's sigma Program and hash namespace.
     pub(super) sigmas: Vec<(FreshNoiseProgram, [u8; 32])>,
     /// The caller's `A'`.
     pub(super) a_prime: Option<RuntimeValue>,

@@ -231,8 +231,9 @@ impl<'a> RnsPreprocessBuild<'a> {
     /// `trapdoor_sigma`). The graph publishes the children's public material, `B` and the
     /// preimage; the trapdoor never leaves it.
     ///
-    /// `sigma` is the caller's encoding of `sigma_0 G` (see
-    /// [Caller inputs](crate::refresh#caller-inputs)): the preprocessing artifacts of its
+    /// `sigma` is the caller's encoding of `sigma_0 G` of the part's chain, which both parts of
+    /// the chain read (see [Caller inputs](crate::refresh#caller-inputs)): the preprocessing
+    /// artifacts of its
     /// Program, whose first output is the encoding, preprocessed with the output use
     /// [`RnsOutputUse::Gadget`] on [`RnsBggParameters::refresh_child_parameters`] (or any chain
     /// whose output carrier is a carrier of the decoding ring); the graph reads its key

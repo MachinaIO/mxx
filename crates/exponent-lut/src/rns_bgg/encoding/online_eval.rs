@@ -779,12 +779,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// product `P` of the refreshed primes (the residue itself when `P = q`); the terms of every
     /// chain sum to `y_j mod P` (see [`crate::refresh`]).
     ///
-    /// `sigma` is the row `g` of the caller's encoding of `sigma_0 G` whose key the part's
-    /// preprocessing read (see [Caller inputs](crate::refresh#caller-inputs)): component 1 of
-    /// that Program's first output, `1 x m` in the decoding ring (port
-    /// [`crate::rns_bgg::SIGMA_ROW_OUTPUT`] of its online evaluation). The graph reads it as a
-    /// plain input; without a value the stage can be recorded but not executed. `A'` is the
-    /// graph input [`crate::rns_bgg::REFRESH_MATRIX_INPUT`] (see [`Self::with_refresh_matrix`]).
+    /// `sigma` is the row `g` of the caller's encoding of `sigma_0 G` of the part's chain (shared
+    /// by its two parts) whose key the part's preprocessing read (see [Caller
+    /// inputs](crate::refresh#caller-inputs)): component 1 of that Program's first output, `1 x
+    /// m` in the decoding ring (port [`crate::rns_bgg::SIGMA_ROW_OUTPUT`] of its online
+    /// evaluation). The graph reads it as a plain input; without a value the stage can be
+    /// recorded but not executed. `A'` is the graph input
+    /// [`crate::rns_bgg::REFRESH_MATRIX_INPUT`] (see [`Self::with_refresh_matrix`]).
     pub fn apply_refresh(
         &mut self,
         target_index: usize,

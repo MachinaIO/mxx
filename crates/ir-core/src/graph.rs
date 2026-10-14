@@ -619,7 +619,10 @@ impl ScopeSealer {
         let name = format!("__capture_{}", self.captured.len());
         let ty = match (mode, value.wire_type()) {
             (
-                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } | LoopInputMode::Gather { .. },
+                LoopInputMode::Zip |
+                LoopInputMode::ZipOffset { .. } |
+                LoopInputMode::ZipQuotient { .. } |
+                LoopInputMode::Gather { .. },
                 WireType::IndexedFamily { element, .. },
             ) => *element.clone(),
             _ => value.wire_type().clone(),

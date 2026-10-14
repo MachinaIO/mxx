@@ -6,13 +6,16 @@
 //! constant (in node payloads, wire types and rings) that differs between instances becomes
 //! `IntExpr::Select { selector: LoopIndex(0), branches }`, and the body's types may therefore
 //! depend on the loop index (see [`crate::types::MEMBER_INDEX`]). Root inputs that are identical
-//! in every instance are passed once. The caller may declare per-instance inputs one family input
+//! in every instance are passed once. The caller may declare per-instance inputs (even equal ones,
+//! such as an artifact of a producer merged over one instance) one family input
 //! ([`MergeInterface::family_input`], e.g. instance `k` reading member `k` of a merged producer's
 //! family); the other per-instance inputs stay one input per instance (named as in that instance)
-//! packed into a family. Every root output is the loop's output family, named as in the first
-//! instance; outputs the caller asks for ([`MergeInterface::unpacked`]) are also returned per
-//! instance, output `name` of instance `k` as `"{name}@{k}"`. A stage boundary carrying families
-//! keeps the merged graph's interface independent of the number of instances.
+//! packed into a family. A family input may also be shared by consecutive groups of instances
+//! (instance `k` reading member `floor(k / d)` of a producer merged over `count / d` instances, a
+//! [`LoopInputMode::ZipQuotient`] input). Every root output is the loop's output family, named as
+//! in the first instance; outputs the caller asks for ([`MergeInterface::unpacked`]) are also
+//! returned per instance, output `name` of instance `k` as `"{name}@{k}"`. A stage boundary
+//! carrying families keeps the merged graph's interface independent of the number of instances.
 //!
 //! Any other difference (a byte string, a name, a structural field) is a [`MergeError`] naming
 //! its location, so the merged graph computes, member by member, exactly what each instance
@@ -57,10 +60,14 @@ pub struct MergeNames {
 
 /// The caller's choices for the merged graph's interface.
 pub struct MergeInterface<'a> {
-    /// Given every instance's input node (all `NodeKind::Input`, not all equal), the name and
-    /// artifact of the one family input replacing them, if any: member `k` of that family is
-    /// instance `k`'s input. The family's type is the merged input type over the member index.
-    pub family_input: &'a dyn Fn(&[&NodeKind]) -> Option<(String, Option<ArtifactInput>)>,
+    /// Given every instance's input node (all `NodeKind::Input`), the name,
+    /// artifact and group size `d` (at least one, dividing the instance count) of the one family
+    /// input replacing them, if any: instance `k`'s input is member `floor(k / d)` of that family
+    /// of `count / d` members, so the instances of one group read one member (`d = 1`: member
+    /// `k`, a [`LoopInputMode::Zip`] input). The family's type is the merged input type of the
+    /// groups' first instances over the member index. Without one, inputs equal in every
+    /// instance are passed once, and the others packed into a family.
+    pub family_input: &'a dyn Fn(&[&NodeKind]) -> Option<(String, Option<ArtifactInput>, usize)>,
     /// Whether the output `name` (of the first instance) is also returned per instance.
     pub unpacked: &'a dyn Fn(&str) -> bool,
 }
@@ -135,24 +142,48 @@ pub fn merge_instances(
             count: count.into(),
         };
         body_inputs.push(merged_type);
-        if kinds.iter().all(|kind| *kind == kinds[0]) {
+        let family = (interface.family_input)(&kinds);
+        if family.is_none() && kinds.iter().all(|kind| *kind == kinds[0]) {
             for instance in &mut names.inputs {
                 instance.insert(input_name(kinds[0]), input_name(kinds[0]));
             }
             let node = NodeHandle::new(kinds[0].clone(), vec![], types[0].clone());
             loop_arguments.push(node.output(0).expect("input value"));
             input_modes.push(LoopInputMode::Broadcast);
-        } else if let Some((family_name, artifact)) = (interface.family_input)(&kinds) {
+        } else if let Some((family_name, artifact, group)) = family {
             for (instance, kind) in names.inputs.iter_mut().zip(&kinds) {
                 instance.insert(input_name(kind), family_name.clone());
             }
+            let (family_type, mode) = match group {
+                1 => (family_type, LoopInputMode::Zip),
+                group if group > 1 && count.is_multiple_of(group) => {
+                    // Member `m` is the input of instance `m d`, the first of its group.
+                    let first = types.iter().step_by(group).cloned().collect::<Vec<_>>();
+                    let [element] = <[WireType; 1]>::try_from(
+                        merger.merge_types(&first, &format!("root input {position} groups"))?,
+                    )
+                    .map_err(|_| MergeError::Structure(format!("root input {position} arity")))?;
+                    let family_type = WireType::IndexedFamily {
+                        element: Box::new(
+                            element.substitute_loop_index(0, &IntExpr::LoopIndex(MEMBER_INDEX)),
+                        ),
+                        count: (count / group).into(),
+                    };
+                    (family_type, LoopInputMode::ZipQuotient { divisor: group })
+                }
+                _ => {
+                    return Err(MergeError::Structure(format!(
+                        "root input {position}: group size {group} of {count} instances"
+                    )));
+                }
+            };
             let node = NodeHandle::new(
                 NodeKind::Input { name: family_name, wire_type: family_type.clone(), artifact },
                 vec![],
                 vec![family_type],
             );
             loop_arguments.push(node.output(0).expect("family input"));
-            input_modes.push(LoopInputMode::Zip);
+            input_modes.push(mode);
         } else {
             // An input name several instances use (for one artifact name of different
             // productions) is suffixed by the instance index.
@@ -692,5 +723,109 @@ fn merge_values(values: &[&Value], location: &str) -> Result<Value, MergeError> 
             "{location}: {}",
             values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(" | ")
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{graph::GraphOutput, types::MatrixType};
+
+    /// A graph scaling its matrix input `name` (`1 x 1` over the ring of `prime`) by `scalar`,
+    /// output `out`.
+    fn instance(name: &str, prime: i64, scalar: i64) -> Graph {
+        let ty = WireType::Matrix(MatrixType {
+            ring: crate::ring::test_ring(prime, 4),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        });
+        let input = NodeHandle::new(
+            NodeKind::Input { name: name.to_owned(), wire_type: ty.clone(), artifact: None },
+            vec![],
+            vec![ty.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let output = NodeHandle::new(
+            NodeKind::MatrixScale { scalar: IntExpr::constant(scalar) },
+            vec![input],
+            vec![ty],
+        )
+        .output(0)
+        .unwrap();
+        Graph::freeze(
+            "instance",
+            vec![],
+            BTreeMap::from([("out".to_owned(), GraphOutput { value: output, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0
+    }
+
+    /// A consumer merged over four instances reads, with groups of two, member `floor(k / 2)` of
+    /// a family of two members over different rings (instance `k` reading chain `floor(k / 2)`):
+    /// the family input has two members, the loop reads it by `ZipQuotient { divisor: 2 }`, and
+    /// the merged graph validates member by member. Instances of one group over different rings,
+    /// and a group size that does not divide the instance count, are rejected.
+    #[test]
+    fn grouped_family_input_reads_member_k_over_group() {
+        let primes = [17, 97];
+        let consumers =
+            (0..4).map(|k| instance(&format!("sigma-{k}"), primes[k / 2], k as i64 + 2));
+        let consumers = consumers.collect::<Vec<_>>();
+        let grouped = |group: usize| {
+            move |_: &[&NodeKind]| Some(("sigma".to_owned(), None::<ArtifactInput>, group))
+        };
+        let merge = |instances: &[Graph], group: usize| {
+            let family_input = grouped(group);
+            let interface = MergeInterface { family_input: &family_input, unpacked: &|_| false };
+            merge_instances("consumer", instances, &interface)
+        };
+        let (merged, names) = merge(&consumers, 2).unwrap();
+        assert!(names.inputs.iter().all(|inputs| inputs.values().all(|name| name == "sigma")));
+        let input = merged
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::Input { name, wire_type, .. } if name == "sigma" => Some(wire_type),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(input, WireType::IndexedFamily { count, .. } if *count == 2.into()));
+        let modes = merged
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(modes, vec![LoopInputMode::ZipQuotient { divisor: 2 }]);
+        let validated = crate::validate::validate(&merged, &crate::ParamEnv::default()).unwrap();
+        let sigma = validated
+            .root_scope()
+            .wire_types
+            .values()
+            .find_map(|ty| match ty {
+                crate::types::ConcreteWireType::DependentFamily { members }
+                    if members.len() == 2 =>
+                {
+                    Some(members.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(sigma[0], sigma[1], "one member per ring");
+        // The groups' first instances give the members' types.
+        let mixed = [17, 97, 97, 17].map(|prime| instance("sigma", prime, 1));
+        let (mixed, _) = merge(&mixed, 2).unwrap();
+        assert!(crate::validate::validate(&mixed, &crate::ParamEnv::default()).is_err());
+        assert!(merge(&consumers, 3).is_err());
+        assert!(merge(&consumers, 0).is_err());
     }
 }

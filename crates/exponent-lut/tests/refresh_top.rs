@@ -12,11 +12,12 @@
 //!
 //! The test provides the refresh's caller inputs (see
 //! [Caller inputs](mxx_exponent_lut::refresh#caller-inputs)): `A'` hash-sampled from the stage
-//! hash key under `MATRIX_TAG`, and, for every part, the encoding of `sigma_0 G` under the run's
-//! secrets: the binary sparse-LWR PRF Program of `n` samples modulo the chain's output prime
-//! ([`FreshNoiseProgram`] with [`PrfDistribution::Binary`]) on its own keys (one key set,
-//! `n` keys, shared by every part) and the invocation's label, preprocessed, encrypted and
-//! evaluated under its own hash namespace on the chain's child chain with gadget outputs.
+//! hash key under `MATRIX_TAG`, and, for every chain (shared by its two parts), the encoding of
+//! `sigma_0 G` under the run's secrets: the binary sparse-LWR PRF Program of `n` samples modulo the
+//! chain's output prime ([`FreshNoiseProgram`] with [`PrfDistribution::Binary`]) on its own keys
+//! (one key set, `n` keys, shared by every chain) and the invocation's label, preprocessed,
+//! encrypted and evaluated once per chain under a hash namespace derived from the chain's, on the
+//! chain's child chain with gadget outputs.
 //!
 //! The residues of every chain are recombined modulo the product `P` of the refreshed primes, and
 //! the round trip checks that `y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` modulo `P` is exactly
@@ -279,9 +280,10 @@ impl SigmaKeys {
         DCRTPoly::from_biguints(&refresh.reference.levels()[0], &bits)
     }
 
-    /// Part `request.part`'s encoding of `sigma_0 G`: the binary PRF Program on the chain's child
-    /// chain, under its own hash namespace, preprocessed with gadget outputs, encrypted on the
-    /// label under the run's secrets and evaluated (by shape only for a record-only run).
+    /// Chain `request.chain`'s encoding of `sigma_0 G`: the binary PRF Program on the chain's
+    /// child chain, under a hash namespace derived from the chain's, preprocessed with gadget
+    /// outputs, encrypted on the label under the run's secrets and evaluated (by shape only for
+    /// a record-only run).
     fn encode<E: api::StageExecution<api::StageStore>>(
         &self,
         top: &RefreshDeclaration,
@@ -290,7 +292,7 @@ impl SigmaKeys {
         execution: &mut E,
         store: &mut api::StageStore,
     ) -> Result<RefreshSigma, api::ApiError> {
-        let (chain, component) = request.part;
+        let chain = request.chain;
         let program = self.program(top, chain);
         let chains = request.chains;
         let parameters = chains
@@ -300,7 +302,6 @@ impl SigmaKeys {
         let namespace: [u8; 32] = Sha256::new()
             .chain_update(b"refresh-top-test/sigma-namespace")
             .chain_update(top.chain_namespace(chain))
-            .chain_update([component as u8])
             .finalize()
             .into();
         let level = parameters.levels()[0].clone();

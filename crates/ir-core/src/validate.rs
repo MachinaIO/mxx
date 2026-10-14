@@ -1791,19 +1791,20 @@ fn validate_structural_boundaries(
                     })?;
                 if let (
                     ConcreteWireType::DependentFamily { members },
-                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. },
+                    LoopInputMode::Zip |
+                    LoopInputMode::ZipOffset { .. } |
+                    LoopInputMode::ZipQuotient { .. },
                     NodeKind::ParallelLoop(spec),
                 ) = (outer, mode, handle.kind())
                 {
-                    // Instance `k` reads member `k + offset`, at its own type.
-                    let offset = match mode {
-                        LoopInputMode::ZipOffset { offset } => offset,
-                        _ => 0,
-                    };
+                    // Instance `k` reads its zipped member (`k + offset`, `floor(k / divisor)`),
+                    // at its own type.
                     let symbolic = symbolic_wire_type(child_scope, input);
                     for index in 0..parallel_instances(spec, env, scope_id, node_id)? {
-                        let member =
-                            members.get(index + offset).ok_or_else(|| ValidationError::Node {
+                        let member = mode
+                            .zipped_member(index)
+                            .and_then(|member| members.get(member))
+                            .ok_or_else(|| ValidationError::Node {
                                 scope: scope_id.clone(),
                                 node: node_id,
                                 message: "zipped family is too short".to_owned(),
@@ -1819,7 +1820,9 @@ fn validate_structural_boundaries(
                 }
                 let actual = match mode {
                     LoopInputMode::Broadcast => outer,
-                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
+                    LoopInputMode::Zip |
+                    LoopInputMode::ZipOffset { .. } |
+                    LoopInputMode::ZipQuotient { .. } => {
                         let ConcreteWireType::IndexedFamily { element, count } = outer else {
                             return node_error(scope_id, node_id, "zipped input is not a family");
                         };
@@ -1830,12 +1833,11 @@ fn validate_structural_boundaries(
                                 scope_id,
                                 node_id,
                             )?;
-                            let offset = match mode {
-                                LoopInputMode::Zip => 0,
-                                LoopInputMode::ZipOffset { offset } => offset,
-                                _ => 0,
-                            };
-                            if iterations > 0 && *count < iterations.saturating_add(offset) {
+                            // The last instance reads the largest member.
+                            if iterations > 0 &&
+                                mode.zipped_member(iterations - 1)
+                                    .is_none_or(|last| last >= *count)
+                            {
                                 return node_error(scope_id, node_id, "zipped family is too short");
                             }
                         }

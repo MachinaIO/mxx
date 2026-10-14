@@ -42,12 +42,14 @@
 //!   A'_(0) | sigma A'_(1)]` is the mask part of the two output rows side by side. The two halves
 //!   must be independent and uniform: with `A'_(0) = A'_(1)`, `y_0 - y_1 = -Delta_0 (r_0 - 1) x
 //!   G^st_0 + e'_0 - e'_1` reveals the payload.
-//! - **The encoding of `sigma_0 G`, per part.** Part `(chain, j)` of chain `q` reads the public key
-//!   `K_g` and the row `g` of an encoding under the caller's mask secret `s = (s_0, 1)` (the mask
-//!   secret of the target's stages) in the ring of the part's decoding level `L` (the ring of `Q`,
-//!   the level's primes in canonical order), with `m` columns (the digits of `Q`): `g = s K_g - v
-//!   G_Q + e_g`, `K_g in R_Q^(2 x m)`, `G_Q` the public gadget of that ring, and `v = sigma_0 (mod
-//!   q)` for the chain's output prime `q` (only `v mod q` matters: a PRF output with payload `(M +
+//! - **The encoding of `sigma_0 G`, per chain.** Chain `q` takes one encoding, shared by its two
+//!   parts `(chain, 0)` and `(chain, 1)`, which both read its public key `K_g` and its row `g`: an
+//!   encoding under the caller's mask secret `s = (s_0, 1)` (the mask secret of the target's
+//!   stages) in the ring of the chain's decoding level `L` (the ring of `Q`, the level's primes in
+//!   canonical order, the same for both parts), with `m` columns (the digits of `Q`): `g = s K_g -
+//!   v G_Q + e_g`, `K_g in R_Q^(2 x m)`, `G_Q` the public gadget of that ring, and `v = sigma_0
+//!   (mod q)` for the chain's output prime `q` (only `v mod q` matters: a PRF output with payload
+//!   `(M +
 //!   1) sigma_0 G_Q` may be passed as is). `sigma_0` must be binary (the security of the refreshed
 //!   output, [`crate::rns_bgg::RnsBggRefresh::security`], assumes a uniform binary mask), the same
 //!   on every chain and component, and the error `e_g` must be bounded as the noise simulation is

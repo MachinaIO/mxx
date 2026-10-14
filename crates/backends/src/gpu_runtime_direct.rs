@@ -1264,7 +1264,17 @@ impl DirectGraph {
         for peer in &region.peer_streams {
             peer.record_event()?.enqueue_wait(&stream)?;
         }
+        for slot in &frame.slots {
+            slot.prepare_graph_launch(&stream)?;
+        }
         let completion = region.executable.launch(&stream)?;
+        for slot in &frame.slots {
+            slot.protect_submission(&completion).map_err(|error| {
+                GpuRuntimeError::LaunchUncertain(format!(
+                    "native graph launched but export retirement failed: {error}"
+                ))
+            })?;
+        }
         for (&(consumer, storage_device, _), &(allocation, written)) in &storage_uses {
             allocation
                 .protect(storage_device, consumer, device_stream(consumer)?, &completion, written)

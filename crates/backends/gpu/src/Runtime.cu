@@ -166,6 +166,9 @@ struct PinnedHostReclaimer
         int device;
         gpuEvent_t completion;
         std::vector<void *> pointers;
+        // A raw guard deliberately leaks on unknown completion. This global
+        // worker never owns the execution's own reclaimer thread.
+        std::shared_ptr<GpuExecutionOwner> *execution_guard = nullptr;
     };
 
     PinnedHostReclaimer()
@@ -180,7 +183,8 @@ struct PinnedHostReclaimer
         shutdown();
     }
 
-    int enqueue(int device, gpuEvent_t completion, std::vector<void *> &&pointers)
+    int enqueue(int device, gpuEvent_t completion, std::vector<void *> &&pointers,
+        std::shared_ptr<GpuExecutionOwner> *execution_guard = nullptr)
     {
         try
         {
@@ -190,7 +194,7 @@ struct PinnedHostReclaimer
                 record_failure_locked("pinned-host reclaimer is stopped");
                 return 1;
             }
-            pending.push_back(Job{device, completion, std::move(pointers)});
+            pending.push_back(Job{device, completion, std::move(pointers), execution_guard});
         }
         catch (const std::exception &error)
         {
@@ -295,6 +299,8 @@ private:
                 record_failure(gpuGetErrorString(error));
             }
         }
+        delete job.execution_guard;
+        job.execution_guard = nullptr;
     }
 
     void run()
@@ -1912,14 +1918,21 @@ extern "C"
         return 0;
     }
 
-    int gpu_device_synchronize()
+    // Error recovery only. The caller explicitly permits device-wide waits
+    // here to establish completion after an uncertain submission. Normal
+    // graph execution and transfer wrappers never call this boundary.
+    int gpu_context_drain(const GpuContext *ctx)
     {
-        gpuError_t err = gpuDeviceSynchronize();
-        if (err != gpuSuccess)
+        if (!ctx || !ctx->execution) return set_error("invalid recovery context");
+        std::set<int> drained;
+        for (int device : ctx->execution->gpu_ids)
         {
-        return set_error(err);
+            if (!drained.insert(mxx_physical_device(device)).second) continue;
+            auto error = mxx_set_device(device);
+            if (error == gpuSuccess) error = gpuDeviceSynchronize();
+            if (error != gpuSuccess) return set_error(error);
         }
-        return 0;
+        return wait_pinned_host_reclaimer(ctx->execution.get());
     }
 
     const char *gpu_last_error()
@@ -1996,109 +2009,123 @@ extern "C"
         return 0;
     }
 
-    // An export slot whose payload lives in device memory: the Graph copy
-    // stays on the GPU and only the small header is host-mapped for the
-    // publication the I/O worker observes.
-    int gpu_export_slot_alloc_device(int physical_device, size_t payload_capacity,
-        void **out_host, void **out_device_header, void **out_device_payload)
+    struct MxxGpuDeviceMemory
     {
-        if (!out_host || !out_device_header || !out_device_payload)
-            return set_error("invalid device export slot allocation arguments");
-        *out_host = nullptr;
-        *out_device_header = nullptr;
-        *out_device_payload = nullptr;
-        gpuError_t error = mxx_set_device(physical_device);
-        if (error != gpuSuccess) return set_error(error);
-        void *host = nullptr;
-        error = gpuHostAlloc(&host, sizeof(MxxExportSlotHeader), gpuHostAllocMapped);
-        if (error != gpuSuccess) return set_error(error);
-        void *device_header = nullptr;
-        error = gpuHostGetDevicePointer(&device_header, host, 0);
-        void *payload = nullptr;
-        if (error == gpuSuccess && payload_capacity != 0)
-            error = gpuMalloc(&payload, payload_capacity);
+        std::shared_ptr<GpuExecutionOwner> execution;
+        int device = -1;
+        size_t partition = 0;
+        void *address = nullptr;
+        size_t bytes = 0;
+        gpuEvent_t producer = nullptr;
+        std::atomic<bool> release_blocked{false};
+        gpuStream_t transfer() const { return execution->transfer_streams_by_partition[partition]; }
+        gpuStream_t retirement() const { return execution->release_streams_by_partition[partition]; }
+    };
+
+    static PinnedHostReclaimer &artifact_reclaimer()
+    {
+        static PinnedHostReclaimer reclaimer;
+        return reclaimer;
+    }
+
+    int gpu_device_memory_alloc(const GpuContext *ctx, const MxxGpuDeviceMemory *related,
+        int device, size_t bytes, MxxGpuDeviceMemory **out_owner, void **out_address)
+    {
+        if ((!ctx && !related) || (ctx && related) || !bytes || !out_owner || !out_address)
+            return set_error("invalid artifact allocation source");
+        *out_owner = nullptr; *out_address = nullptr;
+        auto *memory = new (std::nothrow) MxxGpuDeviceMemory;
+        if (!memory) return set_error("failed to allocate artifact memory owner");
+        memory->execution = ctx ? ctx->execution : related->execution;
+        const auto &ids = memory->execution->gpu_ids;
+        const auto found = std::find(ids.begin(), ids.end(), device);
+        if (found == ids.end()) { delete memory; return set_error("artifact device not owned by execution"); }
+        memory->device = device; memory->partition = static_cast<size_t>(found - ids.begin());
+        memory->bytes = bytes;
+        auto error = mxx_set_device(device);
+        if (error == gpuSuccess) error = gpuEventCreateWithFlags(&memory->producer, gpuEventDisableTiming);
+        if (error == gpuSuccess) error = gpuMallocAsync(&memory->address, bytes, memory->transfer());
+        if (error == gpuSuccess) error = gpuEventRecord(memory->producer, memory->transfer());
         if (error != gpuSuccess)
         {
-            (void)gpuFreeHost(host);
+            // Error-only recovery is explicitly allowed to synchronize.
+            const auto drained = gpuStreamSynchronize(memory->transfer());
+            if (drained != gpuSuccess) { memory->release_blocked.store(true); return set_error(error); }
+            if (memory->address) (void)gpu_device_memory_free(memory);
+            else { if (memory->producer) (void)gpuEventDestroy(memory->producer); delete memory; }
             return set_error(error);
         }
-        memset(host, 0, sizeof(MxxExportSlotHeader));
-        *out_host = host;
-        *out_device_header = device_header;
-        *out_device_payload = payload;
+        *out_owner = memory; *out_address = memory->address;
         return 0;
     }
 
-    int gpu_device_memory_alloc(int physical_device, size_t bytes, void **out)
+    int gpu_device_memory_protect(MxxGpuDeviceMemory *memory, void *completion_event)
     {
-        if (!out || bytes == 0) return set_error("invalid device memory allocation arguments");
-        *out = nullptr;
-        gpuError_t error = mxx_set_device(physical_device);
-        if (error == gpuSuccess) error = gpuMalloc(out, bytes);
+        if (!memory || !completion_event) return set_error("invalid artifact use protection");
+        auto error = mxx_set_device(memory->device);
+        if (error == gpuSuccess)
+            error = gpuStreamWaitEvent(memory->retirement(), reinterpret_cast<gpuEvent_t>(completion_event), 0);
+        if (error != gpuSuccess) memory->release_blocked.store(true);
         return error == gpuSuccess ? 0 : set_error(error);
     }
 
-    int gpu_device_memory_free(int physical_device, void *address)
+    int gpu_device_memory_prepare(const MxxGpuDeviceMemory *memory, int device, void *stream)
     {
-        if (!address) return 0;
-        gpuError_t error = mxx_set_device(physical_device);
-        if (error == gpuSuccess) error = gpuFree(address);
+        if (!memory || !stream) return set_error("invalid artifact producer wait");
+        auto error = mxx_set_device(device);
+        if (error == gpuSuccess)
+            error = gpuStreamWaitEvent(reinterpret_cast<gpuStream_t>(stream), memory->producer, 0);
         return error == gpuSuccess ? 0 : set_error(error);
     }
 
-    // Copy between device allocations, possibly on different GPUs, and return
-    // only after the copy has completed.
-    int gpu_device_memory_copy(
-        int destination_device, void *destination, const void *source, size_t bytes)
+    int gpu_device_memory_free(MxxGpuDeviceMemory *memory)
     {
-        if (bytes == 0) return 0;
-        if (!destination || !source) return set_error("invalid device memory copy arguments");
-        gpuError_t error = mxx_set_device(destination_device);
-        gpuStream_t stream = nullptr;
-        if (error == gpuSuccess) error = gpuStreamCreateWithFlags(&stream, gpuStreamNonBlocking);
-        if (error != gpuSuccess) return set_error(error);
-        error = gpuMemcpyAsync(destination, source, bytes, gpuMemcpyDefault, stream);
-        const gpuError_t synchronized = gpuStreamSynchronize(stream);
-        if (error == gpuSuccess) error = synchronized;
-        const gpuError_t destroyed = gpuStreamDestroy(stream);
-        if (error == gpuSuccess) error = destroyed;
-        return error == gpuSuccess ? 0 : set_error(error);
-    }
-
-    int gpu_device_strided_copy(
-        int device, void *destination, const void *source, MxxStridedCopy copy)
-    {
-        if (!destination || !source || copy.element_bytes == 0)
-            return set_error("invalid device strided copy arguments");
-        gpuError_t error = mxx_set_device(device);
-        gpuStream_t stream = nullptr;
-        if (error == gpuSuccess) error = gpuStreamCreateWithFlags(&stream, gpuStreamNonBlocking);
-        if (error != gpuSuccess) return set_error(error);
-        constexpr uint32_t threads = 256;
-        mxx_strided_copy_kernel<<<strided_copy_blocks(copy, threads), threads, 0, stream>>>(
-            static_cast<uint8_t *>(destination), static_cast<const uint8_t *>(source), copy);
-        error = gpuGetLastError();
-        const gpuError_t synchronized = gpuStreamSynchronize(stream);
-        if (error == gpuSuccess) error = synchronized;
-        const gpuError_t destroyed = gpuStreamDestroy(stream);
-        if (error == gpuSuccess) error = destroyed;
-        return error == gpuSuccess ? 0 : set_error(error);
+        if (!memory) return 0;
+        if (memory->release_blocked.load()) return set_error("artifact retirement completion is uncertain");
+        auto *guard = new (std::nothrow) std::shared_ptr<GpuExecutionOwner>(memory->execution);
+        if (!guard) return set_error("failed to retain artifact retirement execution");
+        auto error = mxx_set_device(memory->device);
+        gpuEvent_t done = nullptr;
+        if (error == gpuSuccess) error = gpuEventCreateWithFlags(&done, gpuEventDisableTiming);
+        if (error == gpuSuccess) error = gpuStreamWaitEvent(memory->retirement(), memory->producer, 0);
+        if (error == gpuSuccess) error = gpuFreeAsync(memory->address, memory->retirement());
+        if (error == gpuSuccess) error = gpuEventRecord(done, memory->retirement());
+        if (error != gpuSuccess)
+        {
+            memory->release_blocked.store(true);
+            // Retain owner, event and guard when completion is unknown.
+            return set_error(error);
+        }
+        if (artifact_reclaimer().enqueue(memory->device, done, {}, guard) != 0)
+        {
+            memory->release_blocked.store(true);
+            return set_error("failed to retain artifact retirement");
+        }
+        (void)gpuEventDestroy(memory->producer);
+        delete memory;
+        return 0;
     }
 
     int gpu_device_memory_download(
-        int physical_device, const void *source, void *destination, size_t bytes)
+        int device, const void *source, void *destination, size_t bytes,
+        const MxxGpuDeviceMemory *owner)
     {
-        if (bytes == 0) return 0;
-        if (!destination || !source) return set_error("invalid device memory download arguments");
-        gpuError_t error = mxx_set_device(physical_device);
-        gpuStream_t stream = nullptr;
-        if (error == gpuSuccess) error = gpuStreamCreateWithFlags(&stream, gpuStreamNonBlocking);
+        if (!bytes) return 0;
+        if (!source || !destination || (owner && owner->device != device))
+            return set_error("invalid artifact download");
+        auto error = mxx_set_device(device);
+        gpuStream_t stream = owner ? owner->transfer() : nullptr;
+        if (error == gpuSuccess && !owner) error = gpuStreamCreateWithFlags(&stream, gpuStreamNonBlocking);
         if (error != gpuSuccess) return set_error(error);
-        error = gpuMemcpyAsync(destination, source, bytes, gpuMemcpyDeviceToHost, stream);
-        const gpuError_t synchronized = gpuStreamSynchronize(stream);
-        if (error == gpuSuccess) error = synchronized;
-        const gpuError_t destroyed = gpuStreamDestroy(stream);
-        if (error == gpuSuccess) error = destroyed;
+        if (owner) error = gpuStreamWaitEvent(stream, owner->producer, 0);
+        if (error == gpuSuccess) error = gpuMemcpyAsync(destination, source, bytes, gpuMemcpyDeviceToHost, stream);
+        const auto complete = gpuStreamSynchronize(stream); // Explicit D2H consumption boundary.
+        if (error == gpuSuccess) error = complete;
+        if (!owner)
+        {
+            const auto destroyed = gpuStreamDestroy(stream);
+            if (error == gpuSuccess) error = destroyed;
+        }
         return error == gpuSuccess ? 0 : set_error(error);
     }
 
@@ -2603,6 +2630,7 @@ extern "C++" {
     {
         int device = -1;
         gpuEvent_t event = nullptr;
+        std::shared_ptr<GpuExecutionOwner> execution;
     };
 
     int validate_patch_value(
@@ -3572,6 +3600,13 @@ extern "C++" {
         else
 #endif
         {
+#if defined(MXX_GPU_BACKEND_HIP)
+            if (hip_graph_prepare_executable(builder->root_graph) != 0)
+            {
+                delete result;
+                return 1;
+            }
+#endif
             const gpuError_t error = gpuGraphInstantiateWithFlags(&result->exec,
                 builder->root_graph, gpuGraphInstantiateFlagAutoFreeOnLaunch);
             if (error != gpuSuccess) { delete result; return set_error(error); }
@@ -4166,6 +4201,102 @@ extern "C++" {
             if (error != gpuSuccess) set_error(error);
         }
         delete event;
+    }
+
+    static int artifact_transfer_complete(const MxxGpuDeviceMemory *source,
+        MxxGpuDeviceMemory *destination, const std::shared_ptr<GpuExecutionOwner> &execution,
+        int device, gpuStream_t stream, gpuError_t error,
+        MxxGpuNativeEvent *event, MxxGpuNativeEvent **out_event)
+    {
+        if (error == gpuSuccess && destination)
+            error = gpuEventRecord(destination->producer, stream);
+        if (error == gpuSuccess) error = gpuEventRecord(event->event, stream);
+        if (error == gpuSuccess && source)
+            error = gpu_device_memory_protect(const_cast<MxxGpuDeviceMemory *>(source), event->event) ? gpuErrorInvalidValue : gpuSuccess;
+        if (error == gpuSuccess && destination)
+            error = gpu_device_memory_protect(destination, event->event) ? gpuErrorInvalidValue : gpuSuccess;
+        if (error != gpuSuccess)
+        {
+            (void)mxx_set_device(device);
+            const auto drained = gpuStreamSynchronize(stream); // Error-only boundary.
+            if (drained != gpuSuccess)
+            {
+                if (source) const_cast<MxxGpuDeviceMemory *>(source)->release_blocked.store(true);
+                if (destination) destination->release_blocked.store(true);
+                return GPU_STATUS_LAUNCH_UNCERTAIN;
+            }
+            mxx_gpu_native_event_destroy(event);
+            return set_error(error);
+        }
+        event->execution = execution;
+        *out_event = event;
+        return 0;
+    }
+
+    int gpu_device_memory_copy_from(MxxGpuDeviceMemory *destination, size_t offset,
+        const void *source, size_t bytes, MxxGpuNativeEvent **out_event)
+    {
+        if (!destination || (!source && bytes) || !out_event || offset > destination->bytes || bytes > destination->bytes - offset)
+            return set_error("invalid artifact upload range");
+        *out_event = nullptr;
+        auto *event = new (std::nothrow) MxxGpuNativeEvent;
+        if (!event) return set_error("failed to allocate artifact copy event");
+        event->device = destination->device;
+        auto error = mxx_set_device(event->device);
+        if (error == gpuSuccess) error = gpuEventCreateWithFlags(&event->event, gpuEventDisableTiming);
+        if (error == gpuSuccess && bytes)
+            error = gpuMemcpyAsync(static_cast<uint8_t *>(destination->address) + offset, source, bytes,
+                gpuMemcpyDefault, destination->transfer());
+        return artifact_transfer_complete(nullptr, destination, destination->execution,
+            destination->device, destination->transfer(), error, event, out_event);
+    }
+
+    int gpu_device_memory_copy(const MxxGpuDeviceMemory *source, size_t offset,
+        MxxGpuDeviceMemory *destination, size_t destination_offset, size_t bytes,
+        MxxGpuNativeEvent **out_event)
+    {
+        if (!source || !destination || !out_event || offset > source->bytes || bytes > source->bytes - offset ||
+            destination_offset > destination->bytes || bytes > destination->bytes - destination_offset)
+            return set_error("invalid artifact copy range");
+        *out_event = nullptr;
+        auto *event = new (std::nothrow) MxxGpuNativeEvent;
+        if (!event) return set_error("failed to allocate artifact copy event");
+        event->device = destination->device;
+        auto error = mxx_set_device(event->device);
+        if (error == gpuSuccess) error = gpuEventCreateWithFlags(&event->event, gpuEventDisableTiming);
+        if (error == gpuSuccess) error = gpuStreamWaitEvent(destination->transfer(), source->producer, 0);
+        if (error == gpuSuccess && bytes)
+            error = gpuMemcpyAsync(static_cast<uint8_t *>(destination->address) + destination_offset,
+                static_cast<const uint8_t *>(source->address) + offset, bytes, gpuMemcpyDefault, destination->transfer());
+        return artifact_transfer_complete(source, destination, destination->execution,
+            destination->device, destination->transfer(), error, event, out_event);
+    }
+
+    int gpu_device_strided_copy(const MxxGpuDeviceMemory *source, size_t offset,
+        const GpuContext *destination_context, int device, void *destination,
+        MxxStridedCopy copy, MxxGpuNativeEvent **out_event)
+    {
+        if (!source || !destination_context || !destination || !copy.element_bytes || !out_event || offset > source->bytes)
+            return set_error("invalid artifact strided copy");
+        const auto execution = destination_context->execution;
+        const auto found = std::find(execution->gpu_ids.begin(), execution->gpu_ids.end(), device);
+        if (found == execution->gpu_ids.end()) return set_error("artifact destination device not owned by execution");
+        const auto stream = execution->transfer_streams_by_partition[static_cast<size_t>(found - execution->gpu_ids.begin())];
+        *out_event = nullptr;
+        auto *event = new (std::nothrow) MxxGpuNativeEvent;
+        if (!event) return set_error("failed to allocate strided copy event");
+        event->device = device;
+        auto error = mxx_set_device(device);
+        if (error == gpuSuccess) error = gpuEventCreateWithFlags(&event->event, gpuEventDisableTiming);
+        if (error == gpuSuccess) error = gpuStreamWaitEvent(stream, source->producer, 0);
+        if (error == gpuSuccess)
+        {
+            constexpr uint32_t threads = 256;
+            mxx_strided_copy_kernel<<<strided_copy_blocks(copy, threads), threads, 0, stream>>>(
+                static_cast<uint8_t *>(destination), static_cast<const uint8_t *>(source->address) + offset, copy);
+            error = gpuGetLastError();
+        }
+        return artifact_transfer_complete(source, nullptr, execution, device, stream, error, event, out_event);
     }
 
     int gpu_device_buffer_copy_from_address(

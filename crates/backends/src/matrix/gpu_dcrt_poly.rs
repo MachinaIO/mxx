@@ -872,7 +872,12 @@ impl GpuDCRTPolyMatrix {
 
     /// Overwrite this already allocated coefficient-domain owner with a
     /// canonical compact matrix, preserving every physical address bound into
-    /// a compiled graph.
+    /// a compiled graph. Uploads use the context-owned transfer stream so
+    /// recorded writer events remain valid for later imports and consumers;
+    /// temporary device buffers are freed in that stream's order. One kernel
+    /// derives packed limb addresses from the resident modulus table, without
+    /// uploading pointer arrays. The payload's pinned staging owner retires
+    /// asynchronously; this wrapper does not wait for device completion.
     ///
     /// # Safety
     /// The caller must have joined the previous graph execution and every
@@ -898,9 +903,6 @@ impl GpuDCRTPolyMatrix {
             return Err(GpuNativeGraphError::Native(
                 "compact import shape, CRT level, or coefficient domain mismatch".into(),
             ));
-        }
-        if unsafe { gpu_matrix_wait(self.raw) } != 0 {
-            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
         }
         if unsafe {
             gpu_matrix_load_compact_bytes(

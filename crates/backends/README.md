@@ -69,14 +69,21 @@ backend and device; canonical artifacts remain independent of GPU plan identity.
 HIP control scheduling adds device-to-host control transfers, event waits, and region launches.
 These costs belong in planning and execution measurements. Logical duplicate device mappings
 are scheduling checks, not evidence of multiple physical GPUs or peer transfer support.
+Before HIP instantiation, executable DAGs bypass empty nodes and remove redundant ancestor
+dependencies while preserving independent work and replay bindings. Compact imports retain
+their writer stream through the context-owned transfer stream.
 
 | Validation target | Current evidence for this change |
 | --- | --- |
-| CPU lib compile/test | Passed; 629 CPU tests, zero failures |
-| CUDA lib compile and device regression | Current compile passed; three smoke repetitions in each logical mode passed; nested control 900 runs across three logical modes passed; matrix named-call regression passes after planner correction; latest long KHE probe pending |
-| HIP lib compile and BGV/device execution | ROCm 7.0.0 compile passed for gfx1100/gfx942; 652 CPU-only tests passed; AMD device execution unverified |
-| AMD wave32, wave64, and multiple physical GPUs | Unverified; separate hardware runs required |
+| CPU lib compile/test | Current CPU compile passed; 652 ordinary tests in HIP binaries passed |
+| CUDA lib compile and device regression | Historical evidence is recorded in the validation notes; not rerun for the local AMD correction |
+| HIP lib compile and BGV/device execution | gfx942 / ROCm 7.14 pre3 compile passed; 84 selected GPU units passed 753 executions across three logical modes; nine synchronization cases passed 8,100 executions with zero failures |
+| AMD wave32, wave64, and multiple physical GPUs | gfx942 wave64 device checks passed; wave32 and multiple physical GPUs remain unverified |
 | TFHE native GPU kernel on AMD | Deferred; the HIP accessor returns `None` |
+
+These gates apply to the runtime and GPU.md compliance corrections recorded by
+`compliance-source-manifest.json`. Error-only recovery may synchronize under the user
+exception; successful device transfers return completion events without host waits.
 
 Detailed logs, source evidence, and incomplete hardware gates are recorded in
 [`AMD_GPU_VALIDATION.md`](../../AMD_GPU_VALIDATION.md). Compilation does not establish AMD

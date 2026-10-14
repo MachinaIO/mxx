@@ -27,6 +27,7 @@ struct HipGraphRegion
     std::vector<gpuGraphNode_t> controls;
     size_t record_offset = 0;
     size_t descriptor_offset = 0;
+    gpuEvent_t control_complete = nullptr;
 };
 
 struct HipGraphSchedule
@@ -46,20 +47,19 @@ struct HipGraphSchedule
     gpuEvent_t descriptors_ready = nullptr;
     uint64_t *device_record = nullptr;
     uint64_t *host_record = nullptr;
-    gpuEvent_t control_complete = nullptr;
     std::map<gpuGraph_t, std::vector<HipGraphRegion>> scopes;
     std::map<gpuGraphNode_t, HipGraphControl> controls;
     std::map<gpuGraphNode_t, std::pair<gpuGraphExec_t, gpuGraphNode_t>> nodes;
     std::vector<gpuGraph_t> source_bodies;
+    std::map<gpuGraph_t, gpuEvent_t> scope_complete;
     gpuGraph_t root = nullptr;
     ~HipGraphSchedule();
     int compile(MxxGpuGraphBuilder *builder);
-    int compile_scope(gpuGraph_t graph, size_t record_base);
+    int compile_scope(gpuGraph_t graph);
     int bind(const MxxGraphBindingValue *values, size_t count);
     gpuGraphExec_t executable(gpuGraphNode_t original) const;
     gpuGraphNode_t node(gpuGraphNode_t original) const;
     gpuError_t upload(gpuStream_t stream);
     gpuError_t launch(gpuStream_t stream);
-    gpuError_t launch_scope(gpuGraph_t graph, gpuStream_t stream);
-    gpuError_t read_controls(const HipGraphRegion &region, bool advance, gpuStream_t stream);
+    gpuError_t submit_controls(const HipGraphRegion &region, bool advance, gpuStream_t stream);
 };

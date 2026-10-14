@@ -10,7 +10,7 @@
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload, decode_stored_payload},
     backend::poly_gpu::{PhysicalExport, transcode_raw_artifact},
-    poly::dcrt::gpu::GpuDeviceMemory,
+    poly::dcrt::gpu::{GpuDeviceMemory, GpuDeviceMemorySource, GpuNativeEvent},
 };
 use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, ProductionId};
 use std::{collections::BTreeMap, sync::Arc};
@@ -86,7 +86,8 @@ impl std::fmt::Debug for DeviceArtifacts {
 impl DeviceArtifacts {
     /// Copy one published chunk of `key` from device memory into its stage,
     /// allocated on the exporting device at the first chunk. Returns whether
-    /// the stage is complete.
+    /// the stage is complete and the queued copy's completion. The I/O
+    /// worker joins that event before releasing its source slot lease.
     pub(crate) fn stage_chunk(
         &mut self,
         key: ArtifactKey,
@@ -95,7 +96,8 @@ impl DeviceArtifacts {
         physical_device: i32,
         source: u64,
         bytes: usize,
-    ) -> Result<bool, String> {
+        source_memory: &GpuDeviceMemory,
+    ) -> Result<(bool, GpuNativeEvent), String> {
         let total = usize::try_from(total_raw_bytes).map_err(|_| "device artifact is too large")?;
         let end = offset
             .checked_add(bytes as u64)
@@ -104,8 +106,12 @@ impl DeviceArtifacts {
         let stage = match self.stages.get(&key) {
             Some(stage) => Arc::clone(stage),
             None => {
-                let memory = GpuDeviceMemory::allocate(physical_device, total)
-                    .map_err(|error| error.to_string())?;
+                let memory = GpuDeviceMemory::allocate(
+                    GpuDeviceMemorySource::Artifact(source_memory),
+                    physical_device,
+                    total,
+                )
+                .map_err(|error| error.to_string())?;
                 let stage = Arc::new(std::sync::Mutex::new(DeviceRawStage {
                     memory,
                     ranges: BTreeMap::new(),
@@ -127,13 +133,13 @@ impl DeviceArtifacts {
         {
             return Err("device artifact chunk overlaps or changes its length".into());
         }
-        stage
+        let completion = stage
             .memory
             .copy_from_device(offset as usize, source, bytes)
             .map_err(|error| error.to_string())?;
         stage.ranges.insert(offset, end);
         stage.written_bytes += bytes as u64;
-        Ok(stage.written_bytes == total_raw_bytes)
+        Ok((stage.written_bytes == total_raw_bytes, completion))
     }
 
     /// Turn the complete stage of `key` into a finished artifact.

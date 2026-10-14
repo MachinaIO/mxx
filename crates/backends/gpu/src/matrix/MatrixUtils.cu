@@ -1,3 +1,5 @@
+#include "MatrixPacked.cu"
+
 constexpr uint32_t kGaussMaxDigits = 64;
 constexpr double kTwoPi = 6.283185307179586476925286766559;
 

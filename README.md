@@ -322,4 +322,5 @@ device execution are separate gates; TFHE on AMD is deferred, while BGV uses the
 backend. Integration tests require explicit authorization; the default script runs lib tests.
 
 Recorded CPU, CUDA, and HIP compilation results and the remaining AMD hardware gates are in
-[`AMD_GPU_VALIDATION.md`](AMD_GPU_VALIDATION.md). AMD device execution is currently unverified.
+[`AMD_GPU_VALIDATION.md`](AMD_GPU_VALIDATION.md). Short GPU unit tests now execute on a gfx942
+wave64 AMD device; wave32 and multiple physical AMD GPUs remain unverified.

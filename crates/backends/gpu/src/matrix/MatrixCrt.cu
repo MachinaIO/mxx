@@ -477,9 +477,10 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
     std::memcpy(plan->pinned_metadata, &metadata, sizeof(metadata));
     error = gpuMemcpyAsync(plan->device_metadata, plan->pinned_metadata,
         sizeof(metadata), gpuMemcpyHostToDevice, plan->stream);
-    // The compiled graph can launch on another compute stream. Complete this
-    // one-time metadata upload before the plan becomes available to emitters.
-    if (error == gpuSuccess) error = gpuStreamSynchronize(plan->stream);
+    // Graph consumers enqueue a wait on this immutable upload's producer
+    // event; construction returns without waiting for the device.
+    if (error == gpuSuccess) error = gpuEventCreateWithFlags(&plan->raw_ready, gpuEventDisableTiming);
+    if (error == gpuSuccess) error = gpuEventRecord(plan->raw_ready, plan->stream);
     if (error != gpuSuccess)
     {
         gpu_matrix_modulus_conversion_plan_destroy(plan);
@@ -556,7 +557,8 @@ extern "C" int gpu_raw_centered_rebase_prepare(
     std::memcpy(plan->pinned_metadata, &metadata, sizeof(metadata));
     error = gpuMemcpyAsync(plan->device_metadata, plan->pinned_metadata,
         sizeof(metadata), gpuMemcpyHostToDevice, plan->stream);
-    if (error == gpuSuccess) error = gpuStreamSynchronize(plan->stream);
+    if (error == gpuSuccess) error = gpuEventCreateWithFlags(&plan->raw_ready, gpuEventDisableTiming);
+    if (error == gpuSuccess) error = gpuEventRecord(plan->raw_ready, plan->stream);
     if (error != gpuSuccess)
     {
         gpu_matrix_modulus_conversion_plan_destroy(plan);
@@ -634,7 +636,8 @@ extern "C" int gpu_raw_centered_round_divide_prepare(
     std::memcpy(plan->pinned_metadata, &metadata, sizeof(metadata));
     error = gpuMemcpyAsync(plan->device_metadata, plan->pinned_metadata,
         sizeof(metadata), gpuMemcpyHostToDevice, plan->stream);
-    if (error == gpuSuccess) error = gpuStreamSynchronize(plan->stream);
+    if (error == gpuSuccess) error = gpuEventCreateWithFlags(&plan->raw_ready, gpuEventDisableTiming);
+    if (error == gpuSuccess) error = gpuEventRecord(plan->raw_ready, plan->stream);
     if (error != gpuSuccess)
     {
         gpu_matrix_modulus_conversion_plan_destroy(plan);

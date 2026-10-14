@@ -36,6 +36,7 @@ typedef struct MxxGpuGraphBuilder MxxGpuGraphBuilder;
 struct MxxGraphPatch;
 typedef struct MxxGpuNativeEvent MxxGpuNativeEvent;
 typedef struct MxxGpuDeviceBuffer MxxGpuDeviceBuffer;
+typedef struct MxxGpuDeviceMemory MxxGpuDeviceMemory;
 typedef struct GpuModulusConversionPlan GpuModulusConversionPlan;
 typedef struct GpuRawPreimageCutoffPlan GpuRawPreimageCutoffPlan;
 typedef struct GpuIndexedMatrixTable GpuIndexedMatrixTable;
@@ -192,7 +193,8 @@ gpuError_t mxx_get_device(int *logical);
 
 int gpu_device_count(int *out_count);
 int gpu_device_mem_info(int device, size_t *out_free, size_t *out_total);
-int gpu_device_synchronize();
+// Error recovery only: explicit device synchronization after an uncertain submission.
+int gpu_context_drain(const GpuContext *ctx);
 
 const char *gpu_last_error();
 
@@ -216,20 +218,25 @@ struct alignas(8) MxxExportSlotHeader
 };
 int gpu_export_slot_alloc(int physical_device, size_t payload_capacity,
     void **out_host, void **out_device);
-int gpu_export_slot_alloc_device(int physical_device, size_t payload_capacity,
-    void **out_host, void **out_device_header, void **out_device_payload);
 int gpu_export_slot_ready(const void *host_header, int *out_ready);
 // Header flags: bit 0 marks a final chunk; MXX_EXPORT_SLOT_SUPPRESSED marks a
 // payload computed after its gate reported a failure.
 #define MXX_EXPORT_SLOT_SUPPRESSED 2U
-// Persistent device allocations for artifacts kept in GPU memory, and
-// synchronous copies out of them.
-int gpu_device_memory_alloc(int physical_device, size_t bytes, void **out);
-int gpu_device_memory_free(int physical_device, void *address);
-int gpu_device_memory_copy(
-    int destination_device, void *destination, const void *source, size_t bytes);
+// Artifact allocations retain the execution streams, without retaining ring
+// constants. Allocation, copies and free are ordered by producer/use events.
+int gpu_device_memory_alloc(const GpuContext *ctx, const MxxGpuDeviceMemory *related,
+    int device, size_t bytes, MxxGpuDeviceMemory **out_owner, void **out_address);
+int gpu_device_memory_free(MxxGpuDeviceMemory *owner);
+int gpu_device_memory_prepare(const MxxGpuDeviceMemory *owner, int device, void *stream);
+int gpu_device_memory_protect(MxxGpuDeviceMemory *owner, void *completion_event);
+int gpu_device_memory_copy_from(MxxGpuDeviceMemory *destination, size_t offset,
+    const void *source, size_t bytes, MxxGpuNativeEvent **out_event);
+int gpu_device_memory_copy(const MxxGpuDeviceMemory *source, size_t offset,
+    MxxGpuDeviceMemory *destination, size_t destination_offset, size_t bytes,
+    MxxGpuNativeEvent **out_event);
 int gpu_device_memory_download(
-    int physical_device, const void *source, void *destination, size_t bytes);
+    int physical_device, const void *source, void *destination, size_t bytes,
+    const MxxGpuDeviceMemory *owner);
 // The elements of a four-dimensional view in two byte-strided layouts.
 struct MxxStridedCopy
 {
@@ -238,8 +245,9 @@ struct MxxStridedCopy
     uint64_t destination_stride[4];
     uint32_t element_bytes;
 };
-int gpu_device_strided_copy(
-    int device, void *destination, const void *source, MxxStridedCopy copy);
+int gpu_device_strided_copy(const MxxGpuDeviceMemory *source, size_t offset,
+    const GpuContext *destination_context, int device, void *destination,
+    MxxStridedCopy copy, MxxGpuNativeEvent **out_event);
 int gpu_export_slot_reset(void *host_header);
 
 // Stream-ordered device buffer owners used by allocation-free graph bodies.

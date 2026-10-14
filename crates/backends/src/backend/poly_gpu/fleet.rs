@@ -47,7 +47,7 @@ use crate::{
                 GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
                 GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
                 GpuRawSmallMatrixView, GpuSignedValuesEncoding, GpuStridedCopy,
-                gpu_device_identity, gpu_device_memory_usage, gpu_device_sync,
+                gpu_device_identity, gpu_device_memory_usage,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -7096,10 +7096,12 @@ impl GpuDcrtBackend {
     }
 
     pub(crate) fn drain_uncertain_launches(&mut self) -> Result<(), GpuNativeGraphError> {
-        gpu_device_sync();
+        let mut drained = std::collections::BTreeSet::new();
         for (_, parameters) in &self.devices {
             for parameter in parameters {
-                parameter.fence_released_memory();
+                if drained.insert(parameter.execution_owner_id()) {
+                    parameter.drain_execution()?;
+                }
             }
         }
         Ok(())

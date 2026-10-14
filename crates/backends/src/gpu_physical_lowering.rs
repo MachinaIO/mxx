@@ -6392,7 +6392,11 @@ pub(super) fn emit_artifact_export(
                         ArtifactType::Preimage { .. }
                 );
             let slot_owner = if on_device {
-                GpuExportSlot::new_on_device(ctx.device, payload_bytes)
+                GpuExportSlot::new_on_device(
+                    &ctx.backend.control_parameters_on_device(ctx.device)?,
+                    ctx.device,
+                    payload_bytes,
+                )
             } else {
                 GpuExportSlot::new(ctx.device, payload_bytes)
             };

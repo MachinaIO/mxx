@@ -13,12 +13,14 @@ use crate::{
     },
     device_artifact::DeviceArtifact,
     gpu_execution_plan::PhysicalValueId,
-    gpu_io_worker::{FrameGeneration, ImportDelivery, ImportedArtifact, IoCompletion},
+    gpu_io_worker::{
+        FrameGeneration, ImportDelivery, ImportTransfer, ImportedArtifact, IoCompletion,
+    },
     gpu_physical_lowering::{ImportDestination, ImportTemplate},
     gpu_runtime_io::{ProducerIoPump, RuntimeIoOperation},
     poly::{
         PolyParams,
-        dcrt::gpu::{GpuDeviceMemory, GpuSignedValuesEncoding, strided_copy_on_device},
+        dcrt::gpu::{GpuDeviceMemory, GpuDeviceMemorySource, GpuSignedValuesEncoding},
     },
 };
 use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
@@ -28,12 +30,13 @@ use std::{error::Error, sync::Arc};
 
 /// Copy an artifact held in GPU memory into `destination` when both describe
 /// the same elements. The artifact holds each part densely; each part is
-/// scattered into the destination's strides. Returns false, copying nothing,
+/// scattered into the destination's strides. Returns `None`, copying nothing,
 /// when the two differ.
 fn copy_device_artifact(
-    artifact: &DeviceArtifact,
-    destination: &GpuResidentValue,
-) -> Result<bool, String> {
+    backend: &GpuDcrtBackend,
+    artifact: Arc<DeviceArtifact>,
+    destination: Arc<GpuResidentValue>,
+) -> Result<Option<ImportTransfer>, String> {
     let physical = destination.physical();
     let selected = (0..physical.parts.len()).collect::<Vec<_>>();
     let layout = PhysicalExport::from_parts(Arc::clone(physical), &selected)?;
@@ -43,14 +46,14 @@ fn copy_device_artifact(
         source.physical.encodings != physical.encodings ||
         source.fragments != layout.fragments
     {
-        return Ok(false);
+        return Ok(None);
     }
-    let mut staged = None;
+    let mut staged = Vec::new();
+    let mut completions = Vec::new();
     for fragment in &layout.fragments {
         let part = &physical.parts[fragment.part as usize];
-        let storage = destination
-            .storage(part.storage)
-            .ok_or("device artifact destination has no bound storage")?;
+        let storage =
+            destination.storage(part.storage).ok_or("device import has no bound storage")?;
         let copy = strided_copy(
             &part.view.extent,
             &part.view.byte_strides,
@@ -66,35 +69,54 @@ fn copy_device_artifact(
         {
             return Err("device artifact fragment exceeds its destination".into());
         }
-        // A kernel on the destination GPU reads the dense part; an artifact on
-        // another GPU is first copied there.
-        let source_address = if artifact.memory.physical_device() == storage.device {
-            artifact.memory.address() + fragment.raw_offset
+        let params = backend.control_parameters_on_device(storage.device)?;
+        let bytes =
+            usize::try_from(fragment.raw_bytes).map_err(|_| "device import exceeds usize")?;
+        let offset = usize::try_from(fragment.raw_offset)
+            .map_err(|_| "device import offset exceeds usize")?;
+        let (memory, at) = if artifact.memory.physical_device() == storage.device {
+            (&artifact.memory, offset)
         } else {
-            let bytes = usize::try_from(fragment.raw_bytes)
-                .map_err(|_| "device artifact fragment exceeds usize")?;
-            let local = GpuDeviceMemory::allocate(storage.device, bytes)
-                .map_err(|error| error.to_string())?;
-            artifact
-                .memory
-                .copy_to_device(
-                    fragment.raw_offset as usize,
-                    storage.device,
-                    local.address(),
-                    bytes,
-                )
-                .map_err(|error| error.to_string())?;
-            staged.insert(local).address()
+            let local = GpuDeviceMemory::allocate(
+                GpuDeviceMemorySource::Parameters(&params),
+                storage.device,
+                bytes,
+            )
+            .map_err(|error| error.to_string())?;
+            completions.push(
+                artifact
+                    .memory
+                    .copy_to(offset, &local, 0, bytes)
+                    .map_err(|error| error.to_string())?,
+            );
+            staged.push(local);
+            (staged.last().expect("staging allocation was inserted"), 0)
         };
-        strided_copy_on_device(
-            storage.device,
-            storage.address + part.view.byte_offset,
-            source_address,
-            copy,
-        )
-        .map_err(|error| error.to_string())?;
+        completions.push(
+            memory
+                .scatter_to(
+                    at,
+                    bytes,
+                    &params,
+                    storage.device,
+                    storage.address + part.view.byte_offset,
+                    copy,
+                )
+                .map_err(|error| error.to_string())?,
+        );
     }
-    Ok(true)
+    // Allocation/copy wrappers return without waiting. The I/O consumer's
+    // completion phase holds all ranges until the GPU work is finished.
+    let retained = (artifact, destination, staged);
+    Ok(Some(ImportTransfer {
+        finish: Box::new(move || {
+            for completion in completions {
+                completion.wait().map_err(|error| error.to_string())?;
+            }
+            drop(retained);
+            Ok(())
+        }),
+    }))
 }
 
 fn trapdoor_secret_parts(bytes: &[u8]) -> Result<[&[u8]; 6], String> {
@@ -406,9 +428,13 @@ pub(crate) fn import_operation(
             ImportedArtifact::Host(payload) => payload,
             ImportedArtifact::Device(artifact) => {
                 if let Some(destination) = &destination &&
-                    copy_device_artifact(&artifact, destination)?
+                    let Some(transfer) = copy_device_artifact(
+                        &backend,
+                        Arc::clone(&artifact),
+                        Arc::clone(destination),
+                    )?
                 {
-                    return Ok(());
+                    return Ok(Some(transfer));
                 }
                 tracing::debug!(
                     target: "mxx_backends::gpu_execute",
@@ -428,6 +454,7 @@ pub(crate) fn import_operation(
                 destination.as_deref(),
                 payload,
             )
+            .map(|()| None)
         }
     });
     Ok(RuntimeIoOperation::Import {

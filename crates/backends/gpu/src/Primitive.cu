@@ -9,6 +9,7 @@
 #include <limits>
 
 #include "matrix/MatrixUtils.h"
+#include "matrix/MatrixPacked.cu"
 
 namespace
 {

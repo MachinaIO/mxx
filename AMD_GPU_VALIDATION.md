@@ -1,6 +1,129 @@
 # AMD GPU implementation validation
 
-Current checkpoint: source `03c5c0719` (see "Cache-release synchronization and final-source
+## Current AMD runtime and GPU.md corrections, 2026-10-14
+
+The current implementation is based on PR #174 head
+`a18fa7101b1f424ce95bb14069edc99ee9e042ce`. The 21 changed source files (including the
+backend README) and seven optimized unit-test binaries matched
+`compliance-source-manifest.json` and `compliance-binaries.json` at validation completion
+under `logs/pr174-amd-fix-20261014/`. The tested source is also preserved in
+`validated-compliance-source/`; the complete patch includes new files. Subsequent
+documentation-only updates are recorded by `compliance-final-source-manifest.json`.
+
+Actual execution used one physical gfx942 wave64 AMD GPU (approximately 256 GiB VRAM),
+HIP 7.14.60850 / ROCm `7.14.0~pre3-29052710811`, and Rust 1.99.0. Identity means
+`MXX_GPU_LOGICAL_DEVICES` is unset; `0,0` and `0,0,0` reuse this same physical GPU.
+
+The corrections remove the reproduced HIP graph deadlocks and compact-import stream
+lifetime failure. The GPU.md re-review also corrected independent control-body scheduling,
+synchronous device-artifact allocation/copies/free, CRT upload waits, per-import pointer
+tables, shared-header function bodies and the GPU artifact Rust filename. Body scheduling
+uses the existing bounded stream pool and separate nested records/events. Compact import
+uses one payload H2D and one unpack kernel covering all active limbs. Graph normalization
+adds one barrier only for a many-to-many join, avoiding quadratic dependency expansion.
+
+Device-only transfer wrappers queue work and return completion events. Artifact consumers
+join completion while retaining all source/destination allocations. A user-authorized
+exception permits device-wide synchronization in error recovery: the three callers of
+`drain_uncertain_launches` occur only inside failure branches. Successful execution does
+not call this boundary; recovery may also delay unrelated work on the same physical GPU.
+
+| Gate | Evidence in the artifact directory | Result |
+| --- | --- | --- |
+| Warning-free CPU workspace lib compilation | `compliance-cpu-build.log`, `.exit` | Passed, exit 0 |
+| Warning-free HIP gfx942 workspace lib compilation | `compliance-hip-build.log`, `.exit` | Passed, exit 0 |
+| Ordinary unit tests in HIP binaries | `compliance-host-summary.json` | 652 passed, zero failures |
+| Selected ignored GPU units, three repetitions per logical mode | `compliance-smoke-summary.json`, `compliance-smoke.exit` | 84 cases, 753 executions, zero failures; the two-device allocation query is skipped in identity mode |
+| Nine synchronization cases, 300 repetitions per logical mode | `compliance-repeat.commands.json`, `compliance-repeat-results.jsonl`, `compliance-repeat-summary.json`, `compliance-repeat.exit` | 8,100 case executions in 2,700 invocations; 300 repetitions for each of 27 case/mode pairs; zero failures, exit 0 |
+| Paired whole-unit timing comparison with unchanged PR | `compliance-timing-results.json`, `compliance-timing-summary.json` | 18 runs passed; three samples per test/source pair; not controlled kernel benchmarks |
+
+The repeated cases cover failed producers, parallel artifact exports, redundant graph joins,
+trapdoor import, independent nested controls, device-resident artifact round trips, raw
+dynamic CRT division, staged BGV SIMD and KHE parallel matrix arithmetic. Exact commands,
+environment, completed repetition counts, per-invocation exit status and output are retained.
+
+The paired whole-test medians were 0.765/0.765 s for matrix rebind, 0.264/0.264 s for
+integer permutation, and 1.015/1.366 s for BGV short-slot inputs (PR/corrected).
+The BGV case is approximately 35% slower in these three paired samples. Successful
+HIP API-only traces show fewer streams/copies but increased time in completion waits
+and pinned retirement; this does not identify one cause for the whole difference.
+`compliance-performance-review.md` preserves the stage counts and raw profile locations.
+Two representative kernel profiles report 306/324 calls for matrix rebind (18 added
+join barriers) and 1,619/1,619 for integer permutation. These are whole-unit totals,
+including setup and planning. The BGV kernel/memory-copy profiler gate remains unverified.
+
+The scoped audit and its resolutions are in `gpu-compliance-review.md`. The historical
+checkpoints below refer to their own source snapshots. No integration tests, long GPU
+Ring-GSW round trip, wave32 run, multiple physical AMD GPUs, physical peer transfer,
+forced host staging, CUDA rerun or sanitizer acceptance is claimed. HIP TFHE kernels
+remain deferred. Profiler stalls observed at the older checkpoint do not establish a
+failure of ordinary execution; BGV kernel/memory-copy profiler acceptance is not claimed.
+
+## Historical runtime-only AMD corrections, 2026-10-14
+
+The completed device gates in this section belong to the runtime-only correction
+snapshot saved in `logs/pr174-amd-fix-20261014/validated-runtime-source/` and
+`final-source.patch`. The newer compliance corrections and their independent terminal gates are
+recorded above. These older results remain specific to the saved runtime-only source.
+
+The local correction is based on PR #174 source
+`a18fa7101b1f424ce95bb14069edc99ee9e042ce`. The changed source hashes, optimized test
+binary hashes, commands, environment, and per-run logs are recorded under
+`logs/pr174-amd-fix-20261014/`. `tested-source-manifest.json` identifies the five changed
+code files. The historical checkpoints below belong to their original snapshots.
+
+The device is one physical `gfx942` GPU with wave64 and approximately 256 GiB VRAM.
+The installed SDK is HIP 7.14.60850 / ROCm `7.14.0~pre3-29052710811`, with Rust 1.99.0.
+The logical mappings `0,0` and `0,0,0` reuse that device; they do not demonstrate
+multiple physical AMD GPUs.
+
+Three corrections address the device failures:
+
+- HIP executable graphs bypass empty nodes and remove transitive dependency edges.
+  Independent kernel branches and their complete happens-before relation are preserved.
+  A many-to-many empty join uses one GPU barrier instead of a quadratic cross product
+  of incoming and outgoing edges. Ordinary graphs and control-region executables use
+  the same preparation. Independent native HIP reproductions stalled with redundant
+  edges or empty-node branches and completed after the corresponding transformation.
+- Compact matrix imports use the context-owned transfer stream. Recorded writer events
+  refer to a stream that remains alive with the matrix, rather than an already destroyed
+  temporary queue. A captured trapdoor-import crash occurred inside `hipEventSynchronize`
+  called by `gpu_matrix_wait`; the fixed path passed the initial 30-run reproduction.
+- Temporary upload buffers are freed in stream order before recording writer completion,
+  so context retirement also observes the staging cleanup before destroying its stream.
+
+The new ignored GPU unit test
+`poly::dcrt::gpu::tests::test_gpu_graph_redundant_fork_join_dependencies_rebind_and_publish`
+checks independent producers, a many-to-many barrier, redundant dependencies, fresh input
+bindings, and every published payload. Existing device tests are unchanged.
+
+Validated runtime-correction snapshot checks:
+
+| Gate | Evidence | Result |
+| --- | --- | --- |
+| Warning-free CPU workspace lib compilation | `completion-cpu-build.log`, `.exit` | Passed |
+| Warning-free HIP gfx942 workspace lib compilation | `completion-hip-build.log`, `.exit` | Passed |
+| Ordinary unit tests in the HIP binaries | `completion-host-summary.json` | 652 passed, zero failures |
+| Selected ignored GPU units, three repetitions in each logical mode | `completion-smoke-summary.json` | 744 executions passed; 83 distinct cases; the two-device allocation query is skipped in identity mode |
+| Six synchronization regression cases, 300 repetitions per logical mode | `sync-repeat.commands.json`, `sync-repeat-summary.json`, `sync-repeat.exit` | 5,400 case executions in 2,700 invocations; zero failures; exit 0; 1,800 case executions per logical mode |
+
+The six repeated cases are the four initially failing BGV, failed-producer, parallel-export,
+and KHE parallel-loop tests, the new graph regression, and the selected trapdoor import test.
+The broader short-unit pass also covers the additional graph stalls found during diagnosis.
+No integration tests, long GPU Ring-GSW round trip, wave32 device run, multiple physical GPU
+run, CUDA device rerun, or sanitizer run is claimed here. HIP TFHE native kernels remain
+deferred. Whole-test timing comparisons are recorded separately; they are not controlled
+kernel benchmarks.
+
+The additional requested GPU.md re-review is recorded in
+`logs/pr174-amd-fix-20261014/gpu-compliance-review.md`. It identifies serialization of
+independent HIP control bodies and inherited synchronous device-artifact copies,
+per-import host pointer tables, and function bodies in a shared header. These findings were open at the runtime-only checkpoint and are resolved in
+the newer source described above. Passing tests alone does not establish compliance.
+
+## Historical compilation and CUDA device checkpoints
+
+Historical checkpoint: source `03c5c0719` (see "Cache-release synchronization and final-source
 gates" below). `gpu_device_release_cached_memory` now synchronizes the context streams before
 its whole-device allocation probe. With that change, the native library reproduction, the root
 addition, the parallel-wave, and the named/borrowed rebind tests report zero use-after-free.

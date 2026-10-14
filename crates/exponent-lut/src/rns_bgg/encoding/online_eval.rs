@@ -87,7 +87,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             data: crate::program::ProgramData::new(),
             hash_namespace: None,
             pending_refresh: None,
-            refresh_matrix_key: None,
+            inputs_by_shape: false,
             runtime: BTreeMap::new(),
         }
     }
@@ -140,11 +140,19 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         Ok(inputs)
     }
 
-    /// Sample a refresh's `A'` from the stage key `hash_key` derived
-    /// under `namespace` (see `RnsPreprocessBuild::with_refresh_matrix_key`).
-    pub fn with_refresh_matrix_key(mut self, namespace: [u8; 32], hash_key: &[u8]) -> Self {
-        self.refresh_matrix_key =
-            Some((namespace, crate::rns_bgg::refresh::child_hash_key(hash_key, &namespace)));
+    /// The value of the caller's `A'` of a refresh (see
+    /// `RnsPreprocessBuild::with_refresh_matrix`).
+    pub fn with_refresh_matrix(mut self, a_prime: RuntimeValue) -> Self {
+        self.runtime.insert(crate::rns_bgg::REFRESH_MATRIX_INPUT.to_owned(), a_prime);
+        self
+    }
+
+    /// This builder binding the Program's integer data by their declared shapes only (graph
+    /// inputs without values, unchecked): with a preprocessing bound by shape (see
+    /// `RnsPreprocessBuild::with_inputs_by_shape`), the stage graph is recorded and exported
+    /// but cannot be executed.
+    pub fn with_inputs_by_shape(mut self) -> Self {
+        self.inputs_by_shape = true;
         self
     }
 
@@ -250,39 +258,11 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         )
     }
 
-    /// Bind this builder to the mask child of part `part` (`(chain, component)`) of
-    /// `declaration`'s refresh; it must carry [`RefreshDeclaration::mask_namespace`] (see
+    /// Bind this builder to the fresh-noise child of part `part` (`(chain, component)`) of
+    /// `declaration`'s refresh; it must carry [`RefreshDeclaration::fresh_namespace`] (see
     /// [`Self::with_hash_namespace`]). Its inputs and material are imported under the child's
     /// namespace; the public payload of its PRF label is the label hashed from `label_tag` (see
     /// [`RefreshDeclaration::label`]), not the encrypted one.
-    #[allow(clippy::too_many_arguments)]
-    pub fn bind_refresh_mask_child(
-        &mut self,
-        declaration: &RefreshDeclaration,
-        part: (usize, usize),
-        label_tag: &[u8],
-        preprocess: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
-        encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
-        hash_key: &[u8],
-    ) -> Result<(), ApiError> {
-        let declaration =
-            crate::rns_bgg::refresh::refresh_part(declaration, part).map_err(ApiError::scheme)?;
-        let spec = *declaration.spec();
-        self.bind_refresh_child(
-            declaration,
-            (declaration.mask_namespace(), declaration.mask().program()),
-            declaration.mask().sampler().prf(),
-            None,
-            crate::rns_bgg::refresh::refresh_artifact_name(spec, "mask"),
-            label_tag,
-            (preprocess, encryption),
-            hash_key,
-        )
-    }
-
-    /// Bind this builder to the fresh-noise child of part `part` of `declaration`'s refresh
-    /// (see [`Self::bind_refresh_mask_child`]); it must carry
-    /// [`RefreshDeclaration::fresh_namespace`].
     #[allow(clippy::too_many_arguments)]
     pub fn bind_refresh_fresh_child(
         &mut self,
@@ -309,7 +289,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     }
 
     /// Bind this builder to the smudge child of the decoder of part `part` of `declaration`'s
-    /// refresh (see [`Self::bind_refresh_mask_child`]); it must carry the decoder's commitment
+    /// refresh (see [`Self::bind_refresh_fresh_child`]); it must carry the decoder's commitment
     /// ([`RefreshDeclaration::decoder`]) as its hash namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_refresh_smudge_child(
@@ -698,7 +678,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// its wire; a Dynamic one at the setup ring under its setup coordinate.
     /// `label`, a public input family with its label values and exponent
     /// layout, replaces that family's encrypted public payload (see
-    /// [`Self::bind_refresh_mask_child`]). `name` maps a role to its artifact name.
+    /// [`Self::bind_refresh_fresh_child`]). `name` maps a role to its artifact name.
     fn bind_encrypted_inputs(
         &mut self,
         program: &ExponentLutProgram,
@@ -793,18 +773,24 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     }
 
     /// Apply part `part` (`(chain, component)`) of `declaration`'s refresh to output
-    /// `target_index` when the graph is built: the bound children (`mask`, `fresh` and the
-    /// decoder's `smudge`) are lowered once, and the graph gains the output `refresh`, the CRT
-    /// term of the part's residue `y_j mod q` of its output prime `q`, a `1 x w_0` row in the
-    /// ring of the product `P` of the refreshed primes (the residue itself when `P = q`); the
-    /// terms of every chain sum to `y_j mod P` (see [`crate::refresh`]). The builder must carry
-    /// the refresh's matrix key ([`Self::with_refresh_matrix_key`]).
+    /// `target_index` when the graph is built: the bound children (`fresh` and the decoder's
+    /// `smudge`) are lowered once, and the graph gains the output `refresh`, the CRT term of the
+    /// part's residue `y_j mod q` of its output prime `q`, a `1 x w_0` row in the ring of the
+    /// product `P` of the refreshed primes (the residue itself when `P = q`); the terms of every
+    /// chain sum to `y_j mod P` (see [`crate::refresh`]).
+    ///
+    /// `sigma` is the row `g` of the caller's encoding of `sigma_0 G` whose key the part's
+    /// preprocessing read (see [Caller inputs](crate::refresh#caller-inputs)): component 1 of
+    /// that Program's first output, `1 x m` in the decoding ring (port
+    /// [`crate::rns_bgg::SIGMA_ROW_OUTPUT`] of its online evaluation). The graph reads it as a
+    /// plain input; without a value the stage can be recorded but not executed. `A'` is the
+    /// graph input [`crate::rns_bgg::REFRESH_MATRIX_INPUT`] (see [`Self::with_refresh_matrix`]).
     pub fn apply_refresh(
         &mut self,
         target_index: usize,
         declaration: &RefreshDeclaration,
         part: (usize, usize),
-        mask: RnsOnlineEvalBuild<'a>,
+        sigma: Option<RuntimeValue>,
         fresh: RnsOnlineEvalBuild<'a>,
         smudge: RnsOnlineEvalBuild<'a>,
     ) -> Result<(), ApiError> {
@@ -821,7 +807,6 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .validate_refresh_children(
                 declaration,
                 &evaluator.program,
-                mask.parameters,
                 fresh.parameters,
                 smudge.parameters,
             )
@@ -841,22 +826,18 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 .as_ref()
                 .and_then(|child| child.decoder_smudge.as_ref())
                 .map(|bound| *bound.commitment()) !=
-                Some(*decoder.commitment()) ||
-            child_program(&mask) != Some(declaration.mask().id()) ||
-            mask.hash_namespace != Some(declaration.mask_namespace())
+                Some(*decoder.commitment())
         {
             return Err(mismatch());
         }
-        if self.refresh_matrix_key.is_none() {
-            return Err(ApiError::input("a refresh needs with_refresh_matrix_key"));
+        if let Some(sigma) = sigma {
+            self.runtime.insert(
+                crate::rns_bgg::refresh::refresh_sigma_input_name(*declaration.spec()),
+                sigma,
+            );
         }
-        self.pending_refresh = Some((
-            target_index,
-            declaration.clone(),
-            Box::new(mask),
-            Box::new(fresh),
-            Box::new(smudge),
-        ));
+        self.pending_refresh =
+            Some((target_index, declaration.clone(), Box::new(fresh), Box::new(smudge)));
         Ok(())
     }
 
@@ -866,13 +847,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         &mut self,
         target_index: usize,
         declaration: &RefreshPartDeclaration,
-        mut mask: RnsOnlineEvalBuild<'a>,
         mut fresh: RnsOnlineEvalBuild<'a>,
         mut smudge: RnsOnlineEvalBuild<'a>,
         outputs: &[RnsBggEncoding],
     ) -> Result<(Mat, HashKeyInputs), RnsBggError> {
         use crate::rns_bgg::refresh::{
             hash_key_input_name, refresh_artifact_name, refresh_combination,
+            refresh_sigma_input_name,
         };
         let target = outputs
             .get(target_index)
@@ -931,24 +912,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .unmask_preimage_bound
             .clone()
             .ok_or(RnsBggError::Binding("the unmask preimage bound is not bound"))?;
-        let matrix_key = match &self.refresh_matrix_key {
-            Some((namespace, key)) => {
-                ring.bytes_input(hash_key_input_name(Some(namespace)), key.len())
-            }
-            None => return Err(RnsBggError::Binding("a refresh needs its matrix key")),
-        };
-        let a_prime = self.parameters.refresh_matrix(level, matrix_key, declaration)?;
-        // The one encoding: the mask carrier's component-1 row (moved down once) for the first
-        // block.
-        let one = {
-            let (outputs, child_manifests) = lower(&mut mask)?;
-            manifests.extend(child_manifests);
-            let carrier = outputs
-                .into_iter()
-                .next()
-                .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
-            (mod_down_encoding(carrier.row, &ring).1, one.1)
-        };
+        let a_prime = self.parameters.refresh_matrix(level, declaration)?;
+        // The one encoding: the caller's row `g` of the encoding of `sigma_0 G` (a carrier of
+        // the decoding ring) for the first block.
+        let one = (ring.input(refresh_sigma_input_name(spec), (1, columns)), one.1);
         let target_row =
             if declaration.component() == 0 { target.row.0.clone() } else { target.row.1.clone() };
         let output_columns = declaration.columns();
@@ -996,16 +963,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .as_mut()
             .ok_or(RnsBggError::Binding("online evaluation artifacts are not bound"))?;
         evaluator.manifests.extend(manifests);
-        let mut hash_keys = [&mask, &fresh, &smudge]
+        let hash_keys = [&fresh, &smudge]
             .into_iter()
             .map(|child| {
                 (hash_key_input_name(child.hash_namespace.as_ref()), child.hash_key.clone())
             })
             .collect::<Vec<_>>();
-        if let Some((namespace, key)) = &self.refresh_matrix_key {
-            hash_keys.push((hash_key_input_name(Some(namespace)), key.clone()));
-        }
-        for child in [&mut mask, &mut fresh, &mut smudge] {
+        for child in [&mut fresh, &mut smudge] {
             self.runtime.append(&mut child.runtime);
         }
         Ok((refreshed, hash_keys))
@@ -1101,7 +1065,9 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 "RNS-BGG preprocess binding does not match the online evaluation Program",
             ));
         }
-        self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
+        if !self.inputs_by_shape {
+            self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
+        }
         let expected_data = (!program.data_families().is_empty()).then(|| self.data.commitment());
         if preprocess_binding.data() != expected_data.as_ref() {
             return Err(ApiError::compatibility(
@@ -1112,7 +1078,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
         let data = crate::program::data_inputs(program, |family| {
             crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family)
         });
-        for family in program.data_families().keys() {
+        for family in program.data_families().keys().filter(|_| !self.inputs_by_shape) {
             let values = self.data.values(*family).expect("validated program data");
             self.runtime.insert(
                 crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), *family),
@@ -1235,8 +1201,8 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             None => None,
         };
         let refreshed = match self.pending_refresh.take() {
-            Some((index, declaration, mask, fresh, smudge)) => Some(
-                self.refresh_row(index, &declaration, *mask, *fresh, *smudge, &outputs)
+            Some((index, declaration, fresh, smudge)) => Some(
+                self.refresh_row(index, &declaration, *fresh, *smudge, &outputs)
                     .map_err(ApiError::scheme)?,
             ),
             None => None,

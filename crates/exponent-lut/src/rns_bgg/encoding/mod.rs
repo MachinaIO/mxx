@@ -569,13 +569,11 @@ pub struct RnsEncryptBuild<'a> {
     prelude: Option<(ProductionId, Manifest)>,
     /// For a refresh child: the namespace its hash key is derived under.
     hash_namespace: Option<[u8; 32]>,
-    /// The bound refresh part: its declaration, and its mask, fresh-noise and smudge children.
-    refresh: Option<(
-        RefreshPartDeclaration,
-        Box<RnsEncryptBuild<'a>>,
-        Box<RnsEncryptBuild<'a>>,
-        Box<RnsEncryptBuild<'a>>,
-    )>,
+    /// The bound refresh part: its declaration, and its fresh-noise and smudge children.
+    refresh: Option<(RefreshPartDeclaration, Box<RnsEncryptBuild<'a>>, Box<RnsEncryptBuild<'a>>)>,
+    /// Bind the inputs' plaintexts by their shapes only, whatever the stage is given (see
+    /// `RnsEncryptBuild::with_inputs_by_shape`).
+    inputs_by_shape: bool,
 }
 
 /// Online evaluation builder with no backend, secrets, or plaintexts.
@@ -609,17 +607,17 @@ pub struct RnsOnlineEvalBuild<'a> {
     data: crate::program::ProgramData,
     /// For a refresh child: the namespace its hash key is derived under.
     hash_namespace: Option<[u8; 32]>,
-    /// The applied refresh part: its target output index, declaration, and mask, fresh-noise
-    /// and smudge children.
+    /// The applied refresh part: its target output index, declaration, and fresh-noise and
+    /// smudge children.
     pending_refresh: Option<(
         usize,
         RefreshPartDeclaration,
         Box<RnsOnlineEvalBuild<'a>>,
         Box<RnsOnlineEvalBuild<'a>>,
-        Box<RnsOnlineEvalBuild<'a>>,
     )>,
-    /// The namespace and key of a refresh's `A'`.
-    refresh_matrix_key: Option<([u8; 32], Vec<u8>)>,
+    /// Bind the Program's data by their shapes only (see
+    /// `RnsOnlineEvalBuild::with_inputs_by_shape`).
+    inputs_by_shape: bool,
     /// The integer data of the Program and of its bound children, by graph
     /// input name: the Program's given data ([`RnsOnlineEvalBuild::with_data`])
     /// and the children's resident inputs holding the entries preprocessing

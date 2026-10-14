@@ -368,10 +368,10 @@ fn refresh_error_rows<P: Poly>(
     payload: &RnsBggPayloadSecret,
     sigma: &P,
     expected: &P,
-    hash_key: &[u8],
+    a_prime: Option<&RuntimeValue>,
 ) -> Result<([Mat; 2], BTreeMap<String, RuntimeValue>), ApiError> {
     use crate::rns_bgg::refresh::{
-        child_hash_key, hash_key_input_name, top_matrix, top_output_ring,
+        REFRESH_MATRIX_INPUT, component_matrix, top_matrix_input, top_output_ring,
     };
     let declaration = top.reference();
     let columns = declaration.columns();
@@ -380,11 +380,10 @@ fn refresh_error_rows<P: Poly>(
     }
     let ring = reference.ring(0).map_err(ApiError::scheme)?;
     let mut runtime = BTreeMap::new();
-    let namespace = top.matrix_namespace();
-    let key_name = hash_key_input_name(Some(&namespace));
-    let key = child_hash_key(hash_key, &namespace);
-    runtime.insert(key_name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
-    let key = ring.bytes_input(key_name, key.len());
+    if let Some(a_prime) = a_prime {
+        runtime.insert(REFRESH_MATRIX_INPUT.to_owned(), a_prime.clone());
+    }
+    let a_input = top_matrix_input(declaration);
     let modulus: BigUint = reference.level(0).map_err(ApiError::scheme)?.modulus().as_ref().clone();
     let sigma = polynomial_input(&ring, &modulus, "top-refresh-sigma", sigma, &mut runtime)?;
     let expected = match super::plaintext_inputs(
@@ -453,7 +452,7 @@ fn refresh_error_rows<P: Poly>(
             })
             .map_err(ApiError::scheme)?,
         };
-        let a_prime = top_matrix(declaration, key.clone(), part);
+        let a_prime = component_matrix(a_input.clone(), part);
         let a_row = |row: usize| {
             a_prime.clone().slice(
                 Some(mxx_ir_core::node::IndexRange {
@@ -486,12 +485,13 @@ fn refresh_error_rows<P: Poly>(
 /// (`j = 0, 1`) of the refresh `top`: `y_j` recombines the
 /// output `refresh` of every part `(chain, j)` (`results[chain][j]`, the
 /// residue `y_j mod q`) modulo the product `P` of the refreshed primes (`Q_0` when every slot
-/// is refreshed); `sigma = (sigma_0, 1)` with the mask
-/// child's bit polynomial `sigma`, `x = expected`, `r` the payload secret,
+/// is refreshed); `sigma = (sigma_0, 1)` with the caller's binary
+/// polynomial `sigma_0 = sigma`, `x = expected`, `r` the payload secret,
 /// and `Delta_0`, `G^st_0` those of the reference chain `reference`
-/// ([`RnsBggParameters::refresh_chain`] with `None`). `A'_(j)` is
-/// sampled under the refresh's matrix namespace of `hash_key`. Per
-/// column, the `n` coefficients centered modulo `P`.
+/// ([`RnsBggParameters::refresh_chain`] with `None`). `A'_(j)` is read from
+/// the caller's `a_prime` (the input [`crate::rns_bgg::REFRESH_MATRIX_INPUT`],
+/// see [Caller inputs](crate::refresh#caller-inputs)). Per column, the `n`
+/// coefficients centered modulo `P`.
 #[allow(clippy::too_many_arguments)]
 pub fn refresh_error<E, S, P>(
     top: &RefreshDeclaration,
@@ -500,7 +500,7 @@ pub fn refresh_error<E, S, P>(
     payload: &RnsBggPayloadSecret,
     sigma: &P,
     expected: &P,
-    hash_key: &[u8],
+    a_prime: &RuntimeValue,
     execution: &mut E,
     store: &mut S,
 ) -> Result<[Vec<Vec<BigInt>>; 2], ApiError>
@@ -511,7 +511,7 @@ where
 {
     let columns = top.reference().columns();
     let (rows, runtime) =
-        refresh_error_rows(top, Some(results), reference, payload, sigma, expected, hash_key)?;
+        refresh_error_rows(top, Some(results), reference, payload, sigma, expected, Some(a_prime))?;
     let mut graph = DslContext::new("rns-bgg-top-refresh-error");
     for (component, row) in rows.into_iter().enumerate() {
         graph = graph
@@ -588,7 +588,8 @@ fn threshold_ones(
 /// built and observed but not executed (its family input [`REFRESH_TERMS_INPUT`] is then
 /// unbound), as the export of its claim needs. The graph decodes in loops over the columns and
 /// coefficients and sums the parts' terms in a loop over the chains, so it does not grow with
-/// the ring dimension, the columns or the refreshed slots.
+/// the ring dimension, the columns or the refreshed slots. `a_prime` is the caller's `A'` (see
+/// [`refresh_error`]), absent for a graph that is not executed.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_refresh<E, S, P>(
     top: &RefreshDeclaration,
@@ -597,7 +598,7 @@ pub fn decode_refresh<E, S, P>(
     payload: &RnsBggPayloadSecret,
     sigma: &P,
     expected: &P,
-    hash_key: &[u8],
+    a_prime: Option<&RuntimeValue>,
     execution: &mut E,
     store: &mut S,
     before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
@@ -610,7 +611,7 @@ where
     let columns = top.reference().columns();
     let dimension = top.reference().ring_dimension as usize;
     let (rows, runtime) =
-        refresh_error_rows(top, results, reference, payload, sigma, expected, hash_key)?;
+        refresh_error_rows(top, results, reference, payload, sigma, expected, a_prime)?;
     let modulus = top.output_primes().into_iter().map(BigUint::from).product::<BigUint>();
     let mut total = Int::constant(0);
     for row in rows {

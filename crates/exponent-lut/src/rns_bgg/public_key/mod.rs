@@ -178,15 +178,17 @@ pub struct RnsPreprocessBuild<'a> {
     hash_namespace: Option<[u8; 32]>,
     /// The applied refresh part.
     refresh: Option<PreparedRefresh<'a>>,
-    /// The graph input name and length of a refresh's `A'` key.
-    refresh_matrix_key: Option<(String, usize)>,
+    /// Bind the Program's RHS plaintexts and data by their shapes only, whatever the stage is
+    /// given (see `RnsPreprocessBuild::with_inputs_by_shape`).
+    inputs_by_shape: bool,
 }
 
-/// A refresh part prepared by preprocessing: its lowered children, the public `B` of the
-/// unmask trapdoor, the decoder's preimage and its coefficient bound.
+/// A refresh part prepared by preprocessing: its lowered children, the production and manifest
+/// of the caller's encoding of `sigma_0 G` it reads the key of, the public `B` of the unmask
+/// trapdoor, the decoder's preimage and its coefficient bound.
 struct PreparedRefresh<'a> {
     declaration: crate::refresh::RefreshPartDeclaration,
-    mask: PublicKeyLowering<'a>,
+    sigma: (mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::Manifest),
     fresh: PublicKeyLowering<'a>,
     smudge: PublicKeyLowering<'a>,
     preimage: Preimage,

@@ -44,14 +44,15 @@ pub use encoding::{
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
-    RnsBggDecoderNoise, RnsBggDynamicNoise, RnsBggMaskSecretComponent, RnsBggNoiseBindings,
-    RnsBggNoiseBound, RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace,
-    RnsBggNoiseValue, RnsBggParameterManifest, RnsBggPlanRequest, RnsBggRefreshNoise,
-    RnsNoiseBuild, simulate_refresh_noise,
+    RefreshSigmaNoise, RnsBggDecoderNoise, RnsBggDynamicNoise, RnsBggMaskSecretComponent,
+    RnsBggNoiseBindings, RnsBggNoiseBound, RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs,
+    RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameterManifest, RnsBggPlanRequest,
+    RnsBggRefreshNoise, RnsNoiseBuild, simulate_refresh_noise,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 pub use refresh::{
-    RefreshChain, RefreshRun, RefreshSecurity, RnsBggRefresh, refresh_noise_accepted,
+    REFRESH_MATRIX_INPUT, RefreshChain, RefreshRun, RefreshSecurity, RefreshSigma,
+    RefreshSigmaRequest, RnsBggRefresh, SIGMA_ROW_OUTPUT, refresh_noise_accepted,
 };
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{

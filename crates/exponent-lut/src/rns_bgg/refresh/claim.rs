@@ -1,13 +1,13 @@
 //! The claim of a recorded refresh run ([`RefreshRun::protocol`]).
 
-use super::run::{RefreshRun, RnsBggRefresh};
+use super::run::{RefreshRun, RnsBggRefresh, SIGMA_ROW_OUTPUT};
 use crate::{
     api::ApiError,
     claim::{external, inputs_ending_with, stage, to_stage},
     program::{RhsId, WireId},
     program_gadgets::prf::SparseLwrPrf,
     refresh::{RefreshDeclaration, bit_flip_source},
-    rns_bgg::{REFRESH_TERMS_INPUT, data_input_name, plaintext_input_prefix},
+    rns_bgg::{REFRESH_MATRIX_INPUT, REFRESH_TERMS_INPUT, data_input_name, plaintext_input_prefix},
 };
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_ir_core::{
@@ -29,46 +29,68 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-/// The phases every part runs, each merged into one stage of the claim.
-const PHASES: [&str; 3] = ["preprocess", "encrypt", "online_eval"];
+/// The phases every part runs, each merged into one stage of the claim: the caller's encoding of
+/// `sigma_0 G` first (the part's preprocessing reads its key, its online evaluation its row).
+const PHASES: [&str; 6] = [
+    "sigma_preprocess",
+    "sigma_encrypt",
+    "sigma_online_eval",
+    "preprocess",
+    "encrypt",
+    "online_eval",
+];
 
 impl RefreshRun {
     /// The recorded run of `refresh` as a closed protocol, with failure probability
-    /// `2^failure_probability_log2` (`None` for a worst-case claim). The run must be complete
-    /// (its decode graph recorded by [`Self::decode`]) and the refresh's source must be
-    /// [`bit_flip_source`].
+    /// `2^failure_probability_log2` (`None` for a worst-case claim). `a_prime` is the recorded
+    /// graph of the caller's stage that produced `A'` and its output name: the protocol then has
+    /// it as stage `a_prime` (its byte inputs external) and the claim is about that `A'`;
+    /// without it `A'` is an external matrix of the reference ring (any `A'`), which the
+    /// protocol states but [`mxx_ir_core::lean::protocol::export`] does not support. The run must
+    /// be complete (its decode graph recorded by [`Self::decode`]) and the refresh's source
+    /// must be [`bit_flip_source`].
     ///
-    /// The protocol has the payload and mask sampling, every part's preprocessing, encryption
-    /// and online evaluation on its chain, and the decode stage, which counts the coefficients
-    /// of `y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` that decode to one (an error of at least
+    /// The protocol has the payload and mask sampling, every part's stages of the caller's
+    /// encoding of `sigma_0 G` (recorded through [`super::RefreshSigmaRequest::record`]; the
+    /// claim needs them, and their Program must be a binary [`crate::refresh::FreshNoiseProgram`]
+    /// on the invocation's label), every part's preprocessing, encryption and online evaluation
+    /// on its chain, and the decode stage, which counts the coefficients of
+    /// `y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` that decode to one (an error of at least
     /// `P / 4`, `P` the product of the refreshed primes); the ideal count is zero. External
-    /// inputs are the hash keys, the source input `X^b` and the expected `X^(1 - b)`, the label
-    /// `a` and its monomials, the selector bits and the coordinate tables (the cell coordinates
-    /// of the key layouts, one per PBC bucket, which every preprocessing stage receives and its
-    /// online evaluation reads from it) of every PRF (the mask keys shared by every part, the
-    /// fresh-noise keys of component `j` by every chain, each decoder's own), the unit offsets,
-    /// and the mask polynomial `sigma_0`. The requirement ties the monomials to `a`, makes every
-    /// selector row one-hot, the expected exponent the LUT of the input, `sigma_0` the bits of
-    /// the mask keys on `a` read through the mask tables, and `a` the invocation's label.
+    /// inputs are the hash keys, the caller's `A'` (any matrix), the source input `X^b` and the
+    /// expected `X^(1 - b)`, the label `a` and its monomials, the selector bits and the
+    /// coordinate tables (the cell coordinates of the key layouts, one per PBC bucket, which
+    /// every preprocessing stage receives and its online evaluation reads) of every PRF (the
+    /// sigma keys, the fresh-noise keys of component `j` shared by every chain, each decoder's
+    /// own), the unit offsets, and the mask polynomial `sigma_0`. The requirement ties the
+    /// monomials to `a`, makes every selector row one-hot, the expected exponent the LUT of the
+    /// input, `sigma_0` the bits of the sigma keys on `a` read through the sigma tables, and `a`
+    /// the invocation's label.
     ///
     /// The phases of the parts are merged into one stage each (by `merge_instances`), and every
     /// per-part input is a member of a family external over the parts (e.g. one family of each
     /// bucket's smudge selector rows over the parts); the requirement checks these families in
-    /// loops over the parts, ties the members of parts that read one key set (the mask keys, a
-    /// component's fresh keys, the label and the source input) and reads the mask keys of part
+    /// loops over the parts, ties the members of parts that read one key set (the sigma keys, a
+    /// component's fresh keys, the label and the source input) and reads the sigma keys of part
     /// 0. The decode stage reads the family of the parts' residue terms. The stages and the claim
     /// thus do not grow with the number of parts or columns.
     pub fn protocol(
         &self,
         refresh: &RnsBggRefresh,
         failure_probability_log2: Option<u32>,
+        a_prime: Option<(&Graph, &str)>,
     ) -> Result<ProtocolDecl, ApiError> {
         let (source, input, _) = bit_flip_source().map_err(ApiError::scheme)?;
         if refresh.source.id() != source.id() {
             return Err(ApiError::input("the refresh claim is stated for the bit-flip source"));
         }
         let top = &refresh.top;
-        let graphs = &self.graphs;
+        // The stage that produced the caller's `A'`, if given.
+        let mut graphs = self.graphs.clone();
+        if let Some((producer, _)) = a_prime {
+            graphs.insert("a_prime".to_owned(), producer.clone());
+        }
+        let graphs = &graphs;
         let graph = |name: &str| {
             graphs
                 .get(name)
@@ -90,6 +112,22 @@ impl RefreshRun {
         ]);
         let parts =
             (0..top.chains()).flat_map(|chain| [(chain, 0), (chain, 1)]).collect::<Vec<_>>();
+        if self.sigmas.len() != parts.len() {
+            return Err(ApiError::input("the run has no sigma encoding per part"));
+        }
+        // Each part's online evaluation reads the row of its sigma encoding.
+        for &(chain, component) in &parts {
+            let part = top
+                .part((chain, component))
+                .ok_or_else(|| ApiError::input("the refresh has no such part"))?;
+            links.insert(
+                super::refresh_sigma_input_name(*part.spec()),
+                (
+                    id(&format!("sigma_online_eval_{chain}_{component}")),
+                    SIGMA_ROW_OUTPUT.to_owned(),
+                ),
+            );
+        }
         // The decode stage reads the family of the parts' residue terms: the merged online
         // evaluation's output family `refresh` (part `(chain, j)` at `2 chain + j`).
         links.insert(REFRESH_TERMS_INPUT.to_owned(), (id("online_eval_0_0"), "refresh".to_owned()));
@@ -105,6 +143,9 @@ impl RefreshRun {
             }
         }
         let mut names = vec!["payload".to_owned(), "mask".to_owned()];
+        if a_prime.is_some() {
+            names.push("a_prime".to_owned());
+        }
         for &(chain, component) in &parts {
             for stage in PHASES {
                 names.push(format!("{stage}_{chain}_{component}"));
@@ -125,6 +166,51 @@ impl RefreshRun {
             input: input.into(),
         };
         let mut externals = Vec::new();
+
+        // The caller's `A'`, read by the parts and the decode stage: the output of its producer
+        // stage `a_prime`, whose byte inputs are externals, or else any matrix of the reference
+        // ring (an external the Lean export does not support).
+        match a_prime {
+            Some((producer, output)) => {
+                links.insert(REFRESH_MATRIX_INPUT.to_owned(), (id("a_prime"), output.to_owned()));
+                for node in producer.root_scope().nodes() {
+                    let NodeKind::Input { name, wire_type, artifact: None } = node.kind() else {
+                        continue;
+                    };
+                    let mxx_ir_core::types::WireType::Bytes { length } = wire_type else {
+                        return Err(ApiError::input("the A' stage reads a non-byte input"));
+                    };
+                    if !name.starts_with("rns-bgg/hash-key") {
+                        externals.push(external(
+                            &format!("a_prime_{name}"),
+                            InputValueContract::Bytes { length: length.clone() },
+                            vec![to_stage("a_prime", name)],
+                        ));
+                    }
+                }
+            }
+            None => {
+                let destinations = names
+                    .iter()
+                    .map(|name| {
+                        Ok(inputs_ending_with(graph(name)?, REFRESH_MATRIX_INPUT)
+                            .iter()
+                            .filter(|input| input.as_str() == REFRESH_MATRIX_INPUT)
+                            .map(|input| to_stage(name, input))
+                            .collect::<Vec<_>>())
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()?
+                    .concat();
+                externals.push(external(
+                    "a_prime",
+                    InputValueContract::MatrixLarge {
+                        matrix_type: super::top_reference_ring(top.reference())
+                            .matrix_type((2, 2 * top.reference().columns())),
+                    },
+                    destinations,
+                ));
+            }
+        }
 
         // Hash keys: one external per derived key name.
         let mut hash_keys = BTreeMap::<String, Vec<ProtocolInputDestination>>::new();
@@ -199,10 +285,10 @@ impl RefreshRun {
         let mut offset_coefficient = Vec::new();
         let mut zero_exponents = BTreeMap::<usize, Vec<ProtocolInputDestination>>::new();
         let mismatch = || ApiError::input("the parts' PRF children differ in shape");
-        for &(chain, component) in &parts {
-            let encrypt = format!("encrypt_{chain}_{component}");
-            let preprocess = format!("preprocess_{chain}_{component}");
-            for child in children(top, (chain, component))? {
+        for (index, &(chain, component)) in parts.iter().enumerate() {
+            for child in children(top, (chain, component), &self.sigmas[index])? {
+                let stage = |phase: &str| format!("{}{phase}_{chain}_{component}", child.stages);
+                let (encrypt, preprocess) = (stage("encrypt"), stage("preprocess"));
                 let prefix = plaintext_input_prefix(Some(&child.namespace), "input");
                 let wire = |wire: WireId, field: &str| {
                     to_stage(&encrypt, &format!("{prefix}/input/{wire:?}.{field}"))
@@ -243,10 +329,13 @@ impl RefreshRun {
                     if entry.0 != families[bucket].members {
                         return Err(mismatch());
                     }
-                    entry.1.push(to_stage(
-                        &preprocess,
-                        &data_input_name(Some(&child.namespace), *table),
-                    ));
+                    let name = data_input_name(Some(&child.namespace), *table);
+                    entry.1.push(to_stage(&preprocess, &name));
+                    // A Program evaluated on its own reads its tables as plain inputs of its
+                    // online evaluation (a child reads them from the part's preprocessing).
+                    if !child.stages.is_empty() {
+                        entry.1.push(to_stage(&stage("online_eval"), &name));
+                    }
                 }
             }
         }
@@ -447,13 +536,13 @@ impl RefreshRun {
                 .1;
             binding.destinations.push(requirement_input(&part_family.name));
         }
-        // `sigma_k` is the bit of mask member `k`: one exactly when `z_k mod Q < Q / 2` for
+        // `sigma_k` is the bit of sigma member `k`: one exactly when `z_k mod Q < Q / 2` for
         // `z_k = sum_b a[coordinate of the selected cell of bucket b]`; slot `f` of bucket `b`'s
         // selector row `k` selects cell `f` of member `k`, whose coordinate is entry `k W + f` of
-        // bucket `b`'s mask table (the zero member `v` for a dummy or padding cell). Every part
-        // reads the same mask keys (its members are tied), so part 0's stand for all.
+        // bucket `b`'s sigma table (the zero member `v` for a dummy or padding cell). Every part
+        // reads the same sigma keys (its members are tied), so part 0's stand for all.
         let sigma = requirement.input::<Family<Int>>("sigma", family(n as usize)).map_err(dsl)?;
-        let mask_prf = top.mask(0).ok_or_else(|| ApiError::input("no mask child"))?.sampler().prf();
+        let mask_prf = self.sigmas[0].0.sampler().prf();
         let mask_family = |name: String| {
             part_families
                 .get(&name)
@@ -537,43 +626,49 @@ impl RefreshRun {
     }
 }
 
-/// One PRF child of a part: its hash namespace, its PRF, its offset RHS (bound to one), and the
-/// external name of its selector families.
+/// One PRF Program of a part: its hash namespace, its PRF, its offset RHS (bound to one), the
+/// external name of its selector families, and the prefix of its stages' names (empty for a
+/// child lowered in the part's stages, `sigma_` for the caller's encoding of `sigma_0 G`).
 struct Child<'a> {
     namespace: [u8; 32],
     prf: &'a SparseLwrPrf,
     offsets: &'a [RhsId],
     selectors: String,
+    stages: &'static str,
 }
 
-/// The mask, fresh-noise and smudge children of part `(chain, component)` of `top`.
-fn children(
-    top: &RefreshDeclaration,
+/// The PRF Programs of part `(chain, component)` of `top`: the caller's encoding of `sigma_0 G`
+/// (`sigma`, its Program and namespace), the fresh-noise child and the decoder's smudge child.
+fn children<'a>(
+    top: &'a RefreshDeclaration,
     (chain, component): (usize, usize),
-) -> Result<[Child<'_>; 3], ApiError> {
+    sigma: &'a (crate::refresh::FreshNoiseProgram, [u8; 32]),
+) -> Result<[Child<'a>; 3], ApiError> {
     let part = (chain, component);
     let missing = || ApiError::input("the refresh has no such part");
-    let (mask, fresh) =
-        (top.mask(chain).ok_or_else(missing)?, top.fresh(part).ok_or_else(missing)?);
+    let fresh = top.fresh(part).ok_or_else(missing)?;
     let decoder = top.decoder(part).ok_or_else(missing)?;
     Ok([
         Child {
-            namespace: top.mask_namespace(part).ok_or_else(missing)?,
-            prf: mask.sampler().prf(),
-            offsets: mask.sampler().offset_rhs(),
+            namespace: sigma.1,
+            prf: sigma.0.sampler().prf(),
+            offsets: sigma.0.sampler().offset_rhs(),
             selectors: "mask".to_owned(),
+            stages: "sigma_",
         },
         Child {
             namespace: top.fresh_namespace(part).ok_or_else(missing)?,
             prf: fresh.sampler().prf(),
             offsets: fresh.sampler().offset_rhs(),
             selectors: format!("fresh_{component}"),
+            stages: "",
         },
         Child {
             namespace: *decoder.commitment(),
             prf: decoder.smudge().prf(),
             offsets: &[],
             selectors: format!("smudge_{chain}_{component}"),
+            stages: "",
         },
     ])
 }

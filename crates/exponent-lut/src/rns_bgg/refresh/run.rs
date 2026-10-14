@@ -2,47 +2,50 @@
 //!
 //! [`RnsBggRefresh`] holds a declared refresh with its source Program, its keys and its chains:
 //! the reference chain ([`RnsBggParameters::refresh_chain`] with `None`) and, per refreshed slot,
-//! the source chain, its pool and the chains of its mask, fresh-noise and smudge children
+//! the source chain, its pool and the chains of its fresh-noise and smudge children
 //! ([`RefreshChain`]). [`refresh_noise_accepted`] checks the simulated noise of every part before
-//! any stage runs, and [`RnsBggRefresh::security`] estimates the security of its encodings and
-//! of its output.
+//! any stage runs, given the error of the caller's encodings of `sigma_0 G`, and
+//! [`RnsBggRefresh::security`] estimates the security of its encodings and of its output.
 //!
 //! [`RnsBggRefresh::run`] samples the payload and mask secrets on the reference chain and runs,
-//! on every chain, the two parts (one per component), each through the three artifact stages:
+//! on every chain, the two parts (one per component). Each part first asks the caller for its
+//! encoding of `sigma_0 G` under those secrets ([`RefreshSigmaRequest`], [`RefreshSigma`]: the
+//! caller runs and records its own preprocessing, encryption and online evaluation, see
+//! [Caller inputs](crate::refresh#caller-inputs)), then runs the three artifact stages:
 //!
 //! - preprocessing prepares the source Program on the chain (under the chain's hash namespace), the
-//!   mask child (a binary polynomial `sigma_0`), the fresh-noise child, one smudge child per
-//!   decoder, the decoded keys, one unmask trapdoor and the preimages;
+//!   fresh-noise child, one smudge child per decoder, the decoded keys (with the caller's `K_g` and
+//!   `A'`), one unmask trapdoor and the preimages;
 //! - encryption encrypts the source input on the chain, the children's inputs on the shared hashed
 //!   PRF label, the one encoding and the unmask hint;
-//! - online evaluation combines `[mask carrier | one encoding]`, the target component and the fresh
-//!   noise into the decoded row of `q`, unmasks and rounds every column with its smudge, and
-//!   outputs the residue `y_j mod q`.
+//! - online evaluation combines `[g | one encoding]` (`g` the caller's row), the target component
+//!   and the fresh noise into the decoded row of `q`, unmasks and rounds every column with its
+//!   smudge, and outputs the residue `y_j mod q`.
 //!
 //! Every stage's validated graph is recorded in the returned [`RefreshRun`], whose
 //! [`RefreshRun::error`] and [`RefreshRun::decode`] recombine the residues of every chain
 //! modulo the product `P` of the refreshed primes and compare them with
-//! `sigma A'_(j) - Delta_0 r_j x G^st_0`, and whose [`RefreshRun::protocol`] states the claim of
-//! the recorded graphs.
+//! `sigma A'_(j) - Delta_0 r_j x G^st_0` for the caller's `sigma_0`, and whose
+//! [`RefreshRun::protocol`] states the claim of the recorded graphs.
 
 use crate::{
     api::{self, ApiError, PlaintextInputs, StageArtifacts, StageExecution, StageOutputs},
     decoder::simulation::AverageCaseConfig,
     program::{ExponentLutProgram, ProgramData, RhsId, WireId},
-    refresh::{RefreshDeclaration, RefreshKeyLayouts},
+    refresh::{FreshNoiseProgram, RefreshDeclaration, RefreshKeyLayouts},
     rns_bgg::{
-        RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseValue, RnsBggParameters,
-        RnsBggPayloadSecret, RnsBggPreprocessEncryptDescriptor, RnsEncryptBuild,
-        RnsOnlineEvalBuild, RnsPreprocessBuild, decode_refresh, refresh_error,
-        simulate_refresh_noise,
+        RefreshSigmaNoise, RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseValue,
+        RnsBggParameters, RnsBggPayloadSecret, RnsBggPreprocessEncryptDescriptor,
+        RnsBggPreprocessOnlineEvalDescriptor, RnsEncryptBuild, RnsOnlineEvalBuild,
+        RnsPreprocessBuild, decode_refresh, refresh_error, simulate_refresh_noise,
     },
     utils::refresh_output_security_bits,
 };
 use bigdecimal::BigDecimal;
 use mxx_backends::{
-    SessionStore,
+    RuntimeValue, SessionStore,
     poly::{
-        Poly, PolyParams,
+        PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
@@ -50,12 +53,16 @@ use mxx_ir_core::{Graph, ParamEnv, ValidatedGraph, artifact::ProductionId};
 use num_bigint::{BigInt, BigUint};
 use std::{cell::RefCell, collections::BTreeMap};
 
+/// The online evaluation output port of the row `g` of the caller's encoding of `sigma_0 G` when
+/// it is the first output of a Program: output `output-0` flattens its public key (ports 0 to 3)
+/// and its two component rows (ports 4 and 5), and `g` is component 1.
+pub const SIGMA_ROW_OUTPUT: &str = "output-0.5";
+
 /// The chains of one refreshed slot: its source chain, the pool hosting it and its children, and
-/// the chains of its mask, fresh-noise and smudge children.
+/// the chains of its fresh-noise and smudge children.
 pub struct RefreshChain {
     pub pool: DCRTPolyParams,
     pub source: RnsBggParameters,
-    pub mask: RnsBggParameters,
     pub fresh: RnsBggParameters,
     pub smudge: RnsBggParameters,
 }
@@ -76,9 +83,6 @@ impl RefreshChain {
         let decoder =
             top.decoder((chain, 0)).ok_or_else(|| ApiError::input("the refresh has no chain"))?;
         Ok(Self {
-            mask: parameters
-                .refresh_mask_parameters(top, chain, source, &pool, 1)
-                .map_err(ApiError::scheme)?,
             fresh: parameters
                 .refresh_fresh_parameters(top, chain, source, &pool, 1)
                 .map_err(ApiError::scheme)?,
@@ -91,8 +95,8 @@ impl RefreshChain {
     }
 
     /// The source chain and the children's chains.
-    pub fn parameters(&self) -> [&RnsBggParameters; 4] {
-        [&self.source, &self.mask, &self.fresh, &self.smudge]
+    pub fn parameters(&self) -> [&RnsBggParameters; 3] {
+        [&self.source, &self.fresh, &self.smudge]
     }
 }
 
@@ -100,6 +104,9 @@ impl RefreshChain {
 /// error width `encoding_error_sigma`, unmask trapdoor width `trapdoor_sigma`) fits its decoding
 /// margin and hides by `statistical_bits` under the average-case noise model with failure
 /// probability `2^-failure_exponent` per accepted bound ([`simulate_refresh_noise`]).
+/// `sigma(chain, chains, average)` is the error of the caller's encodings of `sigma_0 G` on chain
+/// `chain` (both components' parts read it) under the average-case model `average`, e.g.
+/// [`RnsBggParameters::refresh_carrier_noise`] of its Program.
 pub fn refresh_noise_accepted(
     top: &RefreshDeclaration,
     source: &ExponentLutProgram,
@@ -107,6 +114,7 @@ pub fn refresh_noise_accepted(
     trapdoor_sigma: f64,
     statistical_bits: usize,
     failure_exponent: u32,
+    sigma: impl Fn(usize, &RefreshChain, &AverageCaseConfig) -> Result<RefreshSigmaNoise, ApiError>,
 ) -> Result<bool, ApiError> {
     let average = AverageCaseConfig {
         failure_exponent,
@@ -122,10 +130,11 @@ pub fn refresh_noise_accepted(
             &[],
         )
         .map_err(ApiError::scheme)?;
+        let sigma = sigma(chain, &chains, &average)?;
         for component in 0..2 {
             let noise = simulate_refresh_noise(
                 &chains.source,
-                &chains.mask,
+                &sigma,
                 &chains.fresh,
                 &chains.smudge,
                 source,
@@ -227,14 +236,20 @@ impl RnsBggRefresh {
     /// in the session context `context` (byte 30 the part's chain, byte 31 its component), under
     /// the stage hash key `hash_key` and the invocation's label tag `label_tag`
     /// ([`RefreshDeclaration::label`]). `lhs` gives the source Program's inputs on a chain's
-    /// level 0. With `record_only`, the children bind their plaintexts and tables by shape only,
-    /// so the stages can be recorded but not executed (as for an export); otherwise they bind the
-    /// generated keys, which `self.keys` must hold.
+    /// level 0. `a_prime` is the caller's `A'` (see
+    /// [Caller inputs](crate::refresh#caller-inputs)), and `sigma` gives each part's encoding of
+    /// `sigma_0 G` (see [`RefreshSigmaRequest`]) before the part's stages run. With
+    /// `record_only`, the children bind their plaintexts and tables by shape only, so the stages
+    /// can be recorded but not executed (as for an export; `a_prime` and the encodings' rows may
+    /// then be absent); otherwise they bind the generated keys, which `self.keys` must hold.
+    #[allow(clippy::too_many_arguments)]
     pub fn run<E, S>(
         &self,
         (context, hash_key, label_tag): ([u8; 32], [u8; 32], &[u8]),
         record_only: bool,
+        a_prime: Option<RuntimeValue>,
         lhs: impl Fn(&DCRTPolyParams) -> PlaintextInputs<WireId, DCRTPoly>,
+        mut sigma: impl FnMut(RefreshSigmaRequest<'_>, &mut E, &mut S) -> Result<RefreshSigma, ApiError>,
         execution: &mut E,
         store: &mut S,
     ) -> Result<RefreshRun, ApiError>
@@ -242,10 +257,12 @@ impl RnsBggRefresh {
         E: StageExecution<S>,
         S: SessionStore,
     {
-        let keys = match (record_only, &self.keys) {
-            (true, _) => None,
-            (false, Some(keys)) => Some(keys),
-            (false, None) => return Err(ApiError::input("an executed refresh needs its keys")),
+        let keys = match (record_only, &self.keys, &a_prime) {
+            (true, _, _) => None,
+            (false, Some(keys), Some(_)) => Some(keys),
+            (false, _, _) => {
+                return Err(ApiError::input("an executed refresh needs its keys and its A'"));
+            }
         };
         let graphs = StageGraphs::default();
         let payload = RnsEncryptBuild::new(&self.reference, context).sample_payload_secret(
@@ -258,27 +275,57 @@ impl RnsBggRefresh {
             store,
             record(&graphs, "mask".to_owned()),
         )?;
-        let invocation = Invocation { context, hash_key, label_tag };
+        let invocation = Invocation { context, hash_key, label_tag, a_prime: a_prime.as_ref() };
         let mut outputs = Vec::with_capacity(self.chains.len());
         let mut productions = BTreeMap::new();
+        let mut sigmas = Vec::with_capacity(2 * self.chains.len());
         for (chain, chains) in self.chains.iter().enumerate() {
             let lhs = lhs(&chains.source.levels()[0]);
             let mut parts = Vec::with_capacity(2);
             for component in 0..2 {
-                let (part, [preprocess, encrypt]) = self.run_part(
+                let part = (chain, component);
+                let name = |stage: &str| format!("{stage}_{chain}_{component}");
+                let mut part_context = context;
+                part_context[30] = chain as u8;
+                part_context[31] = component as u8;
+                let request = RefreshSigmaRequest {
+                    part,
+                    chains,
+                    context: part_context,
+                    payload: &payload,
+                    mask: &mask,
+                    record_only,
+                    graphs: &graphs,
+                };
+                let provided = sigma(request, execution, store)?;
+                if provided.preprocess.descriptor().binding().program() !=
+                    Some(provided.program.id())
+                {
+                    return Err(ApiError::input("the sigma artifacts are not of its Program"));
+                }
+                let row = provided.online_eval.outputs.get(SIGMA_ROW_OUTPUT).cloned();
+                if row.is_none() && !record_only {
+                    return Err(ApiError::input("an executed refresh needs every sigma row"));
+                }
+                productions
+                    .insert(provided.preprocess.production().clone(), name("sigma_preprocess"));
+                productions.insert(provided.encryption.clone(), name("sigma_encrypt"));
+                let (outputs, [preprocess, encrypt]) = self.run_part(
                     keys,
                     chains,
                     &lhs,
                     (&payload, &mask),
-                    (chain, component),
+                    part,
+                    (&provided, row),
                     &invocation,
                     execution,
                     store,
                     &graphs,
                 )?;
-                productions.insert(preprocess, format!("preprocess_{chain}_{component}"));
-                productions.insert(encrypt, format!("encrypt_{chain}_{component}"));
-                parts.push(part);
+                productions.insert(preprocess, name("preprocess"));
+                productions.insert(encrypt, name("encrypt"));
+                parts.push(outputs);
+                sigmas.push((provided.program, provided.namespace));
             }
             tracing::info!(chain, "top refresh chain evaluated");
             let [first, second] = <[StageOutputs; 2]>::try_from(parts)
@@ -291,14 +338,17 @@ impl RnsBggRefresh {
             outputs: (!record_only).then_some(outputs),
             graphs: graphs.into_inner(),
             productions,
+            sigmas,
+            a_prime,
             hash_key,
             label_tag: label_tag.to_vec(),
         })
     }
 
-    /// One part's preprocessing, encryption and online evaluation on its chain `chains`, its
-    /// outputs and the productions of its preprocessing and encryption. Without `keys`, the
-    /// children bind their plaintexts and tables by shape only.
+    /// One part's preprocessing, encryption and online evaluation on its chain `chains`, with
+    /// the caller's encoding of `sigma_0 G` `sigma` (its artifacts and its row), its outputs and
+    /// the productions of its preprocessing and encryption. Without `keys`, the children bind
+    /// their plaintexts and tables by shape only.
     #[allow(clippy::too_many_arguments)]
     fn run_part<E, S>(
         &self,
@@ -307,6 +357,7 @@ impl RnsBggRefresh {
         lhs: &PlaintextInputs<WireId, DCRTPoly>,
         (payload, mask): (&RnsBggPayloadSecret, &RnsBggMaskSecret),
         (chain, component): (usize, usize),
+        (sigma, sigma_row): (&RefreshSigma, Option<RuntimeValue>),
         invocation: &Invocation<'_>,
         execution: &mut E,
         store: &mut S,
@@ -321,7 +372,6 @@ impl RnsBggRefresh {
         let part = (chain, component);
         let name = |stage: &str| format!("{stage}_{chain}_{component}");
         let missing = |what: &'static str| move || ApiError::input(what);
-        let mask_program = top.mask(chain).ok_or_else(missing("the refresh has no mask child"))?;
         let fresh_program = top.fresh(part).ok_or_else(missing("the refresh has no such part"))?;
         let decoder = top.decoder(part).ok_or_else(missing("the refresh has no such part"))?;
         // One preprocessing session per part.
@@ -329,27 +379,15 @@ impl RnsBggRefresh {
         context[30] = chain as u8;
         context[31] = component as u8;
         let env = ParamEnv::default();
-        let mask_level = chains.mask.levels()[0].clone();
         let fresh_level = chains.fresh.levels()[0].clone();
         let smudge_level = chains.smudge.levels()[0].clone();
         let chain_namespace = top.chain_namespace(chain);
-        let matrix_namespace = top.matrix_namespace();
-        let mask_namespace =
-            top.mask_namespace(part).ok_or_else(missing("the refresh has no such part"))?;
         let fresh_namespace =
             top.fresh_namespace(part).ok_or_else(missing("the refresh has no such part"))?;
         let sampler_error = |error| ApiError::scheme(crate::refresh::RefreshError::Sampler(error));
         let prf_error = |error| ApiError::scheme(crate::refresh::RefreshError::Prf(error));
         let child = ChildSession { context, hash_key, payload };
 
-        let mask_preprocess = child.preprocess(
-            &chains.mask,
-            mask_namespace,
-            mask_program.program(),
-            keys.map(|keys| mask_program.sampler().key_inputs(&mask_level, &keys.mask))
-                .transpose()
-                .map_err(sampler_error)?,
-        )?;
         let fresh_preprocess = child.preprocess(
             &chains.fresh,
             fresh_namespace,
@@ -375,6 +413,13 @@ impl RnsBggRefresh {
                 .map_err(prf_error)?,
         )?;
         smudge_preprocess.bind_decoder_smudge(decoder)?;
+        // The caller's `A'`, read by preprocessing and online evaluation.
+        let preprocess_build =
+            RnsPreprocessBuild::new(&chains.source, context).with_hash_namespace(chain_namespace);
+        let preprocess_build = match invocation.a_prime {
+            Some(a_prime) => preprocess_build.with_refresh_matrix(a_prime.clone()),
+            None => preprocess_build,
+        };
         let no_rhs = PlaintextInputs::<RhsId, DCRTPoly>::new();
         let chain_payload = payload.at_level(&chains.source, 0).map_err(ApiError::scheme)?;
         let (preprocess, online_eval) = api::preprocess(
@@ -383,9 +428,7 @@ impl RnsBggRefresh {
             &no_rhs,
             Some(&chain_payload),
             &hash_key,
-            RnsPreprocessBuild::new(&chains.source, context)
-                .with_hash_namespace(chain_namespace)
-                .with_refresh_matrix_key(matrix_namespace, &hash_key),
+            preprocess_build,
             execution,
             store,
             |build, outputs| {
@@ -394,7 +437,7 @@ impl RnsBggRefresh {
                     top,
                     part,
                     outputs[0].clone(),
-                    mask_preprocess,
+                    (&sigma.preprocess, sigma.program.program()),
                     fresh_preprocess,
                     smudge_preprocess,
                     trapdoor_sigma,
@@ -405,16 +448,6 @@ impl RnsBggRefresh {
         )?;
 
         let a = top.label(hash_key, label_tag).map_err(ApiError::scheme)?;
-        let mask_encrypt = child.encrypt(
-            &preprocess,
-            mask,
-            &chains.mask,
-            mask_namespace,
-            mask_program.program(),
-            keys.map(|_| mask_program.sampler().plaintext_inputs(&mask_level, &a))
-                .transpose()
-                .map_err(sampler_error)?,
-        )?;
         let fresh_encrypt = child.encrypt(
             &preprocess,
             mask,
@@ -447,22 +480,13 @@ impl RnsBggRefresh {
             RnsEncryptBuild::new(&chains.source, context).with_hash_namespace(chain_namespace),
             execution,
             store,
-            |build| build.bind_refresh(top, part, mask_encrypt, fresh_encrypt, smudge_encrypt),
+            |build| build.bind_refresh(top, part, fresh_encrypt, smudge_encrypt),
             record(graphs, name("encrypt")),
         )?;
 
         let child_online = |parameters, namespace| {
             RnsOnlineEvalBuild::new(parameters, context).with_hash_namespace(namespace)
         };
-        let mut mask_online = child_online(&chains.mask, mask_namespace);
-        mask_online.bind_refresh_mask_child(
-            top,
-            part,
-            label_tag,
-            &online_eval,
-            &encrypted,
-            &hash_key,
-        )?;
         let mut fresh_online = child_online(&chains.fresh, fresh_namespace);
         fresh_online.bind_refresh_fresh_child(
             top,
@@ -481,50 +505,85 @@ impl RnsBggRefresh {
             &encrypted,
             &hash_key,
         )?;
+        let online =
+            RnsOnlineEvalBuild::new(&chains.source, context).with_hash_namespace(chain_namespace);
+        let online = match invocation.a_prime {
+            Some(a_prime) => online.with_refresh_matrix(a_prime.clone()),
+            None => online,
+        };
         let outputs = api::online_eval(
             &source.without_lut_values(),
             &env,
             &online_eval,
             &encrypted,
             &hash_key,
-            RnsOnlineEvalBuild::new(&chains.source, context)
-                .with_hash_namespace(chain_namespace)
-                .with_refresh_matrix_key(matrix_namespace, &hash_key),
+            online,
             execution,
             store,
             |build, outputs| {
-                build.apply_refresh(0, top, part, mask_online, fresh_online, smudge_online)?;
+                build.apply_refresh(0, top, part, sigma_row, fresh_online, smudge_online)?;
                 Ok(outputs)
             },
             record(graphs, name("online_eval")),
         )?;
         Ok((outputs, [preprocess.production().clone(), encrypted.production().clone()]))
     }
+}
 
-    /// The mask polynomial `sigma_0` on the reference chain's level 0: the bits of the mask keys
-    /// on the invocation's label ([`RefreshKeyLayouts::mask_bits`]), or zero without generated
-    /// keys (a run that only records the decode graph, where any `sigma_0` serves).
-    fn mask_polynomial(&self, hash_key: [u8; 32], label_tag: &[u8]) -> Result<DCRTPoly, ApiError> {
-        let level = &self.reference.levels()[0];
-        Ok(match &self.keys {
-            Some(keys) => {
-                let bits =
-                    keys.mask_bits(&self.top, hash_key, label_tag).map_err(ApiError::scheme)?;
-                let bits =
-                    bits.into_iter().map(|bit| BigUint::from(u8::from(bit))).collect::<Vec<_>>();
-                DCRTPoly::from_biguints(level, &bits)
-            }
-            None => DCRTPoly::const_zero(level),
-        })
+/// What the caller's `sigma` of [`RnsBggRefresh::run`] receives for one part: the part
+/// `(chain, component)`, its chain's parameters, the part's session context and the run's
+/// secrets. The caller returns the part's encoding of `sigma_0 G` under these secrets (see
+/// [Caller inputs](crate::refresh#caller-inputs)) as a [`RefreshSigma`]: typically it
+/// preprocesses, encrypts and evaluates a binary [`FreshNoiseProgram`] of `n` samples modulo the
+/// chain's output prime on [`RnsBggParameters::refresh_child_parameters`] of `chains.source`,
+/// with the output use [`crate::rns_bgg::RnsOutputUse::Gadget`] and the payload and mask secrets
+/// at that chain's level 0, observing its stages with [`Self::record`] so that the claim
+/// ([`RefreshRun::protocol`]) includes them. With `record_only`, the stages are recorded but not
+/// executed (bind the plaintexts and data by shape, see `with_inputs_by_shape`).
+pub struct RefreshSigmaRequest<'a> {
+    pub part: (usize, usize),
+    pub chains: &'a RefreshChain,
+    pub context: [u8; 32],
+    pub payload: &'a RnsBggPayloadSecret,
+    pub mask: &'a RnsBggMaskSecret,
+    pub record_only: bool,
+    graphs: &'a StageGraphs,
+}
+
+impl<'a> RefreshSigmaRequest<'a> {
+    /// The stage observer recording the graph of the part's sigma stage `phase` (`preprocess`,
+    /// `encrypt` or `online_eval`) as stage `sigma_<phase>_<chain>_<component>` of the run.
+    pub fn record(
+        &self,
+        phase: &str,
+    ) -> impl FnOnce(&ValidatedGraph) -> Result<(), ApiError> + 'a + use<'a> {
+        let (chain, component) = self.part;
+        record(self.graphs, format!("sigma_{phase}_{chain}_{component}"))
     }
 }
 
-/// The session identities of one run: the session context, the stage hash key and the label tag.
+/// The caller's encoding of `sigma_0 G` for one part (see [`RefreshSigmaRequest`]): the Program
+/// that computes it (its first output, a binary [`FreshNoiseProgram`] for the claim's tie of
+/// `sigma_0` to its PRF bits) and the hash namespace its stages ran under, its preprocessing
+/// artifacts (the part's preprocessing reads its key), its encryption production, and its online
+/// evaluation's outputs (the part's online evaluation reads [`SIGMA_ROW_OUTPUT`]; empty for a
+/// record-only run).
+pub struct RefreshSigma {
+    pub program: FreshNoiseProgram,
+    pub namespace: [u8; 32],
+    pub preprocess: StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
+    pub encryption: ProductionId,
+    pub online_eval: StageOutputs,
+}
+
+/// The session identities of one run: the session context, the stage hash key, the label tag and
+/// the caller's `A'`.
 #[derive(Clone, Copy)]
 struct Invocation<'a> {
     context: [u8; 32],
     hash_key: [u8; 32],
     label_tag: &'a [u8],
+    a_prime: Option<&'a RuntimeValue>,
 }
 
 /// What every child stage of one part shares: the part's session context, the stage hash key and
@@ -602,8 +661,9 @@ fn record<'a>(
 
 /// One run of a refresh ([`RnsBggRefresh::run`]): its secrets, every part's outputs and the
 /// recorded stage graphs. Stage `payload` and `mask` sample the secrets, stage
-/// `<phase>_<chain>_<component>` is a part's phase (`preprocess`, `encrypt`, `online_eval`), and
-/// [`Self::decode`] records stage `decode`.
+/// `<phase>_<chain>_<component>` is a part's phase (`preprocess`, `encrypt`, `online_eval`),
+/// stage `sigma_<phase>_<chain>_<component>` the phase of the caller's encoding of `sigma_0 G`
+/// it recorded, and [`Self::decode`] records stage `decode`.
 pub struct RefreshRun {
     pub payload: RnsBggPayloadSecret,
     pub mask: RnsBggMaskSecret,
@@ -613,6 +673,10 @@ pub struct RefreshRun {
     pub(super) graphs: BTreeMap<String, Graph>,
     /// The stage name of every preprocessing and encryption production.
     pub(super) productions: BTreeMap<ProductionId, String>,
+    /// Every part's sigma Program and hash namespace, part `(chain, j)` at `2 chain + j`.
+    pub(super) sigmas: Vec<(FreshNoiseProgram, [u8; 32])>,
+    /// The caller's `A'`.
+    pub(super) a_prime: Option<RuntimeValue>,
     pub(super) hash_key: [u8; 32],
     pub(super) label_tag: Vec<u8>,
 }
@@ -626,11 +690,13 @@ impl RefreshRun {
     }
 
     /// The error rows `e'_j` of the executed `refresh`, per column the `n` coefficients centered
-    /// modulo `P`, for the expected plaintext `expected` on the reference chain's level 0 (see
-    /// [`refresh_error`]). A record-only run has no error rows.
+    /// modulo `P`, for the caller's mask polynomial `sigma` (`sigma_0`, binary) and the expected
+    /// plaintext `expected` on the reference chain's level 0 (see [`refresh_error`]). A
+    /// record-only run has no error rows.
     pub fn error<E, S>(
         &self,
         refresh: &RnsBggRefresh,
+        sigma: &DCRTPoly,
         expected: &DCRTPoly,
         execution: &mut E,
         store: &mut S,
@@ -641,27 +707,30 @@ impl RefreshRun {
     {
         let results =
             self.results().ok_or_else(|| ApiError::input("a record-only run has no errors"))?;
-        let sigma = refresh.mask_polynomial(self.hash_key, &self.label_tag)?;
+        let a_prime =
+            self.a_prime.as_ref().ok_or_else(|| ApiError::input("an executed run has its A'"))?;
         refresh_error(
             &refresh.top,
             &results,
             &refresh.reference,
             &self.payload,
-            &sigma,
+            sigma,
             expected,
-            &self.hash_key,
+            a_prime,
             execution,
             store,
         )
     }
 
-    /// The decode stage of `refresh` for the expected plaintext `expected` (see
-    /// [`decode_refresh`]): the number of refreshed coefficients that fail to decode, zero for a
-    /// correct refresh. Its graph is recorded as stage `decode`; for a record-only run it is
-    /// built and recorded but not executed, so the call then returns the execution's error.
+    /// The decode stage of `refresh` for the caller's mask polynomial `sigma` and the expected
+    /// plaintext `expected` (see [`decode_refresh`]): the number of refreshed coefficients that
+    /// fail to decode, zero for a correct refresh. Its graph is recorded as stage `decode`; for a
+    /// record-only run it is built and recorded but not executed (any `sigma` serves), so the
+    /// call then returns the execution's error.
     pub fn decode<E, S>(
         &mut self,
         refresh: &RnsBggRefresh,
+        sigma: &DCRTPoly,
         expected: &DCRTPoly,
         execution: &mut E,
         store: &mut S,
@@ -670,16 +739,15 @@ impl RefreshRun {
         E: StageExecution<S>,
         S: SessionStore,
     {
-        let sigma = refresh.mask_polynomial(self.hash_key, &self.label_tag)?;
         let graphs = StageGraphs::default();
         let decoded = decode_refresh(
             &refresh.top,
             self.results().as_deref(),
             &refresh.reference,
             &self.payload,
-            &sigma,
+            sigma,
             expected,
-            &self.hash_key,
+            self.a_prime.as_ref(),
             execution,
             store,
             record(&graphs, "decode".to_owned()),

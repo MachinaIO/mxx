@@ -67,7 +67,16 @@ impl<'a> RnsEncryptBuild<'a> {
             prelude: None,
             hash_namespace: None,
             refresh: None,
+            inputs_by_shape: false,
         }
+    }
+
+    /// This builder binding the inputs' plaintexts by their declared shapes only, whatever the
+    /// stage ([`crate::api::encrypt`]) is given, as [`Self::bind_lhs_inputs`] with `None` does:
+    /// the stage graph is recorded and exported but cannot be executed.
+    pub fn with_inputs_by_shape(mut self) -> Self {
+        self.inputs_by_shape = true;
+        self
     }
 
     /// Make this builder a refresh child that samples its public matrices
@@ -79,15 +88,13 @@ impl<'a> RnsEncryptBuild<'a> {
 
     /// Attach the children of part `part` (`(chain, component)`) of `declaration`'s refresh,
     /// each bound to its inputs (the PRF label and `mono(0)`), the secrets and the source's
-    /// preprocess artifacts: `mask` the mask child (under
-    /// [`RefreshDeclaration::mask_namespace`]), `fresh` the fresh-noise child (under
+    /// preprocess artifacts: `fresh` the fresh-noise child (under
     /// [`RefreshDeclaration::fresh_namespace`]) and `smudge` the decoder's smudge child. Their
     /// encodings, the one encoding and the unmask hint are published into this encryption.
     pub fn bind_refresh(
         &mut self,
         declaration: &RefreshDeclaration,
         part: (usize, usize),
-        mask: RnsEncryptBuild<'a>,
         fresh: RnsEncryptBuild<'a>,
         smudge: RnsEncryptBuild<'a>,
     ) -> Result<(), ApiError> {
@@ -117,15 +124,11 @@ impl<'a> RnsEncryptBuild<'a> {
                 Some(declaration.fresh().program().inputs()) ||
             !bound(&smudge, *decoder.commitment()) ||
             smudge.decoder_smudge.as_ref().map(|bound| *bound.commitment()) !=
-                Some(*decoder.commitment()) ||
-            !bound(&mask, declaration.mask_namespace()) ||
-            mask.inputs.as_ref().map(|inputs| inputs.inputs()) !=
-                Some(declaration.mask().program().inputs())
+                Some(*decoder.commitment())
         {
             return Err(mismatch());
         }
-        self.refresh =
-            Some((declaration.clone(), Box::new(mask), Box::new(fresh), Box::new(smudge)));
+        self.refresh = Some((declaration.clone(), Box::new(fresh), Box::new(smudge)));
         Ok(())
     }
 
@@ -463,7 +466,6 @@ impl<'a> RnsEncryptBuild<'a> {
     fn append_refresh(
         &mut self,
         declaration: &RefreshPartDeclaration,
-        mask_child: &RnsEncryptBuild<'a>,
         fresh: &RnsEncryptBuild<'a>,
         smudge: &RnsEncryptBuild<'a>,
         mut graph: DslContext,
@@ -472,8 +474,7 @@ impl<'a> RnsEncryptBuild<'a> {
     ) -> Result<DslContext, ApiError> {
         use crate::rns_bgg::refresh::{
             hash_key_input_name, refresh_artifact_name, refresh_fresh_artifact_name,
-            refresh_fresh_input_key_artifact_name, refresh_mask_artifact_name,
-            refresh_mask_input_key_artifact_name,
+            refresh_fresh_input_key_artifact_name,
         };
         let spec = *declaration.spec();
         let mut child_graph = |graph: DslContext,
@@ -500,13 +501,6 @@ impl<'a> RnsEncryptBuild<'a> {
             declaration.fresh().program(),
             &|role| refresh_fresh_artifact_name(spec, role),
             &|wire, port| refresh_fresh_input_key_artifact_name(spec, wire, port),
-        )?;
-        graph = child_graph(
-            graph,
-            mask_child,
-            declaration.mask().program(),
-            &|role| refresh_mask_artifact_name(spec, role),
-            &|wire, port| refresh_mask_input_key_artifact_name(spec, wire, port),
         )?;
         let decoder = declaration.decoder();
         let key = decoder.artifact_key();
@@ -793,7 +787,8 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         mask: Option<&Self::MaskSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        self.bind_encryption_inputs(inputs, parameters, Some(lhs), payload, mask, hash_key)
+        let lhs = (!self.inputs_by_shape).then_some(lhs);
+        self.bind_encryption_inputs(inputs, parameters, lhs, payload, mask, hash_key)
     }
 
     fn bind_artifacts(
@@ -958,16 +953,8 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             merge_runtime_inputs(&mut self.runtime, &child.runtime)?;
             self.manifests.extend(child.manifests.clone());
         }
-        if let Some((declaration, mask_child, fresh, smudge)) = self.refresh.take() {
-            graph = self.append_refresh(
-                &declaration,
-                &mask_child,
-                &fresh,
-                &smudge,
-                graph,
-                &hash_key,
-                &mask,
-            )?;
+        if let Some((declaration, fresh, smudge)) = self.refresh.take() {
+            graph = self.append_refresh(&declaration, &fresh, &smudge, graph, &hash_key, &mask)?;
         }
         if dynamic {
             graph = self.dynamic_material(graph, &hash_key, |role| role)?;

@@ -8,9 +8,9 @@
 //!
 //! # Computation
 //!
-//! With the one encoding `[g | c_1]`, `g = sigma_0 K_g - (M + 1) sigma_0 G_Q + e_g` the mask
-//! child's carrier (`= -sigma_0 G_Q` modulo `q`) and `c_1` the second block of a public-payload
-//! encoding of `1` at level `l`, and the fresh-noise carriers
+//! With the one encoding `[g | c_1]`, `g = s K_g - v G_Q + e_g` the caller's encoding of
+//! `v = sigma_0` modulo `q` (see [Caller inputs](super#caller-inputs)) and `c_1` the second block
+//! of a public-payload encoding of `1` at level `l`, and the fresh-noise carriers
 //! `f_k = s K_(f,k) - e'_k G_Q + e_(f,k)` (scale 1), for `Q_q = Q / q`:
 //!
 //! - `u = [g | c_1] (I_2 ⊗ G_Q)^-1(Q_q A'_(j)) = s A_1 X - Q_q sigma A'_(j) + e_1 X` modulo `q`;
@@ -23,17 +23,14 @@
 //! [`DecoderTarget::Refresh`]) to `y_j mod q`: every column has its own smudge keys and its own
 //! preimage column, so the columns are decoded independently, but as one `1 x w_0` row (one
 //! smudge family over the columns, one preimage of `w_0` columns). Preprocessing computes the
-//! decoded key `K` by the same steps on the public keys to sample the decoder's preimage; the
-//! output key `A'_(j)` is public.
+//! decoded key `K` by the same steps on the public keys (the caller's `K_g` and `A'`) to sample
+//! the decoder's preimage; the output key `A'_(j)` is the caller's public input.
 
 use super::{FreshNoiseProgram, RefreshError, TopReference, commitment};
 use crate::{
     decoder::decoding::{DecoderDeclaration, DecoderSmudgeProgram, DecoderTarget},
     program::{ExponentLutProgram, ExponentLutProgramId, WireId},
-    program_gadgets::{
-        prf::{PrfKeyShape, SparseLwrPrfProfile},
-        prf_sampler::PrfDistribution,
-    },
+    program_gadgets::prf::{PrfKeyShape, SparseLwrPrfProfile},
 };
 use mxx_backends::sampler::hash::sample_hash_integers;
 use num_bigint::BigUint;
@@ -49,18 +46,16 @@ pub(crate) struct RefreshPartDeclaration {
     primes: usize,
     columns: usize,
     coefficients: usize,
-    matrix_tag: Vec<u8>,
     fresh: FreshNoiseProgram,
     decoder: DecoderDeclaration,
     spec: [u8; 32],
-    /// The commitment of the whole refresh: it names the label and `A'`.
+    /// The commitment of the whole refresh: it names the label.
     refresh: [u8; 32],
     component: usize,
     output_prime: usize,
     output_modulus: u64,
     output_moduli: Vec<u64>,
     reference: TopReference,
-    mask: FreshNoiseProgram,
 }
 
 impl RefreshPartDeclaration {
@@ -69,9 +64,8 @@ impl RefreshPartDeclaration {
     /// CBD(`eta`) noise on the keys of shape `fresh_keys` (one polynomial per column), the decoder
     /// of the output prime `output_prime = (index, q)` (an index into the decoding level's
     /// primes) smudges with `digits` digits on the keys of shape `smudge_keys` (`w_0 n d` members,
-    /// column `k` the members from `k n d`), the mask child's binary samples on the keys of
-    /// shape `mask_keys` (`n` members, the bit modulo `q`), and `A'` under `matrix_tag`;
-    /// `output_moduli` are the refreshed primes (`q` among them).
+    /// column `k` the members from `k n d`); `output_moduli` are the refreshed primes (`q` among
+    /// them).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         source_program: &ExponentLutProgram,
@@ -84,10 +78,8 @@ impl RefreshPartDeclaration {
         component: usize,
         digits: usize,
         reference: TopReference,
-        mask_keys: PrfKeyShape,
         fresh_keys: PrfKeyShape,
         smudge_keys: PrfKeyShape,
-        matrix_tag: Vec<u8>,
         refresh: [u8; 32],
     ) -> Result<Self, RefreshError> {
         let coefficients =
@@ -95,14 +87,6 @@ impl RefreshPartDeclaration {
         if component > 1 || output_prime.0 >= primes || !output_moduli.contains(&output_prime.1) {
             return Err(RefreshError::InvalidDeclaration);
         }
-        // One polynomial of `n` bits `h (1 +- 1)`, `h = 2^-1 mod q`.
-        let mask = FreshNoiseProgram::with_distribution(
-            profile,
-            PrfDistribution::Binary { q_min: output_prime.1 },
-            1,
-            coefficients,
-            mask_keys,
-        )?;
         let columns = reference.columns();
         if primes < 2 {
             return Err(RefreshError::InvalidDeclaration);
@@ -117,7 +101,7 @@ impl RefreshPartDeclaration {
         // the key sets (the decoder's commitment covers its smudge keys). The smudge Programs and
         // their key shapes are lists of one decoder.
         let spec = commitment(&(
-            b"mxx-exponent-lut/refresh/spec/v2".as_slice(),
+            b"mxx-exponent-lut/refresh/spec/v3".as_slice(),
             source_program.id(),
             target_output,
             &profile,
@@ -126,21 +110,11 @@ impl RefreshPartDeclaration {
             columns,
             coefficients,
             digits,
-            &matrix_tag,
             fresh.id(),
             fresh.keys()?,
             vec![smudge.id()],
             vec![smudge.prf().key_shape().ok_or(RefreshError::InvalidDeclaration)?],
-            mask.keys()?,
-            (
-                refresh,
-                component,
-                output_prime.0,
-                output_prime.1,
-                &output_moduli,
-                &reference,
-                mask.id(),
-            ),
+            (refresh, component, output_prime.0, output_prime.1, &output_moduli, &reference),
         ))?;
         let decoder = DecoderDeclaration::from_smudge(
             source_program,
@@ -158,7 +132,6 @@ impl RefreshPartDeclaration {
             primes,
             columns,
             coefficients,
-            matrix_tag,
             fresh,
             decoder,
             spec,
@@ -168,7 +141,6 @@ impl RefreshPartDeclaration {
             output_modulus: output_prime.1,
             output_moduli,
             reference,
-            mask,
         })
     }
 
@@ -203,11 +175,6 @@ impl RefreshPartDeclaration {
     /// The fresh-noise child.
     pub(crate) const fn fresh(&self) -> &FreshNoiseProgram {
         &self.fresh
-    }
-
-    /// The mask child: one polynomial of `n` bits modulo the output prime.
-    pub(crate) const fn mask(&self) -> &FreshNoiseProgram {
-        &self.mask
     }
 
     /// The decoder of the output prime.
@@ -246,7 +213,7 @@ impl RefreshPartDeclaration {
     }
 
     /// The PRF label `a in Z_Q'^v` of an invocation with label tag `label_tag` under the stage
-    /// hash key: uniform weak-PRF input of every mask, fresh-noise and smudge key (random-oracle
+    /// hash key: uniform weak-PRF input of every fresh-noise and smudge key (random-oracle
     /// model), shared by every part of the refresh.
     pub(crate) fn label(
         &self,
@@ -263,25 +230,6 @@ impl RefreshPartDeclaration {
         .into_iter()
         .map(|value| usize::try_from(value).map_err(|_| RefreshError::InvalidDeclaration))
         .collect()
-    }
-
-    /// The hash tag of the public matrix `A'_(j)`: the matrix tag and the component as an
-    /// integer component (parts differ only in integers, so their stages share one structure).
-    pub(crate) fn matrix_hash_tag(&self) -> mxx_dsl::HashTag {
-        let mut tag = mxx_dsl::HashTag::from(
-            [b"refresh/v1/A".as_slice(), self.matrix_tag.as_slice()].concat(),
-        );
-        tag.push("component");
-        tag.push(mxx_ir_core::IntExpr::constant(self.component));
-        tag
-    }
-
-    /// The hash namespace of the mask child.
-    pub(crate) fn mask_namespace(&self) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(b"mxx-exponent-lut/refresh/mask-namespace/v1");
-        digest.update(self.spec);
-        digest.finalize().into()
     }
 
     /// The hash namespace of the fresh-noise child (the decoder's smudge child uses its decoder

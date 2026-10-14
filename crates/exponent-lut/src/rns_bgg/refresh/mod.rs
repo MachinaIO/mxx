@@ -1,9 +1,9 @@
 //! The RNS-BGG arithmetic of the noise refresh (see [`crate::refresh`]).
 //!
-//! The stages of a part share the public pieces defined here: the hash-sampled `A'_(j)` and
-//! one-encoding key, the digit actions `X, Y, z` of the output prime, the combination `d` (the
-//! same on keys and rows), the CRT term of the part's residue, and the refresh's chains, child
-//! hash keys and artifact names.
+//! The stages of a part share the public pieces defined here: the caller's `A'_(j)` (the graph
+//! input [`REFRESH_MATRIX_INPUT`]), the hash-sampled one-encoding key, the digit actions `X, Y, z`
+//! of the output prime, the combination `d` (the same on keys and rows), the CRT term of the
+//! part's residue, and the refresh's chains, child hash keys and artifact names.
 //!
 //! [`run`] runs a declared refresh on its chains and records its stage graphs, and [`claim`]
 //! states the claim of a recorded run.
@@ -15,7 +15,16 @@ use crate::{
 
 mod claim;
 mod run;
-pub use run::{RefreshChain, RefreshRun, RefreshSecurity, RnsBggRefresh, refresh_noise_accepted};
+pub use run::{
+    RefreshChain, RefreshRun, RefreshSecurity, RefreshSigma, RefreshSigmaRequest, RnsBggRefresh,
+    SIGMA_ROW_OUTPUT, refresh_noise_accepted,
+};
+
+/// The graph input of the caller's `A' = [A'_(0) | A'_(1)]` (`2 x 2 w_0` over the reference's
+/// level-0 ring, see [Caller inputs](crate::refresh#caller-inputs)): every part's preprocessing
+/// and online evaluation and the decode stage read it under this name.
+pub const REFRESH_MATRIX_INPUT: &str = "top-refresh-a-prime";
+
 /// `refresh/<spec>/<role>`: the namespace of every refresh artifact.
 pub(crate) fn refresh_artifact_name(spec: [u8; 32], role: &str) -> String {
     format!("refresh/{}/{role}", decoder_commitment_hex(spec))
@@ -35,18 +44,11 @@ pub(crate) fn refresh_fresh_input_key_artifact_name(
     refresh_fresh_artifact_name(spec, &format!("input-key/{wire:?}.{port}"))
 }
 
-/// `refresh/<spec>/mask/<role>`: an artifact of a part's mask child.
-pub(crate) fn refresh_mask_artifact_name(spec: [u8; 32], role: &str) -> String {
-    refresh_artifact_name(spec, &format!("mask/{role}"))
-}
-
-/// The public-key artifact `port` of mask child input `wire`.
-pub(crate) fn refresh_mask_input_key_artifact_name(
-    spec: [u8; 32],
-    wire: WireId,
-    port: usize,
-) -> String {
-    refresh_mask_artifact_name(spec, &format!("input-key/{wire:?}.{port}"))
+/// `refresh/<spec>/sigma-encoding`: the online evaluation's graph input of the caller's row `g`
+/// of the encoding of `sigma_0 G` (see [Caller inputs](crate::refresh#caller-inputs)), one name
+/// per part.
+pub(crate) fn refresh_sigma_input_name(spec: [u8; 32]) -> String {
+    refresh_artifact_name(spec, "sigma-encoding")
 }
 
 /// Part `part` of `declaration`.
@@ -123,9 +125,30 @@ impl RnsBggParameters {
         Ok(level)
     }
 
-    /// The fresh-noise child's chain of chain `chain` of `declaration` (these parameters; see
-    /// [`Self::child_chain`]): its outputs are raw coefficient carriers at their LUT input
-    /// level, moved down once to the decoding level. Both components' fresh children share it.
+    /// The chain on which the raw coefficient Program `child` (one output, a
+    /// [`crate::refresh::FreshNoiseProgram`]) of chain `chain` of `declaration` (these parameters)
+    /// is evaluated (a child chain of these parameters): its output's LUT input level is followed
+    /// by the part's decoding level, so its normalized carrier is a carrier of the decoding
+    /// ring. The fresh-noise children run on it, and so may the caller's encoding of `sigma_0
+    /// G` (see [Caller inputs](crate::refresh#caller-inputs)), with the output use
+    /// [`super::RnsOutputUse::Gadget`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn refresh_child_parameters(
+        &self,
+        declaration: &RefreshDeclaration,
+        chain: usize,
+        source_program: &ExponentLutProgram,
+        child: &crate::refresh::FreshNoiseProgram,
+        pool: &DCRTPolyParams,
+        primes_per_drop: usize,
+    ) -> Result<Self, RnsBggError> {
+        let part = refresh_part(declaration, (chain, 0))?;
+        let level = self.refresh_level(part, source_program)?;
+        self.child_chain(level, noise_program_level(child)?, pool, primes_per_drop)
+    }
+
+    /// The fresh-noise child's chain of chain `chain` of `declaration` (see
+    /// [`Self::refresh_child_parameters`]). Both components' fresh children share it.
     pub fn refresh_fresh_parameters(
         &self,
         declaration: &RefreshDeclaration,
@@ -134,9 +157,17 @@ impl RnsBggParameters {
         pool: &DCRTPolyParams,
         primes_per_drop: usize,
     ) -> Result<Self, RnsBggError> {
-        let part = refresh_part(declaration, (chain, 0))?;
-        let level = self.refresh_level(part, source_program)?;
-        self.child_chain(level, Self::refresh_fresh_level(part)?, pool, primes_per_drop)
+        let fresh = declaration
+            .fresh((chain, 0))
+            .ok_or(RnsBggError::Parameters("the refresh has no such part"))?;
+        self.refresh_child_parameters(
+            declaration,
+            chain,
+            source_program,
+            fresh,
+            pool,
+            primes_per_drop,
+        )
     }
 
     /// The common LUT input level of the fresh-noise child's outputs.
@@ -146,55 +177,31 @@ impl RnsBggParameters {
         noise_program_level(declaration.fresh())
     }
 
-    /// The LUT input level of the mask child's output.
-    pub(crate) fn refresh_mask_level(
-        declaration: &RefreshPartDeclaration,
-    ) -> Result<usize, RnsBggError> {
-        noise_program_level(declaration.mask())
-    }
-
-    /// The mask child's chain of chain `chain` of `declaration` (see
-    /// [`Self::refresh_fresh_parameters`]).
-    pub fn refresh_mask_parameters(
-        &self,
-        declaration: &RefreshDeclaration,
-        chain: usize,
-        source_program: &ExponentLutProgram,
-        pool: &DCRTPolyParams,
-        primes_per_drop: usize,
-    ) -> Result<Self, RnsBggError> {
-        let part = refresh_part(declaration, (chain, 0))?;
-        let level = self.refresh_level(part, source_program)?;
-        self.child_chain(level, Self::refresh_mask_level(part)?, pool, primes_per_drop)
-    }
-
-    /// Check the children's chains `mask`, `fresh` and `smudge` against the part `declaration`.
+    /// Check the children's chains `fresh` and `smudge` against the part `declaration`.
     pub(crate) fn validate_refresh_children(
         &self,
         declaration: &RefreshPartDeclaration,
         source_program: &ExponentLutProgram,
-        mask: &Self,
         fresh: &Self,
         smudge: &Self,
     ) -> Result<usize, RnsBggError> {
         let level = self.refresh_level(declaration, source_program)?;
         self.validate_child_chain(fresh, level, Self::refresh_fresh_level(declaration)?)?;
-        self.validate_child_chain(mask, level, Self::refresh_mask_level(declaration)?)?;
         self.validate_decoder_smudge_parameters(smudge, declaration.decoder(), source_program)?;
         Ok(level)
     }
 
-    /// The public `A'_(j)` of the part `declaration` at level `level`, sampled from `hash_key`
-    /// (the key of [`RefreshDeclaration::matrix_namespace`]) in the reference's level-0 ring,
-    /// the same for every chain, and reduced to level `level`.
+    /// The part `declaration`'s `A'_(j)` at level `level`: columns `j w_0 .. (j + 1) w_0` of the
+    /// caller's input [`REFRESH_MATRIX_INPUT`] ([`top_matrix_input`]), reduced modulo the level's
+    /// primes (a CRT sub-basis of the reference's `Q_0`), the residues of one `A'` on every chain.
     pub(crate) fn refresh_matrix(
         &self,
         level: usize,
-        hash_key: Bytes,
         declaration: &RefreshPartDeclaration,
     ) -> Result<Mat, RnsBggError> {
         let ring = self.ring(level)?;
-        Ok(top_matrix(declaration.reference(), hash_key, declaration).reduce_modulus(&ring))
+        Ok(component_matrix(top_matrix_input(declaration.reference()), declaration)
+            .reduce_modulus(&ring))
     }
 
     /// The public key `A_1` of the one encoding at level `level`: a public
@@ -311,16 +318,23 @@ pub(crate) fn top_reference_target(reference: &TopReference, ring_q: &Ring, q: u
     gadget * ring_q.polynomial([BigInt::from(delta).into()])
 }
 
-/// `A'_(j)` of the part `declaration` in the reference ring (`2 x w_0`).
-pub(crate) fn top_matrix(
-    reference: &TopReference,
-    hash_key: Bytes,
-    declaration: &RefreshPartDeclaration,
-) -> Mat {
-    top_reference_ring(reference).hash_matrix(
-        hash_key,
-        declaration.matrix_hash_tag(),
-        (2, reference.columns()),
+/// The caller's `A' = [A'_(0) | A'_(1)]` as the graph input [`REFRESH_MATRIX_INPUT`] of the
+/// reference ring (`2 x 2 w_0`).
+pub(crate) fn top_matrix_input(reference: &TopReference) -> Mat {
+    top_reference_ring(reference).input(REFRESH_MATRIX_INPUT, (2, 2 * reference.columns()))
+}
+
+/// `A'_(j)` of the part `declaration`: columns `j w_0 .. (j + 1) w_0` of `a_prime` (the component
+/// is an integer of the slice, so the parts' graphs differ only in integers).
+pub(crate) fn component_matrix(a_prime: Mat, declaration: &RefreshPartDeclaration) -> Mat {
+    let columns = declaration.reference().columns();
+    let start = declaration.component() * columns;
+    a_prime.slice(
+        None,
+        Some(mxx_ir_core::node::IndexRange {
+            start: IntExpr::constant(start),
+            end: IntExpr::constant(start + columns),
+        }),
     )
 }
 
@@ -576,9 +590,8 @@ pub(crate) mod tests {
         let key = [5; 32];
         let keys = (0..top.chains())
             .map(|chain| child_hash_key(&key, &top.chain_namespace(chain)))
-            .chain(std::iter::once(child_hash_key(&key, &top.matrix_namespace())))
             .collect::<BTreeSet<_>>();
-        assert_eq!(keys.len(), top.chains() + 1);
+        assert_eq!(keys.len(), top.chains());
     }
 
     /// Synthetic exact carriers (zero errors, no ModDown) under a mask `s = (s_0, 1)` on the
@@ -608,7 +621,16 @@ pub(crate) mod tests {
         let outputs = declaration.columns();
         let width = parameters.component_columns(level).unwrap();
         let s0 = sample("s0", 1);
-        let a_prime = parameters.refresh_matrix(level, hash.clone(), declaration).unwrap();
+        // A hash-sampled `A'` of the reference ring, reduced as the parts reduce the caller's.
+        let a_prime = component_matrix(
+            top_reference_ring(&reference).hash_matrix(
+                hash.clone(),
+                b"a-prime".to_vec(),
+                (2, 2 * reference.columns()),
+            ),
+            declaration,
+        )
+        .reduce_modulus(&ring);
         let one = parameters.refresh_one_key(level, hash.clone(), declaration).unwrap();
         let gadget = parameters.public_gadget(level).unwrap();
         let state = parameters.state_gadget(level).unwrap();
@@ -761,18 +783,15 @@ pub(crate) mod tests {
         assert!(terminal.refresh_level(part, &source).is_err());
         let dynamic = parameters.clone().with_rhs_mode(RhsMode::Dynamic);
         assert!(dynamic.refresh_level(part, &source).is_err());
-        let mask = parameters.refresh_mask_parameters(&top, 0, &source, &pool, 1).unwrap();
         let fresh = parameters.refresh_fresh_parameters(&top, 0, &source, &pool, 1).unwrap();
         let smudge =
             parameters.decoder_smudge_parameters(part.decoder(), &source, &pool, 1).unwrap();
         assert_eq!(
-            parameters.validate_refresh_children(part, &source, &mask, &fresh, &smudge).unwrap(),
+            parameters.validate_refresh_children(part, &source, &fresh, &smudge).unwrap(),
             1
         );
         assert!(
-            parameters
-                .validate_refresh_children(part, &source, &mask, &parameters, &smudge)
-                .is_err(),
+            parameters.validate_refresh_children(part, &source, &parameters, &smudge).is_err(),
             "the source chain is not a child chain"
         );
     }

@@ -73,6 +73,13 @@ use tracing::{info, warn};
 
 /// Rows of `T` per stored chunk.
 pub const ROW_CHUNK: usize = 8;
+/// The bound under which the GPU keeps each entry of `T`, as compact coefficients of two magnitude
+/// bytes. TrapGen samples `T` without truncation; an entry beyond the bound fails its packing (an
+/// error, not a rejection), with probability below `2^-700000` for the trapdoor widths TrapGen
+/// accepts ([`MAX_COMPACT_T_SIGMA`]).
+pub const T_STORAGE_BOUND: u64 = (1 << 16) - 1;
+/// The largest TrapGen width whose `T` the GPU stores under [`T_STORAGE_BOUND`].
+pub const MAX_COMPACT_T_SIGMA: f64 = 64.0;
 /// Draws of `T` before TrapGen reports that the perturbation covariance is not positive definite.
 pub const TRAPGEN_ATTEMPTS: usize = 8;
 /// The smallest accepted Cholesky pivot, relative to `s²`.

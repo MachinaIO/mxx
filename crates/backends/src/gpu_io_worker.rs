@@ -648,7 +648,16 @@ where
                             // copy is written. A write failure fails every
                             // later command, the publication included.
                             GpuExportPayload::Host(bytes) => {
-                                let bytes = bytes.to_vec();
+                                // Copied by several threads: one thread reads
+                                // mapped memory well below its bandwidth.
+                                let bytes = {
+                                    use rayon::prelude::*;
+                                    let mut copy = vec![0u8; bytes.len()];
+                                    copy.par_chunks_mut(16 << 20)
+                                        .zip(bytes.par_chunks(16 << 20))
+                                        .for_each(|(to, from)| to.copy_from_slice(from));
+                                    copy
+                                };
                                 if let Some(reply) = early_reply.take() {
                                     let _ = reply.send(Ok(IoCompletion::Exported { frame }));
                                 }

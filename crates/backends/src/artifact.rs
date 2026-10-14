@@ -782,13 +782,24 @@ impl ArtifactStore for FileArtifactStore {
             return Err(FileArtifactError::InvalidChunk(key));
         }
         let path = stage.temporary.clone();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .open(&path)
             .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-        file.write_all(bytes).map_err(|source| FileArtifactError::Io { path, source })?;
+        // A large chunk is written by several positioned writes at once, which a single
+        // sequential write leaves far below the bandwidth of a local NVMe device.
+        const PIECE: usize = 16 << 20;
+        {
+            use rayon::prelude::*;
+            use std::os::unix::fs::FileExt;
+            bytes
+                .par_chunks(PIECE)
+                .enumerate()
+                .try_for_each(|(index, piece)| {
+                    file.write_all_at(piece, offset + (index * PIECE) as u64)
+                })
+                .map_err(|source| FileArtifactError::Io { path, source })?;
+        }
         stage.ranges.insert(offset, end);
         stage.written_bytes += bytes.len() as u64;
         Ok(stage.written_bytes == total_raw_bytes)

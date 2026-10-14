@@ -6992,6 +6992,168 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     Ok(written)
 }
 
+/// Stream a compact matrix leaf (per coefficient, a sign byte, 0 for zero, 1 positive, 2
+/// negative, and little-endian magnitude bytes) into the coefficient matrix record that
+/// [`transcode_raw_full_matrix`] writes for the same values, without a CRT reconstruction.
+/// The leaf's entries are decoded once and packed in parallel.
+fn transcode_raw_compact_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    sink: &mut W,
+    matrix: &ConcreteMatrixType,
+    leaf: RawExportLeaf,
+) -> Result<u64, String> {
+    let Some(&PhysicalEncoding::CompactCoeff { magnitude_bytes }) = raw_leaf_encoding(layout, leaf)
+    else {
+        return Err("raw compact matrix export has another encoding".into());
+    };
+    if magnitude_bytes > 8 {
+        return Err("raw compact magnitude exceeds 64 bits".into());
+    }
+    let [fragment] =
+        layout.fragments.iter().filter(|fragment| fragment.leaf == leaf).collect::<Vec<_>>()[..]
+    else {
+        return Err("raw compact matrix export must be one fragment".into());
+    };
+    let mut raw =
+        vec![0u8; usize::try_from(fragment.raw_bytes).map_err(|_| "raw fragment exceeds usize")?];
+    source.seek(SeekFrom::Start(fragment.raw_offset)).map_err(|error| error.to_string())?;
+    source.read_exact(&mut raw).map_err(|error| error.to_string())?;
+    let degree = matrix.ring.ring_dimension() as usize;
+    let width = magnitude_bytes + 1;
+    let modulus =
+        matrix.ring.crt_moduli().iter().fold(BigUint::from(1u8), |value, prime| value * *prime);
+    // The record holds centered coefficients modulo q, `q / 2` positive; a bound beyond 64 bits
+    // admits every magnitude a compact coefficient holds.
+    let half = (&modulus >> 1usize).to_u64();
+    let (rows, columns) = (matrix.rows as u64, matrix.columns as u64);
+    // Every entry's coefficients as a magnitude with the sign in bit 63, and the widest
+    // magnitude's bit count.
+    let entries = (0..rows * columns)
+        .into_par_iter()
+        .map(|index| -> Result<(Vec<u64>, u64), String> {
+            let (row, column) = (index / columns, index % columns);
+            let mut bits = 0u64;
+            let values = (0..degree as u64)
+                .map(|coefficient| {
+                    let (offset, _) = fragment
+                        .locate(&[row, column, coefficient, 0])?
+                        .ok_or("raw compact coefficient lies outside its fragment")?;
+                    let offset = usize::try_from(offset).map_err(|_| "raw offset exceeds usize")?;
+                    let bytes = raw
+                        .get(offset..offset + width)
+                        .ok_or("raw compact coefficient is truncated")?;
+                    let mut word = [0u8; 8];
+                    word[..magnitude_bytes].copy_from_slice(&bytes[1..]);
+                    let magnitude = u64::from_le_bytes(word);
+                    let negative = match (bytes[0], magnitude) {
+                        (0, 0) => false,
+                        (1, m) if m != 0 => false,
+                        (2, m) if m != 0 => true,
+                        _ => return Err("raw compact coefficient is not canonical".into()),
+                    };
+                    if half.is_some_and(|half| magnitude > half || (negative && magnitude == half))
+                    {
+                        return Err("raw compact coefficient exceeds q / 2".into());
+                    }
+                    if magnitude >> 63 != 0 {
+                        return Err("raw compact magnitude exceeds 63 bits".into());
+                    }
+                    bits = bits.max(u64::from(u64::BITS - magnitude.leading_zeros()));
+                    Ok(magnitude | (u64::from(negative) << 63))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((values, bits))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let max_magnitude_bits = entries.iter().map(|(_, bits)| *bits).max().unwrap_or(0);
+    let max_coeff_bits = if max_magnitude_bits == 0 { 0 } else { max_magnitude_bits + 1 };
+    // Each coefficient is shifted into a 64-bit accumulator holding fewer than 8 pending bits.
+    if max_coeff_bits > 56 {
+        return Err("raw compact coefficient width exceeds 56 bits".into());
+    }
+    let max_coeff_bits =
+        u16::try_from(max_coeff_bits).map_err(|_| "coefficient width exceeds u16")?;
+    let bytes_per_coeff = max_coeff_bits.div_ceil(8);
+    let coefficient_count = matrix
+        .rows
+        .checked_mul(matrix.columns)
+        .and_then(|count| count.checked_mul(degree))
+        .ok_or("matrix coefficient count overflows")?;
+    let payload_len = coefficient_count
+        .checked_mul(usize::from(max_coeff_bits))
+        .ok_or("matrix payload bit count overflows")?
+        .div_ceil(8);
+    let level =
+        u32::try_from(matrix.ring.crt_depth() - 1).map_err(|_| "matrix CRT level exceeds u32")?;
+    let header = bincode::encode_to_vec(
+        (1u8, 0u8, level, matrix.rows, matrix.columns, max_coeff_bits, bytes_per_coeff),
+        bincode::config::standard(),
+    )
+    .map_err(|error| error.to_string())?;
+    // The bits of each coefficient, least significant first: the magnitude in
+    // `max_coeff_bits - 1` bits, then the sign. An entry fills whole bytes when its bit count
+    // is a multiple of 8, so the entries pack in parallel; otherwise they pack in order.
+    let bits = u32::from(max_coeff_bits);
+    let pack = |values: &[u64], output: &mut [u8]| {
+        let (mut pending, mut filled, mut position) = (0u64, 0u32, 0usize);
+        for &value in values {
+            let value = (value & !(1 << 63)) | ((value >> 63) << (bits - 1));
+            pending |= value << filled;
+            filled += bits;
+            while filled >= 8 {
+                output[position] = pending as u8;
+                position += 1;
+                pending >>= 8;
+                filled -= 8;
+            }
+        }
+        if filled != 0 {
+            output[position] = pending as u8;
+        }
+    };
+    let mut payload = vec![0u8; payload_len];
+    if bits != 0 {
+        if (degree * bits as usize).is_multiple_of(8) {
+            payload
+                .par_chunks_mut(degree * bits as usize / 8)
+                .zip(entries.par_iter())
+                .for_each(|(output, (values, _))| pack(values, output));
+        } else {
+            let values = entries.into_iter().flat_map(|(values, _)| values).collect::<Vec<_>>();
+            pack(&values, &mut payload);
+        }
+    }
+    let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
+    sink.write_all(&header).map_err(|error| error.to_string())?;
+    let mut written = u64::try_from(header.len()).map_err(|_| "matrix header length overflows")?;
+    written = written
+        .checked_add(write_bincode_length(&mut sink, payload_len)?)
+        .ok_or("matrix artifact length overflows")?;
+    sink.write_all(&payload).map_err(|error| error.to_string())?;
+    written = written
+        .checked_add(u64::try_from(payload_len).map_err(|_| "matrix payload length overflows")?)
+        .ok_or("matrix artifact length overflows")?;
+    sink.flush().map_err(|error| error.to_string())?;
+    Ok(written)
+}
+
+/// Copy `bytes` bytes from `source` to `sink` through one large buffer.
+fn copy_exact<R: Read + ?Sized, W: Write + ?Sized>(
+    source: &mut R,
+    sink: &mut W,
+    mut bytes: u64,
+) -> Result<(), String> {
+    let mut buffer = vec![0u8; (bytes.min(64 << 20)) as usize];
+    while bytes > 0 {
+        let chunk = bytes.min(buffer.len() as u64) as usize;
+        source.read_exact(&mut buffer[..chunk]).map_err(|error| error.to_string())?;
+        sink.write_all(&buffer[..chunk]).map_err(|error| error.to_string())?;
+        bytes -= chunk as u64;
+    }
+    Ok(())
+}
+
 /// Stream a trapdoor into its artifact: the public matrix and the tagged secret encoding of
 /// `DCRTTrapdoor::to_compact_bytes`, one component (a leaf) at a time.
 fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
@@ -7023,71 +7185,82 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     .into_iter()
     .map(|(rows, columns)| ConcreteMatrixType { ring: public_matrix.ring.clone(), rows, columns })
     .collect::<Vec<_>>();
-    let mut secret_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-    secret_file
-        .write_all(&crate::sampler::trapdoor::TAGGED_MAGIC)
-        .map_err(|error| error.to_string())?;
-    secret_file
-        .write_all(&[if instantiation.is_computational() {
-            crate::sampler::trapdoor::TAG_COMPUTATIONAL
-        } else {
-            crate::sampler::trapdoor::TAG_STATISTICAL
-        }])
-        .map_err(|error| error.to_string())?;
-    let mut secret_len = crate::sampler::trapdoor::TAGGED_MAGIC.len() as u64 + 1;
+    // Each component is transcoded into its own file; the precomputation, the bulk of a
+    // statistical trapdoor, is copied straight from the raw file into the sink once every length
+    // before it is known.
+    let mut parts = Vec::with_capacity(secret_shapes.len());
     for (leaf, shape) in secret_shapes.iter().enumerate() {
         let mut part_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-        let part_len = transcode_raw_full_matrix(
-            layout,
-            source,
-            &mut part_file,
-            shape,
-            RawExportLeaf::Value(leaf as u32),
-        )?;
-        secret_file.write_all(&part_len.to_le_bytes()).map_err(|error| error.to_string())?;
-        part_file.rewind().map_err(|error| error.to_string())?;
-        std::io::copy(&mut part_file, &mut secret_file).map_err(|error| error.to_string())?;
-        secret_len = secret_len
-            .checked_add(8)
-            .and_then(|length| length.checked_add(part_len))
-            .ok_or("trapdoor secret payload length overflows")?;
+        let leaf = RawExportLeaf::Value(leaf as u32);
+        // A statistical trapdoor holds its row chunks of `T` compactly.
+        let part_len = if matches!(
+            raw_leaf_encoding(layout, leaf),
+            Some(PhysicalEncoding::CompactCoeff { .. })
+        ) {
+            transcode_raw_compact_matrix(layout, source, &mut part_file, shape, leaf)?
+        } else {
+            transcode_raw_full_matrix(layout, source, &mut part_file, shape, leaf)?
+        };
+        parts.push((part_file, part_len));
     }
     // A statistical trapdoor's last leaf is its precomputation, a dense byte range.
-    if let mxx_ir_core::types::TrapdoorInstantiation::Statistical { m_bar } = instantiation {
-        let bytes = crate::sampler::trapdoor::statistical::precomputation_bytes(
-            public_matrix.ring.ring_dimension() as usize,
-            m_bar,
-            digit_count,
-        )
-        .ok_or("trapdoor precomputation length overflows")? as u64;
-        let leaf = RawExportLeaf::Value(secret_shapes.len() as u32);
-        let [fragment] = layout
-            .fragments
-            .iter()
-            .filter(|fragment| fragment.leaf == leaf)
-            .collect::<Vec<_>>()[..]
-        else {
-            return Err("trapdoor precomputation export must be one fragment".into());
-        };
-        if fragment.raw_bytes != bytes {
-            return Err("trapdoor precomputation export has the wrong length".into());
+    let precomputation = match instantiation {
+        mxx_ir_core::types::TrapdoorInstantiation::Statistical { m_bar } => {
+            let bytes = crate::sampler::trapdoor::statistical::precomputation_bytes(
+                public_matrix.ring.ring_dimension() as usize,
+                m_bar,
+                digit_count,
+            )
+            .ok_or("trapdoor precomputation length overflows")? as u64;
+            let leaf = RawExportLeaf::Value(secret_shapes.len() as u32);
+            let [fragment] = layout
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.leaf == leaf)
+                .collect::<Vec<_>>()[..]
+            else {
+                return Err("trapdoor precomputation export must be one fragment".into());
+            };
+            if fragment.raw_bytes != bytes {
+                return Err("trapdoor precomputation export has the wrong length".into());
+            }
+            Some((fragment.raw_offset, bytes))
         }
-        source.seek(SeekFrom::Start(fragment.raw_offset)).map_err(|error| error.to_string())?;
-        secret_file.write_all(&bytes.to_le_bytes()).map_err(|error| error.to_string())?;
-        let copied = std::io::copy(&mut Read::take(&mut *source, bytes), &mut secret_file)
-            .map_err(|error| error.to_string())?;
-        if copied != bytes {
-            return Err("trapdoor precomputation export is truncated".into());
-        }
-        secret_len =
-            secret_len.checked_add(8 + bytes).ok_or("trapdoor secret payload length overflows")?;
-    }
+        _ => None,
+    };
+    let secret_len = parts
+        .iter()
+        .try_fold(crate::sampler::trapdoor::TAGGED_MAGIC.len() as u64 + 1, |length, (_, part)| {
+            length.checked_add(8)?.checked_add(*part)
+        })
+        .and_then(|length| match precomputation {
+            Some((_, bytes)) => length.checked_add(8)?.checked_add(bytes),
+            None => Some(length),
+        })
+        .ok_or("trapdoor secret payload length overflows")?;
     sink.write_all(&public_len.to_le_bytes()).map_err(|error| error.to_string())?;
     public_file.rewind().map_err(|error| error.to_string())?;
-    std::io::copy(&mut public_file, sink).map_err(|error| error.to_string())?;
+    copy_exact(&mut public_file, sink, public_len)?;
     sink.write_all(&secret_len.to_le_bytes()).map_err(|error| error.to_string())?;
-    secret_file.rewind().map_err(|error| error.to_string())?;
-    std::io::copy(&mut secret_file, sink).map_err(|error| error.to_string())?;
+    sink.write_all(&crate::sampler::trapdoor::TAGGED_MAGIC).map_err(|error| error.to_string())?;
+    sink.write_all(&[if instantiation.is_computational() {
+        crate::sampler::trapdoor::TAG_COMPUTATIONAL
+    } else {
+        crate::sampler::trapdoor::TAG_STATISTICAL
+    }])
+    .map_err(|error| error.to_string())?;
+    for (mut part_file, part_len) in parts {
+        sink.write_all(&part_len.to_le_bytes()).map_err(|error| error.to_string())?;
+        part_file.rewind().map_err(|error| error.to_string())?;
+        copy_exact(&mut part_file, sink, part_len)?;
+    }
+    if let Some((offset, bytes)) = precomputation {
+        source.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+        sink.write_all(&bytes.to_le_bytes()).map_err(|error| error.to_string())?;
+        copy_exact(source, sink, bytes).map_err(|error| {
+            format!("trapdoor precomputation export is truncated or unwritable: {error}")
+        })?;
+    }
     16u64
         .checked_add(public_len)
         .and_then(|n| n.checked_add(secret_len))

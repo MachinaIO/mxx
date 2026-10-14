@@ -20,6 +20,14 @@
 //! authorized key must decrypt the message; the unauthorized decryption must complete, and its
 //! rounded phase is not constrained.
 //!
+//! Every workflow (also with `EXPORT_ONLY`) prints, from its recorded graphs, the sizes of the
+//! public key, the ciphertext, the key's secret part (preimages in small matrix form) and its
+//! public evaluation part (`PE_SIZE`, packed at `ceil(log2 q)` bits per coefficient and as
+//! stored), and the GPU work of decryption that `mxx_backends::gpu_cost_model` predicts from the
+//! online evaluation and decoding graphs (`PE_DECRYPT_GPU_COUNT`: `mul64_instructions`, the
+//! weighted 64-bit multiplications, `gadget_decomposed_words`, the RNS residues decomposed into
+//! gadget digits, and the other counters).
+//!
 //! `test_gpu_pe_time_window` runs the time window predicate of the implementation specification
 //! (`BranchingProgram::time_window` for `[0900, 1759]`, class `PeClass::decimal_range(4)`) on its
 //! test vectors with the same parameter search, and exports the same claim with `LEAN_EXPORT`
@@ -51,6 +59,7 @@ use bigdecimal::BigDecimal;
 use mxx_backends::{
     GpuRuntime, RuntimeValue, SessionStore,
     backend::poly_gpu::gpu_backend_on,
+    gpu_cost_model::gpu_operation_counts,
     matrix::dcrt_poly::DCRTPolyMatrix,
     poly::{
         PolyParams,
@@ -64,8 +73,9 @@ use mxx_exponent_lut::{
     utils::{env_usize, ring_dimension_candidates},
 };
 use mxx_ir_core::{
-    Graph, ValidatedGraph,
+    FrozenGraphScopeId, Graph, ParamEnv, ValidatedGraph, WireRef,
     artifact::ProductionId,
+    concretize_wire_type,
     node::NodeKind,
     protocol::{
         ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
@@ -74,6 +84,7 @@ use mxx_ir_core::{
         ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
         ProtocolStage, PurePredicateSpec, StageId, StageInputName, Workflow,
     },
+    types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_pe::{
     BranchingProgram, PeClass, PeNoiseReport, PeParameterRequest, PeParameters, decrypt, encrypt,
@@ -177,9 +188,11 @@ fn program(class: PeClass, attribute: &[usize], value: usize) -> BranchingProgra
     program
 }
 
-/// One executed graph: its stage graph and, for a producing stage, its production.
+/// One executed graph: its stage graph, its compile-parameter bindings, and, for a producing
+/// stage, its production.
 struct Recorded {
     graph: Graph,
+    bindings: ParamEnv,
     production: Option<ProductionId>,
 }
 
@@ -197,9 +210,9 @@ impl<S: SessionStore + Send, E: StageExecution<S>> StageExecution<S> for Recordi
         store: &mut S,
         execution_nonce: [u8; 32],
     ) -> Result<ProductionId, ApiError> {
-        let graph = validated.source.clone();
+        let (graph, bindings) = (validated.source.clone(), validated.bindings.clone());
         let production = self.inner.produce(validated, inputs, store, execution_nonce)?;
-        self.graphs.push(Recorded { graph, production: Some(production.clone()) });
+        self.graphs.push(Recorded { graph, bindings, production: Some(production.clone()) });
         Ok(production)
     }
 
@@ -210,9 +223,9 @@ impl<S: SessionStore + Send, E: StageExecution<S>> StageExecution<S> for Recordi
         store: &mut S,
         execution_nonce: [u8; 32],
     ) -> Result<StageOutputs, ApiError> {
-        let graph = validated.source.clone();
+        let (graph, bindings) = (validated.source.clone(), validated.bindings.clone());
         let outputs = self.inner.evaluate(validated, inputs, store, execution_nonce)?;
-        self.graphs.push(Recorded { graph, production: None });
+        self.graphs.push(Recorded { graph, bindings, production: None });
         Ok(outputs)
     }
 
@@ -292,6 +305,149 @@ const STAGES: [(&str, &str); 9] = [
     ("rns-bgg-online-eval", "online_eval"),
     ("mxx-pe/decrypt", "decode"),
 ];
+
+/// The size of artifacts over the scheme's rings: `packed_bits` at `ceil(log2 q)` bits per `R_q`
+/// coefficient (`ceil(log2(2B + 1))` for a bounded matrix of coefficient bound `B`), and
+/// `stored_bytes` as the backends store them: one 64-bit word per CRT residue of a matrix, and the
+/// small matrix form of a bounded matrix (a sign byte and the bound's magnitude bytes per
+/// coefficient, per CRT limb for a per-limb bound). Preimages are bounded matrices.
+#[derive(Clone, Copy, Debug, Default)]
+struct ArtifactSize {
+    packed_bits: u128,
+    stored_bytes: u128,
+}
+
+impl std::ops::AddAssign for ArtifactSize {
+    fn add_assign(&mut self, other: Self) {
+        self.packed_bits += other.packed_bits;
+        self.stored_bytes += other.stored_bytes;
+    }
+}
+
+impl std::ops::Mul<u128> for ArtifactSize {
+    type Output = Self;
+    fn mul(self, count: u128) -> Self {
+        Self { packed_bits: self.packed_bits * count, stored_bytes: self.stored_bytes * count }
+    }
+}
+
+/// The [`ArtifactSize`] of one value of type `ty`. Trapdoors and typed blobs count zero: only the
+/// master secret key holds a trapdoor, and no measured object holds a blob.
+fn wire_size(ty: &ConcreteWireType) -> ArtifactSize {
+    let coefficients = |matrix: &ConcreteMatrixType| {
+        (matrix.rows * matrix.columns) as u128 * u128::from(matrix.ring.ring_dimension())
+    };
+    match ty {
+        ConcreteWireType::Matrix(matrix) => {
+            let coefficients = coefficients(matrix);
+            ArtifactSize {
+                packed_bits: coefficients * u128::from(matrix.ring.modulus().bits()),
+                stored_bytes: coefficients * matrix.ring.crt_depth() as u128 * 8,
+            }
+        }
+        ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } |
+        ConcreteWireType::Preimage { matrix, max_coefficient_bound, bound_domain } => {
+            let limbs = match bound_domain {
+                CoefficientBoundDomain::Global => 1,
+                CoefficientBoundDomain::PerCrtLimb => matrix.ring.crt_depth() as u128,
+            };
+            let coefficients = coefficients(matrix) * limbs;
+            let bound = max_coefficient_bound.magnitude();
+            ArtifactSize {
+                packed_bits: coefficients * u128::from((bound * 2u8 + 1u8).bits()),
+                stored_bytes: coefficients * (1 + bound.bits().div_ceil(8).max(1) as u128),
+            }
+        }
+        ConcreteWireType::IndexedFamily { element, count } => wire_size(element) * *count as u128,
+        ConcreteWireType::DependentFamily { members } => {
+            members.iter().fold(ArtifactSize::default(), |mut total, member| {
+                total += wire_size(member);
+                total
+            })
+        }
+        ConcreteWireType::Bytes { length } => {
+            ArtifactSize { packed_bits: 8 * *length as u128, stored_bytes: *length as u128 }
+        }
+        ConcreteWireType::Trapdoor { .. } | ConcreteWireType::TypedBlob { .. } => {
+            ArtifactSize::default()
+        }
+        _ => ArtifactSize { packed_bits: 64, stored_bytes: 8 },
+    }
+}
+
+/// The total [`ArtifactSize`] of the outputs of `record`'s graph.
+fn output_size(record: &Recorded) -> ArtifactSize {
+    let scope = record.graph.root_scope();
+    let mut total = ArtifactSize::default();
+    for root in record.graph.outputs().values() {
+        let WireRef { node, port } = root.value;
+        let ty = &scope.nodes()[node.0 as usize].output_types()[port.0 as usize];
+        let concrete = concretize_wire_type(ty, &record.bindings, &FrozenGraphScopeId::Root, node)
+            .unwrap_or_else(|error| panic!("output type of {}: {error}", record.graph.name()));
+        total += wire_size(&concrete);
+    }
+    total
+}
+
+/// The stage of `record` in [`STAGES`].
+fn stage_of(record: &Recorded) -> &'static str {
+    STAGES
+        .iter()
+        .find(|(name, _)| *name == record.graph.name())
+        .map(|(_, stage)| *stage)
+        .unwrap_or_else(|| panic!("unexpected executed graph {}", record.graph.name()))
+}
+
+/// Print, from the recorded graphs of one authorized workflow, the sizes of the public key (the
+/// public setup production; the public seeds add 64 bytes), the ciphertext (the prelude and
+/// encryption productions), the key's secret part (the key generation production, preimages in
+/// small matrix form) and its public evaluation part (the preprocessing production), and the GPU
+/// work of decryption (online evaluation and decoding) that [`gpu_operation_counts`] predicts
+/// from the graphs (`MXX_GPU_NTT_RADIX`, 4 by default, one wave per parallel loop). The totals of
+/// `mul64_instructions` and `gadget_decomposed_words` (the 64-bit RNS residues decomposed into
+/// gadget digits: decomposed ring elements times `n` times the RNS primes the decomposition
+/// keeps) are the "Mul" and "Decomp." of decryption.
+fn report_measurements(graphs: &[Recorded]) {
+    for (object, stages) in [
+        ("public_key", &["setup_public"][..]),
+        ("ciphertext", &["prelude", "encrypt"][..]),
+        ("secret_key", &["keygen"][..]),
+        ("evaluation_key", &["preprocess"][..]),
+    ] {
+        let mut size = ArtifactSize::default();
+        for record in graphs.iter().filter(|record| stages.contains(&stage_of(record))) {
+            size += output_size(record);
+        }
+        eprintln!(
+            "PE_SIZE {object} packed_bytes={} stored_bytes={}",
+            size.packed_bits.div_ceil(8),
+            size.stored_bytes
+        );
+    }
+    let radix =
+        env::var("MXX_GPU_NTT_RADIX").ok().and_then(|value| value.parse().ok()).unwrap_or(4);
+    let mut total = BTreeMap::<String, u128>::new();
+    for record in
+        graphs.iter().filter(|record| ["online_eval", "decode"].contains(&stage_of(record)))
+    {
+        let counts = gpu_operation_counts(&record.graph, &record.bindings, None, radix)
+            .unwrap_or_else(|error| panic!("GPU counts of {}: {error}", record.graph.name()));
+        eprintln!(
+            "PE_DECRYPT_GPU_COUNT stage={} mul64_instructions={} gadget_decomposed_words={} \
+             gadget_decompositions={}",
+            stage_of(record),
+            counts.get("mul64_instructions").copied().unwrap_or(0),
+            counts.get("gadget_decomposed_words").copied().unwrap_or(0),
+            counts.get("gadget_decompositions").copied().unwrap_or(0),
+        );
+        for (name, count) in counts {
+            *total.entry(name).or_default() += count;
+        }
+    }
+    for (name, count) in &total {
+        eprintln!("PE_DECRYPT_GPU_COUNT {name}={count}");
+    }
+}
 
 fn root_inputs(graph: &Graph) -> Vec<String> {
     graph
@@ -695,10 +851,11 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     }
     // The first execution of every graph: the later vectors repeat encryption and decryption.
     let mut seen = std::collections::BTreeSet::new();
-    let graphs = std::mem::take(&mut execution.graphs)
+    let graphs: Vec<Recorded> = std::mem::take(&mut execution.graphs)
         .into_iter()
         .filter(|record| seen.insert(record.graph.name().to_owned()))
         .collect();
+    report_measurements(&graphs);
     (graphs, parameters, failure_exponent)
 }
 
@@ -790,6 +947,7 @@ fn round_trip(
     decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
     eprintln!("decryption (F(x) = 1): {:?}", stage.elapsed());
     report_device_bytes(&store);
+    report_measurements(&graphs);
     (graphs, parameters, failure_exponent)
 }
 
@@ -849,5 +1007,7 @@ fn export_graphs(
         decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).is_err(),
         "the export-only decryption graph is not executed"
     );
-    (std::mem::take(&mut execution.graphs), parameters, failure_exponent)
+    let graphs = std::mem::take(&mut execution.graphs);
+    report_measurements(&graphs);
+    (graphs, parameters, failure_exponent)
 }

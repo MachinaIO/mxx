@@ -171,7 +171,23 @@ fn encrypt_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
 /// Inputs `one`, `encodings`, `public_hash_key`, `input_bits`, and the circuit families; outputs
 /// `vector = c D` and `public_key = A D` of the selected output slot.
 fn evaluate_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
-    let (context, params) = context("boolean-bgg-evaluate");
+    evaluation(parameters, "boolean-bgg-evaluate", true)
+}
+
+/// The `evaluate` graph without its final decomposition: it outputs the output slot's encoding
+/// `c` and public matrix `A` as the layers leave them, before `D = G^(-1)(floor(q / 2) e_2)`. It is
+/// not a protocol stage; cost accounting uses it for the circuit evaluation alone.
+pub fn evaluate_layers_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
+    evaluation(parameters, "boolean-bgg-evaluate-layers", false)
+}
+
+/// The circuit evaluation of `evaluate`, with the final decomposition when `decompose`.
+fn evaluation(
+    parameters: &BooleanBggProtocolParameters,
+    name: &str,
+    decompose: bool,
+) -> BuiltGraph {
+    let (context, params) = context(name);
     let width = params.max_layer_width.clone();
     let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
     let ring = &parameters.ring;
@@ -205,6 +221,15 @@ fn evaluate_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
     )
     .unwrap();
     let output = layers.at(circuit.output_source());
+    if !decompose {
+        return context
+            .output("vector", output.vector)
+            .unwrap()
+            .output("public_key", output.public_key)
+            .unwrap()
+            .build()
+            .unwrap();
+    }
     // D = G^(-1)(floor(q / 2) e_2), so that s G D = floor(q / 2) for s = (s_bar, 1).
     let target = Mat::concat(
         ConcatAxis::Rows,
@@ -822,30 +847,30 @@ mod tests {
         assert_eq!(counts, expected);
     }
 
-    /// The selected row (n = 2^20, 215 x 60-bit moduli, base 4, depth 361) is counted in closed
+    /// The selected row (n = 2^19, 186 x 44-bit moduli, base 4, depth 240) is counted in closed
     /// form: the walk visits each scope a constant number of times, whatever the loop counts.
     #[test]
     fn selected_row_gpu_operation_counts_are_closed_form() {
-        let parameters = generated_parameters(1 << 20, 215, 60, 2);
+        let parameters = generated_parameters(1 << 19, 186, 44, 2);
         let graphs = BooleanBggProtocolGraphs::new(&parameters);
-        let (depth, width) = (361, 15_057_592_995_680u128);
+        let (depth, width) = (240, 20_072_706_095_024u128);
         let mut counts = mxx_backends::gpu_cost_model::gpu_operation_counts(
             &graphs.evaluate.graph,
-            &circuit_bindings(26_214_400, depth, width),
+            &circuit_bindings(31_719_424, depth, width),
             None,
             4,
         )
         .unwrap();
-        let n = 1u128 << 20;
+        let n = 1u128 << 19;
         assert!(counts.remove("unsupported(ring_dimension_above_131072)").unwrap() > 0);
-        // n / 1024 = 1024 > 32 tiles: the wide-stage inverse, 10n + (n / 2) log2(1024 / 32) + 2n.
+        // n / 1024 = 512 > 32 tiles: the wide-stage inverse, 10n + (n / 2) log2(512 / 32) + 2n.
         let expected = expected_evaluate_counts(
             n,
-            215,
+            186,
             parameters.columns() as u128,
             depth as u128,
             width,
-            10 * n + n / 2 * 5 + 2 * n,
+            10 * n + n / 2 * 4 + 2 * n,
         );
         assert_eq!(counts, expected);
     }

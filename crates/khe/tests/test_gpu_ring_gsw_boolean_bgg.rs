@@ -14,8 +14,12 @@
 //! (`mxx_khe::noise_simulate`) and selects the smallest ring dimension and CRT depth that decode
 //! and whose Ring-LWE estimate (`lattice-estimator-cli`, which must be on `PATH` with its Sage
 //! environment) reaches the security target, printing the selection as a parameter row and the
-//! GPU work one evaluation of the row would issue, predicted from the evaluate graph without a
-//! device (`mxx_backends::gpu_cost_model`, one `RING_GSW_BGG_GPU_COUNT` line per counter), and the
+//! GPU work of the row's circuit evaluation, predicted without a device
+//! (`mxx_backends::gpu_cost_model`): one `RING_GSW_BGG_GPU_COUNT stage=..` line for the evaluate
+//! graph (which ends with the decomposition `G^(-1)(floor(q / 2) e_2)`), the decrypt graph (the
+//! rounding), and the evaluate graph without its final decomposition (`evaluate_layers_graph`),
+//! then one line per counter of the last, whose `mul64_instructions` and `gadget_decomposed_words`
+//! are the baseline's "Mul" and "Decomp.", and the
 //! sizes of a `1 x log_base q` public key or ciphertext, a `2 x log_base q` matrix, and a
 //! `(log_base q + 2) x 1` key preimage over that ring (`RING_GSW_BGG_SIZE`), with `log2 q`, the
 //! ring dimension, `C = 2 (log_base q)^2`, and `|1 x log_base q| C` in bits (`RING_GSW_BGG_C`).
@@ -25,15 +29,19 @@
 //! the CPU unit tests of `mxx_khe::bgg::boolean_protocol`: the GPU runtime cannot yet carry a
 //! matrix family through a sequential loop, which the layered evaluation needs.
 //!
-//! Lowering the default Ring-GSW product needs about 40 GiB of host memory.
+//! The Ring-GSW modulus is one prime of the BGG+ CRT basis (the first prime of the basis of
+//! `ENCODING_RING_DIMENSION`, or of the recorded row's ring), so that the evaluation over each CRT
+//! prime of the encodings can be recombined; the test checks that the selected basis contains it.
+//! Lowering the default Ring-GSW product needs about 50 GiB of host memory.
 //!
 //! Environment variables (prefix `MXX_KHE_RING_GSW_BGG_`):
 //!
 //! | Variable | Default | Meaning |
 //! | --- | --- | --- |
-//! | `FHE_RING_DIMENSION`, `FHE_CRT_BITS`, `FHE_CRT_DEPTH` | 2048, 40, 1 | Ring-GSW ring |
+//! | `FHE_RING_DIMENSION` | 2048 | Ring-GSW ring dimension; its modulus is one BGG+ CRT prime |
+//! | `ENCODING_RING_DIMENSION` | `2^19` | BGG+ ring whose first CRT prime is the Ring-GSW modulus |
 //! | `ERROR_SIGMA` | 3.19 | encoding error width; the cutoff is `floor(6.5 sigma)` |
-//! | `CRT_BITS`, `MAX_BASE_BITS`, `MAX_CRT_DEPTH` | 60, 20, 512 | BGG+ CRT width, gadget bases `2^1..2^MAX`, depth limit |
+//! | `CRT_BITS`, `MAX_BASE_BITS`, `MAX_CRT_DEPTH` | 44, 20, 512 | BGG+ CRT width, gadget bases `2^1..2^MAX`, depth limit |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 16, 21 | BGG+ ring dimensions |
 //! | `SECURITY_BITS` | 128 | Ring-LWE security target |
 //! | `TRAPDOOR_SIGMA` | 4.578 | TrapGen width of the key preimage whose size is printed |
@@ -53,7 +61,7 @@ use mxx_ir_core::{Rational, types::TrapdoorInstantiation};
 use mxx_khe::{
     bgg::boolean_protocol::{
         BooleanBggProtocolGraphs, BooleanBggProtocolParameters, SECRET_DIMENSION,
-        boolean_bgg_protocol, circuit_bindings,
+        boolean_bgg_protocol, circuit_bindings, evaluate_layers_graph,
     },
     circuit::{PolyCircuit, boolean_layering_bound},
     circuit_gadgets::{
@@ -65,7 +73,7 @@ use mxx_khe::{
     },
 };
 use num_bigint::{BigInt, BigUint};
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc};
 
 const PREFIX: &str = "MXX_KHE_RING_GSW_BGG_";
 
@@ -252,20 +260,7 @@ fn object_sizes(
 #[test]
 fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     let fhe_ring_dimension = env_usize("FHE_RING_DIMENSION", 2048) as u32;
-    let fhe_crt_bits = env_usize("FHE_CRT_BITS", 40);
-    let fhe_crt_depth = env_usize("FHE_CRT_DEPTH", 1);
     let security_target = env_usize("SECURITY_BITS", 128) as u64;
-    let fhe = DCRTPolyParams::new(fhe_ring_dimension, fhe_crt_depth, fhe_crt_bits, 1, None, None);
-    let circuit = ring_gsw_product(&fhe);
-    let bound = boolean_layering_bound(&circuit);
-    drop(circuit);
-    println!(
-        "RING_GSW_BGG_LAYERING {bound:?} max_layer_width_bound={}",
-        bound.max_layer_width_bound()
-    );
-    let instance_width = bound.input_width as u128;
-    let max_layer_width = bound.max_layer_width_bound();
-
     let recorded = env_string("PARAMETER_ID").map(|parameter_id| {
         let table = std::fs::read_to_string(lean_directory().join("parameters.csv"))
             .expect("the parameter table exists");
@@ -276,11 +271,32 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
             .find(|row| row.parameter_id == parameter_id)
             .unwrap_or_else(|| panic!("no parameter row {parameter_id}"))
     });
+    // The Ring-GSW modulus is one prime of the BGG+ basis, so that the evaluation over each CRT
+    // prime of the encodings can be recombined: the first prime of the basis of a recorded row,
+    // or of the expected encoding ring otherwise, checked against the selected basis below.
+    let (crt_bits, encoding_ring_dimension) = match &recorded {
+        Some(row) => (row.crt_bits, row.ring_dimension),
+        None => (env_usize("CRT_BITS", 44), env_usize("ENCODING_RING_DIMENSION", 1 << 19) as u32),
+    };
+    let gsw_prime =
+        mxx_ir_core::generate_crt_basis(encoding_ring_dimension, 1, crt_bits).unwrap()[0];
+    println!("RING_GSW_BGG_FHE_PRIME {gsw_prime}");
+    let fhe = DCRTPolyParams::new(fhe_ring_dimension, 1, crt_bits, 1, Some(vec![gsw_prime]), None);
+    let circuit = ring_gsw_product(&fhe);
+    let bound = boolean_layering_bound(&circuit);
+    drop(circuit);
+    println!(
+        "RING_GSW_BGG_LAYERING {bound:?} max_layer_width_bound={}",
+        bound.max_layer_width_bound()
+    );
+    let instance_width = bound.input_width as u128;
+    let max_layer_width = bound.max_layer_width_bound();
+
     let row = match recorded {
         Some(row) => {
             assert_eq!(
                 (row.fhe_ring_dimension, row.fhe_crt_bits, row.fhe_crt_depth),
-                (fhe_ring_dimension, fhe_crt_bits, fhe_crt_depth),
+                (fhe_ring_dimension, crt_bits, 1),
                 "the row's Ring-GSW ring is the selected one"
             );
             assert_eq!(
@@ -295,7 +311,7 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
             let request = BooleanBggParameterRequest {
                 depth: bound.depth,
                 secret_dimension: SECRET_DIMENSION,
-                crt_bits: env_usize("CRT_BITS", 60),
+                crt_bits,
                 base_bits: (1..=env_usize("MAX_BASE_BITS", 20)).collect(),
                 ring_dimensions: (env_usize("MIN_LOG_RING_DIMENSION", 16)..=
                     env_usize("MAX_LOG_RING_DIMENSION", 21))
@@ -318,14 +334,14 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
                 parameter_id: format!(
                     "average-gsw{}x{}-n{}-crt{}x{}",
                     fhe_ring_dimension,
-                    fhe_crt_bits,
+                    crt_bits,
                     selection.noise.ring_dimension,
                     selection.crt_depth(),
                     selection.crt_bits
                 ),
                 fhe_ring_dimension,
-                fhe_crt_bits,
-                fhe_crt_depth,
+                fhe_crt_bits: crt_bits,
+                fhe_crt_depth: 1,
                 circuit_depth: bound.depth,
                 instance_width,
                 max_layer_width,
@@ -345,6 +361,11 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     let moduli =
         mxx_ir_core::generate_crt_basis(row.ring_dimension, row.crt_depth, row.crt_bits).unwrap();
     let modulus: BigUint = moduli.iter().map(|&q| BigUint::from(q)).product();
+    assert!(
+        moduli.contains(&gsw_prime),
+        "the Ring-GSW prime {gsw_prime} is not in the selected basis; set {PREFIX}ENCODING_RING_DIMENSION={}",
+        row.ring_dimension
+    );
     let noise = BooleanBggNoise {
         ring_dimension: row.ring_dimension,
         modulus: modulus.clone(),
@@ -371,8 +392,29 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     };
     let bindings = circuit_bindings(row.instance_width, row.circuit_depth, row.max_layer_width);
     let graphs = BooleanBggProtocolGraphs::new(&bgg);
-    // The GPU work of one evaluation, predicted from the evaluate graph alone.
-    let counts = gpu_operation_counts(&graphs.evaluate.graph, &bindings, None, 4).unwrap();
+    // The GPU work of decryption, predicted from its graphs. Each stage is printed: `evaluate`,
+    // which ends with the decomposition `G^(-1)(floor(q / 2) e_2)` and its products, and
+    // `decrypt`, the rounding of `c' - s A'`. The totals count the circuit evaluation alone (the
+    // evaluate graph without its final decomposition, `evaluate_layers_graph`); their
+    // `mul64_instructions` and `gadget_decomposed_words` are the "Mul" and "Decomp." of the
+    // baseline.
+    let layers = evaluate_layers_graph(&bgg);
+    let mut counts = BTreeMap::new();
+    for (stage, graph) in [
+        ("evaluate", &graphs.evaluate.graph),
+        ("decrypt", &graphs.decrypt.graph),
+        ("evaluate_layers", &layers.graph),
+    ] {
+        let stage_counts = gpu_operation_counts(graph, &bindings, None, 4).unwrap();
+        println!(
+            "RING_GSW_BGG_GPU_COUNT stage={stage} mul64_instructions={} gadget_decomposed_words={}",
+            stage_counts.get("mul64_instructions").copied().unwrap_or(0),
+            stage_counts.get("gadget_decomposed_words").copied().unwrap_or(0),
+        );
+        if stage == "evaluate_layers" {
+            counts = stage_counts;
+        }
+    }
     for (name, count) in &counts {
         println!("RING_GSW_BGG_GPU_COUNT {name}={count}");
     }

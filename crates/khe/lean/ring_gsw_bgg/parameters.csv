@@ -1,2 +1,2 @@
 parameter_id,fhe_ring_dimension,fhe_crt_bits,fhe_crt_depth,circuit_depth,instance_width,max_layer_width,ring_dimension,crt_bits,crt_depth,base_bits,error_sigma,error_cutoff,security_bits
-average-gsw2048x40-n1048576-crt215x60,2048,40,1,361,26214400,15057592995680,1048576,60,215,2,3.19,20,275
+average-gsw2048x44-n524288-crt186x44,2048,44,1,240,31719424,20072706095024,524288,44,186,2,3.19,20,200

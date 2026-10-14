@@ -9,6 +9,33 @@ use crate::gpu_schedule::{GpuColumnInterval, GpuColumnSchedule, GpuScheduleError
 #[cfg(feature = "gpu")]
 use crate::poly::dcrt::gpu::{GpuHashTagPart, GpuSignedValuesEncoding};
 
+/// How the selected native backend executes device-generated predicates.
+/// Both strategies retain one compiled body per control site and perform
+/// arithmetic, loop-index updates and rejection tests exclusively on the GPU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg(feature = "gpu")]
+pub enum GpuControlExecution {
+    /// Device-native conditional graph nodes (CUDA).
+    NativeConditional,
+    /// Reusable graph regions selected after a small D2H control record (HIP).
+    HostScheduledRegions,
+}
+
+#[cfg(feature = "gpu")]
+impl GpuControlExecution {
+    /// The strategy is fixed at build time and belongs in a frozen plan key.
+    pub const fn current() -> Self {
+        #[cfg(mxx_gpu_backend = "hip")]
+        {
+            Self::HostScheduledRegions
+        }
+        #[cfg(not(mxx_gpu_backend = "hip"))]
+        {
+            Self::NativeConditional
+        }
+    }
+}
+
 /// A half-open global column range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ColumnRange {
@@ -1170,8 +1197,9 @@ pub(crate) struct CompiledGpuOp {
     pub block: [u32; 3],
     pub shared_bytes: u32,
     pub predecessors: Box<[u32]>,
-    /// Direct nodes in the CUDA conditional body. Dependencies use indices
-    /// local to this body; nested bodies follow the same schema recursively.
+    /// Direct nodes in one reusable conditional body. CUDA embeds it in a
+    /// native conditional node; HIP compiles ordinary regions and selects
+    /// them at D2H control boundaries. Dependencies are body-local, recursively.
     pub body: Option<Box<[CompiledGpuOp]>>,
 }
 
@@ -2076,6 +2104,21 @@ pub enum GpuPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn test_gpu_control_strategy_matches_native_backend() {
+        let expected = if cfg!(mxx_gpu_backend = "hip") {
+            GpuControlExecution::HostScheduledRegions
+        } else {
+            GpuControlExecution::NativeConditional
+        };
+        assert_eq!(GpuControlExecution::current(), expected);
+        assert_ne!(
+            serde_json::to_string(&GpuControlExecution::NativeConditional).unwrap(),
+            serde_json::to_string(&GpuControlExecution::HostScheduledRegions).unwrap(),
+        );
+    }
 
     fn contract(devices: usize) -> GpuPlanContract {
         GpuPlanContract {

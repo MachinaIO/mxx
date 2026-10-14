@@ -287,7 +287,7 @@ impl GpuHashSamplePlan {
     }
 
     /// Emit tag construction, owner-derived limb descriptors and full-Q
-    /// Keccak rejection directly into the active explicit CUDA Graph.
+    /// Keccak rejection directly into the active explicit GPU graph.
     pub fn emit_raw_hash_sample(
         &self,
         stream: &GpuNativeLaunchStream,
@@ -337,7 +337,7 @@ impl GpuHashSamplePlan {
 impl GpuHashSamplePlan {
     /// Emit tag construction and the `bits`-bit integers of a signed-word
     /// family (one sign word, then `words` magnitude words per element) or
-    /// a canonical one-word family into the active explicit CUDA Graph.
+    /// a canonical one-word family into the active explicit GPU graph.
     pub fn emit_raw_hash_integers(
         &self,
         stream: &GpuNativeLaunchStream,

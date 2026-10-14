@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Lattice primitives and concrete execution backends for mxx"
 # Publishes the subgraph-kernel header directory to dependents' build scripts
-# as DEP_MXX_BACKENDS_CUDA_INCLUDE.
+# as DEP_MXX_BACKENDS_GPU_INCLUDE.
 links = "mxx_backends"
 
 [features]

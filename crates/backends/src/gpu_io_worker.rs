@@ -70,7 +70,21 @@ pub(crate) enum ImportedArtifact {
 /// Fills an import's planned GPU owner with the artifact the worker read. The
 /// worker runs it right after the read, so the upload overlaps GPU work that
 /// does not use that owner.
-pub(crate) type ImportDelivery = Box<dyn FnOnce(ImportedArtifact) -> Result<(), String> + Send>;
+/// A queued transfer's consumption boundary. Its closure holds every source
+/// and temporary allocation until the already-submitted work completes.
+pub(crate) struct ImportTransfer {
+    pub finish: Box<dyn FnOnce() -> Result<(), String> + Send>,
+}
+
+pub(crate) type ImportDelivery =
+    Box<dyn FnOnce(ImportedArtifact) -> Result<Option<ImportTransfer>, String> + Send>;
+
+fn finish_delivery(pending: Option<ImportTransfer>) -> Result<(), String> {
+    if let Some(pending) = pending {
+        (pending.finish)()?;
+    }
+    Ok(())
+}
 
 /// The operation represented by a reply.  Every variant carries the exact
 /// frame token supplied with its command.
@@ -565,6 +579,7 @@ where
                             .map_err(IoWorkerError::Upload)
                             .and_then(|payload| {
                                 deliver(ImportedArtifact::Host(payload))
+                                    .and_then(finish_delivery)
                                     .map(|()| IoCompletion::Imported { frame })
                                     .map_err(IoWorkerError::Upload)
                             });
@@ -592,6 +607,7 @@ where
                 };
                 let result = artifact.and_then(|artifact| {
                     deliver(artifact)
+                        .and_then(finish_delivery)
                         .map(|()| IoCompletion::Imported { frame })
                         .map_err(IoWorkerError::Upload)
                 });
@@ -656,7 +672,12 @@ where
                                     .stage_raw_chunk(key, total_raw_bytes, offset, &bytes)
                                     .map_err(IoWorkerError::Store)
                             }
-                            GpuExportPayload::Device { physical_device, address, bytes } => {
+                            GpuExportPayload::Device {
+                                physical_device,
+                                address,
+                                bytes,
+                                memory,
+                            } => {
                                 if let Some(device) = store.device_artifacts() {
                                     device_staged.insert(key.clone());
                                     // A device stage is finished on publish,
@@ -669,8 +690,16 @@ where
                                             physical_device,
                                             address,
                                             bytes,
+                                            memory,
                                         )
-                                        .map(|_| false)
+                                        .and_then(|(_, completion)| {
+                                            // I/O consumption boundary: retain the source
+                                            // lease until its asynchronous copy completes.
+                                            completion
+                                                .wait()
+                                                .map(|()| false)
+                                                .map_err(|error| error.to_string())
+                                        })
                                         .map_err(IoWorkerError::InvalidExport);
                                 }
                                 // A plan made for a device store executes with
@@ -930,7 +959,7 @@ mod tests {
                     descriptor(),
                     false,
                     None,
-                    Box::new(|_| Ok(())),
+                    Box::new(|_| Ok(None)),
                 )
                 .expect("import command");
             drop(request);

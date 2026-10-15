@@ -285,24 +285,24 @@ fn symbolic_wire_type(scope: &GraphScope, wire: &WireRef) -> WireType {
     scope.nodes()[wire.node.0 as usize].output_types()[wire.port.0 as usize].clone()
 }
 
-/// The instance count of a parallel loop.
+/// The symbolic instance count of a parallel loop, without allocating its members.
 fn parallel_instances(
     spec: &crate::node::ParallelLoop,
     env: &ParamEnv,
     scope: &FrozenGraphScopeId,
     node: NodeId,
-) -> Result<usize, ValidationError> {
-    nonnegative_usize(spec.count.evaluate(env)?, "parallel count", scope, node)
+) -> Result<u128, ValidationError> {
+    nonnegative_family_count(spec.count.evaluate(env)?, "parallel count", scope, node)
 }
 
 /// The environment of instance `index` of a parallel loop's body.
 fn instance_env(
     env: &ParamEnv,
     spec: &crate::node::ParallelLoop,
-    index: usize,
+    index: impl Into<BigInt>,
 ) -> Result<ParamEnv, ValidationError> {
     let mut loop_env = env.clone();
-    loop_env.loop_indices.insert(spec.index_slot, BigInt::from(index));
+    loop_env.loop_indices.insert(spec.index_slot, index.into());
     child_bindings(&loop_env, &spec.bindings)
 }
 
@@ -1111,6 +1111,19 @@ fn validate_node(
                 node.id,
             )?)]
         }
+        NodeKind::BlockDiagonal { count } => {
+            require_arity(scope, node, 1)?;
+            if *count == 0 {
+                return node_error(scope, node.id, "block diagonal requires a positive count");
+            }
+            let input = matrix_argument(scope, values, node, 0)?;
+            let (Some(rows), Some(columns)) =
+                (input.rows.checked_mul(*count), input.columns.checked_mul(*count))
+            else {
+                return node_error(scope, node.id, "block diagonal dimensions overflow");
+            };
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { rows, columns, ..input })]
+        }
         NodeKind::Tensor => {
             require_arity(scope, node, 2)?;
             let left = matrix_argument(scope, values, node, 0)?;
@@ -1169,9 +1182,28 @@ fn validate_node(
                 vec![ConcreteWireType::Matrix(matrix)]
             }
         }
+        NodeKind::Sha256BitColumns { rows, columns, index_bits, .. } => {
+            require_arity(scope, node, 0)?;
+            if *rows == 0 ||
+                *columns == 0 ||
+                *index_bits == 0 ||
+                *index_bits < (usize::BITS - (rows - 1).leading_zeros()) as usize ||
+                rows.checked_mul(*columns).is_none() ||
+                rows.checked_mul(*index_bits).is_none()
+            {
+                return node_error(scope, node.id, "invalid SHA-256 column geometry or index width");
+            }
+            vec![
+                ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count: *columns as u128,
+                };
+                2
+            ]
+        }
         NodeKind::HashIntFamily { count, modulus, tag_components, .. } => {
             validate_hash_key_and_tag(scope, values, node, tag_components, env)?;
-            let count = nonnegative_usize(
+            let count = nonnegative_family_count(
                 count.evaluate(env)?,
                 "hash integer family count",
                 scope,
@@ -1403,7 +1435,7 @@ fn validate_node(
             if *family {
                 vec![ConcreteWireType::IndexedFamily {
                     element: Box::new(ConcreteWireType::Int),
-                    count,
+                    count: count as u128,
                 }]
             } else {
                 vec![
@@ -1488,7 +1520,7 @@ fn validate_node(
             }
             match argument(scope, values, node, 0)? {
                 ConcreteWireType::IndexedFamily { element, count }
-                    if is_integer(element) && *count == ring.ring.ring_dimension() as usize => {}
+                    if is_integer(element) && *count == ring.ring.ring_dimension() as u128 => {}
                 _ => {
                     return node_error(
                         scope,
@@ -1534,7 +1566,7 @@ fn validate_node(
             }
             vec![ConcreteWireType::IndexedFamily {
                 element: Box::new(ConcreteWireType::Int),
-                count: ring.ring.ring_dimension() as usize,
+                count: ring.ring.ring_dimension() as u128,
             }]
         }
         NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
@@ -1565,7 +1597,8 @@ fn validate_node(
                 })?;
             match argument(scope, values, node, 0)? {
                 ConcreteWireType::IndexedFamily { element, count }
-                    if element.as_ref() == &ConcreteWireType::Bool && *count == expected_count => {}
+                    if element.as_ref() == &ConcreteWireType::Bool &&
+                        *count == expected_count as u128 => {}
                 _ => {
                     return node_error(
                         scope,
@@ -1594,7 +1627,7 @@ fn validate_node(
             if members.iter().all(|member| member == &members[0]) {
                 vec![ConcreteWireType::IndexedFamily {
                     element: Box::new(members[0].clone()),
-                    count,
+                    count: count as u128,
                 }]
             } else {
                 vec![ConcreteWireType::DependentFamily { members }]
@@ -1602,13 +1635,14 @@ fn validate_node(
         }
         NodeKind::FamilyGetStatic { index } => {
             require_arity(scope, node, 1)?;
-            let index = nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)?;
+            let index =
+                nonnegative_family_count(index.evaluate(env)?, "family index", scope, node.id)?;
             match argument(scope, values, node, 0)?.clone() {
                 ConcreteWireType::IndexedFamily { element, count } if index < count => {
                     vec![*element]
                 }
-                ConcreteWireType::DependentFamily { members } if index < members.len() => {
-                    vec![members[index].clone()]
+                ConcreteWireType::DependentFamily { members } if index < members.len() as u128 => {
+                    vec![members[index as usize].clone()]
                 }
                 ConcreteWireType::IndexedFamily { .. } |
                 ConcreteWireType::DependentFamily { .. } => {
@@ -1748,13 +1782,13 @@ fn validate_structural_boundaries(
                     vec![LoopInputMode::Broadcast; args.len()]
                 }
                 NodeKind::ParallelLoop(loop_spec) => {
-                    let count = nonnegative_usize(
+                    let count = nonnegative_family_count(
                         loop_spec.count.evaluate(env)?,
                         "parallel count",
                         scope_id,
                         node_id,
                     )?;
-                    if count < loop_spec.minimum_count {
+                    if count < loop_spec.minimum_count as u128 {
                         return node_error(scope_id, node_id, "parallel count is below its minimum");
                     }
                     if loop_spec.input_modes.len() != args.len() {
@@ -1800,7 +1834,13 @@ fn validate_structural_boundaries(
                     // Instance `k` reads its zipped member (`k + offset`, `floor(k / divisor)`),
                     // at its own type.
                     let symbolic = symbolic_wire_type(child_scope, input);
-                    for index in 0..parallel_instances(spec, env, scope_id, node_id)? {
+                    let instances = nonnegative_usize(
+                        spec.count.evaluate(env)?,
+                        "dependent parallel count",
+                        scope_id,
+                        node_id,
+                    )?;
+                    for index in 0..instances {
                         let member = mode
                             .zipped_member(index)
                             .and_then(|member| members.get(member))
@@ -1827,7 +1867,7 @@ fn validate_structural_boundaries(
                             return node_error(scope_id, node_id, "zipped input is not a family");
                         };
                         if let NodeKind::ParallelLoop(spec) = handle.kind() {
-                            let iterations = nonnegative_usize(
+                            let iterations = nonnegative_family_count(
                                 spec.count.evaluate(env)?,
                                 "parallel count",
                                 scope_id,
@@ -1886,7 +1926,7 @@ fn validate_structural_boundaries(
                     // Member `k` is instance `k`'s output, at its own type.
                     let symbolic = symbolic_wire_type(child_scope, output);
                     let instances = parallel_instances(spec, env, scope_id, node_id)?;
-                    if members.len() != instances {
+                    if members.len() as u128 != instances {
                         return node_error(scope_id, node_id, "child output type mismatch");
                     }
                     for (index, member) in members.iter().enumerate() {
@@ -1903,7 +1943,7 @@ fn validate_structural_boundaries(
                     let NodeKind::ParallelLoop(spec) = handle.kind() else { unreachable!() };
                     ConcreteWireType::IndexedFamily {
                         element: Box::new(child_type.clone()),
-                        count: nonnegative_usize(
+                        count: nonnegative_family_count(
                             spec.count.evaluate(env)?,
                             "parallel count",
                             scope_id,
@@ -2097,7 +2137,8 @@ fn concretize_wire_type_inner(
             preimage_sigma: preimage_sigma.as_ref().map(|width| width.close(env)).transpose()?,
         },
         WireType::IndexedFamily { element, count } => {
-            let count = nonnegative_usize(count.evaluate(env)?, "family count", scope, node)?;
+            let count =
+                nonnegative_family_count(count.evaluate(env)?, "family count", scope, node)?;
             // An element type naming the member index resolves member by member.
             let dependent = WireType::family_member(element, &IntExpr::constant(0)) != **element;
             if !dependent {
@@ -2106,7 +2147,9 @@ fn concretize_wire_type_inner(
                 let element = concretize_wire_type(element, env, scope, node)?;
                 ConcreteWireType::IndexedFamily { element: Box::new(element), count }
             } else {
-                let members = (0..count)
+                let addressable_count =
+                    nonnegative_usize(BigInt::from(count), "dependent family count", scope, node)?;
+                let members = (0..addressable_count)
                     .map(|index| {
                         let member = WireType::family_member(element, &IntExpr::constant(index));
                         concretize_wire_type(&member, env, scope, node)
@@ -2295,7 +2338,7 @@ fn child_bindings(
     Ok(child)
 }
 
-fn family_element(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<usize>) {
+fn family_element(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<u128>) {
     match ty {
         ConcreteWireType::IndexedFamily { element, count } => (element, Some(*count)),
         scalar => (scalar, None),
@@ -2347,6 +2390,19 @@ fn positive_usize(
         scope: scope.clone(),
         node,
         message: format!("{label} must be a positive usize"),
+    })
+}
+
+fn nonnegative_family_count(
+    value: BigInt,
+    label: &str,
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+) -> Result<u128, ValidationError> {
+    value.to_u128().ok_or_else(|| ValidationError::Node {
+        scope: scope.clone(),
+        node,
+        message: format!("{label} must be a nonnegative 128-bit integer"),
     })
 }
 
@@ -2615,6 +2671,26 @@ mod tests {
         crate::ring::test_validate(&graph("constant-shape", output), &ParamEnv::default())
             .map(|_| ())
             .map_err(node_message)
+    }
+
+    #[test]
+    fn test_block_diagonal_rejects_zero_count_and_dimension_overflow() {
+        for (count, message) in [
+            (0, "block diagonal requires a positive count"),
+            (usize::MAX, "block diagonal dimensions overflow"),
+        ] {
+            let output = value(
+                NodeKind::BlockDiagonal { count },
+                vec![input("input", matrix_type(17, 2, 3))],
+                vec![WireType::Matrix(matrix_type(17, 1, 1))],
+            );
+            let error = crate::ring::test_validate(
+                &graph("block-diagonal-invalid", output),
+                &ParamEnv::default(),
+            )
+            .unwrap_err();
+            assert_eq!(node_message(error), message);
+        }
     }
 
     #[test]
@@ -3625,6 +3701,46 @@ mod tests {
                 .unwrap_err()
             ),
             "coefficient bit width does not cover the modulus"
+        );
+    }
+
+    #[test]
+    fn oversized_uniform_family_retains_exact_cardinality_and_static_bounds() {
+        let count = (usize::MAX as u128) * 130;
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Int),
+            count: IntExpr::constant(count),
+        };
+        let select = |index| {
+            let family = value(
+                NodeKind::Input {
+                    name: "wide-family".to_owned(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![family_type.clone()],
+            );
+            value(
+                NodeKind::FamilyGetStatic { index: IntExpr::constant(index) },
+                vec![family],
+                vec![WireType::Int],
+            )
+        };
+        let validated = crate::ring::test_validate(
+            &graph("wide-family-valid", select(count - 1)),
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert!(validated.root_scope().wire_types.values().any(|ty| matches!(
+            ty, ConcreteWireType::IndexedFamily { count: found, .. } if *found == count
+        )));
+        assert!(
+            crate::ring::test_validate(
+                &graph("wide-family-invalid", select(count)),
+                &ParamEnv::default(),
+            )
+            .is_err()
         );
     }
 

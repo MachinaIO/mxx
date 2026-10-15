@@ -224,6 +224,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RnsModDown { .. } |
                 NodeKind::Transpose |
                 NodeKind::Tensor |
+                NodeKind::BlockDiagonal { .. } |
+                NodeKind::Sha256BitColumns { .. } |
                 NodeKind::UniformResidueSample { .. } |
                 NodeKind::HashSample { .. } |
                 NodeKind::CrtRecompose { .. } |

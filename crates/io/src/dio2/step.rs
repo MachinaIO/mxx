@@ -15,7 +15,9 @@
 //! every refresh part (one PRF, one row of every part's blocks), the smudges of every part and
 //! prime (one PRF, one row of every smudge's columns per digit), and the label products; the last
 //! step's ([`ChainProgram::last`]) computes `Pi_i` and the smudge of the output decoder. The
-//! Program does not grow with the number of parts.
+//! Program does not grow with the number of parts. Production label products are described by
+//! [`LabelProducts`] and lowered directly into DSL families by the refresh composer; they are
+//! not scalar Program output ports. Noise-only Programs retain the scalar balanced-tree model.
 
 use super::{Dio2Error, Dio2Parameters, StreamingFunction, function::StepWires};
 use mxx_exponent_lut::{
@@ -41,9 +43,73 @@ pub const STATE_TAG: &str = "dio2/state";
 pub const PUBLIC_TAG: &str = "dio2/label-0";
 /// Root tag of the label columns `1..=m_v`.
 pub const LABEL_TAG: &str = "dio2/label";
+/// Clear row-major labels used by the symbolic public-product family.
+pub const LABEL_VALUES_INPUT: &str = "dio2/current-labels";
+
+/// A root-row group, without enumerating the members of either label family.
+#[derive(Clone, Debug)]
+pub enum RowGroup {
+    Scalar(Target),
+    Public,
+    Labels,
+    Helpers(Vec<usize>),
+}
+
+impl RowGroup {
+    /// Family cardinality, or `None` for a scalar root row.
+    pub fn count(&self, plan: &StepPlan) -> Option<usize> {
+        match self {
+            Self::Scalar(_) => None,
+            Self::Public => Some(plan.label_rows + 1),
+            Self::Labels => Some(plan.label_rows * plan.label_width),
+            Self::Helpers(sigmas) => Some(sigmas.len()),
+        }
+    }
+
+    /// The refresh target index of a member, in the original part ordering.
+    pub fn target_index(&self, plan: &StepPlan, member: mxx_dsl::Int) -> mxx_dsl::Int {
+        use mxx_dsl::Int;
+        match self {
+            Self::Scalar(target) => Int::constant(plan.target_index(target) as i64),
+            Self::Public => mxx_dsl::select(
+                member.clone().equal(plan.label_rows).to_int(),
+                vec![member.mul(plan.label_width + 1).add(3usize), Int::constant(1)],
+            )
+            .expect("two integer candidates"),
+            Self::Labels => member
+                .clone()
+                .div(plan.label_width)
+                .mul(plan.label_width + 1)
+                .add(member.rem(plan.label_width))
+                .add(4usize),
+            Self::Helpers(sigmas) => Int::evaluate(IntExpr::Select {
+                selector: Box::new(member.expression().expect("a structural member")),
+                branches: sigmas
+                    .iter()
+                    .map(|sigma| IntExpr::constant(plan.target_index(&Target::Helper(*sigma))))
+                    .collect(),
+            }),
+        }
+    }
+
+    /// The root key tag, using symbolic family indices for labels.
+    pub fn key_tag(&self, plan: &StepPlan, member: mxx_dsl::Int) -> mxx_dsl::HashTag {
+        match self {
+            Self::Scalar(target) => target.key_tag(plan).expect("a scalar root tag"),
+            Self::Public => RnsBggRoot::input_tag(PUBLIC_TAG, Some(member)),
+            Self::Labels => RnsBggRoot::input_tag(LABEL_TAG, Some(member)),
+            Self::Helpers(sigmas) => {
+                RnsBggRoot::helper_tag(mxx_dsl::Int::evaluate(IntExpr::Select {
+                    selector: Box::new(member.expression().expect("a structural member")),
+                    branches: sigmas.iter().copied().map(IntExpr::constant).collect(),
+                }))
+            }
+        }
+    }
+}
 
 /// Which refresh targets a noise-only Program materializes. Production and claim graphs always
-/// use [`StepPlan::new`], which materializes every target.
+/// use [`StepPlan::new`], which includes every target, with labels represented symbolically.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NoiseTargets {
     /// Materialize and simulate every target.
@@ -118,9 +184,13 @@ impl Target {
 /// and the sizes of the samplers.
 #[derive(Clone, Debug)]
 pub struct StepPlan {
+    /// Production plans lower label products and targets directly as DSL families. Noise-only
+    /// plans retain scalar products so the existing exact per-column model remains available.
+    pub symbolic_labels: bool,
     /// The automorphisms `K` of every LUT of every step (spec §5), ascending; `1` among them.
     pub automorphisms: Vec<usize>,
-    /// The materialized refresh targets, in part order in full mode. In representative mode
+    /// The materialized refresh targets; production plans omit the symbolic label range. In
+    /// full noise mode these are in part order. In representative mode
     /// `Label { row: 0, column: 0 }` denotes the maximal-leaf label class, not a fixed entry.
     pub targets: Vec<Target>,
     /// Noise-only target selection; full for every production/claim plan.
@@ -142,12 +212,12 @@ pub struct StepPlan {
 }
 
 impl StepPlan {
-    /// The plan of `function` on `parameters`.
+    /// The production plan of `function`, with a symbolic range for all label targets.
     pub fn new(
         parameters: &Dio2Parameters,
         function: &StreamingFunction,
     ) -> Result<Self, Dio2Error> {
-        Self::for_noise(parameters, function, NoiseTargets::Full)
+        Self::build(parameters, function, NoiseTargets::Full, true)
     }
 
     /// Build a noise-only plan with explicit target selection. Unlike `targets.len()`,
@@ -158,8 +228,18 @@ impl StepPlan {
         function: &StreamingFunction,
         noise_targets: NoiseTargets,
     ) -> Result<Self, Dio2Error> {
+        Self::build(parameters, function, noise_targets, false)
+    }
+
+    fn build(
+        parameters: &Dio2Parameters,
+        function: &StreamingFunction,
+        noise_targets: NoiseTargets,
+        symbolic_labels: bool,
+    ) -> Result<Self, Dio2Error> {
         let columns = parameters.columns()?;
         let mut plan = Self {
+            symbolic_labels,
             automorphisms: Vec::new(),
             targets: Vec::new(),
             noise_targets,
@@ -227,9 +307,13 @@ impl StepPlan {
         let anchors = super::anchor_columns(columns).div_ceil(2 * columns);
         plan.full_target_count =
             3 + plan.label_rows * (plan.label_width + 1) + plan.automorphisms.len() + anchors;
-        let labels = match noise_targets {
-            NoiseTargets::Full => plan.label_rows * (plan.label_width + 1),
-            NoiseTargets::Representative => 1,
+        let labels = if symbolic_labels {
+            0
+        } else {
+            match noise_targets {
+                NoiseTargets::Full => plan.label_rows * (plan.label_width + 1),
+                NoiseTargets::Representative => 1,
+            }
         };
         plan.targets = [Target::Private, Target::Public, Target::State]
             .into_iter()
@@ -243,35 +327,47 @@ impl StepPlan {
         Ok(plan)
     }
 
-    /// The rows of a step input as its consumers read them: per graph input name (an imported
-    /// encryption's [`root_row_input_name`] or [`root_helper_input_name`]), its port and the
-    /// targets whose rows it holds, and whether it is a family of them (else one row). Every
-    /// stage that produces a step input outputs these names, so a protocol links each input to
-    /// its producer by name.
-    pub fn input_rows(&self) -> Vec<(String, usize, Vec<Target>, bool)> {
-        let public = (0..self.label_rows)
-            .map(|row| Target::Label { row, column: 0 })
-            .chain([Target::Public])
-            .collect::<Vec<_>>();
-        let labels = (0..self.label_rows)
-            .flat_map(|row| (1..=self.label_width).map(move |column| Target::Label { row, column }))
-            .collect::<Vec<_>>();
-        let mut rows = Vec::new();
-        for port in 0..2 {
-            for (tag, targets, family) in [
-                (PRIVATE_TAG, vec![Target::Private], false),
-                (STATE_TAG, vec![Target::State], false),
-                (PUBLIC_TAG, public.clone(), true),
-                (LABEL_TAG, labels.clone(), true),
-            ] {
-                rows.push((root_row_input_name(tag, port), port, targets, family));
+    /// Original target ordering: private, public, state, all row-major labels, helpers, anchor.
+    pub fn target_index(&self, target: &Target) -> usize {
+        match target {
+            Target::Private => 0,
+            Target::Public => 1,
+            Target::State => 2,
+            Target::Label { row, column } => 3 + row * (self.label_width + 1) + column,
+            Target::Helper(sigma) => {
+                3 + self.label_rows * (self.label_width + 1) +
+                    self.automorphisms
+                        .iter()
+                        .position(|other| other == sigma)
+                        .expect("a planned helper")
             }
-            for (key, sigmas) in &self.helper_families {
-                let helpers = sigmas.iter().map(|sigma| Target::Helper(*sigma)).collect();
-                rows.push((root_helper_input_name(key, port), port, helpers, true));
+            Target::Anchor(block) => {
+                3 + self.label_rows * (self.label_width + 1) + self.automorphisms.len() + block
             }
         }
-        rows
+    }
+
+    /// Root inputs represented by fixed-size group descriptors, not one host value per label.
+    pub fn input_groups(&self) -> Vec<(String, usize, RowGroup)> {
+        let mut groups = Vec::new();
+        for port in 0..2 {
+            for (tag, group) in [
+                (PRIVATE_TAG, RowGroup::Scalar(Target::Private)),
+                (STATE_TAG, RowGroup::Scalar(Target::State)),
+                (PUBLIC_TAG, RowGroup::Public),
+                (LABEL_TAG, RowGroup::Labels),
+            ] {
+                groups.push((root_row_input_name(tag, port), port, group));
+            }
+            for (key, sigmas) in &self.helper_families {
+                groups.push((
+                    root_helper_input_name(key, port),
+                    port,
+                    RowGroup::Helpers(sigmas.clone()),
+                ));
+            }
+        }
+        groups
     }
 
     /// The full number of refresh parts' column blocks: two per target, even in representative
@@ -355,15 +451,20 @@ pub struct ChainOutputs {
     /// The weight-one digit rows of every refresh part and prime ([`StepPlan::smudges`]), in
     /// digit order: a row of `w_0` columns per smudge; of the output decoder: one column.
     /// The refresh re-targets digit `r` to the scalar form `P^r / 2` before adding the rows.
-    /// Noise-representative digits repeat one output position, retaining every digit weight.
-    pub smudge: Vec<usize>,
-    /// The label products, entry `(r, c)` at `r (m_v + 1) + c` in full mode; only the
-    /// maximal-leaf label product at index zero in noise-representative mode.
+    /// All digits share one output row, with digit `r` occupying columns
+    /// `r * smudge_columns .. (r + 1) * smudge_columns`. Noise-representative mode
+    /// stores just one digit, whose bound is used with every actual digit weight.
+    pub smudge: usize,
+    /// Scalar noise-model label products: entry `(r, c)` at `r (m_v + 1) + c` in full noise
+    /// mode, only the maximal-leaf product at index zero in representative mode. Production
+    /// Programs leave this empty and use [`ChainProgram::label_products`] instead.
     pub labels: Vec<usize>,
 }
 
 /// The Program of step `i` on input chunk `x`, with the root tag of every input.
 pub struct ChainProgram {
+    /// Fixed public transition for DSL label families; absent in noise-only and final Programs.
+    pub label_products: Option<LabelProducts>,
     pub program: ExponentLutProgram,
     pub root_inputs: BTreeMap<WireId, String>,
     pub outputs: ChainOutputs,
@@ -424,6 +525,11 @@ impl ChainProgram {
         let profile = parameters.profile()?;
         let mut builder = ExponentLutProgramBuilder::new();
         let mut root_inputs = BTreeMap::new();
+        let label_products = if !last && plan.symbolic_labels && plan.full_target_count != 0 {
+            Some(LabelProducts::new(parameters, x))
+        } else {
+            None
+        };
         let root_prf = |prf: &SparseLwrPrf, root_inputs: &mut BTreeMap<WireId, String>| {
             root_inputs.insert(prf.initial_input(), PRIVATE_TAG.to_owned());
             root_inputs.insert(prf.input_vector(), PUBLIC_TAG.to_owned());
@@ -469,7 +575,7 @@ impl ChainProgram {
             sigma: None,
             automorphed: BTreeMap::new(),
             cbd: None,
-            smudge: Vec::with_capacity(plan.smudge_digits),
+            smudge: 0,
             labels: Vec::new(),
         };
         let mut wires = vec![Operand::Scalar(new_state)];
@@ -477,17 +583,20 @@ impl ChainProgram {
         let mut representative_smudge_ranges = Vec::new();
         match plan.noise_targets {
             NoiseTargets::Full => {
-                for digit in 0..plan.smudge_digits {
-                    let (row, _) =
-                        placed_row(&mut builder, &smudge, plan, smudge_columns, Some(digit))?;
-                    outputs.smudge.push(wires.len());
-                    wires.push(Operand::Scalar(row));
-                }
+                let (row, _) = placed_row(
+                    &mut builder,
+                    &smudge,
+                    plan,
+                    smudge_columns,
+                    Some(plan.smudge_digits),
+                )?;
+                outputs.smudge = wires.len();
+                wires.push(Operand::Scalar(row));
             }
             NoiseTargets::Representative => {
                 let (row, family) = placed_row(&mut builder, &smudge, plan, smudge_columns, None)?;
                 representative_smudge_ranges.extend([smudge.initial_input()..=state, family..=row]);
-                outputs.smudge = vec![wires.len(); plan.smudge_digits];
+                outputs.smudge = wires.len();
                 wires.push(Operand::Scalar(row));
             }
         }
@@ -536,42 +645,48 @@ impl ChainProgram {
                 cbd_sampler = Some(cbd);
             }
             // The label columns `1..=m_v` and the products of the next label matrix.
-            let labels = builder.input_family(
-                IntExpr::constant(plan.label_rows * plan.label_width),
-                AttributeKnowledge::PublicPayload,
-            )?;
-            root_inputs.insert(labels, LABEL_TAG.to_owned());
-            let transition = label_transition(parameters, x);
-            let (rows, selected_columns) = match plan.noise_targets {
-                NoiseTargets::Full => (plan.label_rows, (0..=plan.label_width).collect::<Vec<_>>()),
-                NoiseTargets::Representative => {
-                    let leaves = (0..=plan.label_width)
-                        .map(|column| transition.iter().filter(|row| row[column]).count())
-                        .collect::<Vec<_>>();
-                    let column = (0..leaves.len()).max_by_key(|column| leaves[*column]).unwrap();
-                    omitted_label_products = plan.label_rows *
-                        leaves.iter().map(|count| (*count).max(2) - 1).sum::<usize>() -
-                        (leaves[column].max(2) - 1);
-                    (1, vec![column])
-                }
-            };
-            for row in 0..rows {
-                for column in selected_columns.iter().copied() {
-                    let leaves = (0..plan.label_width)
-                        .filter(|k| transition[*k][column])
-                        .map(|k| Operand::Member {
-                            family: labels,
-                            index: IntExpr::constant(row * plan.label_width + k),
-                        })
-                        .collect::<Vec<_>>();
-                    let product = public_product(&mut builder, leaves, &public)?;
-                    outputs.labels.push(wires.len());
-                    wires.push(Operand::Scalar(product));
+            if !plan.symbolic_labels {
+                let labels = builder.input_family(
+                    IntExpr::constant(plan.label_rows * plan.label_width),
+                    AttributeKnowledge::PublicPayload,
+                )?;
+                root_inputs.insert(labels, LABEL_TAG.to_owned());
+                let transition = label_transition(parameters, x);
+                let (rows, selected_columns) = match plan.noise_targets {
+                    NoiseTargets::Full => {
+                        (plan.label_rows, (0..=plan.label_width).collect::<Vec<_>>())
+                    }
+                    NoiseTargets::Representative => {
+                        let leaves = (0..=plan.label_width)
+                            .map(|column| transition.iter().filter(|row| row[column]).count())
+                            .collect::<Vec<_>>();
+                        let column =
+                            (0..leaves.len()).max_by_key(|column| leaves[*column]).unwrap();
+                        omitted_label_products = plan.label_rows *
+                            leaves.iter().map(|count| (*count).max(2) - 1).sum::<usize>() -
+                            (leaves[column].max(2) - 1);
+                        (1, vec![column])
+                    }
+                };
+                for row in 0..rows {
+                    for column in selected_columns.iter().copied() {
+                        let leaves = (0..plan.label_width)
+                            .filter(|k| transition[*k][column])
+                            .map(|k| Operand::Member {
+                                family: labels,
+                                index: IntExpr::constant(row * plan.label_width + k),
+                            })
+                            .collect::<Vec<_>>();
+                        let product = public_product(&mut builder, leaves, &public)?;
+                        outputs.labels.push(wires.len());
+                        wires.push(Operand::Scalar(product));
+                    }
                 }
             }
         }
         let program = builder.finish(wires)?;
         Ok(Self {
+            label_products,
             program,
             root_inputs,
             outputs,
@@ -590,29 +705,39 @@ impl ChainProgram {
 /// decoder's smudge Program place them. The family-to-row interval identifies the operation
 /// event counts that must be repeated for identical noise-representative smudge digits.
 ///
-/// - CBD noise (`digit` is `None`): member `column n + k` lands at `X^k` of block `column`.
-/// - A smudge digit (`digit` is `Some(r)`): member `(column n + k) d + r` lands at `X^k` of column
-///   `column` with weight one. The refresh applies its full weight `P^r / 2` as a BigInt scalar
-///   re-targeting (see `mxx_exponent_lut::decoder::decoding`), so no power of `P` must fit a
-///   small-constant instruction or its coefficient payload bound.
+/// - CBD noise (`digits` is `None`): member `column n + k` lands at `X^k` of block `column`.
+/// - All smudge digits (`digits` is `Some(d)`): member `(column n + k) d + r` lands at `X^k` of
+///   column `r * columns + column` with weight one. A single indexed body covers all digits. The
+///   refresh applies its full weight `P^r / 2` as a BigInt scalar re-targeting (see
+///   `mxx_exponent_lut::decoder::decoding`), so no power of `P` must fit a small-constant
+///   instruction or its coefficient payload bound.
 fn placed_row(
     builder: &mut ExponentLutProgramBuilder,
     prf: &SparseLwrPrf,
     plan: &StepPlan,
     columns: usize,
-    digit: Option<usize>,
+    digits: Option<usize>,
 ) -> Result<(WireId, WireId), Dio2Error> {
     let PrfOutput::Family(family) = prf.output() else {
         return Err(Dio2Error::Parameters("a sampler needs several members"));
     };
     let n = plan.ring_dimension;
-    let digits = if digit.is_some() { plan.smudge_digits } else { 1 };
-    let range = FamilyRange::full(IntExpr::constant(columns * n))?;
+    let digits = digits.unwrap_or(1);
+    let range = FamilyRange::full(IntExpr::constant(columns * n * digits))?;
     let mut first = None;
     let placed = builder.parallel(range, |builder, index| {
         let member = IntExpr::Add(
-            Box::new(IntExpr::Mul(Box::new(index.clone()), Box::new(IntExpr::constant(digits)))),
-            Box::new(IntExpr::constant(digit.unwrap_or(0))),
+            Box::new(IntExpr::Mul(
+                Box::new(IntExpr::Rem(
+                    Box::new(index.clone()),
+                    Box::new(IntExpr::constant(columns * n)),
+                )),
+                Box::new(IntExpr::constant(digits)),
+            )),
+            Box::new(IntExpr::Div(
+                Box::new(index.clone()),
+                Box::new(IntExpr::constant(columns * n)),
+            )),
         )
         .canonicalize();
         let coefficient =
@@ -625,7 +750,10 @@ fn placed_row(
         first = Some(wire);
         Ok(Operand::Scalar(wire))
     })?;
-    Ok((builder.sum_columns(placed, columns)?, first.expect("a placement emits one body wire")))
+    Ok((
+        builder.sum_columns(placed, columns * digits)?,
+        first.expect("a placement emits one body wire"),
+    ))
 }
 
 /// The product of the public encodings `leaves` by a balanced tree of public products, padded
@@ -655,15 +783,94 @@ fn public_product(
     }
 }
 
+/// A fixed-seed selector recipe for the irregular leaf sets of `D_x`. Each computed column
+/// packs its selected row indices in fixed-width binary fields. Reading one field uses
+/// `index_bits` bit tests; the DSL records one recipe, not an expanded table or a matrix node
+/// per selected leaf or label.
+pub struct LabelProducts {
+    seed: [u8; 32],
+    width: usize,
+    /// The maximum padded leaf count; only the logarithm of this determines graph depth.
+    pub max_leaves: usize,
+    /// Binary field width of an input row index.
+    pub index_bits: usize,
+}
+
+impl LabelProducts {
+    /// Read a selected input row from its packed column, using structural bit positions.
+    pub fn index(
+        &self,
+        packed: mxx_dsl::Int,
+        leaf: mxx_dsl::Int,
+    ) -> Result<mxx_dsl::Int, mxx_dsl::DslError> {
+        let mut index = mxx_dsl::Int::constant(0);
+        for bit in 0..self.index_bits {
+            index = index.add(
+                packed
+                    .clone()
+                    .bit(leaf.clone().mul(self.index_bits).add(bit))?
+                    .to_int()
+                    .mul(1usize << bit),
+            );
+        }
+        Ok(index)
+    }
+
+    /// The clear transition over a row-major integer family. This uses the same leaf selector
+    /// table as the encoding forest, but sums exponents modulo the PRF input modulus.
+    pub fn next(
+        &self,
+        parameters: &Dio2Parameters,
+        labels: &mxx_dsl::Family<mxx_dsl::Int>,
+    ) -> Result<mxx_dsl::Family<mxx_dsl::Int>, mxx_dsl::DslError> {
+        let width = parameters.label_width();
+        let (packed_columns, counts) = self.columns();
+        mxx_dsl::parallel(parameters.label_rows() * (width + 1), |member| {
+            let row = member.clone().div(width + 1);
+            let column = member.rem(width + 1);
+            let packed = packed_columns.at(column.clone());
+            let count = counts.at(column);
+            let total =
+                mxx_dsl::iterate(self.max_leaves, mxx_dsl::Int::constant(0), |leaf, total| {
+                    let index = self.index(packed.clone(), leaf.clone())?;
+                    let value = labels.at(row.clone().mul(width + 1).add(index).add(1usize));
+                    Ok(total.add(mxx_dsl::select(
+                        leaf.less(count.clone()).to_int(),
+                        vec![mxx_dsl::Int::constant(0), value],
+                    )?))
+                })?;
+            Ok(total.rem(parameters.label_modulus()))
+        })
+    }
+
+    /// Retain the fixed seed and exact maximum column size, without embedding the selector table.
+    pub fn new(parameters: &Dio2Parameters, x: &[bool]) -> Self {
+        let width = parameters.label_width();
+        let index_bits = (usize::BITS - (width - 1).leading_zeros()) as usize;
+        let transition = label_transition(parameters, x);
+        let mut max_leaves = 2;
+        for column in 0..=width {
+            max_leaves = max_leaves.max(transition.iter().filter(|row| row[column]).count());
+        }
+        Self { seed: label_transition_seed(x), width, max_leaves, index_bits }
+    }
+
+    /// One shared public computation of all packed columns and their unpadded leaf counts.
+    pub fn columns(&self) -> (mxx_dsl::Family<mxx_dsl::Int>, mxx_dsl::Family<mxx_dsl::Int>) {
+        mxx_dsl::DslContext::new("dio2/label-columns").sha256_bit_columns(
+            self.seed,
+            self.width,
+            self.width + 1,
+            self.index_bits,
+        )
+    }
+}
+
 /// The label transition `D_x in {0,1}^(m_v x (m_v + 1))` of chunk `x` (spec §3): hashed from
 /// the chunk alone, shared by every step.
 pub fn label_transition(parameters: &Dio2Parameters, x: &[bool]) -> Vec<Vec<bool>> {
     let width = parameters.label_width();
-    let mut digest = Sha256::new();
-    digest.update(b"mxx-io/dio2/label-transition/v1");
-    digest.update((x.len() as u64).to_le_bytes());
-    digest.update(x.iter().map(|bit| u8::from(*bit)).collect::<Vec<_>>());
-    let seed: [u8; 32] = digest.finalize().into();
+    let seed = label_transition_seed(x);
     let mut cached_index = usize::MAX;
     let mut block = [0u8; 32];
     let mut bit = |index: usize| {
@@ -679,6 +886,14 @@ pub fn label_transition(parameters: &Dio2Parameters, x: &[bool]) -> Vec<Vec<bool
         block[offset / 8] >> (offset % 8) & 1 == 1
     };
     (0..width).map(|k| (0..=width).map(|c| bit(k * (width + 1) + c)).collect()).collect()
+}
+
+fn label_transition_seed(x: &[bool]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-io/dio2/label-transition/v1");
+    digest.update((x.len() as u64).to_le_bytes());
+    digest.update(x.iter().map(|bit| u8::from(*bit)).collect::<Vec<_>>());
+    digest.finalize().into()
 }
 
 /// The next label matrix `A_(i+1) = A_i[:, 1..] D_x mod Q` in the clear.
@@ -710,6 +925,121 @@ mod tests {
     use super::*;
     use crate::dio2::test_support::toy;
     use mxx_exponent_lut::rns_bgg::RnsBggDerivedWorkload;
+
+    /// All digit counts use the same packed Program output and output identifiers.
+    #[test]
+    fn test_smudge_digits_share_one_program_output() {
+        let mut expected = None;
+        for digits in [1, 3, 60, 306] {
+            let (mut parameters, function) = toy();
+            parameters.smudge_digits = digits;
+            let plan = StepPlan::new(&parameters, &function).unwrap();
+            let keys = ChainKeys {
+                sigma: None,
+                cbd: None,
+                smudge: parameters
+                    .prf
+                    .declared_shape(0, "smudge", plan.output_smudge_members())
+                    .unwrap(),
+            };
+            let program =
+                ChainProgram::last(&parameters, &function, &plan, 1, &[false], &keys).unwrap();
+            let outputs = (program.outputs.smudge, program.program.outputs().to_vec());
+            if let Some(expected) = &expected {
+                assert_eq!(&outputs, expected);
+            } else {
+                expected = Some(outputs);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_prf_selector_family_is_symbolic() {
+        let (parameters, function) = toy();
+        let plan = StepPlan::new(&parameters, &function).unwrap();
+        let keys = ChainKeys {
+            sigma: None,
+            cbd: None,
+            smudge: parameters.prf.declared_shape(0, "oversized", usize::MAX).unwrap(),
+        };
+        let program = ChainProgram::last(&parameters, &function, &plan, 1, &[false], &keys)
+            .expect("symbolic PRF selector table");
+        assert!(
+            program
+                .program
+                .data_families()
+                .values()
+                .any(|family| family.count() > usize::MAX as u128)
+        );
+    }
+
+    /// The symbolic selector and integer transition agree with the existing clear evaluator,
+    /// including arbitrary column leaf counts and multiple rows. Node cardinality is bounded
+    /// independently of the number of label entries (only index bit width grows).
+    #[test]
+    fn symbolic_label_transition_matches_clear_labels() {
+        use mxx_backends::{
+            MemoryArtifactStore, RuntimeValue, authority::CpuExecution, backend::poly::cpu_backend,
+        };
+        use mxx_dsl::DslContext;
+        use mxx_exponent_lut::api::{StageExecution, StageGraph, execute_graph};
+        use num_bigint::BigInt;
+        use rand::Rng;
+        let mut node_counts = Vec::new();
+        for height in [1, 2, 8] {
+            let (mut parameters, _) = toy();
+            parameters.prf.lwr_dimension = height;
+            let mut execution = CpuExecution::new(cpu_backend(parameters.rings().unwrap()));
+            for chunk in [false, true] {
+                let labels = (0..height)
+                    .map(|_| {
+                        (0..=parameters.label_width())
+                            .map(|_| rand::rng().random_range(0..parameters.label_modulus()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let products = LabelProducts::new(&parameters, &[chunk]);
+                let graph = DslContext::new("dio2-symbolic-labels");
+                let input =
+                    graph.int_family_input("labels", height * (parameters.label_width() + 1));
+                let graph = graph
+                    .output("next", products.next(&parameters, &input).unwrap())
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                node_counts.push(
+                    graph.graph.scopes().values().map(|scope| scope.nodes().len()).sum::<usize>(),
+                );
+                let runtime = BTreeMap::from([(
+                    "labels".to_owned(),
+                    RuntimeValue::integer_values(
+                        labels.iter().flatten().copied().map(BigInt::from).collect(),
+                    ),
+                )]);
+                let output = execute_graph(
+                    StageGraph::new(graph, runtime, BTreeMap::new()),
+                    &mxx_ir_core::ParamEnv::default(),
+                    &mut execution,
+                    &mut MemoryArtifactStore::default(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+                let actual =
+                    <CpuExecution as StageExecution<MemoryArtifactStore>>::download_integers(
+                        &execution,
+                        &output.outputs["next"],
+                    )
+                    .unwrap();
+                let expected = next_labels(&parameters, &labels, &[chunk])
+                    .into_iter()
+                    .flatten()
+                    .map(BigInt::from)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+        assert!(node_counts.iter().max().unwrap() < &(node_counts[0] * 2));
+    }
 
     /// Caching a transition hash block preserves the original per-bit hash expansion, including
     /// block boundaries and rows that straddle them.
@@ -752,6 +1082,9 @@ mod tests {
         };
         let program =
             ChainProgram::refreshing(&parameters, &function, &plan, 0, &[true], &keys).unwrap();
+        assert!(program.outputs.labels.is_empty());
+        assert!(program.label_products.is_some());
+        assert!(plan.targets.iter().all(|target| !matches!(target, Target::Label { .. })));
         let workload = RnsBggDerivedWorkload::from_program(&program.program).unwrap();
         for output in program.program.outputs() {
             let wire = match output {

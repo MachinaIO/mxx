@@ -655,7 +655,7 @@ pub fn measure_runtime_container_primitive(
                 else {
                     return Err(expression_error("family output type is not indexed".into()));
                 };
-                if *expected_count != count {
+                if *expected_count != count as u128 {
                     return Err(expression_error(
                         "family output type count does not match node".into(),
                     ));

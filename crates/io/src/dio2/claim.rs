@@ -18,7 +18,8 @@
 //! | `decode` | the final state of the output decoder's plaintext |
 //!
 //! Every plain stage input is linked by name to the stage output it reads (a step input is output
-//! under the names its import reads, see [`StepPlan::input_rows`]) or fed by an external input:
+//! under the names its import reads, see [`super::step::StepPlan::input_groups`]) or fed by an
+//! external input:
 //!
 //! - every hash key (32 bytes);
 //! - `z0`, the initial state, and `a0`, the initial labels `A_0` (entry `(r, c)` at `r (m_v + 1) +
@@ -28,6 +29,8 @@
 //! - the labels' public plaintexts `X^(stride a)` of every step's import, by root tag
 //!   (`label<i>_<tag>_{coefficient,exponent}`), and those of its run on the zero input
 //!   (`keys_label<i>_<tag>_...`, which the decoded keys do not read);
+//! - the clear current-label family of each symbolic label forest (`labels<i>`), constrained
+//!   member-wise to the transition of `a0`; the key-only copy is independently public;
 //! - the keys of every PRF `p` of step `i`: bucket `b`'s selector bits (`selector<i>_<p>_<b>`, with
 //!   zero exponents) and coordinate table (`table<i>_<p>_<b>`, read by preprocessing and both
 //!   online evaluations).
@@ -44,7 +47,7 @@ use super::{
         ANCHOR_INPUT, INITIAL_LABELS_INPUT, INITIAL_STATE_INPUT, PLAINTEXT_INPUT, STATE_OUTPUT,
         anchor_output, chunk_index,
     },
-    step::{ChainProgram, LABEL_TAG, PUBLIC_TAG, label_transition},
+    step::{ChainProgram, LABEL_TAG, LABEL_VALUES_INPUT, LabelProducts, PUBLIC_TAG},
 };
 use mxx_backends::SessionStore;
 use mxx_dsl::{Bool, DslContext, IdealSpec, Int};
@@ -125,12 +128,9 @@ fn range(lower: i64, upper: i64) -> InputValueContract {
     InputValueContract::IntegerRange { lower: lower.into(), upper: upper.into() }
 }
 
-/// `count` members in `[lower, upper]`.
-fn family(count: usize, lower: i64, upper: i64) -> InputValueContract {
-    InputValueContract::Family {
-        count: IntExpr::constant(count),
-        element: Box::new(range(lower, upper)),
-    }
+/// `count` members in `[lower, upper]`, without requiring an addressable runtime vector.
+fn family(count: impl Into<IntExpr>, lower: i64, upper: i64) -> InputValueContract {
+    InputValueContract::Family { count: count.into(), element: Box::new(range(lower, upper)) }
 }
 
 impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
@@ -203,6 +203,16 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                 })?;
         let chunk = chunk_index(&x[step]);
         let program = &obfuscation.steps[step][chunk].program;
+        if name == LABEL_VALUES_INPUT {
+            return Some(Source::External(
+                format!("{}labels{step}", if phase == "keys_online" { "keys_" } else { "" }),
+                family(
+                    plan.label_rows * (plan.label_width + 1),
+                    0,
+                    self.parameters().label_modulus() as i64 - 1,
+                ),
+            ));
+        }
         let previous =
             || if step == 0 { "initial".to_owned() } else { format!("online_{}", step - 1) };
         let step_input = name.starts_with("rns-bgg/root-row/") ||
@@ -370,11 +380,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         let input_family = |name: &str| -> Result<mxx_dsl::Family<Int>, Dio2Error> {
             let count =
                 match &externals.get(name).ok_or(Dio2Error::Input("an external is missing"))?.0 {
-                    InputValueContract::Family { count, .. } => count
-                        .evaluate(&mxx_ir_core::ParamEnv::default())
-                        .ok()
-                        .and_then(|count| num_traits::ToPrimitive::to_usize(&count))
-                        .ok_or(Dio2Error::Input("a family external has no constant count"))?,
+                    InputValueContract::Family { count, .. } => count.clone(),
                     _ => return Err(Dio2Error::Input("an external is not a family")),
                 };
             Ok(requirement.int_family_input(name, count))
@@ -390,45 +396,47 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         // The labels `A_i` from `A_0` by the label transitions of `x`.
         let a0 = input_family("a0")?;
         let width = plan.label_width;
-        let mut labels = (0..plan.label_rows)
-            .map(|row| {
-                (0..=width)
-                    .map(|column| a0.at(Int::constant((row * (width + 1) + column) as i64)))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let q = self.parameters().label_modulus() as i64;
+        let mut labels = a0;
         let prf_stride = self.parameters().profile()?.layout.stride() as i64;
         let state_stride = function.state_layout.stride() as i64;
         let y = input_family("y")?;
         for (step, chunk) in x.iter().enumerate() {
-            for (tag, members) in [
-                (
-                    "public",
-                    (0..plan.label_rows)
-                        .map(|row| labels[row][0].clone())
-                        .chain([Int::constant(0)])
-                        .collect::<Vec<_>>(),
-                ),
-                (
-                    "label",
-                    (0..plan.label_rows)
-                        .flat_map(|row| (1..=width).map(move |column| (row, column)))
-                        .map(|(row, column)| labels[row][column].clone())
-                        .collect(),
-                ),
-            ] {
+            let values_name = format!("labels{step}");
+            if externals.contains_key(&values_name) {
+                let values = input_family(&values_name)?;
+                valid = mxx_dsl::iterate(plan.label_rows * (width + 1), valid, |member, valid| {
+                    Ok(valid & values.at(member.clone()).equal(labels.at(member)))
+                })?;
+                read.push(values_name);
+            }
+            for (tag, count) in
+                [("public", plan.label_rows + 1), ("label", plan.label_rows * width)]
+            {
                 let coefficient = format!("label{step}_{tag}_coefficient");
                 let exponent = format!("label{step}_{tag}_exponent");
                 if !externals.contains_key(&coefficient) {
                     continue;
                 }
                 let (c, e) = (input_family(&coefficient)?, input_family(&exponent)?);
-                for (member, value) in members.into_iter().enumerate() {
-                    let index = Int::constant(member as i64);
-                    valid =
-                        valid & monomial(c.at(index.clone()), e.at(index), value.mul(prf_stride));
-                }
+                valid = mxx_dsl::iterate(count, valid, |index, valid| {
+                    let value = if tag == "public" {
+                        mxx_dsl::select(
+                            index.clone().equal(plan.label_rows).to_int(),
+                            vec![
+                                labels.at(index.clone().rem(plan.label_rows).mul(width + 1)),
+                                Int::constant(0),
+                            ],
+                        )?
+                    } else {
+                        labels.at(index
+                            .clone()
+                            .div(width)
+                            .mul(width + 1)
+                            .add(index.clone().rem(width))
+                            .add(1usize))
+                    };
+                    Ok(valid & monomial(c.at(index.clone()), e.at(index), value.mul(prf_stride)))
+                })?;
                 read.extend([coefficient, exponent]);
             }
             let coefficient = format!("y{step}_coefficient");
@@ -443,20 +451,10 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                 }
                 read.extend([coefficient, exponent]);
             }
-            let transition = label_transition(self.parameters(), chunk);
-            labels = labels
-                .iter()
-                .map(|row| {
-                    (0..=width)
-                        .map(|column| {
-                            (0..width)
-                                .filter(|k| transition[*k][column])
-                                .fold(Int::constant(0), |sum, k| sum.add(row[1 + k].clone()))
-                                .rem(q)
-                        })
-                        .collect()
-                })
-                .collect();
+            if step + 1 < x.len() {
+                labels = LabelProducts::new(self.parameters(), chunk)
+                    .next(self.parameters(), &labels)?;
+            }
         }
         // Every selector row is one-hot.
         for (step, chunk) in x.iter().enumerate() {
@@ -471,15 +469,18 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                         .row_length
                         .ok_or(Dio2Error::Input("a selector family is not row-wise one-hot"))?;
                     let bits = input_family(&name)?;
-                    valid =
-                        mxx_dsl::iterate(selector.members / row_length, valid, |row, valid| {
+                    valid = mxx_dsl::iterate(
+                        selector.members / row_length as u128,
+                        valid,
+                        |row, valid| {
                             let total =
                                 mxx_dsl::iterate(row_length, Int::constant(0), |slot, total| {
                                     Ok(total
                                         .add(bits.at(row.clone().mul(row_length as i64).add(slot))))
                                 })?;
                             Ok(valid & total.equal(1))
-                        })?;
+                        },
+                    )?;
                     read.push(name);
                 }
             }

@@ -55,7 +55,7 @@ use crate::{
         ControlReset, ExternalIoImport, ExternalIoLoop, PhysicalWave, allocate_real_value,
         allocate_return_integer_family_value, allocate_return_integer_value,
         emit_integer_operation, emit_real_operation, finite_loop_count, fixed_child_env,
-        lower_control_node, pack_resident_family, static_family_member,
+        host_family_count, lower_control_node, pack_resident_family, static_family_member,
     },
     gpu_schedule::GpuColumnInterval,
     gpu_subgraph_kernel::GpuSubgraphKernel,
@@ -344,7 +344,7 @@ fn host_integer_values(
             ConcreteWireType::IndexedFamily { element, count },
         ) if element.as_ref() == &ConcreteWireType::Int &&
             element_type == &ConcreteWireType::Int &&
-            values.len() == *count =>
+            values.len() as u128 == *count =>
         {
             values
                 .iter()
@@ -400,7 +400,7 @@ fn planned_integer_input(
             (Box::new([0, 0]), Box::new([1, words_per_value as u64]), Box::new([stride, 8]))
         }
         ConcreteWireType::IndexedFamily { element, count }
-            if element.as_ref() == &ConcreteWireType::Int && *count == values.len() =>
+            if element.as_ref() == &ConcreteWireType::Int && *count == values.len() as u128 =>
         {
             (
                 Box::new([0, 0, 0]),
@@ -769,6 +769,7 @@ fn append_fixed_child_candidates(
             NodeKind::FamilyGetStatic { .. } |
             NodeKind::FamilyGetDynamic { .. } |
             NodeKind::Concat { .. } |
+            NodeKind::BlockDiagonal { .. } |
             NodeKind::BitExtract { .. } |
             NodeKind::BoolToInt |
             NodeKind::ConstantBool(_) |
@@ -813,6 +814,7 @@ fn append_fixed_child_candidates(
             NodeKind::GaussianSample { .. } |
             NodeKind::HashSample { .. } |
             NodeKind::HashIntFamily { .. } |
+            NodeKind::Sha256BitColumns { .. } |
             NodeKind::TrapdoorSample { .. } => {}
             NodeKind::PreimageSample { .. } => append_preimage_candidate(
                 validated,
@@ -1289,7 +1291,7 @@ fn resident_input_with_type(
             let ConcreteWireType::IndexedFamily { element, count } = expected else {
                 return Err("GPU resident family input has a nonfamily declared type".into());
             };
-            if element.as_ref() != element_type || *count != values.len() {
+            if element.as_ref() != element_type || *count != values.len() as u128 {
                 return Err("GPU resident family input has the wrong element type or count".into());
             }
             let members = values.iter().map(resident_input).collect::<Result<Vec<_>, _>>()?;
@@ -7306,7 +7308,8 @@ pub(crate) fn plan_physical_graph(
                 // device value: every member is imported into its slot before
                 // the first consumer. Selections alone keep importing only the
                 // selected member.
-                let keys = (0..*count)
+                let count = host_family_count(*count)?;
+                let keys = (0..count)
                     .map(|index| ArtifactKey {
                         production: artifact.production_id.clone(),
                         name: artifact.artifact_name.clone(),
@@ -7330,7 +7333,7 @@ pub(crate) fn plan_physical_graph(
                     backend,
                     device,
                     ty,
-                    &vec![BigInt::from(0u8); *count],
+                    &vec![BigInt::from(0u8); count],
                     &range,
                     storage,
                 )?;
@@ -7938,6 +7941,7 @@ pub(crate) fn plan_physical_graph(
                     NodeKind::Transpose |
                     NodeKind::Tensor |
                     NodeKind::Concat { .. } |
+                    NodeKind::BlockDiagonal { .. } |
                     NodeKind::Slice { .. } |
                     NodeKind::ModulusReduce { .. } |
                     NodeKind::CenteredRoundDivide { .. } |
@@ -8136,7 +8140,7 @@ pub(crate) fn plan_physical_graph(
                 // Each family member is its own indexed Int artifact.
                 let members = match &scalar_type {
                     ConcreteWireType::IndexedFamily { count, .. } => {
-                        (0..*count).map(Some).collect()
+                        (0..host_family_count(*count)?).map(Some).collect()
                     }
                     ConcreteWireType::Int | ConcreteWireType::ConstantInt => vec![None],
                     _ => return Err(format!("GPU output {name} is not artifact-compatible")),
@@ -8206,7 +8210,7 @@ pub(crate) fn plan_physical_graph(
                 // Publish from the resident family after every producer and
                 // consumer: each member is exported in the coefficient domain
                 // on its own, so the loop that produced it is not replayed.
-                let (element, count) = (element.as_ref().clone(), *count);
+                let (element, count) = (element.as_ref().clone(), host_family_count(*count)?);
                 if !matches!(element, ConcreteWireType::Matrix(_)) {
                     return Err(format!("GPU family output {name} needs matrix members"));
                 }

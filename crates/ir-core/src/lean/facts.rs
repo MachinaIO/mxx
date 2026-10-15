@@ -21,13 +21,16 @@
 //!
 //! A proof then holds `F : S.Facts ctx outputs` and reads an atom as `F.c<k>.<field>`, whose
 //! statement mentions only wire constants.
+//! Each scope shares its environment binders and context notation in a local section, keeping
+//! source size proportional to its atoms rather than repeating environment types per atom.
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A parallel-loop conjunct over a child scope, as the parent renders it.
 pub(super) struct ChildLoop {
     /// The rendered conjunct, `(∀ i : Fin n, …)`.
     pub conjunct: String,
-    pub count: usize,
+    /// Symbolic cardinality, rendered directly as a Lean natural without iteration.
+    pub count: u128,
     /// The child relation (unqualified) and its arguments before its inputs.
     pub child: String,
     pub env_arguments: String,
@@ -192,7 +195,7 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
             _ => None,
         })
     };
-    let implicit = scope
+    let variables = scope
         .env
         .iter()
         .map(|(binder, ty)| format!("{{{binder} : {ty}}}"))
@@ -200,12 +203,14 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
         .join(" ");
     let env_names =
         scope.env.iter().map(|(binder, _)| binder.as_str()).collect::<Vec<_>>().join(" ");
-    let ctx_type = format!("{name}.Ctx {env_names}");
+    let implicit = "";
+    let ctx_type = format!("{name}Ctx");
     let mut out = format!(
         "set_option genInjectivity false in\nset_option genSizeOf false in\nstructure {name}.Ctx {} where\n  inputs : {}\n  witness : {name}.Witness\n\n",
         scope.env.iter().map(|(b, t)| format!("({b} : {t})")).collect::<Vec<_>>().join(" "),
         scope.input_type
     );
+    out.push_str(&format!("section\nvariable {variables}\nlocal notation \"{ctx_type}\" => ({name}.Ctx {env_names})\n\n"));
     for (wire, ty, term) in &scope.wires {
         out.push_str(&format!(
             "def {name}.{wire} {implicit} (ctx : {ctx_type}) : {} :=\n  {}\n\n",
@@ -345,6 +350,7 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
             constants(&child.outputs),
         ));
     }
+    out.push_str("end\n\n");
     out
 }
 

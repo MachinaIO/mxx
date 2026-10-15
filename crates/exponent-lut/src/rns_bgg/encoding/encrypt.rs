@@ -22,7 +22,7 @@ fn validate_decoder_smudge_input_key_artifacts(
                 count
                     .evaluate(&ParamEnv::default())
                     .ok()
-                    .and_then(|value| value.to_usize())
+                    .and_then(|value| value.to_u128())
                     .ok_or(RnsBggError::Binding("decoder smudge family count is not concrete"))?,
             ),
         };
@@ -80,6 +80,8 @@ impl<'a> RnsEncryptBuild<'a> {
     /// [`super::root_helper_input_name`]) to the state form of every non-terminal level. A public
     /// input's payload is its plaintext in `lhs`, which holds the public inputs only. The rows
     /// are the encodings of a mask secret no stage knows, so the stage binds no secret.
+    /// With [`Self::with_inputs_by_shape`], public plaintexts are symbolic graph inputs and
+    /// `lhs` must be empty; no family payloads are allocated or made executable.
     pub fn bind_root_rows<P: Poly>(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
@@ -98,6 +100,27 @@ impl<'a> RnsEncryptBuild<'a> {
                 return Err(ApiError::input("an imported input has no root tag"));
             }
             let public = declaration.knowledge() == AttributeKnowledge::PublicPayload;
+            if self.inputs_by_shape {
+                if !lhs.is_empty() {
+                    return Err(ApiError::input("shape-only imported plaintexts must be empty"));
+                }
+                if public {
+                    let shape = match declaration.shape() {
+                        InputBinding::Scalar(()) => InputBinding::Scalar(()),
+                        InputBinding::Family(count) => InputBinding::Family(IntExpr::constant(
+                            count.evaluate(parameters).map_err(|_| {
+                                ApiError::input("imported input family count is not concrete")
+                            })?,
+                        )),
+                    };
+                    let name = format!("{prefix}/input/{wire:?}");
+                    self.plaintexts.insert(
+                        *wire,
+                        super::plaintext_handles(&ring, &name, shape).map_err(ApiError::input)?,
+                    );
+                }
+                continue;
+            }
             match (public, lhs.get(wire)) {
                 (true, Some(value)) => {
                     let name = format!("{prefix}/input/{wire:?}");
@@ -292,7 +315,9 @@ impl<'a> RnsEncryptBuild<'a> {
 
     /// This builder binding the inputs' plaintexts by their declared shapes only, whatever the
     /// stage ([`crate::api::encrypt`]) is given, as [`Self::bind_lhs_inputs`] with `None` does:
-    /// the stage graph is recorded and exported but cannot be executed.
+    /// the stage graph is recorded and exported but cannot be executed. Shape-only family
+    /// cardinalities retain arbitrary-precision integers; concrete bindings still check their
+    /// addressable vector lengths against the declarations.
     pub fn with_inputs_by_shape(mut self) -> Self {
         self.inputs_by_shape = true;
         self
@@ -967,7 +992,11 @@ impl RnsEncryptBuild<'_> {
                 None => {
                     let shape = match declaration.shape() {
                         InputBinding::Scalar(()) => InputBinding::Scalar(()),
-                        InputBinding::Family(count) => InputBinding::Family(concrete(count)?),
+                        InputBinding::Family(count) => InputBinding::Family(IntExpr::constant(
+                            count.evaluate(parameters).map_err(|_| {
+                                ApiError::input("encryption input family count is not concrete")
+                            })?,
+                        )),
                     };
                     super::plaintext_handles(&ring, &name, shape)
                 }

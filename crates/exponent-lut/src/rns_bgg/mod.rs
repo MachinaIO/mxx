@@ -2231,7 +2231,7 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
                 .unzip();
             runtime.insert(coefficient_name, RuntimeValue::integer_values(coefficients));
             runtime.insert(exponent_name, RuntimeValue::integer_values(exponents));
-            InputBinding::Family(values.len())
+            InputBinding::Family(IntExpr::constant(values.len()))
         }
     };
     plaintext_handles(ring, name, shape)
@@ -2241,11 +2241,12 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
 /// a family of `count` members) that [`plaintext_inputs`] binds, without
 /// values: a graph that binds its plaintexts by shape only is the graph of
 /// any plaintexts of that shape, which can be validated and exported but not
-/// executed.
+/// executed. Family counts remain integer expressions, so shape-only bindings do not require
+/// an addressable host vector or truncate large symbolic PRF selector tables.
 pub(crate) fn plaintext_handles(
     ring: &Ring,
     name: &str,
-    shape: InputBinding<(), usize>,
+    shape: InputBinding<(), IntExpr>,
 ) -> Result<InputBinding<Mat, PlaintextFamily>, String> {
     let (coefficient_name, exponent_name) =
         (format!("{name}.coefficient"), format!("{name}.exponent"));
@@ -2262,7 +2263,7 @@ pub(crate) fn plaintext_handles(
             ))
         }
         InputBinding::Family(count) => InputBinding::Family(PlaintextFamily {
-            coefficients: context.int_family_input(coefficient_name, count),
+            coefficients: context.int_family_input(coefficient_name, count.clone()),
             exponents: context.int_family_input(exponent_name, count),
         }),
     })

@@ -155,6 +155,7 @@ returns the matching per-leaf `ArtifactBinding`s for a `ProtocolStage`.
 | `ring.polynomial([c_0, c_1, ...])` | The scalar polynomial `c_0 + c_1 X + ...` (compile expressions, for example `ring.modulus().floor_div(2)`). |
 | `ring.all_coefficients(shape, value)` | The matrix whose every entry is the polynomial with all `N` coefficients equal to `value`; its graph and Lean export do not grow with `N`. |
 | `ring.constant(shape, ConstantMatrix::...)` | Any constant: `Zero`, `Identity`, `UnitRow { index }`, `UnitColumn { index }`, `Gadget { base, small }`, `PowerOfBase { base, exponent }`, `Rotation { exponent }`, `Polynomial { coefficients }`, or `AllCoefficients { value }`. |
+| `ctx.sha256_bit_columns(seed, rows, columns, index_bits)` | Two integer families, packed selected row indices and counts, from exact SHA-256 bit-matrix expansion. One node stores the seed and dimensions; no selector literals or sampling assumptions. |
 | `ring.from_coefficients(&values)` | The scalar polynomial whose coefficients are a runtime `Family<Int>` of length `N`, reduced modulo `Q`. |
 | `ring.from_evaluations(&values)` | The scalar polynomial with the given NTT evaluation slots, in the backend's native order. |
 | `ring.pack_polynomial_coefficients(bits, coefficient_bits)` | The scalar polynomial whose coefficients are given as bits, coefficient by coefficient, least significant bit first. |
@@ -199,6 +200,7 @@ the GPU. A `HashTag` separates different matrices derived from one key:
 | `a.mul_small_rhs(bounded)` | The product `a * bounded` with a bounded right operand (a `SmallMatrix` or a `Preimage`, the two types that implement `BoundedMatrix`), which the backends compute faster than an ordinary product. |
 | `Mat::multi_row_gemm_accumulate(vec![(c_i, a_i, b_i), ...], bias)` | `sum_i c_i * a_i * b_i + bias` as one fused operation. |
 | `a.tensor(b)` | The tensor (Kronecker) product. |
+| `a.block_diagonal(count)` | `I_count ⊗ a`, with positive `count`; one IR operation, independent of the number of blocks. |
 
 ### 8.2 Shape
 

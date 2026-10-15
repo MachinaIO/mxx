@@ -1660,6 +1660,19 @@ impl Mat {
         Self::from_node(NodeKind::Tensor, vec![self, rhs], ty)
     }
 
+    /// Repeats this matrix on the diagonal: `I_count ⊗ self`.
+    /// Records one operation regardless of the positive number of blocks.
+    #[track_caller]
+    pub fn block_diagonal(self, count: usize) -> Self {
+        assert!(count > 0, "block diagonal requires at least one block");
+        let ty = MatrixType {
+            rows: self.matrix_type.rows.clone() * IntExpr::constant(count),
+            columns: self.matrix_type.columns.clone() * IntExpr::constant(count),
+            ..self.matrix_type.clone()
+        };
+        Self::from_node(NodeKind::BlockDiagonal { count }, vec![self], ty)
+    }
+
     #[track_caller]
     pub fn decompose(self, base: impl Into<IntExpr>, digit_count: impl Into<IntExpr>) -> Preimage {
         self.decompose_with_mode(base.into(), digit_count.into(), false)
@@ -2200,6 +2213,32 @@ impl DslContext {
         );
         let expression = node.output(0).expect("evaluated integer expression");
         Int { value: expression }.add(Int::constant(0))
+    }
+
+    /// The packed ascending row indices and counts of a deterministic SHA-256 bit matrix.
+    /// Bit `r * columns + c` uses `SHA256(seed || (bit / 256).to_le_bytes())`, with
+    /// little-endian bits within each byte. The graph stores only the seed and dimensions.
+    pub fn sha256_bit_columns(
+        &self,
+        seed: [u8; 32],
+        rows: usize,
+        columns: usize,
+        index_bits: usize,
+    ) -> (Family<Int>, Family<Int>) {
+        let count = IntExpr::constant(columns);
+        let ty = WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
+        let node = NodeHandle::new(
+            NodeKind::Sha256BitColumns { seed, rows, columns, index_bits },
+            Vec::new(),
+            vec![ty; 2],
+        );
+        let family = |port| Family {
+            values: vec![node.output(port).expect("SHA-256 column family")],
+            element_schema: IntType,
+            count: count.clone(),
+            member_slot: None,
+        };
+        (family(0), family(1))
     }
 
     /// `count` integers uniform on `[0, modulus)` for a power-of-two `modulus`,
@@ -3157,6 +3196,42 @@ mod tests {
             .unwrap();
         built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(built.graph.outputs().len(), 9);
+    }
+
+    #[test]
+    fn test_block_diagonal_graph_and_lean_size_are_bounded() {
+        for count in [1, 270, 30_000] {
+            let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+            let graph = DslContext::new("block-diagonal")
+                .output("out", ring.input("input", (2, 3)).block_diagonal(count))
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(graph.graph.root_scope().nodes().len(), 2);
+            let validated = graph.validate(&ParamEnv::default()).unwrap();
+            let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
+            assert_eq!(lean.source.matches("MxxRuntime.blockDiagonalRuns").count(), 1);
+            assert!(!lean.source.contains("MxxRuntime.concatDiagonal"));
+            assert!(lean.source.len() < 30_000);
+        }
+    }
+
+    #[test]
+    fn test_sha256_columns_graph_and_lean_size_are_bounded() {
+        let mut sizes = Vec::new();
+        for rows in [8usize, 64, 8192] {
+            let context = DslContext::new("sha256-columns");
+            let bits = (usize::BITS - (rows - 1).leading_zeros()) as usize;
+            let columns = context.sha256_bit_columns([3; 32], rows, rows + 1, bits);
+            let graph = context.output("out", columns).unwrap().build().unwrap();
+            assert_eq!(graph.graph.root_scope().nodes().len(), 1);
+            let validated = graph.validate(&ParamEnv::default()).unwrap();
+            let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
+            assert_eq!(lean.source.matches("MxxRuntime.sha256BitColumns").count(), 1);
+            assert!(!lean.source.contains("selectInt"));
+            sizes.push(lean.source.len());
+        }
+        assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() < 100);
     }
 
     #[test]

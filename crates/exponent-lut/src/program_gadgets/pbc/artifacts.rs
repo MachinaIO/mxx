@@ -351,7 +351,7 @@ pub(crate) fn require_family_descriptor(
         return Err(PbcError::ArtifactIdentityMismatch);
     };
     if descriptor.artifact_type != expected_type ||
-        descriptor.family_count != Some(expected_count) ||
+        descriptor.family_count != Some(expected_count as u128) ||
         descriptor.layout.as_deref() != expected_layout
     {
         return Err(PbcError::ArtifactIdentityMismatch);

@@ -428,6 +428,17 @@ noncomputable def rotationPolynomial {q n : Nat} (exponent : Int) : ExactMatrix 
 noncomputable def liftInteger {q n : Nat} (value : Int) : ExactMatrix q n 1 1 :=
   fun _ _ ↦ (value : ExactPoly q n)
 
+/-- Repeated diagonal blocks, with zero entries between distinct blocks. -/
+def blockDiagonalRuns {q n rows columns : Nat} (count : Nat)
+    (input : ExactMatrix q n rows columns)
+    (output : ExactMatrix q n (rows * count) (columns * count)) : Prop :=
+  0 < count ∧ ∀ (blockRow blockColumn : Fin count) (row : Fin rows) (column : Fin columns),
+    output ⟨blockRow.val * rows + row.val, by
+      have := blockRow.isLt; have := row.isLt; nlinarith⟩
+      ⟨blockColumn.val * columns + column.val, by
+        have := blockColumn.isLt; have := column.isLt; nlinarith⟩ =
+      if blockRow = blockColumn then input row column else 0
+
 /-- Tensor layout uses left indices as the outer blocks, matching the runtime. -/
 def tensorRuns {q n r₁ r₂ c₁ c₂ : Nat}
     (left : ExactMatrix q n r₁ c₁) (right : ExactMatrix q n r₂ c₂)

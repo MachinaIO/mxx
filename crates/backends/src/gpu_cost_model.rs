@@ -441,7 +441,10 @@ impl Model<'_> {
                 self.charge("gadget_digit_coefficients", digits * n)?;
                 fresh(self, wires, Form::Compact);
             }
-            NodeKind::Concat { .. } | NodeKind::Slice { .. } | NodeKind::Transpose => {
+            NodeKind::Concat { .. } |
+            NodeKind::BlockDiagonal { .. } |
+            NodeKind::Slice { .. } |
+            NodeKind::Transpose => {
                 for index in 0..arguments.len() {
                     let input = argument(wires, index)?;
                     self.need_eval(input)?;

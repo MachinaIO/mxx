@@ -235,7 +235,9 @@ pub enum ConcreteWireType {
     },
     IndexedFamily {
         element: Box<ConcreteWireType>,
-        count: usize,
+        /// Symbolic cardinality; execution additionally requires host-addressable storage.
+        /// Validation and Lean export do not allocate one value per member.
+        count: u128,
     },
     /// A family whose members have different types (an index-dependent element type).
     DependentFamily {

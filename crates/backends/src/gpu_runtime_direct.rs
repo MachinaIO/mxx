@@ -167,7 +167,9 @@ use crate::{
         KernelArg, PhysicalEncoding, PhysicalValueId,
     },
     gpu_io_worker::{FrameGeneration, IoCompletion},
-    gpu_physical_control::{static_family_member, wave_family_member, wave_family_members},
+    gpu_physical_control::{
+        host_family_count, static_family_member, wave_family_member, wave_family_members,
+    },
     gpu_physical_lowering::{
         ImportTemplate, PhysicalFrame, plan_physical_graph, single_root_physical_plan,
     },
@@ -2162,6 +2164,7 @@ impl GpuRuntime {
                 ))
             }
         };
+        let count = host_family_count(count).map_err(GpuRuntimeError::Execution)?;
         let mut decoded = vec![None; count];
         for part in resident.physical().parts.iter() {
             let encoding = match resident.physical().encodings.get(part.leaf as usize) {
@@ -2458,7 +2461,8 @@ impl GpuRuntime {
                         "validated artifact descriptor has no input source".into(),
                     ));
                 };
-                let members = descriptor.family_count.map_or(1, |count| count);
+                let members = host_family_count(descriptor.family_count.unwrap_or(1))
+                    .map_err(GpuPlanError::InvalidInput)?;
                 for member in 0..members {
                     let key = ArtifactKey {
                         production: source.production_id.clone(),
@@ -3453,8 +3457,13 @@ impl GpuRuntime {
             let members = manifest
                 .artifacts
                 .values()
-                .map(|artifact| artifact.family_count.unwrap_or(1))
-                .sum::<usize>();
+                .try_fold(0usize, |total, artifact| {
+                    let count = host_family_count(artifact.family_count.unwrap_or(1))?;
+                    total.checked_add(count).ok_or_else(|| {
+                        "published artifact count exceeds host addressability".to_owned()
+                    })
+                })
+                .map_err(GpuRuntimeError::Execution)?;
             if let Some(trial) = self.io_trial.as_mut() {
                 trial.published = Some((published, members, publishing.elapsed().as_secs_f64()));
             }
@@ -3975,7 +3984,7 @@ impl GpuRuntime {
                     GpuRuntimeError::Execution("Gather index family is too short".into())
                 })?;
                 let count = template.descriptor.family_count.unwrap_or(0);
-                key.index = Some(num_traits::ToPrimitive::to_usize(selected).filter(|index| *index < count).ok_or_else(
+                key.index = Some(num_traits::ToPrimitive::to_usize(selected).filter(|index| (*index as u128) < count).ok_or_else(
                     || {
                         GpuRuntimeError::Artifact(format!(
                             "gathered artifact index {selected} is outside its family of {count}"
@@ -4045,7 +4054,7 @@ impl GpuRuntime {
                 .evaluate(&env)
                 .ok()
                 .and_then(|index| num_traits::ToPrimitive::to_usize(&index))
-                .filter(|index| *index < count)
+                .filter(|index| (*index as u128) < count)
                 .ok_or_else(|| {
                     GpuRuntimeError::Artifact(
                         "host-selected artifact index is outside its family".into(),
@@ -4173,6 +4182,8 @@ fn planned_import_requests(
                 .descriptor
                 .family_count
                 .ok_or_else(|| invalid("selected artifact import has no finite family count"))?;
+            let family_count =
+                host_family_count(family_count).map_err(GpuRuntimeError::Execution)?;
             let encoding = match frame.program.values[import.selector.0 as usize].encodings.as_ref()
             {
                 [crate::gpu_execution_plan::PhysicalEncoding::Signed(encoding)] => *encoding,
@@ -4231,7 +4242,7 @@ fn planned_export_slots(
             let valid_index = match (site.index, descriptor.family_count) {
                 (None, None) => site.occurrence == 0,
                 // A streamed member is the first occurrence of its lane's site.
-                (Some(index), Some(count)) if index < count => {
+                (Some(index), Some(count)) if (index as u128) < count => {
                     u64::try_from(index).is_ok_and(|index| index == site.occurrence) ||
                         (site.streamed && site.occurrence == 0)
                 }

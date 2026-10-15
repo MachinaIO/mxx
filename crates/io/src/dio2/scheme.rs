@@ -11,6 +11,10 @@
 //! whose composed refresh unmasks and rounds every part for every prime and recombines the
 //! residues into the rows of `S_(i+1)` (spec §6.8); the last step's output decoder returns the
 //! state monomial modulo the first prime, read as the final state.
+//!
+//! Root rows and refresh outputs use symbolic family groups. The public label forest reads
+//! root rows and their clear labels directly in the online stage, avoiding scalar Program
+//! output ports and host-side polynomial materialization for the full label matrix.
 
 use super::{
     Dio2Error, Dio2Parameters, StreamingFunction, anchor_columns,
@@ -18,7 +22,10 @@ use super::{
         ComposeMode, HINT_INPUT, NEXT_ANCHOR_INPUT, OUTPUT_KEY_OUTPUT, OUTPUT_PLAINTEXT_OUTPUT,
         OUTPUT_PREIMAGE_INPUT, StepCompose, key_output, preimage_input,
     },
-    step::{ChainKeys, ChainProgram, LABEL_TAG, PUBLIC_TAG, StepPlan, Target, next_labels},
+    step::{
+        ChainKeys, ChainProgram, LABEL_TAG, LABEL_VALUES_INPUT, PUBLIC_TAG, RowGroup, StepPlan,
+        Target, next_labels,
+    },
 };
 use crate::Obfuscation;
 use mxx_backends::{
@@ -57,8 +64,9 @@ pub struct Dio2Function {
 }
 
 /// A step input `S_i` (spec §5): the root rows at `Q_0` by the graph input names an imported
-/// encryption reads ([`StepPlan::input_rows`]), the anchor hint ([`HINT_INPUT`]), and the clear
-/// labels.
+/// encryption reads ([`StepPlan::input_groups`]), the anchor hint ([`HINT_INPUT`]), and the clear
+/// labels. Shape-only graph recording omits the clear labels and binds their graph inputs
+/// symbolically; such a step input is not executable without external payload bindings.
 #[derive(Clone)]
 pub struct StepInput {
     values: BTreeMap<String, RuntimeValue>,
@@ -109,6 +117,7 @@ pub struct Dio2Obfuscation {
 /// stage it runs, by stage name, and the stage of every production, for the claim of a run
 /// ([`super::claim`]).
 pub struct Dio2<E, S> {
+    inputs_by_shape: bool,
     parameters: Dio2Parameters,
     execution: E,
     store: S,
@@ -172,6 +181,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
     pub fn new(parameters: Dio2Parameters, execution: E, store: S) -> Result<Self, Dio2Error> {
         parameters.validate()?;
         Ok(Self {
+            inputs_by_shape: false,
             parameters,
             execution,
             store,
@@ -183,6 +193,17 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
 
     pub fn parameters(&self) -> &Dio2Parameters {
         &self.parameters
+    }
+
+    /// Declare PRF keys, preprocessing plaintexts, tables and full clear-label runtime families
+    /// by shape for graph-only claims, including imported public plaintexts. Such graphs
+    /// require external keys/tables/labels before execution; clear-label sampling and
+    /// transitions are omitted, so recorded step inputs have no clear runtime labels. Use only with
+    /// an executor that records graphs without running them. By default obfuscation generates
+    /// keys and binds every value.
+    pub fn with_inputs_by_shape(mut self) -> Self {
+        self.inputs_by_shape = true;
+        self
     }
 
     /// The root of step `step` of the obfuscation keyed by `hash_key`.
@@ -290,7 +311,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         let generate = |rng: &mut StdRng, count| {
             parameters.prf.generate_keys(rng, count).map_err(|_| Dio2Error::Parameters("PRF keys"))
         };
-        let keys = (0..chunks)
+        let keys = (0..if self.inputs_by_shape { 0 } else { chunks })
             .map(|_| {
                 Ok(ChunkKeys {
                     sigma: generate(&mut rng, plan.ring_dimension)?,
@@ -327,7 +348,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                     &plan,
                     &input.y[step],
                     &x,
-                    &keys[chunk],
+                    keys.get(chunk),
                     (step, chunk),
                     &hash_key,
                     &chain,
@@ -465,7 +486,8 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             self.secrets.insert(name.to_owned(), ("mask".to_owned(), "mask".to_owned()));
         }
         let q = self.parameters.label_modulus();
-        let labels = (0..plan.label_rows)
+        let label_rows = if self.inputs_by_shape { 0 } else { plan.label_rows };
+        let labels = (0..label_rows)
             .map(|_| (0..=plan.label_width).map(|_| rand::rng().random_range(0..q)).collect())
             .collect::<Vec<Vec<usize>>>();
         let hash_key = root.hash_key_input();
@@ -482,48 +504,64 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             INITIAL_LABELS_INPUT,
             plan.label_rows * (plan.label_width + 1),
         );
-        let mut rows = BTreeMap::new();
-        for target in &plan.targets {
-            let pair = |value: Mat, row: &(Mat, Mat)| {
-                (value.clone() * row.0.clone(), value * row.1.clone())
+        for (name, port, group) in plan.input_groups() {
+            let mut failure = None;
+            let mut encode = |member: Int| {
+                let pair = |value: Mat, row: &(Mat, Mat)| {
+                    (value.clone() * row.0.clone(), value * row.1.clone())
+                };
+                let payload = match &group {
+                    RowGroup::Scalar(Target::Private) => pair(ring.identity(1), &t),
+                    RowGroup::Scalar(Target::State) => {
+                        pair(monomial(initial_state.clone().mul(state_stride)), &t)
+                    }
+                    RowGroup::Public => {
+                        let row = member.clone().rem(plan.label_rows);
+                        let entry = label_values.at(row.mul(plan.label_width + 1));
+                        let exponent = mxx_dsl::select(
+                            member.clone().equal(plan.label_rows).to_int(),
+                            vec![entry.mul(prf_stride), Int::constant(0)],
+                        )?;
+                        pair(monomial(exponent), &s)
+                    }
+                    RowGroup::Labels => {
+                        let entry = label_values.at(member
+                            .clone()
+                            .div(plan.label_width)
+                            .mul(plan.label_width + 1)
+                            .add(member.clone().rem(plan.label_width))
+                            .add(1usize));
+                        pair(monomial(entry.mul(prf_stride)), &s)
+                    }
+                    RowGroup::Helpers(sigmas) => {
+                        let sigma = IntExpr::Select {
+                            selector: Box::new(member.expression()?),
+                            branches: sigmas.iter().copied().map(IntExpr::constant).collect(),
+                        };
+                        (s.0.clone().ring_automorphism(sigma), ring.identity(1))
+                    }
+                    RowGroup::Scalar(_) => return Err(mxx_dsl::DslError::Schema),
+                };
+                let tag = group.key_tag(plan, member);
+                let key = root.key(hash_key.clone(), tag);
+                let row = root
+                    .encode(&key, &s, payload, (error(plan.columns), error(plan.columns)))
+                    .map_err(|error| {
+                        failure = Some(Dio2Error::from(error));
+                        mxx_dsl::DslError::Schema
+                    })?;
+                Ok(if port == 0 { row.0 } else { row.1 })
             };
-            let payload = match target {
-                Target::Private => pair(ring.identity(1), &t),
-                Target::State => pair(monomial(initial_state.clone().mul(state_stride)), &t),
-                Target::Public => pair(ring.identity(1), &s),
-                Target::Label { row, column } => {
-                    let entry = label_values
-                        .at(Int::constant((row * (plan.label_width + 1) + column) as i64));
-                    pair(monomial(entry.mul(prf_stride)), &s)
-                }
-                Target::Helper(sigma) => {
-                    (s.0.clone().ring_automorphism(IntExpr::constant(*sigma)), ring.identity(1))
-                }
-                Target::Anchor(_) => continue,
-            };
-            let tag = target.key_tag(plan).ok_or(Dio2Error::Input("a root target has a tag"))?;
-            let key = root.key(hash_key.clone(), tag);
-            rows.insert(
-                *target,
-                root.encode(&key, &s, payload, (error(plan.columns), error(plan.columns)))?,
-            );
-        }
-        for (name, port, targets, is_family) in plan.input_rows() {
-            let members = targets
-                .iter()
-                .map(|target| {
-                    let row = rows.get(target).ok_or(Dio2Error::Input("a root row is missing"))?;
-                    Ok(if port == 0 { row.0.clone() } else { row.1.clone() })
-                })
-                .collect::<Result<Vec<_>, Dio2Error>>()?;
-            graph = if is_family {
-                graph.output(name, mxx_dsl::Family::pack(members)?)?
+            let result = if let Some(count) = group.count(plan) {
+                mxx_dsl::parallel(count, &mut encode)
+                    .and_then(|members| graph.output(name, members))
             } else {
-                graph.output(
-                    name,
-                    members.into_iter().next().ok_or(Dio2Error::Input("a root row is missing"))?,
-                )?
+                encode(Int::constant(0)).and_then(|member| graph.output(name, member))
             };
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            graph = result?;
         }
         let anchor_columns = anchor_columns(plan.columns);
         let secret_row = Mat::concat(ConcatAxis::Columns, vec![s.0.clone(), s.1.clone()]);
@@ -537,13 +575,15 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             (root.hash_key_input_name(), RuntimeValue::Bytes(root.hash_key().as_slice().into())),
             (ANCHOR_INPUT.to_owned(), anchor.clone()),
             (INITIAL_STATE_INPUT.to_owned(), RuntimeValue::Int(input.initial_state.into())),
-            (
+        ]);
+        if !self.inputs_by_shape {
+            runtime.insert(
                 INITIAL_LABELS_INPUT.to_owned(),
                 RuntimeValue::integer_values(
                     labels.iter().flatten().map(|value| (*value).into()).collect(),
                 ),
-            ),
-        ]);
+            );
+        }
         payload.bind_runtime(&mut runtime);
         mask.bind_runtime(&mut runtime);
         Ok(StepInput { values: self.execute("initial", graph, runtime)?, labels })
@@ -554,13 +594,10 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
     fn zero_input(&mut self, plan: &StepPlan, like: &StepInput) -> Result<StepInput, Dio2Error> {
         let ring = self.parameters.root([0; 32])?.ring();
         let mut graph = DslContext::new("dio2-zero");
-        for (name, _, targets, is_family) in plan.input_rows() {
+        for (name, _, group) in plan.input_groups() {
             let zero = || ring.zero((1, plan.columns));
-            graph = if is_family {
-                graph.output(
-                    name,
-                    mxx_dsl::Family::pack(targets.iter().map(|_| zero()).collect())?,
-                )?
+            graph = if let Some(count) = group.count(plan) {
+                graph.output(name, mxx_dsl::parallel(count, |_| Ok(zero()))?)?
             } else {
                 graph.output(name, zero())?
             };
@@ -574,6 +611,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
 
     /// Preprocess the Program of `(step, chunk)`: its RHS plaintexts are the obfuscator's
     /// chunk and the PRF keys' selectors and offsets, its data the keys' coordinate tables.
+    /// Graph-only mode declares the keys and binds selectors and tables by shape instead.
     #[allow(clippy::too_many_arguments)]
     fn preprocess(
         &mut self,
@@ -581,7 +619,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         plan: &StepPlan,
         y: &[bool],
         x: &[bool],
-        keys: &ChunkKeys,
+        keys: Option<&ChunkKeys>,
         (step, chunk): (usize, usize),
         hash_key: &[u8; 32],
         chain_parameters: &RnsBggParameters,
@@ -593,11 +631,32 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                 &layouts.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>(),
             )
         };
-        let smudge_keys = if last { &keys.output } else { &keys.smudge };
+        let shape_or_declare =
+            |role: &str, members, layouts: Option<&[PbcGeneratedKeyLayout]>| match layouts {
+                Some(layouts) => shape(layouts).map_err(Dio2Error::from),
+                None => self
+                    .parameters
+                    .prf
+                    .declared_shape(chunk as u64, role, members)
+                    .map_err(|error| Dio2Error::Api(ApiError::scheme(error))),
+            };
+        let smudge_keys = keys.map(|keys| if last { &keys.output[..] } else { &keys.smudge[..] });
         let chain_keys = ChainKeys {
-            sigma: (!last).then(|| shape(&keys.sigma)).transpose()?,
-            cbd: (!last).then(|| shape(&keys.cbd)).transpose()?,
-            smudge: shape(smudge_keys)?,
+            sigma: (!last)
+                .then(|| {
+                    shape_or_declare("sigma", plan.ring_dimension, keys.map(|keys| &keys.sigma[..]))
+                })
+                .transpose()?,
+            cbd: (!last)
+                .then(|| {
+                    shape_or_declare("cbd", plan.cbd_members(), keys.map(|keys| &keys.cbd[..]))
+                })
+                .transpose()?,
+            smudge: shape_or_declare(
+                if last { "output" } else { "smudge" },
+                plan.noise_smudge_members(last),
+                smudge_keys,
+            )?,
         };
         let program = if last {
             ChainProgram::last(&self.parameters, function, plan, step, x, &chain_keys)?
@@ -624,24 +683,35 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                 }
             }
         };
-        merge(program.smudge.key_inputs::<DCRTPoly>(&level, smudge_keys)?, program.smudge.tables());
-        if let Some(cbd) = &program.cbd {
-            merge(cbd.key_inputs::<DCRTPoly>(&level, &keys.cbd)?, cbd.prf().tables());
-        }
-        if let Some(sigma) = &program.sigma {
-            merge(sigma.key_inputs::<DCRTPoly>(&level, &keys.sigma)?, sigma.prf().tables());
+        if let Some(keys) = keys {
+            merge(
+                program
+                    .smudge
+                    .key_inputs::<DCRTPoly>(&level, smudge_keys.expect("generated smudge keys"))?,
+                program.smudge.tables(),
+            );
+            if let Some(cbd) = &program.cbd {
+                merge(cbd.key_inputs::<DCRTPoly>(&level, &keys.cbd)?, cbd.prf().tables());
+            }
+            if let Some(sigma) = &program.sigma {
+                merge(sigma.key_inputs::<DCRTPoly>(&level, &keys.sigma)?, sigma.prf().tables());
+            }
         }
         let (stage_key, context) = Self::stage(hash_key, step, chunk);
+        let mut builder = RnsPreprocessBuild::new(chain_parameters, context)
+            .with_data(data.clone())
+            .with_root_inputs(program.root_inputs.clone())
+            .with_output_use(RnsOutputUse::Gadget);
+        if self.inputs_by_shape {
+            builder = builder.with_inputs_by_shape();
+        }
         let preprocess = api::preprocess(
             &program.program,
             &ParamEnv::default(),
             &rhs,
             Some(payload),
             &stage_key,
-            RnsPreprocessBuild::new(chain_parameters, context)
-                .with_data(data.clone())
-                .with_root_inputs(program.root_inputs.clone())
-                .with_output_use(RnsOutputUse::Gadget),
+            builder,
             &mut self.execution,
             &mut self.store,
             |_, outputs| Ok(outputs),
@@ -654,7 +724,8 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
     }
 
     /// The imported rows of `input` that `program`'s inputs and LUT helpers read, and the
-    /// public payloads of its public inputs (spec §6.1).
+    /// public payloads of its public inputs (spec §6.1). Shape-only graph recording binds
+    /// public payloads by declaration instead of allocating polynomial vectors.
     fn imported(
         &self,
         program: &ChainProgram,
@@ -673,7 +744,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             .map(|table| table.helper_family_key())
             .collect::<std::collections::BTreeSet<_>>();
         let mut rows = BTreeMap::new();
-        for (name, port, _, _) in plan.input_rows() {
+        for (name, port, _) in plan.input_groups() {
             let read = tags.iter().any(|tag| root_row_input_name(tag, port) == name) ||
                 keys.iter().any(|key| root_helper_input_name(key, port) == name);
             if read {
@@ -683,25 +754,20 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             }
         }
         let mut lhs = BTreeMap::new();
+        if self.inputs_by_shape {
+            return Ok((rows, lhs));
+        }
         for (wire, tag) in &program.root_inputs {
-            let members = plan
-                .input_rows()
-                .into_iter()
-                .find(|(name, _, _, _)| *name == root_row_input_name(tag, 0))
-                .map(|(_, _, targets, _)| targets)
-                .ok_or(Dio2Error::Input("an unknown root tag"))?;
             if matches!(tag.as_str(), PUBLIC_TAG | LABEL_TAG) {
-                let label = |target: &Target| match target {
-                    Target::Label { row, column } => input.labels[*row][*column],
-                    _ => 0,
+                let members = if tag == PUBLIC_TAG {
+                    input.labels.iter().map(|row| row[0]).chain([0]).collect::<Vec<_>>()
+                } else {
+                    input.labels.iter().flat_map(|row| row[1..].iter().copied()).collect()
                 };
                 lhs.insert(
                     *wire,
                     InputBinding::Family(
-                        members
-                            .iter()
-                            .map(|target| monomial(level, label(target) * prf_stride))
-                            .collect(),
+                        members.iter().map(|value| monomial(level, value * prf_stride)).collect(),
                     ),
                 );
             }
@@ -732,7 +798,11 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             }
             ComposeMode::Decode => (format!("import_{step}"), format!("online_{step}")),
         };
-        let encrypted = RnsEncryptBuild::new(chain_parameters, context).import(
+        let mut encryption = RnsEncryptBuild::new(chain_parameters, context);
+        if self.inputs_by_shape {
+            encryption = encryption.with_inputs_by_shape();
+        }
+        let encrypted = encryption.import(
             &material.program.program.encryption_inputs(),
             &ParamEnv::default(),
             &lhs,
@@ -749,6 +819,38 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             .with_data(material.data.clone())
             .with_root_inputs(material.program.root_inputs.clone())
             .with_output_use(RnsOutputUse::Gadget);
+        if self.inputs_by_shape {
+            builder = builder.with_inputs_by_shape();
+        }
+        if material.program.label_products.is_some() {
+            if !self.inputs_by_shape {
+                builder.bind_runtime_input(
+                    LABEL_VALUES_INPUT,
+                    RuntimeValue::integer_values(
+                        input
+                            .labels
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .map(num_bigint::BigInt::from)
+                            .collect(),
+                    ),
+                );
+            }
+            for tag in [LABEL_TAG, PUBLIC_TAG] {
+                for port in 0..2 {
+                    let name = root_row_input_name(tag, port);
+                    builder.bind_runtime_input(
+                        name.clone(),
+                        input
+                            .values
+                            .get(&name)
+                            .cloned()
+                            .ok_or(Dio2Error::Input("a label root row is missing"))?,
+                    );
+                }
+            }
+        }
         if let Some(next_root) = next_root {
             builder.bind_runtime_input(
                 next_root.hash_key_input_name(),
@@ -874,7 +976,11 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             }
             input = StepInput {
                 values: outputs,
-                labels: next_labels(&self.parameters, &input.labels, chunk_bits_),
+                labels: if self.inputs_by_shape {
+                    Vec::new()
+                } else {
+                    next_labels(&self.parameters, &input.labels, chunk_bits_)
+                },
             };
         }
         Err(Dio2Error::Input("an obfuscation has at least one step"))

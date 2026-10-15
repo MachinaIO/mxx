@@ -6020,7 +6020,8 @@ pub(crate) fn emit_compiled_subgraph_kernel(
                 operands.push(GpuSubgraphOperandView::MatrixFamily {
                     layout,
                     table: table.device_address(),
-                    count: *count as u64,
+                    count: u64::try_from(*count)
+                        .map_err(|_| invalid("subgraph kernel family count exceeds u64"))?,
                 });
             }
             2 | 3 => {

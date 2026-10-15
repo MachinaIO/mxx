@@ -82,6 +82,19 @@ Families remain functions on `Fin N`; sequential loops use `MxxIR.IterRuns` with
 state tuple. Changing closed counts does not enumerate lanes or steps. `MxxIR.IterRuns.invariant`
 provides the reusable initial/step invariant elimination rule.
 
+`blockDiagonalRuns` represents `I_k ⊗ X` with one relation. `sha256BitColumns` specifies
+deterministic bit-column selector families by the concrete SHA-256 implementation in
+`RuntimeHash.lean`, independently of `HashModel`. `RuntimeHashColumnsExamples.lean` checks its
+digest stream against reference vectors, including multi-byte little-endian counters.
+Long scope boundary types are named once with parameterized abbreviations, so facts do not
+repeat an entire large output tuple in every theorem.
+Fact sections also share environment binders and a local context notation, while deep child
+scope names are bounded in length. Pure broadcast/zip repacking loops are definitional family
+projections, retaining count guards and checked prefix indexing rather than extra witnesses.
+Large protocol graph/facts sources use declaration-boundary `_Part_<index>` modules, each at
+most 3,000,000 source bytes. The original module imports the final part and keeps its public
+namespace unchanged. All declarations remain present; partitioning does not weaken the claim.
+
 Production Diamond artifacts are generated and checked inside parameter search, not through
 these fixtures. Application proofs remain in their owning crate; the shared exporter and
 linked-claim renderer live in `crates/ir-core/src/lean`.

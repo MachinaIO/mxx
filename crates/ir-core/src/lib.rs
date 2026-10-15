@@ -17,6 +17,7 @@ pub mod constraints;
 pub mod encoding;
 pub mod expr;
 pub mod graph;
+pub mod hash_columns;
 pub mod inventory;
 pub mod lean;
 pub mod merge;

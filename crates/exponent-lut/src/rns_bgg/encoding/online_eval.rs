@@ -177,7 +177,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// This builder binding the Program's integer data by their declared shapes only (graph
     /// inputs without values, unchecked): with a preprocessing bound by shape (see
     /// `RnsPreprocessBuild::with_inputs_by_shape`), the stage graph is recorded and exported
-    /// but cannot be executed.
+    /// but cannot be executed. Input and data cardinalities need not fit a host index: graph
+    /// validation uses integer expressions rather than allocating their members.
     pub fn with_inputs_by_shape(mut self) -> Self {
         self.inputs_by_shape = true;
         self
@@ -1081,11 +1082,10 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
     ) -> Result<(), ApiError> {
         for declaration in program.inputs().values() {
             if let InputBinding::Family(count) = declaration.shape() {
-                let count =
-                    count.evaluate(parameters).ok().and_then(|value| value.to_usize()).ok_or_else(
-                        || ApiError::input("online evaluation input family count is not concrete"),
-                    )?;
-                if count == 0 {
+                let count = count.evaluate(parameters).map_err(|_| {
+                    ApiError::input("online evaluation input family count is not concrete")
+                })?;
+                if count <= BigInt::from(0) {
                     return Err(ApiError::input("online evaluation input family count is empty"));
                 }
             }

@@ -11,7 +11,7 @@ use crate::{
         poly_gpu::{GpuDcrtBackend, PhysicalExport, transcode_raw_artifact},
     },
     gpu_execution_plan::{PhysicalEncoding, PhysicalValue},
-    gpu_physical_control::static_family_member,
+    gpu_physical_control::{host_family_count, static_family_member},
     poly::dcrt::gpu::GpuSignedValuesEncoding,
 };
 use mxx_ir_core::{
@@ -311,9 +311,10 @@ fn hash_value(
         }
         RuntimeValue::Resident(resident) => {
             if let ConcreteWireType::IndexedFamily { element, count } = ty {
+                let count = host_family_count(*count)?;
                 hasher.update([11]);
                 hasher.update(count.to_le_bytes());
-                for index in 0..*count {
+                for index in 0..count {
                     let member = static_family_member(resident, index)?;
                     hash_value(backend, &RuntimeValue::Resident(member), element, hasher)?;
                 }
@@ -438,7 +439,7 @@ fn hash_value(
             let ConcreteWireType::IndexedFamily { element, count } = ty else {
                 return Err("indexed input has non-family metadata".into());
             };
-            if values.len() != *count || element_type != element.as_ref() {
+            if values.len() as u128 != *count || element_type != element.as_ref() {
                 return Err("indexed input does not match validated family metadata".into());
             }
             hasher.update([11]);

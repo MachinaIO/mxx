@@ -292,7 +292,8 @@ impl PhysicalValue {
             let mut family_bounds = Vec::new();
             let mut leaf_ty = &self.ty;
             while let ConcreteWireType::IndexedFamily { element, count } = leaf_ty {
-                family_bounds.push(*count as u64);
+                family_bounds
+                    .push(u64::try_from(*count).map_err(|_| "physical family count exceeds u64")?);
                 leaf_ty = element;
             }
             if matches!(encoding, PhysicalEncoding::CompactCoeff { .. }) &&

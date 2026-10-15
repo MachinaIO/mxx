@@ -95,6 +95,8 @@ impl<'a> RnsPreprocessBuild<'a> {
     /// This builder binding the Program's RHS plaintexts and data by their declared shapes only,
     /// whatever the stage ([`crate::api::preprocess`]) is given, as [`Self::bind_rhs_inputs`]
     /// with `None` does: the stage graph is recorded and exported but cannot be executed.
+    /// Family cardinalities stay arbitrary-precision; no host-addressable selector vector is
+    /// needed to declare or lower the graph.
     pub fn with_inputs_by_shape(mut self) -> Self {
         self.inputs_by_shape = true;
         self
@@ -729,7 +731,6 @@ impl<'a> RnsPreprocessBuild<'a> {
                         let count = count
                             .evaluate(parameters)
                             .ok()
-                            .and_then(|value| value.to_usize())
                             .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
                         InputBinding::Family(
                             mxx_dsl::parallel(IntExpr::constant(count), |index| {
@@ -756,13 +757,9 @@ impl<'a> RnsPreprocessBuild<'a> {
                     let shape = match declaration {
                         InputBinding::Scalar(()) => InputBinding::Scalar(()),
                         InputBinding::Family(count) => InputBinding::Family(
-                            count
-                                .evaluate(parameters)
-                                .ok()
-                                .and_then(|value| value.to_usize())
-                                .ok_or_else(|| {
-                                    ApiError::input("RHS family count is not concrete")
-                                })?,
+                            count.evaluate(parameters).ok().map(IntExpr::constant).ok_or_else(
+                                || ApiError::input("RHS family count is not concrete"),
+                            )?,
                         ),
                     };
                     super::plaintext_handles(&ring, &name, shape)
@@ -785,7 +782,6 @@ impl<'a> RnsPreprocessBuild<'a> {
                         .clone()
                         .evaluate(parameters)
                         .ok()
-                        .and_then(|value| value.to_usize())
                         .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
                     let members = plaintexts.count().clone();
                     if members != IntExpr::constant(expected) {
@@ -1097,6 +1093,55 @@ mod test {
     use super::*;
 
     use mxx_ir_core::ParamEnv;
+
+    /// Shape-only Static preprocessing preserves a selector count larger than `usize` through
+    /// plaintext handles, reference/material families and the actual Program lowerer.
+    #[test]
+    fn oversized_rhs_shape_lowers_without_a_runtime_vector() {
+        use mxx_backends::poly::dcrt::poly::DCRTPoly;
+        let parameters =
+            RnsBggParameters::new(vec![DCRTPolyParams::new(16, 2, 17, 4, None, None); 2], 1, 1)
+                .unwrap();
+        let count = IntExpr::constant(usize::MAX as u128 * 130);
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(count.clone()).unwrap();
+        let products = builder
+            .parallel(
+                crate::program::FamilyRange::full(count.clone()).unwrap(),
+                |builder, index| {
+                    builder
+                        .mul_private(Operand::Scalar(input), Operand::Member { family: rhs, index })
+                        .map(Operand::Scalar)
+                },
+            )
+            .unwrap();
+        let program = builder
+            .finish(vec![Operand::Member { family: products, index: IntExpr::constant(0) }])
+            .unwrap();
+        let payload = crate::rns_bgg::RnsBggPayloadSecret {
+            row: (parameters.ring(0).unwrap().identity(1), parameters.ring(0).unwrap().identity(1)),
+            binding: None,
+        };
+        let mut child = RnsPreprocessBuild::new(&parameters, [1; 32]).with_inputs_by_shape();
+        child
+            .bind_rhs_inputs::<DCRTPoly>(
+                &program,
+                &ParamEnv::default(),
+                None,
+                Some(&payload),
+                &[2; 32],
+            )
+            .unwrap();
+        let evaluator = child.evaluator.as_ref().unwrap();
+        let InputBinding::Family(plaintexts) = &evaluator.rhs[&rhs] else {
+            panic!("selector plaintext family")
+        };
+        assert_eq!(plaintexts.count(), &count);
+        let (evaluator, families, environment) =
+            <RnsPreprocessBuild as PreprocessBuild<DCRTPoly>>::lowering_state(&mut child).unwrap();
+        lower_program(&program, evaluator, families, environment).unwrap();
+    }
 
     #[test]
     fn preprocess_classifies_raw_and_public_outputs_as_cached() {

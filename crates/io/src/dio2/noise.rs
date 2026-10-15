@@ -7,6 +7,11 @@
 //! therefore bounds the decoders of every step, and the decoders keep the invariant when they
 //! decode exactly.
 //!
+//! Production labels are DSL families rather than scalar Program outputs. Noise-only Programs
+//! retain the original scalar balanced trees: the family lowerer preserves their ascending
+//! leaves, two-leaf minimum, multiplication order and odd-node carries exactly. Representative
+//! mode therefore continues to use the same maximal-leaf envelope and full event counts.
+//!
 //! Part `(t, j)` of a refreshing step decodes, for every prime `q` of `Q_0`, at the decoding level
 //! `L` (modulus `Q = Q_0`, `m` digits, `Q_q = Q / q`),
 //!
@@ -201,11 +206,9 @@ impl StepNoise<'_> {
         let public = self.chain_parameters.form_weights(level, RnsBggForm::Public)?;
         let outs = &program.outputs;
         let smudge = sum(
-            &outs
-                .smudge
-                .iter()
-                .zip(smudge_weights(self.parameters, &modulus))
-                .map(|(output, weight)| retarget(*output, &[weight]))
+            &smudge_weights(self.parameters, &modulus)
+                .into_iter()
+                .map(|weight| retarget(outs.smudge, &[weight]))
                 .collect::<Result<Vec<_>, _>>()?,
             NoiseCorrelation::Unknown,
         );
@@ -438,7 +441,7 @@ impl StepNoise<'_> {
         Ok(trace.outputs)
     }
 
-    /// The exact physical event budget of the full Program, not just its representatives.
+    /// The scalar-digit event budget of the full protocol, not just its representatives.
     /// Root and CBD family multiplicities are already full in the trace. Omitted scalar label
     /// products each add `2 n w_0` events, with no alignment or coefficient
     /// normalization on the equal-modulus public path. This restores the same evaluation-audit
@@ -447,7 +450,9 @@ impl StepNoise<'_> {
     /// the PRF and digit row by `d`, but not shared input bindings or PRF row reductions. The
     /// existing audit records a PRF row reduction's fixed row-width count, independent of its
     /// outer member count; all other PRF operations and all placed-row operations scale with
-    /// `d`. No other operations depend on the smudge row.
+    /// `d`. Packing the full digit rows into one column-sum node must not shrink this
+    /// budget: restore its `d` logical reductions explicitly. No other operations
+    /// depend on the smudge row.
     fn evaluation_events(
         &self,
         program: &ChainProgram,
@@ -458,6 +463,21 @@ impl StepNoise<'_> {
             BigUint::from(self.chain_parameters.component_columns(0)?);
         let mut events = trace.node_event_counts.values().sum::<BigUint>() +
             BigUint::from(program.omitted_label_products) * coordinates;
+        if self.plan.noise_targets == NoiseTargets::Full && self.plan.smudge_digits > 1 {
+            let Operand::Scalar(wire) = &program.program.outputs()[program.outputs.smudge] else {
+                return Err(Dio2Error::Parameters("the smudge row is a scalar output"));
+            };
+            let node = trace
+                .dependencies
+                .wires
+                .get(wire)
+                .ok_or(Dio2Error::Parameters("the smudge reduction is missing"))?;
+            let count = trace
+                .node_event_counts
+                .get(&node.0)
+                .ok_or(Dio2Error::Parameters("the smudge event count is missing"))?;
+            events += count * BigUint::from(self.plan.smudge_digits - 1);
+        }
         if self.plan.noise_targets == NoiseTargets::Representative && self.plan.smudge_digits > 1 {
             let mut visited = BTreeSet::new();
             for (wire, node) in &trace.dependencies.wires {
@@ -534,7 +554,7 @@ mod tests {
             parameters.smudge_digits = digits;
             parameters.prf.lwr_dimension = label_rows;
             parameters.encoding_error_sigma = encoding_sigma.into();
-            let full = StepPlan::new(&parameters, &function).unwrap();
+            let full = StepPlan::for_noise(&parameters, &function, NoiseTargets::Full).unwrap();
             let representative =
                 StepPlan::for_noise(&parameters, &function, NoiseTargets::Representative).unwrap();
             assert!(representative.targets.len() < full.targets.len());

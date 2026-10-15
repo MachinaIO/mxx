@@ -2545,7 +2545,7 @@ pub(crate) mod routing_tests {
                     "pbc-family".into(),
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix_type),
-                        family_count: Some(binding.family_count),
+                        family_count: Some(binding.family_count as u128),
                         availability: ArtifactAvailability::Transferred,
                         layout: None,
                     },

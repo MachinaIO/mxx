@@ -104,10 +104,11 @@ pub enum ArtifactType {
         schema_hash: [u8; 32],
     },
     /// A family stored as one artifact, of `count` members of type `element`: a family whose
-    /// members are families. Its size does not grow with `count`.
+    /// members are families. Its size does not grow with `count`; symbolic cardinalities
+    /// need not fit a host index, while stores check addressability before materialization.
     IndexedFamily {
         element: Box<ArtifactType>,
-        count: usize,
+        count: u128,
     },
     /// A family stored as one artifact, member `k` of type `members[k]`: a family whose member
     /// types depend on the member index (an output family of a loop over index-dependent rings,
@@ -199,7 +200,8 @@ impl ArtifactType {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
-    pub family_count: Option<usize>,
+    /// Symbolic uniform-family cardinality. Concrete stores check addressability separately.
+    pub family_count: Option<u128>,
     pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
@@ -228,7 +230,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationEr
 pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
-    pub family_count: Option<usize>,
+    pub family_count: Option<u128>,
     pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
@@ -315,6 +317,31 @@ pub fn export_validated_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_family_manifest_round_trips_exactly() {
+        let count = (usize::MAX as u128) * 130;
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
+            artifacts: BTreeMap::from([(
+                "wide-family".to_owned(),
+                ManifestArtifact {
+                    artifact_type: ArtifactType::IndexedFamily {
+                        element: Box::new(ArtifactType::Bytes { length: 1 }),
+                        count,
+                    },
+                    family_count: Some(count),
+                    availability: ArtifactAvailability::Transferred,
+                    layout: None,
+                },
+            )]),
+        };
+        validate_manifest(&manifest).unwrap();
+        let encoded = crate::encoding::canonical_json(&manifest).unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains(&count.to_string()));
+        assert_eq!(serde_json::from_slice::<Manifest>(&encoded).unwrap(), manifest);
+    }
 
     #[test]
     fn cached_manifest_artifacts_validate() {

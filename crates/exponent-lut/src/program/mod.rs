@@ -762,18 +762,21 @@ pub enum ProgramValidationError {
 }
 
 /// The declaration of an integer data family ([`ExponentLutProgramBuilder::data_family`]):
-/// `count` entries, each below `bound` when the family is bounded. A bounded family may select
+/// `count` entries, each below `bound` when the family is bounded. Counts use 128 bits so a
+/// symbolic table can contain a row per addressable member without its flattened cardinality
+/// fitting in `usize`. Concrete bindings still require an addressable vector of all entries.
+/// A bounded family may select
 /// wire members ([`Operand::Selected`]); the noise model and the export read the bound as the
 /// range of every entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DataFamily {
-    count: usize,
+    count: u128,
     bound: Option<usize>,
 }
 
 impl DataFamily {
-    /// The number of entries.
-    pub fn count(&self) -> usize {
+    /// The symbolic number of entries, including tables too large for a runtime vector.
+    pub fn count(&self) -> u128 {
         self.count
     }
     /// The exclusive upper bound of every entry, when the family is bounded.
@@ -836,7 +839,7 @@ impl ProgramData {
         let invalid = |reason: &str| ProgramValidationError::InvalidStructure(reason.into());
         if self.0.keys().ne(program.data.keys()) ||
             self.0.iter().any(|(family, values)| {
-                program.data.get(family).map(DataFamily::count) != Some(values.len())
+                program.data.get(family).map(DataFamily::count) != Some(values.len() as u128)
             })
         {
             return Err(invalid("program data does not match the declared families"));
@@ -1214,7 +1217,9 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
     for table in &program.luts {
         if let Some((family, offset)) = table.data_values() &&
             !program.data.get(&family).is_some_and(|declaration| {
-                offset.checked_add(table.input_width).is_some_and(|end| end <= declaration.count)
+                offset
+                    .checked_add(table.input_width)
+                    .is_some_and(|end| end as u128 <= declaration.count)
             })
         {
             return Err(ProgramValidationError::InvalidLut);
@@ -2794,6 +2799,44 @@ mod tests {
             serde_json::to_string(&DataFamily { count: 3, bound: None }).unwrap(),
             serde_json::to_string(&3usize).unwrap()
         );
+        assert_eq!(
+            serde_json::to_string(&DataFamily { count: 3, bound: Some(4) }).unwrap(),
+            serde_json::to_string(&(3usize, 4usize)).unwrap()
+        );
+    }
+
+    /// Symbolic data counts and positions can exceed machine addressability, while concrete
+    /// bindings must still provide exactly all entries and static bounds remain exact.
+    #[test]
+    fn oversized_data_families_preserve_exact_bounds_and_reject_concrete_bindings() {
+        let count = usize::MAX as u128 * 130;
+        let build = |position| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder
+                .input_family(IntExpr::constant(2), AttributeKnowledge::PublicPayload)
+                .unwrap();
+            let data = builder.data_family(count, Some(2)).unwrap();
+            let output = builder
+                .mul_small_constant(
+                    Operand::Selected {
+                        family: input,
+                        data,
+                        position: IntExpr::constant(position),
+                    },
+                    vec![1],
+                    IntExpr::constant(0),
+                )
+                .unwrap();
+            builder.finish(vec![Operand::Scalar(output)]).map(|program| (program, data))
+        };
+        let (program, data) = build(count - 1).unwrap();
+        assert_eq!(program.data_families()[&data].count(), count);
+        assert_eq!(
+            serde_json::to_string(&program.data_families()[&data]).unwrap(),
+            format!("[{count},2]")
+        );
+        assert!(ProgramData::new().with(data, vec![0]).validate(&program).is_err());
+        assert_eq!(build(count).unwrap_err(), ProgramValidationError::MemberOutOfBounds);
     }
 
     #[test]

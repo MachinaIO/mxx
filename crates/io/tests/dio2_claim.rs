@@ -9,6 +9,11 @@
 //! failure probability `2^-MXX_IO_DIO2_CLAIM_FAILURE_EXPONENT` (default 40) under the
 //! average-case model, or is about every execution when it is `worst`. `MXX_IO_DIO2_CLAIM_EXPORT`
 //! names the directory of the Lean modules (none: the protocol is only built).
+//! Ring/PRF overrides (same prefix): `RING_DIMENSION`, `PRIMES`, `CRT_BITS`, `BASE_BITS`,
+//! `LEVELS`, `SMUDGE_DIGITS`, `PRF_NU`, `PRF_H`, `PRF_Q`, `PRF_P`, `PRF_BUCKET_WIDTH`,
+//! `ERROR_SIGMA`, `TRAPDOOR_SIGMA`. Defaults retain the toy round trip. Production values are
+//! `65536,27,60,6,38,306,1024,31,256,32,0,4,4`, respectively. This is graph-only execution,
+//! not a noise/security check or an executable production-sized obfuscation.
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{
@@ -32,27 +37,33 @@ fn read(name: &str, default: &str) -> String {
     std::env::var(format!("MXX_IO_DIO2_{name}")).unwrap_or_else(|_| default.to_owned())
 }
 
-/// The parameters and the function of the GPU round trip.
+/// The toy round trip, with explicit ring, chain, sampler and PRF overrides for graph export.
 fn toy() -> (Dio2Parameters, StreamingFunction) {
     let crt_bits = read("CRT_BITS", "50").parse().unwrap();
-    let primes = gen_modulus_and_warmup(8, read("PRIMES", "5").parse().unwrap(), crt_bits, None)
-        .expect("CRT basis");
+    let ring_dimension = read("RING_DIMENSION", "8").parse().unwrap();
+    let primes = gen_modulus_and_warmup(
+        ring_dimension,
+        read("PRIMES", "5").parse().unwrap(),
+        crt_bits,
+        None,
+    )
+    .expect("CRT basis");
     let parameters = Dio2Parameters {
-        ring_dimension: 8,
+        ring_dimension,
         crt_bits,
         base_bits: read("BASE_BITS", "12").parse().unwrap(),
         primes,
         levels: read("LEVELS", "6").parse().unwrap(),
         prf: PrfSettings {
-            lwr_dimension: 1,
-            support_weight: 1,
-            input_modulus: 16,
-            output_modulus: 8,
-            bucket_width: 0,
+            lwr_dimension: read("PRF_NU", "1").parse().unwrap(),
+            support_weight: read("PRF_H", "1").parse().unwrap(),
+            input_modulus: read("PRF_Q", "16").parse().unwrap(),
+            output_modulus: read("PRF_P", "8").parse().unwrap(),
+            bucket_width: read("PRF_BUCKET_WIDTH", "0").parse().unwrap(),
         },
         smudge_digits: read("SMUDGE_DIGITS", "1").parse().unwrap(),
         trapdoor_sigma: read("TRAPDOOR_SIGMA", "4").parse().unwrap(),
-        encoding_error_sigma: BigDecimal::from(0),
+        encoding_error_sigma: read("ERROR_SIGMA", "0").parse::<BigDecimal>().unwrap(),
     };
     let function =
         StreamingFunction::additive(1, 1, 1, ExpLayout { stride_log2: 1, width_log2: 2 });
@@ -114,6 +125,9 @@ impl StageExecution<MemoryArtifactStore> for GraphOnly {
 
 #[test]
 fn test_dio2_claim_export() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let (parameters, function) = toy();
     let x =
         read("CLAIM_X", "0,1").split(',').map(|bit| vec![bit.trim() == "1"]).collect::<Vec<_>>();
@@ -123,7 +137,9 @@ fn test_dio2_claim_export() {
         exponent => Some(exponent.parse().unwrap()),
     };
     let execution = GraphOnly(CpuExecution::new(cpu_backend(parameters.rings().unwrap())));
-    let mut dio2 = Dio2::new(parameters, execution, MemoryArtifactStore::default()).unwrap();
+    let mut dio2 = Dio2::new(parameters, execution, MemoryArtifactStore::default())
+        .unwrap()
+        .with_inputs_by_shape();
     let steps = function.stream_length();
     let y = (0..steps).map(|_| vec![false; function.obf_chunk_bits]).collect::<Vec<_>>();
     // A fixed hash key, so that every export writes the same modules.
@@ -135,6 +151,10 @@ fn test_dio2_claim_export() {
         .unwrap();
     dio2.evaluate(&obfuscation, &x).unwrap();
     let protocol = dio2.protocol(&obfuscation, &x, failure).unwrap();
+    for requirement in &protocol.bundle.requirements {
+        mxx_ir_core::validate(requirement.graph(), &protocol.bindings)
+            .expect("claim requirement validates");
+    }
     if let Ok(directory) = std::env::var("MXX_IO_DIO2_CLAIM_EXPORT") {
         std::fs::create_dir_all(&directory).unwrap();
         mxx_ir_core::lean::protocol::export(&protocol, std::path::Path::new(&directory), true)

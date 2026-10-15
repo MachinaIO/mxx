@@ -176,6 +176,40 @@ Chernoff and Hoeffding bounds over the sampling tape and the sub-Gaussian moment
 Gaussian. Graphs that use gadget decomposition read their layouts from `Backend.backend`, and a
 long constant polynomial is a named definition `M.<scope>.table_<node>` that a proof can refer to.
 
+### Compact repeated diagonal matrices
+
+`Mat::block_diagonal(k)` records `NodeKind::BlockDiagonal { count: k }` with one input.
+Validation requires `k > 0`, checks dimension multiplication for overflow, and gives an
+`r k × c k` result for an `r × c` input. The CPU executor and GPU physical lowerer repeat
+the source along the diagonal with zeros elsewhere, exactly as diagonal concatenation.
+Export emits one `MxxRuntime.blockDiagonalRuns k X Y` atom, not `k - 1` concat witnesses.
+Its definition in `crates/ir-core/lean/RuntimeMatrixOps.lean` constrains every block pair:
+diagonal entries equal the source and off-diagonal entries are zero. It introduces no axiom
+or opaque primitive.
+
+`Sha256BitColumns { seed, rows, columns, index_bits }` has no inputs and two indexed integer
+family outputs of length `columns`: packed ascending selected row indices and their counts.
+The stream is exactly SHA-256 of the 32-byte seed followed by the little-endian 64-bit block
+counter; bit indices are row-major and little-endian within each digest byte. Validation checks
+positive dimensions, sufficient packed index width and addressable products. The emitted
+`MxxRuntime.sha256BitColumns` relation is the concrete SHA-256 computation in `RuntimeHash.lean`,
+with UInt32 arithmetic, not `HashModel`. Source size is independent of the selector matrix size.
+
+Long scope boundary types are shared through parameterized `InputType`/`OutputType`
+abbreviations; fact modules and linked claims also share repeated types and long literals.
+These are definitionally equal aliases, not weakened type or relation interfaces.
+Fact sections bind their common environment once and use a local context notation. Deep
+structural child scopes receive bounded-length names. Input-only parallel bodies with no
+parameter bindings and only broadcast/indexed-zip inputs export as function projections
+instead of existential families with universally quantified identity equations. The loop
+count equation and expression guards remain explicit; prefix zips retain checked `Fin`
+coercions. Computed bodies and dependent-family zips keep their ordinary relational semantics.
+Protocol export partitions large graph/facts sources at declaration boundaries into modules of
+at most 3,000,000 bytes. Each part imports its predecessor, restores local notation/section
+environments, and preserves all declarations and their namespaces. The original module name
+re-exports the final part. This bounds individual files even when fixed CRT/PRF circuit bodies
+are large; it does not remove atoms or reduce the total elaborated proposition.
+
 ## 6. Examples
 
 | Protocol | Declared in | Statement | Proof |

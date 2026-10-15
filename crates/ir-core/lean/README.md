@@ -94,6 +94,17 @@ projections, retaining count guards and checked prefix indexing rather than extr
 Large protocol graph/facts sources use declaration-boundary `_Part_<index>` modules, each at
 most 3,000,000 source bytes. The original module imports the final part and keeps its public
 namespace unchanged. All declarations remain present; partitioning does not weaken the claim.
+Record scopes with more than 512 local bindings move their `Ctx`, wire definitions and `outs`
+from the facts module into the relation module. Their body uses one context instead of a long
+let telescope; the facts module reuses those definitions with the same names and signatures.
+Unused pure bindings remain named definitions. Prefix zips use `Fin.castLE` and share one
+closed `by decide` inequality per pair of family lengths, without running `omega` in the body.
+Offset/quotient zips likewise share a single small-context bound lemma. Large non-root scopes
+use the same record representation; lifted definitions retain noncomputability across parts.
+Lifted `noncomputable def` declarations skip unnecessary executable-code generation while
+retaining their kernel-checked values for definitional equality and proofs.
+Large independent bodies use balanced fragment conjunctions and matching logarithmic-depth
+facts projections, rather than a long telescope of intermediate proof bindings.
 
 Production Diamond artifacts are generated and checked inside parameter search, not through
 these fixtures. Application proofs remain in their owning crate; the shared exporter and

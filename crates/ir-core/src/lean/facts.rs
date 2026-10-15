@@ -1,10 +1,11 @@
 //! Facts modules: the atoms of a record scope as named projections over wire constants.
 //!
-//! A record scope `S` (a root, or a body containing a loop) is `∃ witness, S.body … witness`,
-//! where `S.body` is a chain of `let`s ending in the `S.constraints_k` fragments. Destructuring
-//! that body in a proof (`extract_lets`, `obtain`) puts thousands of `let` variables into one
-//! context, and every later step is abstracted over them. The facts module of `S` instead names
-//! everything once, at the top level:
+//! A record scope `S` (a root, a large scope, or a body containing a loop) is
+//! `∃ witness, S.body … witness`. Small bodies use a chain of `let`s ending in the
+//! `S.constraints_k` fragments; large bodies use the context-indexed constants directly.
+//! Destructuring a long let body in a proof (`extract_lets`, `obtain`) puts thousands of variables
+//! into one context, and every later step is abstracted over them. The facts module of `S` instead
+//! names everything once, at the top level:
 //!
 //! - `S.Ctx env` holds the scope's `inputs` and `witness`, over the arguments `env` the body takes
 //!   before its inputs (backend, hash model, sampling tape and path, parameters, loop indices);
@@ -53,8 +54,45 @@ pub(super) struct RecordScope<'a> {
     /// Whether the fragments are independent (the body is their conjunction) rather than each
     /// ending in the call of the next (see [`super::ExportOptions::facts`]).
     pub independent: bool,
+    /// Independent fragments arranged in a balanced conjunction tree.
+    pub balanced: bool,
     pub output_tuple: String,
     pub loops: Vec<ChildLoop>,
+}
+
+pub(super) enum Declarations {
+    All,
+    Bindings,
+    Facts,
+}
+
+pub(super) fn balanced_conjunction(parts: &[String]) -> String {
+    match parts {
+        [] => "True".to_owned(),
+        [part] => part.clone(),
+        _ => {
+            let middle = parts.len() / 2;
+            format!(
+                "({} ∧ {})",
+                balanced_conjunction(&parts[..middle]),
+                balanced_conjunction(&parts[middle..])
+            )
+        }
+    }
+}
+
+fn balanced_projection(root: &str, index: usize, count: usize) -> String {
+    assert!(index < count);
+    if count == 1 {
+        root.to_owned()
+    } else {
+        let middle = count / 2;
+        if index < middle {
+            balanced_projection(&format!("{root}.1"), index, middle)
+        } else {
+            balanced_projection(&format!("{root}.2"), index - middle, count - middle)
+        }
+    }
 }
 
 /// Replaces identifiers for which `replace` gives a term; keeps «…», strings, numerals, fields.
@@ -184,7 +222,11 @@ fn field_names(conjuncts: &[&str]) -> Vec<String> {
 }
 
 /// The facts declarations of one record scope; `records` names the record scopes emitted so far.
-pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> String {
+pub(super) fn render(
+    scope: &RecordScope<'_>,
+    records: &BTreeSet<String>,
+    declarations: Declarations,
+) -> String {
     let name = scope.name;
     let wires = scope.wires.iter().map(|(wire, _, _)| wire.as_str()).collect::<BTreeSet<_>>();
     let constants = |text: &str| {
@@ -205,24 +247,44 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
         scope.env.iter().map(|(binder, _)| binder.as_str()).collect::<Vec<_>>().join(" ");
     let implicit = "";
     let ctx_type = format!("{name}Ctx");
-    let mut out = format!(
-        "set_option genInjectivity false in\nset_option genSizeOf false in\nstructure {name}.Ctx {} where\n  inputs : {}\n  witness : {name}.Witness\n\n",
-        scope.env.iter().map(|(b, t)| format!("({b} : {t})")).collect::<Vec<_>>().join(" "),
-        scope.input_type
-    );
-    out.push_str(&format!("section\nvariable {variables}\nlocal notation \"{ctx_type}\" => ({name}.Ctx {env_names})\n\n"));
-    for (wire, ty, term) in &scope.wires {
+    let mut out = if matches!(declarations, Declarations::Facts) {
+        String::new()
+    } else {
+        format!(
+            "set_option genInjectivity false in\nset_option genSizeOf false in\nstructure {name}.Ctx {} where\n  inputs : {}\n  witness : {name}.Witness\n\n",
+            scope.env.iter().map(|(b, t)| format!("({b} : {t})")).collect::<Vec<_>>().join(" "),
+            scope.input_type
+        )
+    };
+    let section = if matches!(declarations, Declarations::Bindings) {
+        "noncomputable section\nset_option linter.unusedVariables false"
+    } else {
+        "section"
+    };
+    out.push_str(&format!("{section}\nvariable {variables}\nlocal notation \"{ctx_type}\" => ({name}.Ctx {env_names})\n\n"));
+    if !matches!(declarations, Declarations::Facts) {
+        let definition = if matches!(declarations, Declarations::Bindings) {
+            "noncomputable def"
+        } else {
+            "def"
+        };
+        for (wire, ty, term) in &scope.wires {
+            out.push_str(&format!(
+                "{definition} {name}.{wire} {implicit} (ctx : {ctx_type}) : {} :=\n  {}\n\n",
+                constants(ty),
+                constants(term)
+            ));
+        }
         out.push_str(&format!(
-            "def {name}.{wire} {implicit} (ctx : {ctx_type}) : {} :=\n  {}\n\n",
-            constants(ty),
-            constants(term)
+            "{definition} {name}.outs {implicit} (ctx : {ctx_type}) : {} :=\n  {}\n\n",
+            scope.output_type,
+            constants(&scope.output_tuple)
         ));
     }
-    out.push_str(&format!(
-        "def {name}.outs {implicit} (ctx : {ctx_type}) : {} :=\n  {}\n\n",
-        scope.output_type,
-        constants(&scope.output_tuple)
-    ));
+    if matches!(declarations, Declarations::Bindings) {
+        out.push_str("end\n\n");
+        return out;
+    }
     let last = scope.fragments.len() - 1;
     let output_equation = format!("outputs = {}", scope.output_tuple);
     let mut fragment_conjuncts = scope
@@ -293,7 +355,16 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
         fields.concat()
     ));
     let mut proof = String::new();
-    let parts = if scope.independent {
+    let parts = if scope.balanced {
+        (0..=last)
+            .map(|part| {
+                format!(
+                    "({name}.facts_{part} (ctx := ctx) (outputs := outputs) {})",
+                    balanced_projection("h", part, last + 1)
+                )
+            })
+            .collect::<Vec<_>>()
+    } else if scope.independent {
         // The body is `constraints_0 … ∧ … ∧ constraints_last …`: fragment `k` is its `k`-th
         // conjunct. Each tail `t<k>` is named once, so no projection chain grows with `k`.
         proof.push_str("  have t0 := h\n");
@@ -357,6 +428,18 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balanced_fragments_have_matching_logarithmic_projections() {
+        let parts = ["a", "b", "c", "d", "e"].map(str::to_owned);
+        assert_eq!(balanced_conjunction(&parts), "((a ∧ b) ∧ (c ∧ (d ∧ e)))");
+        assert_eq!(balanced_projection("h", 0, 5), "h.1.1");
+        assert_eq!(balanced_projection("h", 2, 5), "h.2.1");
+        assert_eq!(balanced_projection("h", 4, 5), "h.2.2.2");
+        for index in 0..1025 {
+            assert!(balanced_projection("h", index, 1025).matches('.').count() <= 11);
+        }
+    }
 
     #[test]
     fn substitution_keeps_fields_quotes_and_numerals() {

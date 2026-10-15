@@ -204,6 +204,22 @@ parameter bindings and only broadcast/indexed-zip inputs export as function proj
 instead of existential families with universally quantified identity equations. The loop
 count equation and expression guards remain explicit; prefix zips retain checked `Fin`
 coercions. Computed bodies and dependent-family zips keep their ordinary relational semantics.
+Each pair of prefix lengths shares one closed numeric inequality, proved by `decide` and used
+through `Fin.castLE`. It does not run a bound-solving tactic in each member's local context.
+Record scopes with more than 512 bindings declare their context-indexed wire computations in
+the relation module, and the body refers to those computations using a single context binding.
+The facts module reuses these `Ctx`, wire and `outs` declarations with their existing signatures.
+This removes the deep let telescope; it does not remove computations, witnesses or constraints.
+Large non-root scopes also use this record representation. Lifted computations live in a
+`noncomputable section`, since matrix operations need not have executable Lean definitions;
+partitioning restores that section across file boundaries. Offset and quotient zips share
+one bound lemma per numeric index transformation, proved with only a `Fin` index in context.
+Lifted wire/`outs` definitions also carry an explicit `noncomputable` modifier to skip
+executable-code generation; merely entering a noncomputable section still attempts code
+generation for computable projections. Their defining equations remain kernel-checked.
+Large independent bodies balance their fragment conjunctions. Facts extraction follows the
+same binary tree with logarithmic-depth projections, without accumulating one local proof
+binding per fragment. Only conjunction association changes; every atom and witness remains.
 Protocol export partitions large graph/facts sources at declaration boundaries into modules of
 at most 3,000,000 bytes. Each part imports its predecessor, restores local notation/section
 environments, and preserves all declarations and their namespaces. The original module name

@@ -25,11 +25,17 @@ a parallel or gather loop `∀ i : Fin n, …` maps its body; a sequential loop
 a relation (or constraint fragment) taking a tape uses its bridge; a tape sampler uses its
 `ExponentSampling` lemma; every other atom is the same proposition on both sides.
 
+Partition modules retain the parent namespace. Each bridge imports its dependencies' bridges,
+reads their declarations for resolving calls and witnesses, and proves only its own declarations.
+Relation and facts partitions are both renamed on the worst-case side.
+
 Usage: `python3 gen_bridge.py <average directory> <worst directory> [<library prefix>]`.
 """
 import os
 import re
 import sys
+
+from xmodules import module_sources, partition_base
 
 avg, worst = sys.argv[1], sys.argv[2]
 prefix = sys.argv[3] if len(sys.argv) > 3 else 'RefreshTop'
@@ -39,7 +45,8 @@ os.makedirs(f'{avg}/bridge', exist_ok=True)
 
 
 def is_relation(name):
-    return bool(ROOTS.fullmatch(name)) and not name.endswith('_Facts')
+    base = partition_base(name)
+    return bool(ROOTS.fullmatch(base)) and not base.endswith('_Facts')
 
 
 modules = sorted(f[:-5] for f in os.listdir(f'{avg}/generated')
@@ -53,15 +60,18 @@ def write(sub, name, text):
 
 
 def renamed(text):
-    return ROOTS.sub(lambda m: 'W_' + m.group(1), text)
+    text = ROOTS.sub(lambda m: 'W_' + m.group(1), text)
+    return re.sub(r'\b((?:Ideal|Requirement_0)(?:_Facts)?_Part_\d+)\b',
+                  lambda m: 'W_' + m.group(1), text)
 
 
-for m in modules:
+for m in sorted(f[:-5] for f in os.listdir(f'{worst}/generated')
+                if f.endswith('.lean') and is_relation(f[:-5])):
     write('worst', f'W_{m}', renamed(open(f'{worst}/generated/{m}.lean').read()))
 # The worst-case export's facts modules (`<module>_Facts`, exported with
 # `MXX_EXPONENT_LUT_REFRESH_TOP_LEAN_FACTS=1`), renamed alike: the modular proof reads them.
 for f in sorted(os.listdir(f'{worst}/generated')):
-    if f.endswith('_Facts.lean') and is_relation(f[:-len('_Facts.lean')]):
+    if f.endswith('.lean') and partition_base(f[:-5]).endswith('_Facts'):
         write('worst', f'W_{f[:-5]}', renamed(open(f'{worst}/generated/{f}').read()))
 
 claim = open(f'{worst}/generated/Claim.lean').read()
@@ -180,9 +190,15 @@ TAPE = re.compile(r'\btape\b')
 
 def gen_module(m):
     text = open(f'{avg}/generated/{m}.lean').read()
-    B = blocks(text)
-    out = [f'''import {m}
-import W_{m}
+    own = blocks(text)
+    B = {}
+    for _, source in module_sources(f'{avg}/generated', m):
+        B.update(blocks(source))
+    namespace = partition_base(m)
+    dependencies = re.findall(r'^import (\w+)\s*$', text, re.M)
+    imports = ''.join(f'import Bridge_{dep}\n' for dep in dependencies if dep in modules)
+    out = [f'''{imports}import {m}
+import W_{namespace}
 import ExponentSampling
 
 /-! Every run of the average-case relations of `{m}` is a run of its worst-case relations
@@ -252,12 +268,12 @@ theorem {m}.iterRuns_mono {{State : Type}} {{f g : Nat → State → State → P
             hs = fresh('hs')
             return f'({m}.iterRuns_mono {h} (fun _ _ _ {hs} ↦ {term(step, hs)}))'
         head = e.split(' ', 1)[0]
-        if head.startswith(f'{m}.'):
-            head = head[len(m) + 1:]
+        if head.startswith(f'{namespace}.'):
+            head = head[len(namespace) + 1:]
         if head in B and B[head][0] == 'abbrev' and head.endswith('.body'):
             return term(expression(B[head][2]), h)
         if bridged(head):
-            return f'({m}.{head}.bridge {h})'
+            return f'({namespace}.{head}.bridge {h})'
         raise ValueError(f'{m}: no bridge for atom {e[:300]}')
 
     def signature(name, header, kind):
@@ -284,7 +300,7 @@ theorem {m}.iterRuns_mono {{State : Type}} {{f g : Nat → State → State → P
                 binders.append(n)
         return avg_args, w_args, binders
 
-    for name, (kind, header, lines) in B.items():
+    for name, (kind, header, lines) in own.items():
         if not header.endswith(': Prop :=') or not bridged(name):
             continue
         if kind == 'abbrev' and name.endswith('.body'):
@@ -292,11 +308,11 @@ theorem {m}.iterRuns_mono {{State : Type}} {{f g : Nat → State → State → P
         assert kind == 'def' or re.search(r'\.constraints_\d+$', name), (m, name)
         counter[0] = 0
         avg_args, w_args, binders = signature(name, header, kind)
-        script = [] if kind == 'abbrev' else [f'  delta W_{m}.{name}']
+        script = [] if kind == 'abbrev' else [f'  delta W_{namespace}.{name}']
         script.append(f'  exact {term(expression(lines), "h")}')
         out.append(f'''
-theorem {m}.{name}.bridge {{{' '.join(binders)}}}
-    (h : {m}.{name} {' '.join(avg_args)}) : W_{m}.{name} {' '.join(w_args)} := by
+theorem {namespace}.{name}.bridge {{{' '.join(binders)}}}
+    (h : {namespace}.{name} {' '.join(avg_args)}) : W_{namespace}.{name} {' '.join(w_args)} := by
 ''' + '\n'.join(script) + '\n')
     write('bridge', f'Bridge_{m}', '\n'.join(out))
 

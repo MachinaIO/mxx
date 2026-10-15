@@ -73,7 +73,9 @@ pub(super) fn partition(
         current.push_str(block);
         current.push_str("\n\n");
         has_declaration = true;
-        if block.trim_start().starts_with("section\n") {
+        if block.trim_start().starts_with("section\n") ||
+            block.trim_start().starts_with("noncomputable section\n")
+        {
             if section.is_some() {
                 return Err("nested generated sections cannot be partitioned".into());
             }
@@ -102,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_partition_restores_local_notations_and_section_environments() {
-        let mut source = "namespace Partitioned\n\nstructure Params where\n  value : Nat\n\nlocal notation \"mxxNat0\" => 7\n\nsection\nvariable {params : Params}\nlocal notation \"ctx\" => params.value\n\n".to_string();
+        let mut source = "namespace Partitioned\n\nstructure Params where\n  value : Nat\n\nlocal notation \"mxxNat0\" => 7\n\nnoncomputable section\nvariable {params : Params}\nlocal notation \"ctx\" => params.value\n\n".to_string();
         for index in 0..30 {
             source.push_str(&format!("def value_{index} : Nat := ctx + mxxNat0\n\n"));
         }

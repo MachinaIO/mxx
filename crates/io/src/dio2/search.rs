@@ -15,8 +15,8 @@
 //! Settings (`MXX_IO_DIO2_SEARCH_*`): `LOG_N` (list, default `16,17`), `CRT_BITS` (list, default
 //! `60,55,50`), `BASE_BITS` (list of gadget bases, default `CRT_BITS / 2`), `MIN_PRIMES`,
 //! `MAX_PRIMES` (default `1`, `64`), `SECURITY_BITS` (default `100`), `STATISTICAL_BITS` (default
-//! `100`), `FAILURE_EXPONENT` (default `100`), `ERROR_SIGMA` (default `4`), `TRAPDOOR_SIGMA`
-//! (default `4`).
+//! `100`), `FAILURE_EXPONENT` (default `100`), `NOISE_MODEL` (`average` or `worst`, default
+//! `average`), `ERROR_SIGMA` (default `4`), `TRAPDOOR_SIGMA` (default `4`).
 
 #[cfg(test)]
 mod tests {
@@ -127,10 +127,12 @@ mod tests {
         bits: usize,
         failure_exponent: u32,
     ) -> Result<(BigUint, bool), Dio2Error> {
+        let average = average_model(failure_exponent);
+        let worst_case = setting("NOISE_MODEL", "average") == "worst";
         let noise = simulate_noise_targets(
             parameters,
             function,
-            Some(&average_model(failure_exponent)),
+            (!worst_case).then_some(&average),
             NoiseTargets::Representative,
         )?;
         let worst = noise

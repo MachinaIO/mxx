@@ -14,8 +14,8 @@ This script writes, in the average-case parameter directory:
   path … → W_Stage_x.D …` for every relation `D` whose signature takes a tape, and
   `BridgeRuns.lean` with `GeneratedClaim.runs_bridge`;
 and deletes the `.lean` files of `worst/` and `bridge/` it no longer writes, and sets the roots
-of the `RefreshTopGenerated`, `RefreshTopWorst` and `RefreshTopBridge` libraries in
-`lakefile.toml`.
+of the `<prefix>Generated`, `<prefix>Worst` and `<prefix>Bridge` libraries in `lakefile.toml`
+(`<prefix>` the optional third argument, `RefreshTop` by default).
 
 The bridge reads each relation as a proposition: `let` lines are kept by definitional unfolding;
 `∃` binders (record witnesses `∃ witness : D.Witness`, scalar chains `∃ (x : T),`, gathered
@@ -25,13 +25,14 @@ a parallel or gather loop `∀ i : Fin n, …` maps its body; a sequential loop
 a relation (or constraint fragment) taking a tape uses its bridge; a tape sampler uses its
 `ExponentSampling` lemma; every other atom is the same proposition on both sides.
 
-Usage: `python3 gen_bridge.py <average directory> <worst directory>`.
+Usage: `python3 gen_bridge.py <average directory> <worst directory> [<library prefix>]`.
 """
 import os
 import re
 import sys
 
 avg, worst = sys.argv[1], sys.argv[2]
+prefix = sys.argv[3] if len(sys.argv) > 3 else 'RefreshTop'
 ROOTS = re.compile(r'\b(Stage_\w+|Ideal|Requirement_0)\b')
 os.makedirs(f'{avg}/worst', exist_ok=True)
 os.makedirs(f'{avg}/bridge', exist_ok=True)
@@ -339,8 +340,8 @@ for sub in ('worst', 'bridge'):
 
 # The library roots.
 generated = sorted(f[:-5] for f in os.listdir(f'{avg}/generated') if f.endswith('.lean'))
-roots = {'RefreshTopGenerated': generated, 'RefreshTopWorst': sorted(written['worst']),
-         'RefreshTopBridge': sorted(written['bridge'])}
+roots = {f'{prefix}Generated': generated, f'{prefix}Worst': sorted(written['worst']),
+         f'{prefix}Bridge': sorted(written['bridge'])}
 lake = open(f'{avg}/lakefile.toml').read()
 for lib, names in roots.items():
     lake, n = re.subn(rf'(name = "{lib}"\n(?:(?!\[\[).*\n)*?roots = )\[[^\]]*\]',

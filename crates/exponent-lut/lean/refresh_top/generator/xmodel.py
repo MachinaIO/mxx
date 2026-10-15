@@ -323,8 +323,24 @@ def split_conj(body):
     return [c.strip() for c in split_top(body.strip(), ' ∧\n')]
 
 
+def expand_matrix_notations(text):
+    """Replace the export's local notations, the matrix types `mxxMat<k>` and the numerals
+    `mxxNat<k>`, by what they name (a module reading the scopes cannot see them)."""
+    numerals = dict(re.findall(r'^local notation "(mxxNat\d+)" => (\d+)$', text, re.M))
+    text = re.sub(r'\bmxxNat\d+\b', lambda m: numerals.get(m.group(0), m.group(0)), text)
+    notations = dict(re.findall(r'^local notation "(mxxMat\d+)" => (.+)$', text, re.M))
+    if not notations:
+        return text
+    # A type ascription `(t : mxxMat<k>)` takes the type bare, as the exports without notations
+    # write it; elsewhere (an argument of a product or a family type) it is parenthesized.
+    text = re.sub(r'(: )(mxxMat\d+)\)', lambda m: m.group(1) + notations.get(m.group(2), m.group(2)) + ')',
+                  text)
+    return re.sub(r'\bmxxMat\d+\b', lambda m: f'({notations[m.group(0)]})'
+                  if m.group(0) in notations else m.group(0), text)
+
+
 def parse_module(gdir, module):
-    text = open(f'{gdir}/{module}.lean').read()
+    text = expand_matrix_notations(open(f'{gdir}/{module}.lean').read())
     scopes = collections.OrderedDict()
     frags = collections.defaultdict(dict)   # scope -> k -> (params, body)
     defs = {}
@@ -390,7 +406,7 @@ def parse_module(gdir, module):
 def parse_facts(gdir, module, scopes):
     """Attach record fields (names), wire definitions and `_at` lemmas from `M_Facts.lean`."""
     try:
-        text = open(f'{gdir}/{module}_Facts.lean').read()
+        text = expand_matrix_notations(open(f'{gdir}/{module}_Facts.lean').read())
     except FileNotFoundError:
         return
     for m in re.finditer(r'^def ([A-Za-z_0-9]+)\.(w_\d+(?:_\d+)?(?:_concat_\d+)?) \{[^\n]*\) : ([^\n]*) :=\n  ([^\n]*)', text, re.M):

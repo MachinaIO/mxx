@@ -8,16 +8,18 @@ average-case package and writes, into its `proof/` directory,
   `Dio2Proof.Comp` (refresh_top's `GenIface` keeps its own bundles under the same names);
 - `Gen_<Module>_Scopes.lean`: the adapters, whose bundle references name `Dio2Proof.Comp`.
 
-Usage: gen_adapters_dio2.py <average package> <Module>…   (modules `W_Stage_*`)
+Usage: gen_adapters_dio2.py <average package> [<Module>…]   (default: all logical `W_Stage_*`)
 """
 import os
 import re
 import sys
+from pathlib import Path
 
 here = os.path.dirname(os.path.abspath(__file__))
 generic = os.path.join(here, '../../../../exponent-lut/lean/refresh_top/generic')
 sys.path.insert(0, here)
 import xroles_dio2  # noqa: E402,F401
+import dio2_meta  # noqa: E402
 
 sys.path.insert(0, os.path.join(here, '../../../../exponent-lut/lean/refresh_top/generator'))
 import gen_adapters as GA  # noqa: E402
@@ -33,16 +35,71 @@ def ad_equation(s, info, cx):
     return binders, call, f'outputs = {GA.wire_term(s, m.group(1))}', '  exact h'
 
 
+def ad_expose(s, info, cx):
+    """Expose the exact exported relation without assuming a forest/digit invariant."""
+    binders, call, _ = GA.header(s)
+    body = s.def_src.split(' : Prop :=\n', 1)[1].strip()
+    names = GA.sig_names(s)
+    anonymous = [name for name, _ in names if name.startswith('x_')]
+    if anonymous and re.search(r'\b_\b', body):
+        raise GA.Fail('anonymous binder in exposed body')
+    return binders, call, '(' + body + ')', '  exact h'
+
+
 for role in ('import.copy', 'import.label', 'sampler.monomial'):
     GA.ADAPTERS[role] = ad_equation
+for role in ('label.forest.branch', 'label.forest.entry', 'label.forest.public',
+             'label.forest.evaluate', 'label.forest.gather', 'label.forest.assemble',
+             'label.zero', 'smudge.digit.step', 'smudge.digit.weight', 'instance.body',
+             'preimage.sample', 'sampler.gather-placement', 'decode.round.step'):
+    GA.ADAPTERS[role] = ad_expose
+
+
+def ad_scalar_gather(s, info, cx):
+    per, flat = GA.atom_names(s)
+    per = GA.use_rfl_out(per, flat)
+    gets = [(name, term) for name, term in flat if term.startswith('MxxRuntime.familyGetDynamic ')]
+    if len(gets) != 1:
+        raise GA.Fail('scalar gather must have exactly one family read')
+    got, term = gets[0]
+    _, args = GA.xmodel.app_split(term)
+    index = args[1]
+    lower = [name for name, term in flat if term == '0 ≤ ' + index]
+    upper = [name for name, term in flat if term.startswith(index + ' < ')]
+    if len(lower) != 1 or len(upper) != 1:
+        raise GA.Fail('scalar gather has ambiguous read-index bounds')
+    binders, call, _ = GA.header(s)
+    conclusion = f'GatherUnpack.Spec (k := 1) (inputs, ()) {GA.wire_term(s, index)} (outputs, ())'
+    proof = f'''  obtain {GA.pattern(s, per)} := h
+  exact GatherUnpack.sem {lower[0]} {upper[0]} {GA.fin_match(1, [got])}'''
+    return binders, call, conclusion, proof
+
+
+GA.ADAPTERS['gather.scalar'] = ad_scalar_gather
 GA.BUNDLE_ROLES |= {'lut.key-table.flat', 'lut.member.flat', 'lut.key-member.flat', 'prf.cell-flat', 'enc.rooted-branch-key', 'enc.rooted-label-entry'}
 
 pkg, modules = sys.argv[1], sys.argv[2:]
 proof = os.path.join(pkg, 'proof')
 gdir = os.path.join(pkg, 'worst')
+metadata = dio2_meta.extract(Path(pkg))
+if not modules:
+    modules = sorted(Path(name).stem for name in metadata['sources']
+                     if name.startswith('worst/W_Stage_') and '_Facts' not in name
+                     and '_Part_' not in name)
+os.makedirs(proof, exist_ok=True)
+roles, unknown = GA.xroles.assign(gdir, modules)
+if unknown:
+    raise SystemExit('Unclassified scopes: ' + repr(unknown))
+for module, scopes in roles.items():
+    for scope, info in scopes.items():
+        if info['role'] == 'smudge.digit.step' and \
+                info['count'] != metadata['views']['worst']['smudge_digits']:
+            raise SystemExit(f'{module}.{scope}: digit count disagrees with dio2_meta')
 V, failures = GA.collect_variants(gdir, modules)
 for f in failures:
     print('  BUNDLE FAIL', *f)
+if failures:
+    raise SystemExit('Cannot generate all computation bundles')
 iface = open(os.path.join(generic, 'GenIface.lean')).read()
 section = V.lean()
 section = section[section.index('\n', section.index('-- BEGIN GENERATED COMP')) + 1:
@@ -67,6 +124,9 @@ for m in modules:
     print(f'{m}: {len(done)} adapters, skipped {dict(skipped)}, failed {len(failed)}')
     for f in failed:
         print('  FAIL', *f)
+    unsupported = set(skipped) - {'stage.root', 'decode.root', 'unused.body'}
+    if failed or unsupported:
+        raise SystemExit('Cannot generate all adapters for ' + m)
     out = out.replace('import GenIface\n', 'import Dio2Comp\n', 1)
     out = re.sub(r'(?<![\w.])(\w+\.Comp(?:_\d+)?)(?![\w.])',
                  lambda x: f'Dio2Proof.Comp.{x.group(1)}' if x.group(1) in names else x.group(1), out)

@@ -17,20 +17,83 @@ classify the dio2 stages too. The new roles, recognized from structure only as i
 | `enc.rooted-branch-key` | the key of a rooted LUT branch (preprocess) |
 | `enc.rooted-label-entry` | the key of a rooted label entry (preprocess) |
 
+V2 also recognizes symbolic `label.forest.*` scopes, `label.zero`, scalar gathers,
+fused gather/monomial placement, and block-diagonal smudge digit steps and weights.
+Port aliases and matrix/numeral notations are resolved across imported partitions.
+Definitions without a loop parent are reported explicitly as `unused.body`.
+
 Usage: xroles_dio2.py <generated dir> [--json out.json] [Module…]   (default: every stage)
 """
 import os
+import re
 import sys
 
 REFRESH_TOP = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            '../../../../exponent-lut/lean/refresh_top/generator')
 sys.path.insert(0, REFRESH_TOP)
 import xroles  # noqa: E402
+import xmodel  # noqa: E402
+
+_sources = xmodel.module_sources
+
+
+def export_sources(gdir, module):
+    """Resolve port aliases across all partitions before parsing their signatures."""
+    sources = _sources(gdir, module)
+    aliases = dict(match for _, text in sources for match in re.findall(
+        r'^abbrev (\w+\.(?:InputType|OutputType)) : Type :=\n  ([^\n]+)', text, re.M))
+    notations = '\n'.join(line for _, text in sources for line in re.findall(
+        r'^local notation "mxx(?:Nat|Mat)\d+" => [^\n]+$', text, re.M))
+    prefix = notations + '\n' if len(sources) > 1 else ''
+    return [(name, prefix + re.sub(r'\((\w+\.(?:InputType|OutputType))\)',
+                         lambda match: '(' + aliases.get(match[1], match[1]) + ')', text))
+            for name, text in sources]
+
+
+xmodel.module_sources = export_sources
 
 _base = xroles.role_of
 
 
 def role_of(cx, s):
+    par = cx.parent.get(s.name)
+    how = par[1].kind if par else 'root'
+    atoms = s.atom_kinds()
+    operations = xroles.lets(s)
+    params = dict(how=how)
+    if par:
+        params['count'] = par[1].count
+    if how == 'root' and s.name != 'generatedRoot':
+        return 'unused.body', params
+    if how == 'seq' and set(atoms) == {'familyGetDynamic'} and \
+            operations.get('matrixAdd') == atoms['familyGetDynamic'] and \
+            len(s.inputs) == 2 * len(s.output):
+        params.update(k=len(s.output), F=xroles.fam_len(s.inputs[len(s.output)]))
+        return 'sum.members.step', params
+    if how == 'seq' and 'blockDiagonalRuns' in atoms:
+        return 'smudge.digit.step', params
+    if how == 'par' and set(atoms) == {'familyGetDynamic'} and 'multiplyMonomial' in operations:
+        return 'sampler.gather-placement', params
+    if how == 'par' and set(atoms) == {'familyGetDynamic'} and len(s.inputs) == 1 and \
+            ' × ' not in s.input_type and ' × ' not in s.output_type:
+        return 'gather.scalar', params
+    if how == 'par' and not atoms and set(operations) == {'liftInteger', 'matrixMulScalarLeft'}:
+        return 'smudge.digit.weight', params
+    if how == 'par' and not atoms and not s.inputs and len(s.output) == 1 and \
+            set(operations) == {'const'}:
+        return 'label.zero', params
+    if how == 'par' and 'uniformIntervalSample' in atoms and 'gadgetMatrixRuns' in atoms:
+        return ('label.forest.branch' if 'ringAutomorphismRuns' in atoms
+                else 'label.forest.entry'), params
+    if how == 'par' and s.loops and 'select' in atoms and 'familyGetStatic' in atoms:
+        return 'label.forest.assemble', params
+    if how == 'par' and 'select' in atoms and 'familyGetDynamic' in atoms:
+        if 'hashSample' in atoms:
+            return 'label.forest.public', params
+        if 'gadgetDecomposeRuns' in atoms:
+            return 'label.forest.evaluate', params
+        if not s.loops:
+            return 'label.forest.gather', params
     r, reason = _base(cx, s)
     if r == 'instance.body':
         # A root parallel over the members of one LUT round (its loop child a LUT step): the round
@@ -41,7 +104,7 @@ def role_of(cx, s):
         A = s.atom_kinds()
         if set(A) == {'familyGetStatic'} and [k for k, _ in kids] == ['par', 'seq'] and \
                 A['familyGetStatic'] == 2 * len(s.output) and \
-                [_base(cx, c)[0] for _, c in kids] == ['gather.unpack', 'sum.members.step']:
+                [role_of(cx, c)[0] for _, c in kids] == ['gather.unpack', 'sum.members.step']:
             loop = [a.loop for a in s.loops][0]
             p = dict(reason)
             p.update(k=len(s.output), W=loop.count, F=xroles.fam_len(s.inputs[0]))
@@ -49,7 +112,7 @@ def role_of(cx, s):
         # A root parallel over the members of a LUT key table (the switching ciphertexts of a
         # LUT, encrypted without an error term; refresh_top's `lut.key-table` samples one).
         if [k for k, _ in kids] == ['par', 'seq'] and \
-                [_base(cx, c)[0] for _, c in kids] == ['lut.key-table.index', 'lut.key-table.step'] \
+                [role_of(cx, c)[0] for _, c in kids] == ['lut.key-table.index', 'lut.key-table.step'] \
                 and len(s.inputs) == 3 and len(s.output) == 4:
             p = dict(reason)
             p.update(W=[a.loop for a in s.loops][1].count)
@@ -107,7 +170,8 @@ if __name__ == '__main__':
         out = args[i + 1]
         del args[i:i + 2]
     modules = args or sorted(f[:-5] for f in os.listdir(gdir)
-                             if f.startswith('Stage_') and f.endswith('.lean') and '_Facts' not in f)
+                             if f.startswith(('Stage_', 'W_Stage_')) and f.endswith('.lean')
+                             and '_Facts' not in f and '_Part_' not in f)
     import collections
     import json
     res, unknown = xroles.assign(gdir, modules)

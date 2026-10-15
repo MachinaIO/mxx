@@ -38,9 +38,9 @@ srcDir = "../../../../exponent-lut/lean/refresh_top/generic"
 moreLeanArgs = ["--tstack=1000000"]
 roots = ["GenFinal", "GenDecode", "TopCrtGeneric", "GenIface", "GenKey", "GenPbc", "ModularGlue", "GenRel", "GenLabel", "GenLut", "GenLoop", "GenRelLut", "GenReq", "GenFinalLink", "GenFinalFresh", "GenFinalValues", "GenSmudge", "GenInstLemmas"]
 
-# Production correctness proofs are not yet supplied.
+# Port foundation; stage correctness proofs are added separately.
 [[lean_lib]]
 name = "Dio2Proof"
 srcDir = "proof"
 moreLeanArgs = ["--tstack=1000000"]
-roots = []
+roots = ["Dio2Cell", "Dio2CellBridge", "Dio2Comp", "Dio2Decode", "Dio2Diag", "Dio2Final", "Dio2Generic", "Dio2Ideal", "Dio2Inv", "Dio2Keys", "Dio2KeysLoops", "Dio2Label", "Dio2Lut", "Dio2LutBridge", "Dio2Part", "Dio2PartRows", "Dio2Rel", "Dio2Requirement", "Dio2Sampler", "Dio2Sharp", "Dio2SmudgeCore", "Gen_W_Stage_anchor_publics_Scopes", "Gen_W_Stage_anchors_Scopes", "Gen_W_Stage_decode_Scopes", "Gen_W_Stage_import_0_Scopes", "Gen_W_Stage_import_1_Scopes", "Gen_W_Stage_initial_Scopes", "Gen_W_Stage_keys_import_0_0_Scopes", "Gen_W_Stage_keys_import_1_1_Scopes", "Gen_W_Stage_keys_online_0_0_Scopes", "Gen_W_Stage_keys_online_1_1_Scopes", "Gen_W_Stage_mask_Scopes", "Gen_W_Stage_online_0_Scopes", "Gen_W_Stage_online_1_Scopes", "Gen_W_Stage_payload_Scopes", "Gen_W_Stage_preimages_0_0_Scopes", "Gen_W_Stage_preimages_1_1_Scopes", "Gen_W_Stage_preprocess_0_0_Scopes", "Gen_W_Stage_preprocess_1_1_Scopes", "Gen_W_Stage_zero_Scopes"]

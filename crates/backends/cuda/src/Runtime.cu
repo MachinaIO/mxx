@@ -1638,12 +1638,13 @@ extern "C"
         size_t *out_total_global_memory,
         int *out_driver_version,
         int *out_runtime_version,
-        uint64_t *out_context_generation)
+        uint64_t *out_context_generation,
+        size_t *out_resident_threads)
     {
         if (device < 0 || !out_name || name_capacity == 0 || !out_compute_major ||
             !out_uuid || uuid_capacity < 33 || !out_compute_minor ||
             !out_total_global_memory || !out_driver_version || !out_runtime_version ||
-            !out_context_generation)
+            !out_context_generation || !out_resident_threads)
         {
             return set_error("invalid gpu_device_get_identity arguments");
         }
@@ -1683,6 +1684,8 @@ extern "C"
         *out_compute_major = properties.major;
         *out_compute_minor = properties.minor;
         *out_total_global_memory = properties.totalGlobalMem;
+        *out_resident_threads = static_cast<size_t>(properties.multiProcessorCount) *
+                                static_cast<size_t>(properties.maxThreadsPerMultiProcessor);
         return 0;
     }
 

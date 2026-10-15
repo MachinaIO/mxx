@@ -28,7 +28,11 @@
 //! encoding whose payload is a monomial, so the payload term of `C_k` keeps
 //! its `l1` norm one; the scalar actions, whose coefficients carry `W^-1`,
 //! are applied last, per branch. A LUT's `branches` public action holds the
-//! product keys `T` depth by depth, in the order of [`RadixDepth::branches`].
+//! product keys `T` as internal-depth families and leaf member-group/slot families.
+//!
+//! Root-site leaf branches sharing a switch member reuse each companion expansion across
+//! depths, after the internal parents have been computed. Leaf keys are published directly
+//! per group and slot, with one lane per switch member, without repacking across groups.
 //!
 //! A LUT on a public payload switches its branches with the helpers alone,
 //! with no digit companion (see [`super::public_lut`]).
@@ -257,6 +261,51 @@ pub(crate) fn radix_plan(
         });
     }
     Ok(plan)
+}
+
+/// Leaf branches sharing one switch expand its companions once per lane, so a lane holds the input
+/// and product rows of all its slots at once; at most this many slots share a lane.
+const LEAF_SLOTS_PER_LANE: usize = 4;
+
+/// Leaf members with the same depth layout share parallel loops of at most
+/// [`LEAF_SLOTS_PER_LANE`] consecutive slots each. Each lane is one switch; each slot is a branch
+/// using that switch, with its original position at its depth.
+pub(crate) struct LeafMembers {
+    pub(crate) switches: Vec<usize>,
+    pub(crate) depths: Vec<usize>,
+    pub(crate) positions: Vec<Vec<usize>>,
+}
+
+pub(crate) fn leaf_members(plan: &[RadixDepth]) -> Vec<LeafMembers> {
+    let mut members = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+    for (d, depth) in plan.iter().enumerate() {
+        for b in depth.internal..depth.branches.len() {
+            members.entry(depth.switches[b]).or_default().push((d, b));
+        }
+    }
+    let mut layouts = BTreeMap::<Vec<usize>, Vec<(usize, Vec<usize>)>>::new();
+    for (k, branches) in members {
+        let (depths, positions) = branches.into_iter().unzip();
+        layouts.entry(depths).or_default().push((k, positions));
+    }
+    layouts
+        .into_iter()
+        .flat_map(|(depths, members)| {
+            let switches = members.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+            let slots = (0..depths.len()).collect::<Vec<_>>();
+            slots
+                .chunks(LEAF_SLOTS_PER_LANE)
+                .map(|chunk| LeafMembers {
+                    switches: switches.clone(),
+                    depths: chunk.iter().map(|&slot| depths[slot]).collect(),
+                    positions: chunk
+                        .iter()
+                        .map(|&slot| members.iter().map(|(_, positions)| positions[slot]).collect())
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// `ModSwitch_(pq -> q)(entry G~)` at `level`: the `1 x 1` `entry` over the

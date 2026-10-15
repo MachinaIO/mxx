@@ -763,7 +763,7 @@ impl EncodingLowering<'_> {
         let key_rows =
             [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
         let offset = member.clone().unwrap_or(IntExpr::constant(0)) * IntExpr::constant(count);
-        let imported = self.imported_public_action(level, 0)?;
+        let imported = self.imported_public_key(level)?;
         if selected.is_some() && imported.is_none() {
             return Err(RnsBggError::Binding(
                 "an RHS member selected at run time is read only at root scope",
@@ -819,22 +819,17 @@ impl EncodingLowering<'_> {
         let split = |row: &Mat| super::split_row(row, columns);
         let companion = rows.last().ok_or(RnsBggError::Binding("companion row"))?;
         let key = match imported {
-            Some((key, _)) => key,
+            Some(key) => key,
             None => (split(&rows[0]), split(&rows[1])),
         };
         Ok((split(&(product[0].clone() + companion.clone())), key))
     }
 
-    /// The public action preprocessing published for the current site if
-    /// it is at root scope (see [`super::public_action_role`]): its output
-    /// key at `level` and, for `switched > 0` branches, the rows of their
-    /// product keys `T_k`. A site in a family body returns `None`, and its
+    /// The output key at `level` that preprocessing published for the current site if it is at
+    /// root scope (see [`super::public_action_role`]); a root LUT reads its branch keys member by
+    /// member ([`Self::streamed_dynamic_lut`]). A site in a family body returns `None`, and its
     /// evaluation recomputes the same action from the setup matrices.
-    fn imported_public_action(
-        &self,
-        level: usize,
-        switched: usize,
-    ) -> Result<Option<(RnsBggMatrix, Option<[Mat; 2]>)>, RnsBggError> {
+    fn imported_public_key(&self, level: usize) -> Result<Option<RnsBggMatrix>, RnsBggError> {
         let output = self.site()?.output;
         if !self.program.root_private_sites().contains(&output) {
             return Ok(None);
@@ -854,9 +849,7 @@ impl EncodingLowering<'_> {
         };
         let key = [0, 1, 2, 3].map(|port| import("key", port, columns));
         let [k00, k01, k10, k11] = key;
-        let branches = (switched > 0)
-            .then(|| [0, 1].map(|port| import("branches", port, switched * 2 * columns)));
-        Ok(Some(((k00, k01), (k10, k11))).map(|key| (key, branches)))
+        Ok(Some(((k00, k01), (k10, k11))))
     }
 
     /// `Aut_k` of an encoding row (see [`crate::rns_bgg::dynamic`]): `r_k =
@@ -960,6 +953,10 @@ impl EncodingLowering<'_> {
         if switched.is_empty() {
             return Ok(initial);
         }
+        // A root site reads the branch keys preprocessing published, one branch at a time.
+        if self.program.root_private_sites().contains(&self.site()?.output) {
+            return self.streamed_dynamic_lut(input, table, &switched, initial);
+        }
         let (_, companions) = state
             .automorphisms
             .as_ref()
@@ -984,7 +981,8 @@ impl EncodingLowering<'_> {
         let width = 2 * columns;
         let key_rows =
             [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
-        let imported = self.imported_public_action(level, switched.len())?;
+        // Only a site in a family body comes here, which imports no public action.
+        let imported = None::<(RnsBggMatrix, Option<[Mat; 2]>)>;
         let public_top = |branch: IntExpr| {
             crate::rns_bgg::dynamic::automorphism_public_top(
                 self.parameters,
@@ -1094,7 +1092,7 @@ impl EncodingLowering<'_> {
     ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
         let state = self.dynamic_state()?;
         let level = self.workload.level(input.wire())?;
-        let imported = self.imported_public_action(level, 0)?.map(|(key, _)| key);
+        let imported = self.imported_public_key(level)?;
         let (row, key) = crate::rns_bgg::public_lut::dynamic_public_lut(
             self.parameters,
             &state.setup,
@@ -1167,8 +1165,8 @@ impl EncodingLowering<'_> {
                 helper: select(&members(ks, &|k| setup.helper_member(k))?, index),
             })
         };
-        let total = plan.iter().map(|depth| depth.branches.len()).sum();
-        let imported = self.imported_public_action(level, total)?;
+        // Only a site in a family body comes here, which imports no public action.
+        let imported = None::<(RnsBggMatrix, Option<[Mat; 2]>)>;
         let recompute = imported.is_none();
         let split = |row: &Mat| super::split_row(row, columns);
         let block = |row: &Mat, index: IntExpr| {
@@ -1346,6 +1344,243 @@ impl EncodingLowering<'_> {
             Some((cached, _)) => Ok((sum.0, cached)),
             None => Ok(sum),
         }
+    }
+}
+
+impl EncodingLowering<'_> {
+    /// Evaluate internal parents in root parallel loops, retaining their switched rows and
+    /// keys. Leaf lanes then group branches across depths by member, sharing each compact
+    /// companion expansion. Within a member, switches consume the published `T_b` rows with
+    /// one-branch read-ahead from group/slot families at the current member index; weighted
+    /// terms are summed member by member. A lane retains one companion-result row per slot,
+    /// two current and two read-ahead T rows, and one summed encoding row. Parent inputs and
+    /// the shared companion loop's inner/outer accumulators are additional lane-local work.
+    fn streamed_dynamic_lut(
+        &self,
+        input: &RnsBggEncoding,
+        table: &LutTable,
+        switched: &[usize],
+        initial: (RnsBggRow, RnsBggMatrix),
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let state = self.dynamic_state()?;
+        let setup = &state.setup;
+        let (_, companions) = state
+            .automorphisms
+            .as_ref()
+            .ok_or(RnsBggError::Binding("the automorphism packages are not imported"))?;
+        let level = self.workload.level(input.wire())?;
+        let key = self
+            .imported_public_key(level)?
+            .ok_or(RnsBggError::Binding("a root LUT needs its published key"))?;
+        let output = self.site()?.output;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.data)?;
+        let layout = table.input_layout();
+        let representation = table.output_representation();
+        let columns = self.parameters.component_columns(level)?;
+        let count = automorphism_companion_count(self.parameters, level, columns)?;
+        let public_rows = super::automorphism_public_rows(self.parameters, level)?;
+        let width = 2 * columns;
+        let coefficient = |k: IntExpr| {
+            EncodingLowering::lut_coefficient(
+                self.parameters,
+                level,
+                layout,
+                representation,
+                k,
+                values.clone(),
+            )
+        };
+        let members = |ks: &[usize], member: &dyn Fn(usize) -> Result<usize, RnsBggError>| {
+            ks.iter().map(|k| member(*k)).collect::<Result<Vec<_>, _>>()
+        };
+        let split = |row: &Mat| super::split_row(row, columns);
+        let schema = |_| DslError::Schema;
+        let ring = self.parameters.ring(level)?;
+        let plan = crate::rns_bgg::dynamic::radix_plan(setup, switched)?;
+        let mut sum = initial.0;
+        let mut parents: Vec<(Family<RnsBggRow>, Family<RnsBggMatrix>)> = Vec::new();
+        let input_rows =
+            [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
+        let companion = |rows: &[[Mat; 2]], k: IntExpr, member: IntExpr| {
+            super::companion_block(
+                self.parameters,
+                level,
+                columns,
+                rows.len(),
+                &|branch, r, a| {
+                    Ok(super::row_entry(&rows[branch][r], a).ring_automorphism(k.clone()))
+                },
+                None,
+                Some(&|a: IntExpr, j: IntExpr| {
+                    let index = member.clone() * IntExpr::constant(count) +
+                        (a - IntExpr::constant(public_rows)) * IntExpr::constant(width) +
+                        j;
+                    self.read_companion(companions.at(Int::evaluate(index.canonicalize())))
+                }),
+                Some((public_rows, &|| Ok(ring.zero((1, width))))),
+            )
+        };
+        let finish = |parent: &RnsBggRow,
+                      k: IntExpr,
+                      inverse: IntExpr,
+                      inverse_helper: IntExpr,
+                      helper: IntExpr,
+                      coefficient_k: IntExpr,
+                      companion: &Mat,
+                      pre_key: RnsBggMatrix,
+                      keep: bool|
+         -> Result<(RnsBggRow, Option<RnsBggMatrix>, RnsBggRow), RnsBggError> {
+            let (row, key) = self.automorphism_branch(
+                level,
+                parent,
+                &AutomorphismSwitch { k, inverse, inverse_helper, helper },
+                &|| split(companion),
+                &|| pre_key.clone(),
+                keep,
+            )?;
+            let action = scalar_action(self.parameters, level, coefficient(coefficient_k)?)?;
+            let term = scalar_action_row(row.clone(), &action);
+            Ok((row, keep.then(|| (split(&key[0]), split(&key[1]))), term))
+        };
+        let import = |group: crate::rns_bgg::BranchGroup, members: usize| {
+            [0, 1].map(|port| {
+                ring.family_artifact_input(
+                    self.preprocess.clone(),
+                    self.preprocess_artifact_name(crate::rns_bgg::branch_keys_role(
+                        output, group, port,
+                    )),
+                    members,
+                    (1, width),
+                    ArtifactAvailability::Transferred,
+                )
+            })
+        };
+        for (d, depth) in plan.iter().enumerate() {
+            if depth.internal == 0 {
+                continue;
+            }
+            let switches = &depth.switches;
+            let switch_members = members(switches, &|k| setup.switching_member(k))?;
+            let inverses = members(switches, &|k| setup.automorphism_inverse(k))?;
+            let inverse_helpers = members(&inverses, &|k| setup.helper_member(k))?;
+            let helpers = members(switches, &|k| setup.helper_member(k))?;
+            let keys = import(crate::rns_bgg::BranchGroup::Internal { depth: d }, depth.internal);
+            let family = mxx_dsl::parallel(depth.internal, |position| {
+                let b = position.expression()?;
+                let (parent, rows) = if d == 0 {
+                    (input.row.clone(), input_rows.clone())
+                } else {
+                    let index = Int::evaluate(select(&depth.parents, b.clone()));
+                    let key = parents[d - 1].1.at(index.clone());
+                    (parents[d - 1].0.at(index), [super::join_row(&key.0), super::join_row(&key.1)])
+                };
+                let companion = companion(
+                    &[rows],
+                    select(switches, b.clone()),
+                    select(&switch_members, b.clone()),
+                )
+                .map_err(schema)?;
+                let pre_key = (split(&keys[0].at(position.clone())), split(&keys[1].at(position)));
+                let (row, key, term) = finish(
+                    &parent,
+                    select(switches, b.clone()),
+                    select(&inverses, b.clone()),
+                    select(&inverse_helpers, b.clone()),
+                    select(&helpers, b.clone()),
+                    select(&depth.branches, b),
+                    &companion[0],
+                    pre_key,
+                    true,
+                )
+                .map_err(schema)?;
+                Ok((row, key.unwrap(), term))
+            })
+            .map_err(graph)?;
+            let terms = family.field(|(_, _, term)| term).map_err(graph)?;
+            sum = add_encoding_rows(
+                sum,
+                crate::rns_bgg::member_sum(&terms, depth.internal, add_encoding_rows)?,
+            );
+            parents.push((
+                family.field(|(row, _, _)| row).map_err(graph)?,
+                family.field(|(_, key, _)| key).map_err(graph)?,
+            ));
+        }
+        for (group_index, group) in
+            crate::rns_bgg::dynamic::leaf_members(&plan).into_iter().enumerate()
+        {
+            let leaf_keys = (0..group.depths.len())
+                .map(|slot| {
+                    let [top, bottom] = import(
+                        crate::rns_bgg::BranchGroup::Leaf { group: group_index, slot },
+                        group.switches.len(),
+                    );
+                    (top, bottom)
+                })
+                .collect::<Vec<_>>();
+            let switch_members = members(&group.switches, &|k| setup.switching_member(k))?;
+            let inverses = members(&group.switches, &|k| setup.automorphism_inverse(k))?;
+            let inverse_helpers = members(&inverses, &|k| setup.helper_member(k))?;
+            let helpers = members(&group.switches, &|k| setup.helper_member(k))?;
+            let terms = mxx_dsl::parallel(group.switches.len(), |member| {
+                let member = member.expression()?;
+                let mut parent_rows = Vec::new();
+                let mut key_rows = Vec::new();
+                let mut coefficients = Vec::new();
+                for (slot, d) in group.depths.iter().enumerate() {
+                    let b = select(&group.positions[slot], member.clone());
+                    coefficients.push(select(&plan[*d].branches, b.clone()));
+                    if *d == 0 {
+                        parent_rows.push(input.row.clone());
+                        key_rows.push(input_rows.clone());
+                    } else {
+                        let index = Int::evaluate(select(&plan[*d].parents, b));
+                        let key = parents[d - 1].1.at(index.clone());
+                        parent_rows.push(parents[d - 1].0.at(index));
+                        key_rows.push([super::join_row(&key.0), super::join_row(&key.1)]);
+                    }
+                }
+                let k = select(&group.switches, member.clone());
+                let companions =
+                    companion(&key_rows, k.clone(), select(&switch_members, member.clone()))
+                        .map_err(schema)?;
+                let read = |slot: usize| {
+                    let (top, bottom) = &leaf_keys[slot];
+                    let index = Int::evaluate(member.clone());
+                    (top.at(index.clone()), bottom.at(index))
+                };
+                let (top, bottom) = read(0);
+                let mut state = ((ring.zero((1, columns)), ring.zero((1, columns))), top, bottom);
+                for slot in 0..group.depths.len() {
+                    // Keep the next import inside the sequential body, so only the current
+                    // and read-ahead T rows are live while this slot is switched.
+                    state = mxx_dsl::iterate(1, state, |_, (sum, top, bottom)| {
+                        let (next_top, next_bottom) = read((slot + 1) % group.depths.len());
+                        let (_, _, term) = finish(
+                            &parent_rows[slot],
+                            k.clone(),
+                            select(&inverses, member.clone()),
+                            select(&inverse_helpers, member.clone()),
+                            select(&helpers, member.clone()),
+                            coefficients[slot].clone(),
+                            &companions[slot],
+                            (split(&top), split(&bottom)),
+                            false,
+                        )
+                        .map_err(schema)?;
+                        Ok((add_encoding_rows(sum, term), next_top, next_bottom))
+                    })?;
+                }
+                let (term, _, _) = state;
+                Ok(term)
+            })
+            .map_err(graph)?;
+            sum = add_encoding_rows(
+                sum,
+                crate::rns_bgg::member_sum(&terms, group.switches.len(), add_encoding_rows)?,
+            );
+        }
+        Ok((sum, key))
     }
 }
 

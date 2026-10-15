@@ -56,7 +56,7 @@
 //! | `STORAGE` | `device` | Stage artifacts: `device` (matrices in GPU memory, others in host memory), `host`, `file` (a temporary directory), or `file:<directory>` |
 //! | `CRT_DEPTH` | unset | `test_gpu_pe_time_window`: the parameters at this CRT depth and the smallest ring dimension, without the noise simulation and the security estimate (parameters a search already accepted) |
 //! | `SINGLE_TIME` | 0 | `test_gpu_pe_time_window`: 1 encrypts and decrypts once, at a random accepted time of `[0900, 1759]`, instead of every vector of `TIME_VECTORS` |
-//! | `ESTIMATE_FROM` | unset | `test_gpu_pe_time_window`: `encrypt` runs setup and key generation, then only plans the encryption and the online evaluation (`MXX_EXPONENT_LUT_ESTIMATE_ONLY` from then on) |
+//! | `ESTIMATE_FROM` | unset | `test_gpu_pe_time_window`: `encrypt` runs setup and key generation, then only plans the encryption and the online evaluation (`MXX_EXPONENT_LUT_ESTIMATE_ONLY` from then on); `keygen` runs setup only and plans every later stage |
 //! | `DISCARD_CIPHERTEXTS` | 0 | `test_gpu_pe_time_window` with `file` storage: 1 deletes each vector's ciphertext productions after its decryption, so the store holds one ciphertext at a time |
 //!
 //! With `MXX_EXPONENT_LUT_ESTIMATE_ONLY=1` (see `mxx_exponent_lut::gpu_execution`),
@@ -869,6 +869,15 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
     eprintln!("setup: {:?}", stage.elapsed());
     report_device_bytes(&store);
+    // `ESTIMATE_FROM=keygen`: setup runs, so key generation, which reads its artifacts, can be
+    // planned; it and every later stage are then only planned.
+    let estimate_from = env::var(variable("ESTIMATE_FROM"));
+    if estimate_from.as_deref() == Ok("keygen") {
+        // SAFETY: set before the key generation stages read it; this test is the only thread
+        // touching the environment.
+        unsafe { env::set_var("MXX_EXPONENT_LUT_ESTIMATE_ONLY", "1") };
+        eprintln!("estimate mode from key generation on: the remaining stages are only planned");
+    }
     let stage = Instant::now();
     let key = keygen(&public_key, &master, window, &mut execution, &mut store).unwrap();
     eprintln!("key generation ([0900, 1759]): {:?}", stage.elapsed());
@@ -876,8 +885,9 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     // `ESTIMATE_FROM=encrypt`: setup and key generation run, so the encryption and online
     // evaluation that read their artifacts can be planned; those are then only planned.
     let estimate = estimate ||
-        match env::var(variable("ESTIMATE_FROM")).as_deref() {
+        match estimate_from.as_deref() {
             Err(_) => false,
+            Ok("keygen") => true,
             Ok("encrypt") => {
                 // SAFETY: set before the encryption stages read it; this test is the only thread
                 // touching the environment.
@@ -887,7 +897,9 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
                 );
                 true
             }
-            Ok(value) => panic!("{} must be `encrypt`, got `{value}`", variable("ESTIMATE_FROM")),
+            Ok(value) => {
+                panic!("{} must be `keygen` or `encrypt`, got `{value}`", variable("ESTIMATE_FROM"))
+            }
         };
     let listing = |directory: &PathBuf| -> std::collections::BTreeSet<PathBuf> {
         std::fs::read_dir(directory)

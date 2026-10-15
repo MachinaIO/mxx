@@ -80,6 +80,9 @@ namespace
         size_t source_count;
         size_t target_count;
         size_t discarded_count;
+        size_t gadget_digits;
+        // Targets are a source subset, so checking the source basis covers both.
+        bool use_u32;
         size_t retained[kCrtMaxLimbs];
         size_t discarded[kCrtMaxLimbs];
         uint64_t source_moduli[kCrtMaxLimbs];
@@ -87,7 +90,74 @@ namespace
         uint64_t division_inverses[kCrtMaxLimbs];
         uint64_t divisor_residues[kCrtMaxLimbs];
         uint64_t garner[kCrtMaxLimbs * kCrtMaxLimbs];
+        // Discarded modulus `digit` modulo target modulus `target`, at
+        // `target * kCrtMaxLimbs + digit`.
+        uint64_t discarded_residues[kCrtMaxLimbs * kCrtMaxLimbs];
+        // Shoup companions `floor(w 2^64 / q)` of the constant multipliers
+        // above, and `floor((2^word_bits - 1) / q)` per modulus for reductions.
+        // The 32-bit kernel uses the high word of each Shoup companion.
+        uint64_t garner_shoup[kCrtMaxLimbs * kCrtMaxLimbs];
+        uint64_t discarded_residues_shoup[kCrtMaxLimbs * kCrtMaxLimbs];
+        uint64_t division_inverses_shoup[kCrtMaxLimbs];
+        uint64_t source_reciprocals[kCrtMaxLimbs];
+        uint64_t target_reciprocals[kCrtMaxLimbs];
     };
+
+    uint64_t crt_shoup_host(uint64_t multiplier, uint64_t modulus)
+    {
+        return static_cast<uint64_t>(
+            (static_cast<unsigned __int128>(multiplier) << 64U) / modulus);
+    }
+
+    // `value * multiplier mod modulus` for `value, multiplier < modulus < 2^63`.
+    __device__ __forceinline__ uint64_t crt_mul_shoup(
+        uint64_t value, uint64_t multiplier, uint64_t multiplier_shoup, uint64_t modulus)
+    {
+        if (modulus > (UINT64_MAX >> 1U)) return mul_mod_u64(value, multiplier, modulus);
+        const uint64_t quotient = __umul64hi(value, multiplier_shoup);
+        const uint64_t remainder = value * multiplier - quotient * modulus;
+        return remainder >= modulus ? remainder - modulus : remainder;
+    }
+
+    // `value mod modulus` for any 64-bit `value`, `reciprocal` being
+    // `floor((2^64 - 1) / modulus)`: the quotient estimate is short by at most one.
+    __device__ __forceinline__ uint64_t crt_reduce(
+        uint64_t value, uint64_t modulus, uint64_t reciprocal)
+    {
+        const uint64_t remainder = value - __umul64hi(value, reciprocal) * modulus;
+        return remainder >= modulus ? remainder - modulus : remainder;
+    }
+
+    // Full-width 32-bit Shoup: retain the carry of the remainder for q >= 2^31.
+    __device__ __forceinline__ uint32_t crt_mul_shoup(
+        uint32_t value, uint32_t multiplier, uint64_t companion, uint32_t modulus)
+    {
+        const uint32_t quotient = __umulhi(value, static_cast<uint32_t>(companion >> 32));
+        const uint32_t product = value * multiplier;
+        const uint32_t subtracted = quotient * modulus;
+        const uint32_t remainder = product - subtracted;
+        const uint32_t high = __umulhi(value, multiplier) - __umulhi(quotient, modulus) -
+            static_cast<uint32_t>(product < subtracted);
+        return high || remainder >= modulus ? remainder - modulus : remainder;
+    }
+
+    __device__ __forceinline__ uint32_t crt_reduce(
+        uint32_t value, uint32_t modulus, uint32_t reciprocal)
+    {
+        const uint32_t remainder = value - __umulhi(value, reciprocal) * modulus;
+        return remainder >= modulus ? remainder - modulus : remainder;
+    }
+
+    __device__ __forceinline__ uint32_t crt_add(uint32_t a, uint32_t b, uint32_t modulus)
+    {
+        const uint32_t sum = a + b;
+        return sum < a || sum >= modulus ? sum - modulus : sum;
+    }
+
+    __device__ __forceinline__ uint64_t crt_add(uint64_t a, uint64_t b, uint64_t modulus)
+    {
+        return add_mod_u64(a, b, modulus);
+    }
 
     __device__ __forceinline__ int crt_compare_words(
         const uint64_t *lhs,
@@ -395,7 +465,8 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
     GpuContext *ctx, int device, void *stream_raw,
     const uint64_t *source_moduli, size_t source_count,
     const uint64_t *target_moduli, size_t target_count,
-    int round_scale, GpuModulusConversionPlan **out_plan)
+    int round_scale, const uint64_t *gadget_residues, size_t gadget_digits,
+    GpuModulusConversionPlan **out_plan)
 {
     if (!ctx || !stream_raw || !source_moduli || !target_moduli || !out_plan ||
         !source_count || !target_count || source_count > kCrtMaxLimbs ||
@@ -405,7 +476,9 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
     *out_plan = nullptr;
     ModulusConversionMetadata metadata{};
     metadata.source_count = source_count;
+    metadata.gadget_digits = gadget_digits;
     metadata.target_count = target_count;
+    metadata.use_u32 = true;
     bool retained[kCrtMaxLimbs]{};
     for (size_t limb = 0; limb < source_count; ++limb)
     {
@@ -413,6 +486,7 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
             source_moduli[limb] <= 1 || !(source_moduli[limb] & 1))
             return set_error("raw modulus source basis/context mismatch");
         metadata.source_moduli[limb] = source_moduli[limb];
+        metadata.use_u32 &= source_moduli[limb] <= UINT32_MAX;
     }
     for (size_t limb = 0; limb < target_count; ++limb)
     {
@@ -438,8 +512,13 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
                 modulus, inverse))
                 return set_error("raw modulus discarded basis is not invertible");
             metadata.garner[previous * kCrtMaxLimbs + limb] = inverse;
+            metadata.garner_shoup[previous * kCrtMaxLimbs + limb] =
+                crt_shoup_host(inverse, modulus);
         }
     }
+    for (size_t limb = 0; limb < source_count; ++limb)
+        metadata.source_reciprocals[limb] =
+            (metadata.use_u32 ? UINT32_MAX : UINT64_MAX) / source_moduli[limb];
     for (size_t limb = 0; limb < target_count; ++limb)
     {
         const uint64_t modulus = target_moduli[limb];
@@ -452,6 +531,16 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
         if (round_scale && !mod_inverse_u64(divisor, modulus, inverse))
             return set_error("raw modulus divisor is not invertible");
         metadata.division_inverses[limb] = inverse;
+        metadata.division_inverses_shoup[limb] = crt_shoup_host(inverse, modulus);
+        metadata.target_reciprocals[limb] =
+            (metadata.use_u32 ? UINT32_MAX : UINT64_MAX) / modulus;
+        for (size_t index = 0; index < metadata.discarded_count; ++index)
+        {
+            const uint64_t residue = source_moduli[metadata.discarded[index]] % modulus;
+            metadata.discarded_residues[limb * kCrtMaxLimbs + index] = residue;
+            metadata.discarded_residues_shoup[limb * kCrtMaxLimbs + index] =
+                crt_shoup_host(residue, modulus);
+        }
     }
     cudaError_t error = mxx_set_device(device);
     if (error != cudaSuccess) return set_error(error);
@@ -460,7 +549,7 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
     plan->context = ctx;
     plan->device = device;
     plan->stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    plan->metadata_bytes = sizeof(metadata);
+    plan->metadata_bytes = sizeof(metadata) + 2 * gadget_digits * source_count * sizeof(uint64_t);
     plan->ring_dimension = static_cast<size_t>(ctx->N);
     plan->round_scale = round_scale != 0;
     plan->source_count = source_count;
@@ -475,8 +564,15 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
         return set_error(error);
     }
     std::memcpy(plan->pinned_metadata, &metadata, sizeof(metadata));
+    auto *scales = reinterpret_cast<uint64_t *>(
+        static_cast<char *>(plan->pinned_metadata) + sizeof(metadata));
+    for (size_t i = 0; i < gadget_digits * source_count; ++i)
+    {
+        scales[2 * i] = gadget_residues[i];
+        scales[2 * i + 1] = crt_shoup_host(gadget_residues[i], source_moduli[i % source_count]);
+    }
     error = cudaMemcpyAsync(plan->device_metadata, plan->pinned_metadata,
-        sizeof(metadata), cudaMemcpyHostToDevice, plan->stream);
+        plan->metadata_bytes, cudaMemcpyHostToDevice, plan->stream);
     // The compiled graph can launch on another compute stream. Complete this
     // one-time metadata upload before the plan becomes available to emitters.
     if (error == cudaSuccess) error = cudaStreamSynchronize(plan->stream);
@@ -652,42 +748,61 @@ namespace
     };
     static_assert(sizeof(RawCrtSources) < 4096, "raw CRT source arguments exceed CUDA limit");
 
-    __global__ void raw_modulus_conversion_kernel(
-        RawCrtSources sources, MxxRawMatrixLimb destination,
+    // Every target limb of one coefficient: the mixed-radix digits of the
+    // discarded limbs, shared by all target limbs, are computed once, and every
+    // product has a constant multiplier with a precomputed Shoup companion.
+    template <typename Word>
+    __global__ void raw_modulus_conversion_rows_kernel(
+        RawCrtSources sources, RawCrtSources destinations,
         const ModulusConversionMetadata *metadata,
         size_t columns, size_t degree, size_t coefficient_count,
-        size_t coefficient_offset, size_t target_limb, bool round_scale)
+        size_t coefficient_offset, bool round_scale)
     {
         const size_t local = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         const size_t index = coefficient_offset + local;
         if (index >= coefficient_count) return;
         const size_t poly = index / degree;
         const size_t coefficient = index - poly * degree;
-        const uint64_t modulus = metadata->target_moduli[target_limb];
-        uint64_t digits[kCrtMaxLimbs];
-        bool negative = false;
-        if (round_scale)
+        Word input[kCrtMaxLimbs];
+        for (size_t limb = 0; limb < metadata->source_count; ++limb)
+            input[limb] = crt_reduce(static_cast<Word>(raw_matrix_load(sources.limbs[limb],
+                poly, coefficient, columns)), static_cast<Word>(metadata->source_moduli[limb]),
+                static_cast<Word>(metadata->source_reciprocals[limb]));
+        const auto *scales = reinterpret_cast<const uint64_t *>(metadata + 1);
+        const size_t gadget_digits = metadata->gadget_digits ? metadata->gadget_digits : 1;
+        for (size_t gadget_digit = 0; gadget_digit < gadget_digits; ++gadget_digit)
         {
-            for (size_t digit_index = 0; digit_index < metadata->discarded_count; ++digit_index)
+            Word scaled[kCrtMaxLimbs];
+            for (size_t limb = 0; limb < metadata->source_count; ++limb)
+            {
+                const size_t scale = 2 * (gadget_digit * metadata->source_count + limb);
+                scaled[limb] = metadata->gadget_digits ? crt_mul_shoup(input[limb],
+                    static_cast<Word>(scales[scale]), scales[scale + 1],
+                    static_cast<Word>(metadata->source_moduli[limb])) : input[limb];
+            }
+            Word digits[kCrtMaxLimbs];
+            bool negative = false;
+            const size_t discarded_count = round_scale ? metadata->discarded_count : 0;
+            for (size_t digit_index = 0; digit_index < discarded_count; ++digit_index)
             {
                 const size_t source_index = metadata->discarded[digit_index];
-                const uint64_t source_modulus = metadata->source_moduli[source_index];
-                uint64_t digit = raw_matrix_load(sources.limbs[source_index],
-                    poly, coefficient, columns) % source_modulus;
+                const Word source_modulus = metadata->source_moduli[source_index];
+                const Word reciprocal = metadata->source_reciprocals[source_index];
+                Word digit = scaled[source_index];
                 for (size_t previous = 0; previous < digit_index; ++previous)
                 {
-                    const uint64_t residue = digits[previous] % source_modulus;
-                    const uint64_t difference = digit >= residue ? digit - residue :
+                    const Word residue = crt_reduce(digits[previous], source_modulus, reciprocal);
+                    const Word difference = digit >= residue ? digit - residue :
                         source_modulus - (residue - digit);
-                    digit = mul_mod_u64(difference,
-                        metadata->garner[previous * kCrtMaxLimbs + digit_index],
-                        source_modulus);
+                    const size_t garner = previous * kCrtMaxLimbs + digit_index;
+                    digit = crt_mul_shoup(difference, static_cast<Word>(metadata->garner[garner]),
+                        metadata->garner_shoup[garner], source_modulus);
                 }
                 digits[digit_index] = digit;
             }
-            for (size_t digit_index = metadata->discarded_count; digit_index-- > 0;)
+            for (size_t digit_index = discarded_count; digit_index-- > 0;)
             {
-                const uint64_t half =
+                const Word half =
                     metadata->source_moduli[metadata->discarded[digit_index]] / 2;
                 if (digits[digit_index] != half)
                 {
@@ -695,30 +810,36 @@ namespace
                     break;
                 }
             }
-        }
-        uint64_t value = raw_matrix_load(
-            sources.limbs[metadata->retained[target_limb]],
-            poly, coefficient, columns) % modulus;
-        if (round_scale)
-        {
-            uint64_t residual = 0;
-            for (size_t digit_index = metadata->discarded_count; digit_index-- > 0;)
+            for (size_t target = 0; target < metadata->target_count; ++target)
             {
-                residual = add_mod_u64(mul_mod_u64(residual,
-                    metadata->source_moduli[metadata->discarded[digit_index]] % modulus,
-                    modulus), digits[digit_index] % modulus, modulus);
+                const Word modulus = metadata->target_moduli[target];
+                const Word reciprocal = metadata->target_reciprocals[target];
+                Word value = scaled[metadata->retained[target]];
+                if (round_scale)
+                {
+                    const size_t row = target * kCrtMaxLimbs;
+                    Word residual = 0;
+                    for (size_t digit_index = discarded_count; digit_index-- > 0;)
+                    {
+                        residual = crt_add(crt_mul_shoup(residual,
+                            static_cast<Word>(metadata->discarded_residues[row + digit_index]),
+                            metadata->discarded_residues_shoup[row + digit_index], modulus),
+                            crt_reduce(digits[digit_index], modulus, reciprocal), modulus);
+                    }
+                    if (negative)
+                    {
+                        const Word divisor = metadata->divisor_residues[target];
+                        residual = residual >= divisor ? residual - divisor :
+                            modulus - (divisor - residual);
+                    }
+                    value = value >= residual ? value - residual : modulus - (residual - value);
+                    value = crt_mul_shoup(value, static_cast<Word>(metadata->division_inverses[target]),
+                        metadata->division_inverses_shoup[target], modulus);
+                }
+                raw_matrix_store(destinations.limbs[target], poly * gadget_digits + gadget_digit,
+                    coefficient, columns * gadget_digits, value);
             }
-            if (negative)
-            {
-                const uint64_t divisor = metadata->divisor_residues[target_limb];
-                residual = residual >= divisor ? residual - divisor :
-                    modulus - (divisor - residual);
-            }
-            value = value >= residual ? value - residual : modulus - (residual - value);
-            value = mul_mod_u64(value,
-                metadata->division_inverses[target_limb], modulus);
         }
-        raw_matrix_store(destination, poly, coefficient, columns, value);
     }
 
     __global__ void raw_centered_rebase_kernel(
@@ -926,6 +1047,9 @@ static int raw_modulus_conversion_emit_impl(
         (runtime_divisor && (!plan || !plan->centered_round_divide ||
             runtime_encoding < 0 || runtime_encoding == 2)))
         return set_error("invalid dynamic centered round divisor view");
+    const auto *metadata = plan ? static_cast<const ModulusConversionMetadata *>(plan->pinned_metadata) : nullptr;
+    const size_t gadget_digits = plan && !plan->centered_rebase && !plan->centered_round_divide && metadata ?
+        std::max<size_t>(1, metadata->gadget_digits) : 1;
     if (!plan || !plan->device_metadata || plan->context != ctx ||
         validate_raw_view(ctx, source, stream_raw) != 0 ||
         !destination || !destination->limbs || !destination->limb_count ||
@@ -934,13 +1058,12 @@ static int raw_modulus_conversion_emit_impl(
         source->degree != destination->degree ||
         source->row_origin != destination->row_origin ||
         source->column_origin != destination->column_origin ||
-        source->rows != destination->rows || source->columns != destination->columns ||
+        source->rows != destination->rows || source->columns * gadget_digits != destination->columns ||
         source->limb_count != plan->source_count ||
         destination->limb_count != plan->target_count ||
         source_binding_base > UINT32_MAX - source->limb_count ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw modulus conversion emission");
-    const auto *metadata = static_cast<const ModulusConversionMetadata *>(plan->pinned_metadata);
     if (!metadata) return set_error("raw modulus conversion metadata is absent");
     const auto *rebase = static_cast<const CenteredRebaseMetadata *>(plan->pinned_metadata);
     const auto *round_divide =
@@ -1024,6 +1147,43 @@ static int raw_modulus_conversion_emit_impl(
         }
         return 0;
     }
+    if (!plan->centered_rebase)
+    {
+        // A modulus conversion writes every target limb of a coefficient in
+        // one thread, sharing the discarded limbs' mixed-radix digits.
+        RawCrtSources destinations{};
+        std::vector<MxxGraphPatch> patches;
+        patches.reserve(source->limb_count + destination->limb_count);
+        for (size_t source_limb = 0; source_limb < source->limb_count; ++source_limb)
+            patches.push_back(MxxGraphPatch{nullptr,
+                MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
+                static_cast<uint32_t>(offsetof(RawCrtSources, limbs) +
+                    source_limb * sizeof(MxxRawMatrixLimb)), sizeof(void *),
+                static_cast<uint32_t>(source_binding_base + source_limb), 0});
+        for (size_t limb = 0; limb < destination->limb_count; ++limb)
+        {
+            destinations.limbs[limb] = destination->limbs[limb];
+            patches.push_back(MxxGraphPatch{nullptr,
+                MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1,
+                static_cast<uint32_t>(offsetof(RawCrtSources, limbs) +
+                    limb * sizeof(MxxRawMatrixLimb)), sizeof(void *),
+                static_cast<uint32_t>(destination_binding_base + limb), 0});
+        }
+        for (size_t offset = 0; offset < count; offset += 65535 * 128)
+        {
+            const size_t chunk = std::min<size_t>(65535 * 128, count - offset);
+            const dim3 grid(static_cast<uint32_t>((chunk + 127) / 128));
+            const int status = mxx_gpu_launch_kernel(ctx, stream,
+                metadata->use_u32 ? raw_modulus_conversion_rows_kernel<uint32_t> :
+                    raw_modulus_conversion_rows_kernel<uint64_t>, grid, dim3(128), 0,
+                patches.data(), patches.size(), sources, destinations,
+                static_cast<const ModulusConversionMetadata *>(plan->device_metadata),
+                source->columns, static_cast<size_t>(source->degree), count, offset,
+                plan->round_scale);
+            if (status != 0) return status;
+        }
+        return 0;
+    }
     for (size_t target_limb = 0; target_limb < destination->limb_count; ++target_limb)
     {
         std::vector<MxxGraphPatch> patches;
@@ -1041,21 +1201,13 @@ static int raw_modulus_conversion_emit_impl(
         {
             const size_t chunk = std::min<size_t>(65535 * 128, count - offset);
             const dim3 grid(static_cast<uint32_t>((chunk + 127) / 128));
-            const int status = plan->centered_rebase ?
-                mxx_gpu_launch_kernel(ctx, stream,
-                    raw_centered_rebase_kernel, grid, dim3(128), 0,
-                    patches.data(), patches.size(),
-                    sources, destination->limbs[target_limb],
-                    static_cast<const CenteredRebaseMetadata *>(plan->device_metadata),
-                    source->columns, static_cast<size_t>(source->degree), count,
-                    offset, target_limb) :
-                mxx_gpu_launch_kernel(ctx, stream,
-                    raw_modulus_conversion_kernel, grid, dim3(128), 0,
-                    patches.data(), patches.size(),
-                    sources, destination->limbs[target_limb],
-                    static_cast<const ModulusConversionMetadata *>(plan->device_metadata),
-                    source->columns, static_cast<size_t>(source->degree), count,
-                    offset, target_limb, plan->round_scale);
+            const int status = mxx_gpu_launch_kernel(ctx, stream,
+                raw_centered_rebase_kernel, grid, dim3(128), 0,
+                patches.data(), patches.size(),
+                sources, destination->limbs[target_limb],
+                static_cast<const CenteredRebaseMetadata *>(plan->device_metadata),
+                source->columns, static_cast<size_t>(source->degree), count,
+                offset, target_limb);
             if (status != 0) return status;
         }
     }

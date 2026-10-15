@@ -165,7 +165,8 @@ int gpu_device_get_identity(
     size_t *out_total_global_memory,
     int *out_driver_version,
     int *out_runtime_version,
-    uint64_t *out_context_generation);
+    uint64_t *out_context_generation,
+    size_t *out_resident_threads);
 
 /// Transfers ownership of pinned host pointers to the context-owned
 /// reclaimer. The reclaimer records a completion event on `stream`, waits
@@ -457,7 +458,8 @@ int gpu_raw_modulus_conversion_prepare(
     GpuContext *ctx, int physical_device, void *stream,
     const uint64_t *source_moduli, size_t source_count,
     const uint64_t *target_moduli, size_t target_count,
-    int round_scale, GpuModulusConversionPlan **out_plan);
+    int round_scale, const uint64_t *gadget_residues, size_t gadget_digits,
+    GpuModulusConversionPlan **out_plan);
 int gpu_raw_centered_rebase_prepare(
     GpuContext *ctx, int physical_device, void *stream,
     const uint64_t *source_moduli, size_t source_count,
@@ -491,6 +493,11 @@ int gpu_raw_compact_pack_emit(
     const MxxRawSmallMatrixView *destination, uint32_t *status,
     uint32_t source_binding_base, uint32_t destination_binding,
     uint32_t status_binding);
+int gpu_raw_matrix_column_add(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *sum, const MxxRawMatrixView *term,
+    const MxxRawMatrixView *output, const void *index, int encoding,
+    uint32_t sum_binding, uint32_t term_binding, uint32_t output_binding,
+    uint32_t index_binding);
 int gpu_raw_matrix_dynamic_slice(
     GpuContext *ctx, void *stream, const MxxRawMatrixView *source,
     const MxxRawMatrixView *destination,

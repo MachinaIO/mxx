@@ -777,11 +777,11 @@ mod tests {
         };
         let slots = depth * width;
         // Root: the one-key slice (2 x m) and the packed key family (2 x mW) leave the hash
-        // samples, each lane lifts its plaintext, and the decoding target concatenates two
-        // constants and multiplies two m-digit decompositions. Every slot transforms the
-        // m x m digits of G^(-1)(A_right) twice and its constant 2; every layer transforms the
-        // constant-one plaintext once.
-        let forward = 2 * m + 2 * m * width + width + slots * (2 * m * m + 1) + depth + 2 + 2 * m;
+        // samples, each lane lifts its plaintext, and the decoding target multiplies two m-digit
+        // decompositions. Every slot transforms the m x m digits of G^(-1)(A_right) twice. Static
+        // constants (each slot's 2, each layer's constant-one plaintext, and the decoding
+        // target's two) are uploaded in the evaluation domain once, with no device transform.
+        let forward = 2 * m + 2 * m * width + width + slots * 2 * m * m + 2 * m;
         // Every slot decomposes A_right (2 x m); the decoding target is 2 x 1.
         let inverse_polys = slots * 2 * m + 2;
         let shoup =

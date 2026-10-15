@@ -19,13 +19,11 @@ pub struct GpuRuntimeOptions {
     /// After selecting a candidate, time every graph node's operations
     /// separately and report each node's predicted share of the plan's time.
     pub profile_nodes: bool,
-    /// After selecting a candidate, execute it once with its artifact I/O:
-    /// each root wave group runs its first this many waves and each root
-    /// host-driven loop that many iterations, their exports are discarded
-    /// with the trial session, and the report adds an I/O-inclusive estimate.
-    /// A plan whose store is on the host or on disk always runs this trial,
-    /// with 2 waves when unset; a GPU-resident store runs it only when set.
-    pub io_trial_waves: Option<NonZeroUsize>,
+    /// Enable an artifact I/O trial even for a GPU-resident store. Trials run
+    /// one cold and one steady wave or host-loop iteration (or the only one
+    /// for a count-one group).
+    /// Host and file stores always run the trial. Trial exports are discarded.
+    pub io_trial: bool,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -93,13 +91,7 @@ impl GpuRuntimeOptions {
             ),
         };
         let profile_nodes = flag("MXX_GPU_PROFILE_NODES")?;
-        let io_trial_waves = match env::var_os("MXX_GPU_IO_TRIAL_WAVES") {
-            None => None,
-            Some(_) => Some(
-                NonZeroUsize::new(positive_usize("MXX_GPU_IO_TRIAL_WAVES", 2)?)
-                    .expect("positive_usize rejects zero"),
-            ),
-        };
+        let io_trial = flag("MXX_GPU_IO_TRIAL")?;
         Ok(Self {
             max_parallel_instances,
             measurement_warmups,
@@ -108,7 +100,7 @@ impl GpuRuntimeOptions {
             integer_input_ranges: BTreeMap::new(),
             subgraph_kernels: Vec::new(),
             profile_nodes,
-            io_trial_waves,
+            io_trial,
         })
     }
 }
@@ -127,7 +119,7 @@ mod tests {
             "MXX_GPU_MEASUREMENT_ITERATIONS",
             "MXX_GPU_RELEASE_FENCE_INTERVAL",
             "MXX_GPU_PROFILE_NODES",
-            "MXX_GPU_IO_TRIAL_WAVES",
+            "MXX_GPU_IO_TRIAL",
         ] {
             unsafe { std::env::remove_var(name) };
         }
@@ -137,7 +129,7 @@ mod tests {
         assert_eq!(options.measurement_iterations.get(), 2);
         assert_eq!(options.release_fence_interval, None);
         assert!(!options.profile_nodes);
-        assert_eq!(options.io_trial_waves, None);
+        assert!(!options.io_trial);
     }
 
     #[test]
@@ -149,7 +141,7 @@ mod tests {
             std::env::set_var("MXX_GPU_MEASUREMENT_ITERATIONS", "5");
             std::env::set_var("MXX_GPU_RELEASE_FENCE_INTERVAL", "7");
             std::env::set_var("MXX_GPU_PROFILE_NODES", "1");
-            std::env::set_var("MXX_GPU_IO_TRIAL_WAVES", "2");
+            std::env::set_var("MXX_GPU_IO_TRIAL", "1");
         }
         let options = GpuRuntimeOptions::from_env().unwrap();
         assert_eq!(options.max_parallel_instances.get(), 3);
@@ -157,14 +149,14 @@ mod tests {
         assert_eq!(options.measurement_iterations.get(), 5);
         assert_eq!(options.release_fence_interval.map(NonZeroUsize::get), Some(7));
         assert!(options.profile_nodes);
-        assert_eq!(options.io_trial_waves.map(NonZeroUsize::get), Some(2));
+        assert!(options.io_trial);
         unsafe {
             std::env::remove_var("MXX_GPU_MAX_PARALLEL_INSTANCES");
             std::env::remove_var("MXX_GPU_MEASUREMENT_WARMUPS");
             std::env::remove_var("MXX_GPU_MEASUREMENT_ITERATIONS");
             std::env::remove_var("MXX_GPU_RELEASE_FENCE_INTERVAL");
             std::env::remove_var("MXX_GPU_PROFILE_NODES");
-            std::env::remove_var("MXX_GPU_IO_TRIAL_WAVES");
+            std::env::remove_var("MXX_GPU_IO_TRIAL");
         }
     }
 }

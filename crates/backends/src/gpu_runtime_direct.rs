@@ -38,17 +38,23 @@
 //! rejection after a feasible candidate counts as one): wider tiles and waves launch fewer jobs,
 //! so narrower ones past such a plateau are not measured. Widening W also stops at a rejection. For
 //! each `(W, C)` candidate it lowers the graph, actually allocates it, checks its persistent
-//! allocations against the device budget (`MXX_GPU_MEMORY_FRACTION`), compiles its regions with a
-//! boundary also at every graph node's operations, and times `measurement_warmups +
-//! measurement_iterations` trials. A trial does not launch a region whose work (operations, value
-//! types and shapes, and launch shapes, not where the data is) a trial of this runtime already
-//! timed: that time is reused per launch, and a host-driven loop's body runs for its first
-//! iteration only, its time counting for every iteration. The node boundaries make that reuse per
-//! node, so candidates that differ only in some nodes' tiling time only those nodes; a candidate's
-//! time is the sum of its segments, which pays a launch per segment and no overlap across them. A
-//! candidate whose segmented allocation, compilation, or trial fails is measured again with its
-//! production regions, and is rejected when that fails too; no VRAM requirement is predicted. Each
-//! region's time is weighted by how often production replays it, and the fastest feasible candidate
+//! allocations against the device budget (`MXX_GPU_MEMORY_FRACTION`), compiles its regions, and
+//! times `measurement_warmups + measurement_iterations` trials. A trial does not launch a region
+//! whose work (operations, value types and shapes, and launch shapes, not where the data is) a
+//! trial of this runtime already timed: that time is reused per launch, and a host-driven loop's
+//! body runs for its first iteration only, its time counting for every iteration. Static device
+//! loops at every nesting depth run at one iteration in a baseline probe, then each independent
+//! equal-count sibling group is raised to two. With delta d_i and count n_i, the extra cost is
+//! E_i = (n_i - 1) d_i + n_i sum(E_child); the region is baseline + sum(E_root). Unequal-count
+//! siblings use separate deltas. Negative deltas are logged, not clamped. Retry loops run one
+//! attempt, device-computed limits run whole, and every probe resets mutable controls and restores
+//! production limits on success or error. Each distinct region key runs once per trial, including
+//! within a candidate. A candidate whose allocation, compilation, or trial fails is rejected. Each
+//! region's time is weighted by how often production replays it. In the tile sweep, the two widest
+//! measured tile widths fix each region's time as a line in its operation count (`TileWidthFit`),
+//! and a narrower width that fills the device is lowered, allocated, and compiled but timed on that
+//! line rather than launched; an extrapolated best is measured before it is selected, and the wave
+//! sweep always measures. The fastest feasible candidate
 //! is frozen into a value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected
 //! report.
 //!
@@ -61,28 +67,28 @@
 //! logged and leaves `node_costs` empty.
 //!
 //! The trials above time the Graph alone, without artifact reads or writes. With a host or file
-//! store, or with `io_trial_waves` set, `plan_with_store` then executes the selected plan once with
-//! its artifact I/O: each root wave group runs only its first `io_trial_waves` waves (2 when unset)
-//! and each root host-driven loop that many iterations. A store that keeps artifacts on the GPU
-//! runs the trial only when `io_trial_waves` is set. Planning reads only the imported artifacts
-//! whose type has no zero payload, such as integers; the others need not exist yet:
+//! store, or with `io_trial` set, `plan_with_store` then executes the selected plan once with
+//! its artifact I/O: each root wave group and root host-driven loop runs one cold and one steady
+//! wave or iteration, with full compute and read-ahead active. Structurally identical groups
+//! reuse the first group's cold/steady times and launch nothing. Keys ignore data-selecting
+//! scalar constants but retain body work, loop counts, wave geometry and I/O descriptors.
+//! Skipped outputs use the same zero-initialized plan storage and synthetic import policy
+//! as skipped waves; the trial does not validate output values.
+//! Nested work runs whole and is counted only in its enclosing measurement. A GPU-resident store
+//! runs this trial only when `io_trial` is set. Every group uses the same trial, regardless of its
+//! compute cost.
 //!
-//! - Before the trial, one load is timed per imported artifact type. A zero payload of the type is
-//!   stored under a fresh production, dropped from the store's cache
-//!   (`ArtifactStore::evict_cached`), loaded under a timer, and removed. The result is kept by the
-//!   runtime and reused for that type by later trials. A type without a zero payload is not timed
-//!   and the trial reads its stored artifact.
-//! - In the trial, each import waits on the I/O worker for its type's load time and delivers a zero
-//!   payload, which is decoded and uploaded as a real one.
-//! - Exports go to a fresh trial production. After the run their writes are published and committed
-//!   under a timer, never finalized, and `SessionStore::discard_session` removes the production. An
-//!   export that includes what a skipped wave or iteration would have written reads the plan
-//!   memory's initial zeros there.
+//! Regions outside waves and host loops are never launched in this trial. Their compute comes
+//! from the selected candidate's region estimates; imports use measured type load times and
+//! exports use one real staging/encoding/publish/commit measurement per type on zero raw bytes.
+//! Imports with a zero payload use a measured store load delay plus a real decode/upload; the
+//! report labels these synthetic loads. Other imports read the stored artifact. Trial productions
+//! are discarded, never finalized.
 //!
-//! The report's `io_predicted_seconds` is the trial's wall time, with every unrun wave or iteration
-//! counted at the time of its group's or loop's last measured one, and every unwritten export of
-//! the production at the mean publish-and-commit time of the written ones. The session's final
-//! manifest write is not counted. A failed trial fails planning.
+//! The report's `io_predicted_seconds` includes each group's cold time + (count - 1) * steady
+//! time, the final export drain, and boundary compute and I/O. Unwritten wave exports use the
+//! measured mean publish/commit cost. The final manifest write is excluded. A failed trial fails
+//! planning.
 //!
 //! ## Options
 //!
@@ -95,7 +101,7 @@
 //! | `measurement_iterations` | `MXX_GPU_MEASUREMENT_ITERATIONS` | 2 |
 //! | `release_fence_interval` | `MXX_GPU_RELEASE_FENCE_INTERVAL` | unset |
 //! | `profile_nodes` | `MXX_GPU_PROFILE_NODES` | false |
-//! | `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset (2 for a host or file store) |
+//! | `io_trial` | `MXX_GPU_IO_TRIAL` | false (host and file stores always run a trial) |
 //! | `integer_input_ranges` | (set in code) | empty |
 //! | `subgraph_kernels` | (set in code) | empty |
 //!
@@ -148,6 +154,9 @@ mod io_trial_tests;
 #[cfg(test)]
 #[path = "gpu_runtime_direct/node_profile_tests.rs"]
 mod node_profile_tests;
+#[cfg(test)]
+#[path = "gpu_runtime_direct/sampling_tests.rs"]
+mod sampling_tests;
 #[cfg(test)]
 #[path = "gpu_runtime_direct/selected_artifact_tests.rs"]
 mod selected_artifact_tests;
@@ -307,6 +316,8 @@ impl GpuOutputRef<'_> {
 }
 
 struct GraphRegion {
+    #[cfg(test)]
+    launches: usize,
     start_operation: u32,
     end_operation: u32,
     executable: GpuNativeGraphExec,
@@ -440,7 +451,9 @@ fn geometric_candidates(maximum: usize, value: impl Fn(usize) -> usize) -> Vec<u
 /// iteration replays the same body work, so the first iteration's time counts
 /// for each later one, and for each iteration of every loop enclosing it. A
 /// region with a `cached` launch time is not launched: that time counts for
-/// each of its launches instead.
+/// each of its launches instead. Each launched region is timed by
+/// [`time_region`], which samples nested structural loops. Equal keys within
+/// this trial share their first measurement.
 fn run_trial_regions(
     graph: &mut DirectGraph,
     frame: &PhysicalFrame,
@@ -448,17 +461,21 @@ fn run_trial_regions(
 ) -> Result<(Vec<f64>, Vec<usize>), GpuRuntimeError> {
     let mut seconds = vec![0.0; graph.regions.len()];
     let mut launches = vec![0usize; graph.regions.len()];
+    let mut trial_times = BTreeMap::new();
     let mut timed = |graph: &mut DirectGraph, region: usize, repeats: u64| {
         launches[region] =
             launches[region].saturating_add(usize::try_from(repeats).unwrap_or(usize::MAX));
-        let launch = match cached.get(region) {
-            Some(Some(launch)) => *launch,
+        let key = region_key(
+            frame,
+            graph.regions[region].start_operation as usize,
+            graph.regions[region].end_operation as usize,
+            false,
+        );
+        let launch = match cached[region].or_else(|| trial_times.get(&key).copied()) {
+            Some(launch) => launch,
             _ => {
-                let started = Instant::now();
-                if let Err(error) = graph
-                    .launch_region(frame, region)
-                    .and_then(|done| done.wait().map_err(GpuRuntimeError::from))
-                {
+                let timed_region = time_region(graph, frame, region);
+                if let Err(error) = &timed_region {
                     // Name the failed region's operations: a device fault surfaces
                     // only at the region's completion.
                     let (start, end) = (
@@ -478,9 +495,10 @@ fn run_trial_regions(
                         *implementations.entry(name).or_default() += 1;
                     }
                     tracing::error!(region, start, end, ?implementations, %error, "GPU trial region failed");
-                    return Err(error);
                 }
-                started.elapsed().as_secs_f64()
+                let seconds = timed_region?;
+                trial_times.insert(key, seconds);
+                seconds
             }
         };
         seconds[region] += launch * repeats as f64;
@@ -496,6 +514,169 @@ fn run_trial_regions(
         ));
     }
     Ok((seconds, launches))
+}
+
+/// Time a region with every static structural loop at one iteration, then
+/// raise each independent equal-count sibling group to two. For a loop i,
+/// E_i = (n_i - 1) d_i + n_i sum(E_child); the region is R0 + sum(E_root).
+/// Retries run once. All mutable controls are reset before each probe and
+/// production limits are restored even when a probe fails.
+fn time_region(
+    graph: &mut DirectGraph,
+    frame: &PhysicalFrame,
+    region: usize,
+) -> Result<f64, GpuRuntimeError> {
+    let (start, end) = (
+        graph.regions[region].start_operation as usize,
+        graph.regions[region].end_operation as usize,
+    );
+    let loops = sampled_loops(frame, &frame.program.operations[start..end], start);
+    sample_region(frame, &loops, || {
+        let started = Instant::now();
+        graph.launch_region(frame, region)?.wait()?;
+        Ok(started.elapsed().as_secs_f64())
+    })
+}
+
+/// A group of independent siblings with the same count and enclosing-loop
+/// multiplicity. Keeping their joint delta preserves concurrent execution.
+struct SampledLoop<'a> {
+    limits: Vec<&'a crate::poly::dcrt::gpu::GpuSignedValues>,
+    count: u64,
+    ancestors: f64,
+}
+
+fn sample_region(
+    frame: &PhysicalFrame,
+    loops: &[SampledLoop<'_>],
+    mut launch: impl FnMut() -> Result<f64, GpuRuntimeError>,
+) -> Result<f64, GpuRuntimeError> {
+    let reset = |sampling: bool, probe: Option<usize>| -> Result<(), GpuRuntimeError> {
+        for control in &frame.control_resets {
+            control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
+        }
+        reset_preimage_replays(frame, None).map_err(GpuRuntimeError::Execution)?;
+        for replay in &frame.preimage_replays {
+            replay.limit.upload_u64(&[if sampling { 1 } else { u64::from(replay.planned_max) }])?;
+            replay.limit.wait_until_ready()?;
+        }
+        for (index, group) in loops.iter().enumerate() {
+            for limit in &group.limits {
+                limit.upload_u64(&[if !sampling {
+                    group.count
+                } else if probe == Some(index) {
+                    2
+                } else {
+                    1
+                }])?;
+                limit.wait_until_ready()?;
+            }
+        }
+        Ok(())
+    };
+    let measured: Result<f64, GpuRuntimeError> = (|| {
+        reset(true, None)?;
+        let first = launch()?;
+        let mut estimate = first;
+        for (index, group) in loops.iter().enumerate().filter(|(_, group)| group.count > 1) {
+            reset(true, Some(index))?;
+            let delta = launch()? - first;
+            if delta < 0.0 {
+                tracing::debug!(index, delta, "negative GPU loop probe delta");
+            }
+            estimate += group.ancestors * (group.count - 1) as f64 * delta;
+        }
+        Ok(estimate)
+    })();
+    let restored = reset(false, None);
+    let seconds = measured?;
+    restored?;
+    Ok(seconds)
+}
+
+/// Collect static loops at every depth. Dependency reachability within each
+/// body determines concurrent siblings. Device-computed bounds run whole;
+/// retry bodies are visited with multiplicity one.
+fn sampled_loops<'a>(
+    frame: &'a PhysicalFrame,
+    operations: &[CompiledGpuOp],
+    base: usize,
+) -> Vec<SampledLoop<'a>> {
+    fn visit<'a>(
+        frame: &'a PhysicalFrame,
+        operations: &[CompiledGpuOp],
+        base: usize,
+        ancestors: f64,
+        result: &mut Vec<SampledLoop<'a>>,
+    ) {
+        let mut reachable = Vec::<BTreeSet<usize>>::new();
+        let mut siblings = Vec::<Vec<(usize, usize)>>::new();
+        for (index, op) in operations.iter().enumerate() {
+            let mut predecessors = BTreeSet::new();
+            for predecessor in
+                op.predecessors.iter().filter_map(|p| (*p as usize).checked_sub(base))
+            {
+                if operations[predecessor].body.is_some() {
+                    predecessors.insert(predecessor);
+                }
+                predecessors.extend(reachable[predecessor].iter().copied());
+            }
+            reachable.push(predecessors);
+            let primitive =
+                &frame.program.implementations.resolve(op.implementation).unwrap().primitive;
+            let mut nested_ancestors = ancestors;
+            if *primitive == GpuNativePrimitive::LoopWhile {
+                let KernelArg::Value(id) = op.arguments[2] else { unreachable!() };
+                let (_, bound) = frame.owners[&id].storages().next().unwrap();
+                let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+                let control = frame.control_resets.iter().find_map(|control| match control {
+                    crate::gpu_physical_control::ControlReset::Loop { limit, count, .. }
+                        if Arc::as_ptr(limit).cast::<()>() == pointer =>
+                    {
+                        Some((limit.as_ref(), *count))
+                    }
+                    _ => None,
+                });
+                if let Some((limit, count)) = control {
+                    if count == 0 {
+                        continue;
+                    }
+                    let entry = result.len();
+                    result.push(SampledLoop { limits: vec![limit], count, ancestors });
+                    if let Some(group) = siblings.iter_mut().find(|group| {
+                        group.iter().all(|(other, _)| !reachable[index].contains(other))
+                    }) {
+                        group.push((index, entry));
+                    } else {
+                        siblings.push(vec![(index, entry)]);
+                    }
+                    nested_ancestors *= count as f64;
+                } else if !frame
+                    .preimage_replays
+                    .iter()
+                    .any(|replay| Arc::as_ptr(&replay.limit).cast::<()>() == pointer)
+                {
+                    continue;
+                }
+            }
+            if let Some(body) = &op.body {
+                visit(frame, body, 0, nested_ancestors, result);
+            }
+        }
+        for group in siblings {
+            let first = group[0].1;
+            if group.iter().all(|(_, entry)| result[*entry].count == result[first].count) {
+                for (_, entry) in group.into_iter().skip(1) {
+                    let limits = std::mem::take(&mut result[entry].limits);
+                    result[first].limits.extend(limits);
+                }
+            }
+        }
+    }
+    let mut result = Vec::new();
+    visit(frame, operations, base, 1.0, &mut result);
+    result.retain(|group| !group.limits.is_empty());
+    result
 }
 
 /// Time the regions `regions`, which end at operation `end`, each launch
@@ -561,11 +742,13 @@ fn trial_region_range(
 /// A key for the work of the operations `start..end` of `frame`, equal for
 /// two regions that launch the same work: each operation's primitive, the
 /// type, encoding and view shape of every value it reads or writes, its U64,
-/// I64 and F64 arguments, the kind of every other argument, its launch
+/// I64 and F64 arguments, the integer opcode, the kind of every other argument, its launch
 /// shape and device, its dependencies relative to `start`, and its body.
 /// Storage slots, byte offsets and binding numbers are left out: they say
-/// where the data is, not how much work it is.
-fn region_key(frame: &PhysicalFrame, start: usize, end: usize) -> u64 {
+/// where the data is, not how much work it is. With `drop_constants`, scalar
+/// U64/U64List/I64/F64 values are omitted for I/O group reuse; argument kinds
+/// and positions remain, and device-loop static counts are included.
+fn region_key(frame: &PhysicalFrame, start: usize, end: usize, drop_constants: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     fn value(frame: &PhysicalFrame, id: PhysicalValueId, hasher: &mut impl Hasher) {
         match frame.program.values.get(id.0 as usize) {
@@ -579,22 +762,75 @@ fn region_key(frame: &PhysicalFrame, start: usize, end: usize) -> u64 {
             None => u64::MAX.hash(hasher),
         }
     }
-    fn operation(frame: &PhysicalFrame, op: &CompiledGpuOp, base: usize, hasher: &mut impl Hasher) {
+    fn operation(
+        frame: &PhysicalFrame,
+        op: &CompiledGpuOp,
+        base: usize,
+        drop_constants: bool,
+        hasher: &mut impl Hasher,
+    ) {
         format!(
             "{:?}",
             frame.program.implementations.resolve(op.implementation).map(|i| &i.primitive)
         )
         .hash(hasher);
-        for argument in op.arguments.iter() {
+        if drop_constants &&
+            frame.program.implementations.resolve(op.implementation).unwrap().primitive ==
+                GpuNativePrimitive::LoopWhile
+        {
+            let KernelArg::Value(id) = op.arguments[2] else { unreachable!() };
+            let (_, bound) = frame.owners[&id].storages().next().unwrap();
+            let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+            for control in &frame.control_resets {
+                if let crate::gpu_physical_control::ControlReset::Loop { limit, count, .. } =
+                    control
+                {
+                    if Arc::as_ptr(limit).cast::<()>() == pointer {
+                        count.hash(hasher);
+                    }
+                }
+            }
+        }
+        op.arguments.len().hash(hasher);
+        for (position, argument) in op.arguments.iter().enumerate() {
+            position.hash(hasher);
             std::mem::discriminant(argument).hash(hasher);
             match argument {
                 KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) => {
                     value(frame, *id, hasher)
                 }
-                KernelArg::U64(word) => word.hash(hasher),
-                KernelArg::U64List(words) => words.hash(hasher),
-                KernelArg::I64(word) => word.hash(hasher),
-                KernelArg::F64(word) => word.to_bits().hash(hasher),
+                KernelArg::U32(word)
+                    if position == 0 &&
+                        frame
+                            .program
+                            .implementations
+                            .resolve(op.implementation)
+                            .unwrap()
+                            .primitive ==
+                            GpuNativePrimitive::IntegerOperation =>
+                {
+                    word.hash(hasher)
+                }
+                KernelArg::U64(word) => {
+                    if !drop_constants {
+                        word.hash(hasher);
+                    }
+                }
+                KernelArg::U64List(words) => {
+                    if !drop_constants {
+                        words.hash(hasher);
+                    }
+                }
+                KernelArg::I64(word) => {
+                    if !drop_constants {
+                        word.hash(hasher);
+                    }
+                }
+                KernelArg::F64(word) => {
+                    if !drop_constants {
+                        word.to_bits().hash(hasher);
+                    }
+                }
                 KernelArg::OptionalValue(None) |
                 KernelArg::U32(_) |
                 KernelArg::OptionalBinding(_) => {}
@@ -611,7 +847,7 @@ fn region_key(frame: &PhysicalFrame, start: usize, end: usize) -> u64 {
             Some(body) => {
                 body.len().hash(hasher);
                 for inner in body {
-                    operation(frame, inner, 0, hasher);
+                    operation(frame, inner, 0, drop_constants, hasher);
                 }
             }
             None => usize::MAX.hash(hasher),
@@ -619,7 +855,77 @@ fn region_key(frame: &PhysicalFrame, start: usize, end: usize) -> u64 {
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for op in &frame.program.operations[start..end] {
-        operation(frame, op, start, &mut hasher);
+        operation(frame, op, start, drop_constants, &mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Work and I/O of a root trial group, independent of data-selecting constants.
+/// Nested wave geometry and host-loop counts are retained along with the body.
+fn io_group_key(frame: &PhysicalFrame, start: u32, end: u32, count: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    region_key(frame, start as usize, end as usize, true).hash(&mut hasher);
+    count.hash(&mut hasher);
+    let range = start..end;
+    for wave in frame.waves.iter().filter(|wave| range.contains(&wave.body_start)) {
+        (wave.body_start - start, wave.body_end - start, wave.active_lanes).hash(&mut hasher);
+    }
+    for body in frame.external_io_loops.iter().filter(|body| range.contains(&body.body_start)) {
+        (body.body_start - start, body.body_end - start, body.count).hash(&mut hasher);
+        for import in &body.ahead {
+            format!("{:?}", import.template.descriptor).hash(&mut hasher);
+            (import.template.staged, import.template.read_ahead).hash(&mut hasher);
+        }
+    }
+    for import in frame.import_templates.iter().filter(|t| range.contains(&t.before_operation)) {
+        (
+            import.before_operation - start,
+            import.staged,
+            import.read_ahead,
+            import.member.is_some(),
+        )
+            .hash(&mut hasher);
+        format!("{:?}{:?}", import.descriptor, import.expected_type).hash(&mut hasher);
+    }
+    for import in frame
+        .external_io_imports
+        .iter()
+        .chain(frame.external_io_loops.iter().flat_map(|body| &body.imports))
+        .filter(|t| range.contains(&t.request_operation))
+    {
+        (import.request_operation - start, import.before_operation - start, import.staged)
+            .hash(&mut hasher);
+        format!("{:?}{:?}", import.descriptor, import.expected_type).hash(&mut hasher);
+    }
+    let mut exports_by_slot = BTreeMap::<_, Vec<_>>::new();
+    let mut family_counts = BTreeMap::<_, usize>::new();
+    for template in &frame.export_templates {
+        exports_by_slot.entry(template.slot).or_default().push(template);
+        if let Some(index) = template.index {
+            let count = family_counts.entry(&template.name).or_default();
+            *count = (*count).max(index + 1);
+        }
+    }
+    for (offset, op) in frame.program.operations[start as usize..end as usize].iter().enumerate() {
+        if frame.program.implementations.resolve(op.implementation).unwrap().primitive ==
+            GpuNativePrimitive::ExportPublish
+        {
+            let KernelArg::U32(slot) = op.arguments[0] else { unreachable!() };
+            for template in exports_by_slot.get(&(slot as usize)).into_iter().flatten() {
+                offset.hash(&mut hasher);
+                format!("{:?}{:?}", template.artifact_type, template.availability)
+                    .hash(&mut hasher);
+                (
+                    template.streamed,
+                    template.export.raw_total_bytes,
+                    template.fragment_index,
+                    template.final_chunk,
+                )
+                    .hash(&mut hasher);
+                family_counts.get(&template.name).hash(&mut hasher);
+            }
+        }
     }
     hasher.finish()
 }
@@ -1028,6 +1334,8 @@ impl DirectGraph {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
             regions.push(GraphRegion {
+                #[cfg(test)]
+                launches: 0,
                 start_operation: start as u32,
                 end_operation: end as u32,
                 executable,
@@ -1247,6 +1555,10 @@ impl DirectGraph {
             peer.record_event()?.enqueue_wait(&stream)?;
         }
         let completion = region.executable.launch(&stream)?;
+        #[cfg(test)]
+        {
+            region.launches += 1;
+        }
         for (device, stream) in std::iter::once((region.device, &stream))
             .chain(region.peer_streams.iter().map(|peer| (peer.physical_device(), peer)))
         {
@@ -1307,6 +1619,97 @@ fn control_address(
 }
 
 /// The distinct device IDs a plan contract places work on.
+/// A planned candidate's region times, each region's operation count, and
+/// whether the times were measured rather than extrapolated.
+struct CandidateTiming {
+    regions: Vec<(u32, f64)>,
+    counts: Vec<usize>,
+    measured: bool,
+}
+
+/// The operations of each region of `graph`, nested bodies included.
+fn region_operation_counts(frame: &PhysicalFrame, graph: &DirectGraph) -> Vec<usize> {
+    fn count(op: &CompiledGpuOp) -> usize {
+        1 + op.body.iter().flatten().map(count).sum::<usize>()
+    }
+    graph
+        .regions
+        .iter()
+        .map(|region| {
+            frame.program.operations[region.start_operation as usize..region.end_operation as usize]
+                .iter()
+                .map(count)
+                .sum()
+        })
+        .collect()
+}
+
+/// Region times of two measured tile widths C at one wave width, from which a
+/// narrower tile width's are extrapolated.
+///
+/// C splits only the column jobs of matrix products, sums, and differences
+/// and of preimage samples; every other operation, and every region boundary,
+/// is the same at each C. Each such job's work is linear in its width: a
+/// product job (`raw_matrix_mul_kernel`) computes every output column's inner
+/// products independently, a sum or difference is elementwise, and a
+/// statistical or gadget preimage samples each column independently, so their
+/// grids and their arithmetic grow with the width. The jobs of one node cover
+/// its columns once at every C, so the part of a region's time that is linear
+/// in the widths is the same at each C, and only each job's fixed launch cost
+/// varies: a region's time is `a + b J`, where `J` is its operation count,
+/// fitted per region through the two measured widths. A width whose jobs
+/// leave the device partly idle runs below this line, so the extrapolation is
+/// used only for widths whose narrowest per-column parallelism (`C n / 2`
+/// evaluation points of a statistical preimage) fills the device's resident
+/// threads.
+struct TileWidthFit {
+    counts: [Vec<usize>; 2],
+    seconds: [Vec<f64>; 2],
+}
+
+impl TileWidthFit {
+    fn new(first: &CandidateTiming, second: &CandidateTiming) -> Option<Self> {
+        (first.measured &&
+            second.measured &&
+            first.counts.len() == second.counts.len() &&
+            first.regions.len() == first.counts.len() &&
+            second.regions.len() == second.counts.len())
+        .then(|| Self {
+            counts: [first.counts.clone(), second.counts.clone()],
+            seconds: [
+                first.regions.iter().map(|(_, seconds)| *seconds).collect(),
+                second.regions.iter().map(|(_, seconds)| *seconds).collect(),
+            ],
+        })
+    }
+
+    /// Each region's extrapolated seconds, or `None` when the regions differ
+    /// or a region's count differs from two measured equal counts.
+    fn extrapolate(&self, counts: &[usize]) -> Option<Vec<f64>> {
+        if counts.len() != self.counts[0].len() {
+            return None;
+        }
+        counts
+            .iter()
+            .enumerate()
+            .map(|(region, &count)| {
+                let (first, second) = (self.counts[0][region], self.counts[1][region]);
+                let (at_first, at_second) = (self.seconds[0][region], self.seconds[1][region]);
+                if count == first {
+                    return Some(at_first);
+                }
+                if count == second {
+                    return Some(at_second);
+                }
+                (first != second).then(|| {
+                    let slope = (at_first - at_second) / (first as f64 - second as f64);
+                    (at_first + slope * (count as f64 - first as f64)).max(0.0)
+                })
+            })
+            .collect()
+    }
+}
+
 fn contract_devices(
     contract: &crate::gpu_execution_plan::GpuPlanContract,
 ) -> Result<BTreeSet<i32>, GpuPlanError> {
@@ -1910,6 +2313,8 @@ pub struct GpuExecutionPlan {
     logical: FrozenGpuPlan,
     report: GpuWarmupReport,
     measured_costs: GpuMeasuredCostCache,
+    /// Compute estimates by production region, including replay multiplicities.
+    region_seconds: Vec<(u32, f64)>,
     backend_execution_identity: u64,
     frame: PhysicalFrame,
     graph: DirectGraph,
@@ -1982,20 +2387,56 @@ pub struct GpuRuntime {
     host_loop_indices: BTreeMap<u32, u64>,
 }
 
-/// The limit and measurements of one I/O trial execute.
+/// The executed ranges and measurements of one I/O trial.
 struct IoTrial {
-    waves: usize,
+    /// Operation ranges whose full compute participates in the I/O trial.
+    ranges: Vec<std::ops::Range<u32>>,
+    /// Export slots written inside those ranges; all others are modeled.
+    export_slots: BTreeSet<usize>,
+    outside_seconds: f64,
+    outside_exports: usize,
     /// Per root wave group or host-driven loop, keyed by its first operation:
     /// its full wave or iteration count and each measured one's seconds.
     measured: BTreeMap<u32, (usize, Vec<f64>)>,
+    /// First measured site per structural key, local to this I/O trial.
+    representatives: BTreeMap<u64, u32>,
+    /// Full cold/steady estimates for groups that launched nothing.
+    reused_seconds: f64,
     /// The measured load seconds of each descriptor the plan imports.
     loads: Vec<(ManifestArtifact, f64)>,
     /// A producer's exports published and committed after the trial, the
-    /// production's full member count, and the seconds they took.
+    /// production's executed-scope member count, and the seconds they took.
     published: Option<(usize, usize, f64)>,
 }
 
 impl IoTrial {
+    /// Register a representative or account for a completed one's entire group.
+    fn reuse(&mut self, graph: &str, site: u32, key: u64, waves: usize) -> bool {
+        let representative = self.representatives.get(&key).copied();
+        tracing::info!(
+            graph,
+            site,
+            key,
+            waves,
+            reused = representative.is_some(),
+            "GPU I/O trial group"
+        );
+        if let Some(representative) = representative {
+            if let Some((_, times)) = self.measured.get(&representative) {
+                self.reused_seconds +=
+                    times[0] + waves.saturating_sub(1) as f64 * times.last().unwrap();
+            }
+            true
+        } else {
+            self.representatives.insert(key, site);
+            false
+        }
+    }
+
+    fn contains(&self, operation: u32) -> bool {
+        self.ranges.iter().any(|range| range.contains(&operation))
+    }
+
     fn record(&mut self, site: u32, total: usize, seconds: f64) {
         self.measured.entry(site).or_insert_with(|| (total, Vec::new())).1.push(seconds);
     }
@@ -2009,7 +2450,8 @@ impl IoTrial {
     }
 
     /// `seconds` of the trial plus every unrun wave or iteration at the time
-    /// of the last measured one of its group or loop, and every unpublished
+    /// of the last measured one of its group or loop, each reused group at its
+    /// representative's cold + (count - 1) * steady time, and every unpublished
     /// export at the mean time of the published ones.
     fn extrapolate(&self, seconds: f64) -> f64 {
         let unpublished = self
@@ -2020,6 +2462,8 @@ impl IoTrial {
             })
             .unwrap_or(0.0);
         seconds +
+            self.outside_seconds +
+            self.reused_seconds +
             unpublished +
             self.measured
                 .values()
@@ -2031,10 +2475,6 @@ impl IoTrial {
 }
 
 /// Whether artifacts with these descriptors have the same stored payload.
-/// Waves of each root wave group, and iterations of each root host-driven
-/// loop, an I/O trial runs when `io_trial_waves` is unset.
-const DEFAULT_IO_TRIAL_WAVES: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2).unwrap();
-
 fn same_payload(left: &ManifestArtifact, right: &ManifestArtifact) -> bool {
     left.artifact_type == right.artifact_type &&
         left.availability == right.availability &&
@@ -2480,38 +2920,115 @@ impl GpuRuntime {
             self.plan_with_payload_sizes(validated, inputs, &sizes, device_artifact_exports, None)?;
         // A host or file store's reads and writes take time the Graph trials
         // do not measure, so its plans always run an I/O trial.
-        let waves = self
-            .options
-            .io_trial_waves
-            .or_else(|| (!device_artifact_exports).then_some(DEFAULT_IO_TRIAL_WAVES));
-        if let Some(waves) = waves {
-            plan.report.io_predicted_seconds =
-                self.io_trial(&mut plan, inputs, store, waves.get())?;
+        if self.options.io_trial || !device_artifact_exports {
+            plan.report.io_predicted_seconds = self.io_trial(&mut plan, inputs, store)?;
         }
         Ok(plan)
     }
 
-    /// Execute `plan` once with its artifact I/O, each root wave group for
-    /// its first `waves` waves and each root host-driven loop for its first
-    /// `waves` iterations. Imports never read the artifacts they name, so
-    /// those need not exist: each waits for the load time measured once per
-    /// artifact type on a dummy (see `measure_trial_loads`) and delivers a
-    /// zero payload. Exports go to a fresh trial production, are published
-    /// and committed after the run, and its session is discarded. Returns the
+    /// Execute the cold and steady waves or iterations of each root group
+    /// with full compute and artifact I/O once per structural key; reuse its
+    /// cold/steady times for equal groups and model regions outside those groups.
+    /// As with skipped waves, downstream trial work may read unwritten, zeroed
+    /// plan buffers. Artifact imports use synthetic payloads where supported;
+    /// other imports still read the store. Trial values are not correctness outputs.
+    /// Synthetic imports wait for the measured type load time and upload zeros;
+    /// types without zero payloads read stored artifacts. Exports go to a fresh trial production,
+    /// are published and committed after the run, and its session is discarded. Returns the
     /// I/O-inclusive estimate, or `None` for a plan without artifact I/O.
     fn io_trial<S: SessionStore + Send>(
         &mut self,
         plan: &mut GpuExecutionPlan,
         inputs: &BTreeMap<String, RuntimeValue>,
         store: &mut S,
-        waves: usize,
     ) -> Result<Option<f64>, GpuPlanError> {
         if !plan.has_artifact_io() {
             return Ok(None);
         }
         let loads = self.measure_trial_loads(&plan.frame, store)?;
         let nonce: [u8; 32] = rand::random();
-        self.io_trial = Some(IoTrial { waves, measured: BTreeMap::new(), loads, published: None });
+        let ranges = plan
+            .frame
+            .waves
+            .iter()
+            .map(|wave| wave.body_start..wave.body_end)
+            .chain(plan.frame.external_io_loops.iter().map(|body| body.body_start..body.body_end))
+            .collect::<Vec<_>>();
+        let contains = |operation| ranges.iter().any(|range| range.contains(&operation));
+        let mut export_slots = BTreeSet::new();
+        for (index, op) in plan.frame.program.operations.iter().enumerate() {
+            if contains(index as u32) &&
+                plan.frame.program.implementations.resolve(op.implementation).unwrap().primitive ==
+                    GpuNativePrimitive::ExportPublish
+            {
+                let KernelArg::U32(slot) = op.arguments[0] else { unreachable!() };
+                export_slots.insert(slot as usize);
+            }
+        }
+        let outside_compute = plan
+            .region_seconds
+            .iter()
+            .filter(|(start, _)| !contains(*start))
+            .map(|(_, seconds)| seconds)
+            .sum::<f64>();
+        let mut boundary_loads = loads.clone();
+        let mut outside_loads = 0.0;
+        let imports = plan
+            .frame
+            .import_templates
+            .iter()
+            .filter(|import| !contains(import.before_operation))
+            .map(|import| (&import.key, &import.descriptor, None))
+            .chain(
+                plan.frame
+                    .external_io_imports
+                    .iter()
+                    .filter(|import| !contains(import.request_operation))
+                    .map(|import| (&import.key, &import.descriptor, Some(import.selector))),
+            );
+        for (key, descriptor, selector) in imports {
+            let seconds = if let Some((_, seconds)) =
+                boundary_loads.iter().find(|(measured, _)| same_payload(measured, descriptor))
+            {
+                *seconds
+            } else {
+                let mut key = key.clone();
+                if descriptor.family_count.is_some() && key.index.is_none() {
+                    key.index = Some(match selector {
+                        Some(selector) => {
+                            let value =
+                                RuntimeValue::Resident(Arc::clone(&plan.frame.owners[&selector]));
+                            let selected = self
+                                .download_integer_family(&value)
+                                .map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
+                            num_traits::ToPrimitive::to_usize(&selected[0]).unwrap()
+                        }
+                        None => 0,
+                    });
+                }
+                let started = Instant::now();
+                store
+                    .load(&key, descriptor)
+                    .map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
+                let seconds = started.elapsed().as_secs_f64();
+                boundary_loads.push((descriptor.clone(), seconds));
+                seconds
+            };
+            outside_loads += seconds;
+        }
+        let (outside_exports, export_seconds) =
+            self.measure_trial_exports(&plan.frame, &export_slots, store)?;
+        self.io_trial = Some(IoTrial {
+            ranges,
+            export_slots,
+            outside_seconds: outside_compute + outside_loads + export_seconds,
+            outside_exports,
+            measured: BTreeMap::new(),
+            representatives: BTreeMap::new(),
+            reused_seconds: 0.0,
+            loads,
+            published: None,
+        });
         let started = Instant::now();
         let run = self.execute_with_artifacts(plan, inputs.clone(), store, nonce);
         let seconds = started.elapsed().as_secs_f64();
@@ -2529,10 +3046,17 @@ impl GpuRuntime {
         }
         run.map_err(|error| GpuPlanError::Measurement(format!("GPU I/O trial failed: {error}")))?;
         let predicted = trial.extrapolate(seconds);
+        if !trial.loads.is_empty() {
+            plan.report.reason.push_str(&format!(
+                "; I/O trial uses synthetic zero-payload loads for {} artifact types",
+                trial.loads.len()
+            ));
+        }
         let (published, exports, publish_seconds) = trial.published.unwrap_or_default();
         tracing::info!(
             graph = plan.validated.source.name(),
-            waves,
+            waves = 2,
+            synthetic_zero_payload_load_types = trial.loads.len(),
             trial_seconds = seconds,
             published,
             exports,
@@ -2542,6 +3066,82 @@ impl GpuRuntime {
             "GPU I/O trial"
         );
         Ok(Some(predicted))
+    }
+
+    /// Measure staging, encoding, publication and commit once per boundary
+    /// export type on zero raw bytes. No Graph region is launched for these
+    /// exports; the production member count weights the measured type cost.
+    fn measure_trial_exports<S: SessionStore>(
+        &self,
+        frame: &PhysicalFrame,
+        executed: &BTreeSet<usize>,
+        store: &mut S,
+    ) -> Result<(usize, f64), GpuPlanError> {
+        let mut measured = Vec::new();
+        let mut total = 0.0;
+        let mut members = 0;
+        for template in
+            frame.export_templates.iter().filter(|t| t.final_chunk && !executed.contains(&t.slot))
+        {
+            members += 1;
+            if let Some((_, seconds)) =
+                measured.iter().find(|(ty, _)| ty == &template.artifact_type)
+            {
+                total += seconds;
+                continue;
+            }
+            let production = ProductionId {
+                spec_hash: SpecHash(rand::random()),
+                execution_nonce: rand::random(),
+            };
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: "io-trial-export".into(),
+                index: None,
+            };
+            let handle = ArtifactHandle {
+                key: key.clone(),
+                artifact_type: template.artifact_type.clone(),
+                availability: template.availability,
+                layout: None,
+            };
+            let measured_export = (|| {
+                store.open_session(&SessionDescriptor::new(
+                    production.clone(),
+                    "io-trial-export",
+                    [0; 32],
+                ))?;
+                let started = Instant::now();
+                let bytes = template.export.raw_total_bytes;
+                let zeros = vec![0; (bytes as usize).min(1 << 20)];
+                for offset in (0..bytes).step_by(zeros.len()) {
+                    let length = ((bytes - offset) as usize).min(zeros.len());
+                    store.stage_raw_chunk(key.clone(), bytes, offset, &zeros[..length])?;
+                }
+                let export = Arc::clone(&template.export);
+                let job = store.encode_staged(
+                    &key,
+                    &template.artifact_type,
+                    template.availability,
+                    None,
+                    artifact_payload_kind(&template.artifact_type).unwrap(),
+                    Box::new(move |source, sink| {
+                        crate::backend::poly_gpu::transcode_raw_artifact(&export, source, sink)
+                    }),
+                )?;
+                let (encoded, _) = job()?;
+                store.publish_encoded(key.clone(), encoded)?;
+                store.commit_artifact(&handle)?;
+                Ok::<_, S::Error>(started.elapsed().as_secs_f64())
+            })();
+            let removed = store.discard_session(&production);
+            let seconds =
+                measured_export.map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
+            removed.map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
+            measured.push((template.artifact_type.clone(), seconds));
+            total += seconds;
+        }
+        Ok((members, total))
     }
 
     /// The load seconds of each artifact descriptor `frame` imports, measured
@@ -2564,12 +3164,12 @@ impl GpuRuntime {
             .iter()
             .map(|template| &template.descriptor)
             .chain(frame.external_io_imports.iter().map(|import| &import.descriptor))
-            .chain(
-                frame
-                    .external_io_loops
+            .chain(frame.external_io_loops.iter().flat_map(|body| {
+                body.imports
                     .iter()
-                    .flat_map(|body| body.imports.iter().map(|import| &import.descriptor)),
-            );
+                    .map(|import| &import.descriptor)
+                    .chain(body.ahead.iter().map(|import| &import.template.descriptor))
+            }));
         let mut loads = Vec::<(ManifestArtifact, f64)>::new();
         for descriptor in descriptors {
             if loads.iter().any(|(measured, _)| same_payload(measured, descriptor)) {
@@ -2643,7 +3243,12 @@ impl GpuRuntime {
             .regions
             .iter()
             .map(|region| {
-                region_key(frame, region.start_operation as usize, region.end_operation as usize)
+                region_key(
+                    frame,
+                    region.start_operation as usize,
+                    region.end_operation as usize,
+                    false,
+                )
             })
             .collect::<Vec<_>>();
         let cached =
@@ -2753,11 +3358,11 @@ impl GpuRuntime {
             .collect())
     }
 
-    /// Lower, allocate, compile, and time the `(W, C)` candidate `geometry`,
-    /// returning each region's start operation with its seconds. With
-    /// `segmented`, a region boundary also lies at every graph node's
-    /// operations, so a segment of work an earlier candidate timed is reused
-    /// even when the rest of its production region differs.
+    /// Lower, allocate, and compile the `(W, C)` candidate `geometry` with its
+    /// production regions, and time it: extrapolated by `fit` when that covers
+    /// its regions, measured otherwise. Returns each region's start operation
+    /// with its seconds, each region's operation count, and whether the times
+    /// were measured.
     #[allow(clippy::too_many_arguments)]
     fn measure_candidate(
         &mut self,
@@ -2767,8 +3372,8 @@ impl GpuRuntime {
         artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
         device_artifact_exports: bool,
         (candidate_w, candidate_c): (usize, usize),
-        segmented: bool,
-    ) -> Result<Vec<(u32, f64)>, GpuPlanError> {
+        fit: Option<&TileWidthFit>,
+    ) -> Result<CandidateTiming, GpuPlanError> {
         let logical =
             single_root_physical_plan(validated, contract.clone(), candidate_c, candidate_w)
                 .map_err(GpuPlanError::InvalidInput)?;
@@ -2781,20 +3386,27 @@ impl GpuRuntime {
             artifact_payload_sizes,
             &self.options.subgraph_kernels,
             device_artifact_exports,
-            segmented,
+            false,
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, contract, None)?;
         wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
         frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
-        let boundaries = std::mem::take(&mut frame.node_operations)
-            .into_iter()
-            .flat_map(|(_, _, range)| [range.start as usize, range.end as usize])
-            .collect::<Vec<_>>();
-        let mut graph = DirectGraph::compile(&self.backend, &mut frame, &boundaries)?;
+        let mut graph = DirectGraph::compile(&self.backend, &mut frame, &[])?;
         validate_allocated_budget(&frame, contract, Some(&graph))?;
+        let counts = region_operation_counts(&frame, &graph);
+        if let Some(seconds) = fit.and_then(|fit| fit.extrapolate(&counts)) {
+            let regions = graph
+                .regions
+                .iter()
+                .zip(seconds)
+                .map(|(region, seconds)| (region.start_operation, seconds))
+                .collect();
+            return Ok(CandidateTiming { regions, counts, measured: false });
+        }
         graph.bind(&frame).map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-        self.measure_regions(&frame, &mut graph)
+        let regions = self.measure_regions(&frame, &mut graph)?;
+        Ok(CandidateTiming { regions, counts, measured: true })
     }
 
     /// Complete the frees of dropped candidate owners and Graphs and return
@@ -2983,7 +3595,25 @@ impl GpuRuntime {
             .max()
             .unwrap_or(1)
             .min(self.options.max_parallel_instances.get());
-        let mut best = None::<(usize, usize, f64, Vec<(u32, f64)>)>;
+        // The ring dimension of the widest matrix and the device's resident
+        // threads bound the tile widths whose time is extrapolated.
+        let ring_dimension = validated
+            .scopes
+            .values()
+            .flat_map(|scope| scope.wire_types.values())
+            .filter_map(|ty| ty.matrix_type().map(|matrix| matrix.ring.ring_dimension() as usize))
+            .max()
+            .unwrap_or(1);
+        let resident_threads = contract_devices(&contract)?
+            .into_iter()
+            .map(|device| {
+                crate::poly::dcrt::gpu::gpu_device_identity(device)
+                    .map(|identity| identity.resident_threads)
+                    .map_err(GpuPlanError::Resource)
+            })
+            .try_fold(0usize, |most, threads| threads.map(|threads| most.max(threads)))?;
+        // The best candidate: W, C, seconds, region times, and whether measured.
+        let mut best = None::<(usize, usize, f64, Vec<(u32, f64)>, bool)>;
         let mut measured = GpuMeasuredCostCache::default();
         let mut rejected = Vec::new();
         let candidate_columns = match fixed_geometry.map(|(column, _)| column) {
@@ -3021,6 +3651,13 @@ impl GpuRuntime {
                 phases.push(waves.iter().skip(1).map(|&w| (w, c)).collect());
             }
             let mut stale = 0;
+            // The two widest measured tile widths of the tile sweep, and the
+            // fit through them.
+            let mut fitted = Vec::<CandidateTiming>::new();
+            // Every measured candidate of the sweep, widest first: C, seconds,
+            // and region times.
+            let mut sweep_measured = Vec::<(usize, f64, Vec<(u32, f64)>)>::new();
+            let mut fit = None::<TileWidthFit>;
             for (candidate_w, candidate_c) in phases[phase].clone() {
                 if stale >= PLATEAU {
                     tracing::debug!(
@@ -3030,56 +3667,64 @@ impl GpuRuntime {
                     );
                     break;
                 }
-                // Node segments let a candidate reuse the times of the
-                // segments it shares with earlier ones; a candidate whose
-                // segmented frame fails is measured with its production
-                // regions instead.
-                let trial = self
-                    .measure_candidate(
-                        &validated,
-                        &contract,
-                        inputs,
-                        artifact_payload_sizes,
-                        device_artifact_exports,
-                        (candidate_w, candidate_c),
-                        true,
-                    )
-                    .or_else(|error| {
-                        tracing::debug!(
-                            candidate_w,
-                            candidate_c,
-                            %error,
-                            "segmented GPU plan candidate failed; measuring its production regions"
-                        );
-                        self.release_candidate_memory(&contract)?;
-                        self.measure_candidate(
-                            &validated,
-                            &contract,
-                            inputs,
-                            artifact_payload_sizes,
-                            device_artifact_exports,
-                            (candidate_w, candidate_c),
-                            false,
-                        )
-                    });
+                let saturates = candidate_c.saturating_mul(ring_dimension) / 2 >= resident_threads;
+                let trial = self.measure_candidate(
+                    &validated,
+                    &contract,
+                    inputs,
+                    artifact_payload_sizes,
+                    device_artifact_exports,
+                    (candidate_w, candidate_c),
+                    fit.as_ref().filter(|_| phase == 0 && saturates),
+                );
                 // The candidate's owners and Graphs are gone; complete their
                 // frees and return the pools' retained memory so the next
                 // candidate, and the selected plan, are admitted on their own.
                 self.release_candidate_memory(&contract)?;
                 match trial {
-                    Ok(regions) if regions.iter().all(|(_, seconds)| seconds.is_finite()) => {
-                        let seconds = regions.iter().map(|(_, seconds)| seconds).sum::<f64>();
-                        tracing::debug!(
-                            candidate_w,
-                            candidate_c,
-                            seconds,
-                            "measured GPU plan candidate"
-                        );
+                    Ok(timing) if timing.regions.iter().all(|(_, seconds)| seconds.is_finite()) => {
+                        let seconds =
+                            timing.regions.iter().map(|(_, seconds)| seconds).sum::<f64>();
+                        if timing.measured {
+                            tracing::debug!(
+                                candidate_w,
+                                candidate_c,
+                                seconds,
+                                "measured GPU plan candidate"
+                            );
+                        } else {
+                            tracing::debug!(
+                                candidate_w,
+                                candidate_c,
+                                seconds,
+                                "extrapolated GPU plan candidate"
+                            );
+                        }
                         measured.insert(candidate_w, candidate_c, seconds);
-                        if best.as_ref().is_none_or(|(_, _, current, _)| {
+                        let improves = best.as_ref().is_none_or(|(_, _, current, _, _)| {
                             seconds < *current * (1.0 - PREFERENCE)
-                        }) {
-                            best = Some((candidate_w, candidate_c, seconds, regions));
+                        });
+                        if timing.measured {
+                            sweep_measured.push((candidate_c, seconds, timing.regions.clone()));
+                        }
+                        if phase == 0 && timing.measured && fitted.len() < 2 {
+                            fitted.push(CandidateTiming {
+                                regions: timing.regions.clone(),
+                                counts: timing.counts.clone(),
+                                measured: true,
+                            });
+                            if let [first, second] = &fitted[..] {
+                                fit = TileWidthFit::new(first, second);
+                            }
+                        }
+                        if improves {
+                            best = Some((
+                                candidate_w,
+                                candidate_c,
+                                seconds,
+                                timing.regions,
+                                timing.measured,
+                            ));
                             stale = 0;
                         } else {
                             stale += 1;
@@ -3102,8 +3747,55 @@ impl GpuRuntime {
                     }
                 }
             }
+            // An extrapolated best is measured before it is selected or widened,
+            // and keeps its place only when its measured time still beats every
+            // measured candidate of the sweep by `PREFERENCE`.
+            if let Some(&(w, c, extrapolated, _, false)) = best.as_ref() {
+                let trial = self.measure_candidate(
+                    &validated,
+                    &contract,
+                    inputs,
+                    artifact_payload_sizes,
+                    device_artifact_exports,
+                    (w, c),
+                    None,
+                );
+                self.release_candidate_memory(&contract)?;
+                match trial {
+                    Ok(timing) => {
+                        let seconds =
+                            timing.regions.iter().map(|(_, seconds)| seconds).sum::<f64>();
+                        tracing::debug!(
+                            candidate_w = w,
+                            candidate_c = c,
+                            seconds,
+                            extrapolated,
+                            "measured the extrapolated best GPU plan candidate"
+                        );
+                        measured.insert(w, c, seconds);
+                        sweep_measured.push((c, seconds, timing.regions));
+                    }
+                    Err(error) => {
+                        tracing::debug!(candidate_w = w, candidate_c = c, %error, "rejected GPU plan candidate");
+                        rejected.push(format!("W={w}, C={c}: {error}"));
+                    }
+                }
+                // The sweep's measured candidates are widest first, the
+                // extrapolated best last.
+                let mut ordered = sweep_measured.clone();
+                ordered.sort_by(|a, b| b.0.cmp(&a.0));
+                best = ordered
+                    .into_iter()
+                    .fold(None::<(usize, f64, Vec<(u32, f64)>)>, |best, candidate| match best {
+                        Some((_, current, _)) if candidate.1 >= current * (1.0 - PREFERENCE) => {
+                            best
+                        }
+                        _ => Some(candidate),
+                    })
+                    .map(|(c, seconds, regions)| (w, c, seconds, regions, true));
+            }
         }
-        let (selected_w, selected_c, selected_seconds, selected_regions) =
+        let (selected_w, selected_c, selected_seconds, selected_regions, _) =
             best.ok_or_else(|| {
                 GpuPlanError::Resource(format!(
                     "no feasible measured (W,C) candidate: {}",
@@ -3168,6 +3860,7 @@ impl GpuRuntime {
             logical,
             report,
             measured_costs: measured,
+            region_seconds: selected_regions,
             backend_execution_identity: self.backend.execution_identity(),
             frame,
             graph,
@@ -3397,6 +4090,11 @@ impl GpuRuntime {
         let mut planned = Vec::with_capacity(all.len());
         let mut streamed = BTreeMap::new();
         for (index, slot) in all.into_iter().enumerate() {
+            if self.io_trial.as_ref().is_some_and(|trial| {
+                !trial.export_slots.contains(&plan.frame.export_templates[index].slot)
+            }) {
+                continue;
+            }
             if plan.frame.export_templates[index].streamed {
                 streamed.insert(index, slot);
             } else {
@@ -3450,7 +4148,11 @@ impl GpuRuntime {
                 .map(|artifact| artifact.family_count.unwrap_or(1))
                 .sum::<usize>();
             if let Some(trial) = self.io_trial.as_mut() {
-                trial.published = Some((published, members, publishing.elapsed().as_secs_f64()));
+                trial.published = Some((
+                    published,
+                    members - trial.outside_exports,
+                    publishing.elapsed().as_secs_f64(),
+                ));
             }
         }
         if let Some((_, manifest)) = persist.filter(|_| !trial) {
@@ -3599,6 +4301,7 @@ impl GpuRuntime {
                             group_index,
                             parent_occurrence,
                             &path,
+                            active_wave.is_none() && host_loop.is_none(),
                             pump,
                         )?;
                     }
@@ -3621,7 +4324,12 @@ impl GpuRuntime {
                 None => &plan.frame.external_io_imports,
                 Some(loop_index) => &plan.frame.external_io_loops[loop_index].imports,
             };
-            for import in selected.iter().filter(|import| import.before_operation == operation) {
+            for import in selected.iter().filter(|import| {
+                import.before_operation == operation &&
+                    self.io_trial
+                        .as_ref()
+                        .is_none_or(|trial| trial.contains(import.request_operation))
+            }) {
                 let pump = pump.as_deref_mut().ok_or_else(|| {
                     GpuRuntimeError::Artifact("selected import has no I/O pump".into())
                 })?;
@@ -3650,7 +4358,15 @@ impl GpuRuntime {
                 let index_owner = Arc::clone(&loop_body.index_owner);
                 // An I/O trial runs a root loop's first iterations only.
                 let root = active_wave.is_none() && host_loop.is_none();
-                let limit = self.io_trial.as_ref().filter(|_| root).map(|trial| trial.waves);
+                if let Some(trial) = self.io_trial.as_mut().filter(|_| root) {
+                    let count = usize::try_from(count).unwrap_or(usize::MAX);
+                    let key = io_group_key(&plan.frame, body_start, body_end, count);
+                    if trial.reuse(plan.validated.source.name(), body_start, key, count) {
+                        region = plan.graph.region_interval(body_start, body_end)?.end;
+                        continue;
+                    }
+                }
+                let limit = self.io_trial.as_ref().filter(|_| root).map(|_| 2);
                 let iterations = limit.map_or(count, |limit| count.min(limit as u64));
                 // Each host-selected member is read one iteration ahead.
                 if iterations > 0 {
@@ -3695,6 +4411,10 @@ impl GpuRuntime {
             if static_imports {
                 self.finish_boundary_imports(plan, pump, operation, active_imports)?;
             }
+            if self.io_trial.is_some() && active_wave.is_none() && host_loop.is_none() {
+                region += 1;
+                continue;
+            }
             // A plan without waves bound its owners and uploaded its seeds
             // once; after a wave rebound its lanes' owners and uploaded its
             // seeds, the next launch rebinds, and a root launch restores the
@@ -3724,26 +4444,42 @@ impl GpuRuntime {
         group_index: usize,
         parent_occurrence: Option<usize>,
         parent_path: &[u64],
+        trial_root: bool,
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
     ) -> Result<(), GpuRuntimeError> {
         let group = &groups[group_index];
+        if let Some(trial) = self.io_trial.as_mut().filter(|_| trial_root) {
+            let key =
+                io_group_key(&plan.frame, group.body_start, group.body_end, group.waves.len());
+            if trial.reuse(plan.validated.source.name(), group.body_start, key, group.waves.len()) {
+                return Ok(());
+            }
+        }
         // An I/O trial runs a root group's first waves only, reading ahead no
         // further than them.
         let limit = self
             .io_trial
             .as_ref()
-            .filter(|_| parent_occurrence.is_none())
-            .map_or(group.waves.len(), |trial| trial.waves.min(group.waves.len()));
+            .filter(|_| trial_root)
+            .map_or(group.waves.len(), |_| 2.min(group.waves.len()));
         // Each wave's read-ahead members are read while the previous wave
         // runs, into the owner the wave before that one used.
         let mut indices = BTreeMap::new();
-        for &ahead in group.waves.iter().take(2.min(limit)) {
-            self.start_read_ahead(plan, pump, Some(ahead), &mut indices)?;
+        if self.io_trial.is_none() {
+            for &ahead in group.waves.iter().take(2.min(limit)) {
+                self.start_read_ahead(plan, pump, Some(ahead), &mut indices)?;
+            }
         }
         // Each wave's `owner_bindings` hold its plan-owned output members, and
         // the family owner was packed from those same members at plan time.
         for (ordinal, &wave_index) in group.waves.iter().enumerate().take(limit) {
             let wave_started = Instant::now();
+            if self.io_trial.is_some() && ordinal == 0 {
+                self.start_read_ahead(plan, pump, Some(wave_index), &mut indices)?;
+                if let Some(&next) = group.waves.get(1).filter(|_| limit > 1) {
+                    self.start_read_ahead(plan, pump, Some(next), &mut indices)?;
+                }
+            }
             let wave = &plan.frame.waves[wave_index];
             let mut logical_path = parent_path.to_vec();
             logical_path.push(
@@ -3830,7 +4566,7 @@ impl GpuRuntime {
             // wave after the next one.
             let ahead = group.waves.get(ordinal + 2).copied().filter(|_| ordinal + 2 < limit);
             self.start_read_ahead(plan, pump, ahead, &mut indices)?;
-            if let Some(trial) = self.io_trial.as_mut().filter(|_| parent_occurrence.is_none()) {
+            if let Some(trial) = self.io_trial.as_mut().filter(|_| trial_root) {
                 trial.record(
                     group.body_start,
                     group.waves.len(),
@@ -3879,7 +4615,9 @@ impl GpuRuntime {
         for control in &plan.frame.control_resets {
             control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
         }
-        check_preimage_replays(&plan.frame, None).map_err(GpuRuntimeError::DeviceStatus)?;
+        if self.io_trial.is_none() {
+            check_preimage_replays(&plan.frame, None).map_err(GpuRuntimeError::DeviceStatus)?;
+        }
         if pump.is_none() {
             plan.completed_runs += 1;
         }
@@ -3904,7 +4642,9 @@ impl GpuRuntime {
         let frame = FrameGeneration::new(0, plan.completed_runs);
         for index in scope_import_templates(plan, active_imports) {
             let template = &plan.frame.import_templates[index];
-            if template.before_operation != operation {
+            if template.before_operation != operation ||
+                self.io_trial.as_ref().is_some_and(|trial| !trial.contains(operation))
+            {
                 continue;
             }
             let pump = pump.as_deref_mut().ok_or_else(|| {
@@ -3930,8 +4670,18 @@ impl GpuRuntime {
         let frame = FrameGeneration::new(0, plan.completed_runs);
         for index in templates {
             let template = &plan.frame.import_templates[index];
+            if self
+                .io_trial
+                .as_ref()
+                .is_some_and(|trial| !trial.contains(template.before_operation))
+            {
+                continue;
+            }
             let mut key = template.key.clone();
-            if let Some((family, position)) = template.member {
+            if template.member.is_some() && self.io_trial.is_some() {
+                // The selector has not been computed during planning.
+                key.index = Some(0);
+            } else if let Some((family, position)) = template.member {
                 if !indices.contains_key(&family) {
                     let owner = plan.frame.owners.get(&family).ok_or_else(|| {
                         GpuRuntimeError::Execution("Gather index family is not resident".into())
@@ -4131,6 +4881,7 @@ fn planned_import_requests(
         .external_io_imports
         .iter()
         .chain(frame.external_io_loops.iter().flat_map(|body| &body.imports))
+        .filter(|import| trial.is_none_or(|trial| trial.contains(import.request_operation)))
         .map(|import| {
             let invalid = |message: &str| GpuRuntimeError::Artifact(message.into());
             if import.descriptor.artifact_type != import.expected_type {

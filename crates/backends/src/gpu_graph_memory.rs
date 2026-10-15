@@ -36,8 +36,11 @@
 //! replayed wave or host-loop body it overlaps, since a replay runs the whole body again. Spans are
 //! regions because operations of one region may run concurrently while regions launch in order.
 //! Values whose spans share no region share bytes, so a chain of loops, each reading the running
-//! result of the one before, needs about two of them at once. Any other scratch value, together
-//! with inputs, outputs, wave-bound members, and imports, is an allocation of its own.
+//! result of the one before, needs about two of them at once. A later wave's member of a parallel
+//! loop output, which the host binds for its wave, takes an arena range too, live from its loop to
+//! the last read of its family, so the member families of successive loops share bytes; a member
+//! the host reads after the execution does not. Any other scratch value, together with inputs,
+//! outputs, other wave-bound values, and imports, is an allocation of its own.
 
 use crate::{
     backend::{BoundStorage, GpuResidentValue, poly_gpu::GpuDcrtBackend},
@@ -64,6 +67,9 @@ pub(crate) struct GpuDeferredScratch {
     /// A full matrix, or a bounded matrix held compactly.
     ty: ConcreteWireType,
     device: i32,
+    /// A later wave's member of a parallel loop output, which the host binds
+    /// for its wave: it holds memory from its loop to the family's last read.
+    replayed: bool,
 }
 
 /// Whether `bound` has no memory yet: its allocation is deferred to
@@ -90,7 +96,23 @@ pub(crate) fn deferred_scratch_storage(
         device,
         address: placeholder_address(),
         bytes,
-        owner: Arc::new(GpuDeferredScratch { ty, device }),
+        owner: Arc::new(GpuDeferredScratch { ty, device, replayed: false }),
+    }
+}
+
+/// Storage of `bytes` for a later wave's member of a parallel loop output of
+/// type `ty` on `device`. Its memory is a range of the plan's arena, live from
+/// the loop to the last read of the member.
+pub(crate) fn deferred_replay_storage(
+    device: i32,
+    ty: ConcreteWireType,
+    bytes: u64,
+) -> BoundStorage {
+    BoundStorage {
+        device,
+        address: placeholder_address(),
+        bytes,
+        owner: Arc::new(GpuDeferredScratch { ty, device, replayed: true }),
     }
 }
 
@@ -107,7 +129,7 @@ pub(crate) fn deferred_scratch_compact(
         device,
         address: placeholder_address(),
         bytes: u64::try_from(payload_bytes).map_err(|_| "GPU compact scratch size exceeds u64")?,
-        owner: Arc::new(GpuDeferredScratch { ty, device }),
+        owner: Arc::new(GpuDeferredScratch { ty, device, replayed: false }),
     };
     GpuResidentValue::new(Arc::new(physical), BTreeMap::from([(storage, bound)]), Box::new([]))
         .map(Arc::new)
@@ -159,7 +181,11 @@ pub(crate) fn deferred_scratch_matrix(
         device: limb_device,
         address: placeholder_address(),
         bytes: u64::try_from(data_bytes).map_err(|_| "GPU scratch size exceeds u64")?,
-        owner: Arc::new(GpuDeferredScratch { ty: ConcreteWireType::Matrix(ty.clone()), device }),
+        owner: Arc::new(GpuDeferredScratch {
+            ty: ConcreteWireType::Matrix(ty.clone()),
+            device,
+            replayed: false,
+        }),
     };
     let resident = GpuResidentValue::new(
         Arc::new(physical.clone()),
@@ -271,28 +297,38 @@ pub(crate) fn plan_graph_scratch(
         first_write: Option<usize>,
     }
     let mut groups = BTreeMap::<*const (), Group>::new();
-    let mut group_of = BTreeMap::<PhysicalValueId, *const ()>::new();
-    let mut collect =
-        |id: PhysicalValueId, owner: &GpuResidentValue, eligible: bool, packable: bool| {
-            for (_, bound) in owner.storages() {
-                if !bound.owner.is::<GpuDeferredScratch>() {
-                    continue;
-                }
-                let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
-                let group = groups.entry(pointer).or_insert_with(|| Group {
-                    placeholder: bound.clone(),
-                    members: Vec::new(),
-                    eligible: true,
-                    packable: true,
-                    references: BTreeSet::new(),
-                    first_write: None,
-                });
-                group.members.push(id);
-                group.eligible &= eligible;
-                group.packable &= packable;
-                group_of.insert(id, pointer);
+    // A value rebound by waves has an owner per wave.
+    let mut group_of = BTreeMap::<PhysicalValueId, Vec<*const ()>>::new();
+    // A later wave's own loop output member takes an arena range for its live
+    // span through every value that views it, unless the host reads it after
+    // the execution: `host_read`.
+    let mut collect = |id: PhysicalValueId,
+                       owner: &GpuResidentValue,
+                       eligible: bool,
+                       packable: bool,
+                       host_read: bool| {
+        for (_, bound) in owner.storages() {
+            let Some(deferred) = bound.owner.downcast_ref::<GpuDeferredScratch>() else {
+                continue;
+            };
+            let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+            let group = groups.entry(pointer).or_insert_with(|| Group {
+                placeholder: bound.clone(),
+                members: Vec::new(),
+                eligible: true,
+                packable: true,
+                references: BTreeSet::new(),
+                first_write: None,
+            });
+            group.members.push(id);
+            group.eligible &= eligible;
+            group.packable &= if deferred.replayed { !host_read } else { packable };
+            let pointers = group_of.entry(id).or_default();
+            if !pointers.contains(&pointer) {
+                pointers.push(pointer);
             }
-        };
+        }
+    };
     for (&id, owner) in &frame.owners {
         let physical = &frame.program.values[id.0 as usize];
         let packable = owner.storages().count() == 1 && !frame.scratch_protected.contains(&id);
@@ -309,26 +345,45 @@ pub(crate) fn plan_graph_scratch(
                     [PhysicalEncoding::CompactCoeffPerCrtLimb { .. }]
             )
         ) && packable;
-        collect(id, owner, eligible, packable);
+        let host_read = frame.output_ids.values().any(|&output| output == id);
+        collect(id, owner, eligible, packable, host_read);
     }
-    // Wave bindings are swapped in by the host between launches.
+    // Wave bindings are swapped in by the host between launches. A later
+    // wave's own member is written by that wave's body, from its start.
+    let mut replay_writes = Vec::<(*const (), usize)>::new();
     for wave in &frame.waves {
         for (&id, owner) in &wave.owner_bindings {
-            collect(id, owner, false, false);
+            let host_read = wave.family_members.values().flatten().any(|&(_, member)| member == id);
+            collect(id, owner, false, false, host_read);
+            for (_, bound) in owner.storages() {
+                if bound.owner.downcast_ref::<GpuDeferredScratch>().is_some_and(|d| d.replayed) {
+                    let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+                    replay_writes.push((pointer, wave.body_start as usize));
+                }
+            }
         }
     }
     for (index, op) in frame.program.operations.iter().enumerate() {
         // Operations of any device may share one allocation: its barriers
         // order every use, and only copies reach across devices.
         visit(op, &mut |id, written| {
-            let Some(group) = group_of.get(&id).and_then(|pointer| groups.get_mut(pointer)) else {
-                return;
-            };
-            group.references.insert(index);
-            if written {
-                group.first_write = Some(group.first_write.map_or(index, |first| first.min(index)));
+            for pointer in group_of.get(&id).into_iter().flatten() {
+                let Some(group) = groups.get_mut(pointer) else {
+                    continue;
+                };
+                group.references.insert(index);
+                if written {
+                    group.first_write =
+                        Some(group.first_write.map_or(index, |first| first.min(index)));
+                }
             }
         });
+    }
+    for (pointer, start) in replay_writes {
+        if let Some(group) = groups.get_mut(&pointer) {
+            group.references.insert(start);
+            group.first_write = Some(group.first_write.map_or(start, |first| first.min(start)));
+        }
     }
     // A placed import is written by the host from its load site on: every
     // owner of its destination (a wave's read-ahead twin too) spans from
@@ -544,8 +599,10 @@ pub(crate) fn plan_graph_scratch(
         }
         persistent.insert(pointer, bound);
     }
+
     persistent.extend(pack_arena(backend, arena)?);
     let sizes = plan.place(starts, frame.program.operations.len());
+    tracing::debug!(?sizes, "GPU plan scratch pools");
     plan.pools = allocate_buffers(backend, &sizes)?;
     rebind(&mut frame.owners, &persistent)?;
     for wave in &mut frame.waves {
@@ -576,6 +633,7 @@ fn pack_arena(
         .zip(offsets)
         .map(|(&(pointer, device, _, _, bytes), offset)| (pointer, device, offset, bytes))
         .collect::<Vec<_>>();
+    tracing::debug!(?sizes, "GPU plan scratch arena");
     let buffers = allocate_buffers(backend, &sizes)?;
     placed
         .into_iter()

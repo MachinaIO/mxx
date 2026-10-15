@@ -437,6 +437,7 @@ pub(crate) enum GpuNativePrimitive {
     GadgetDecomposeCoeff,
     GadgetDecomposeCompact,
     MatrixAdd,
+    MatrixColumnAdd,
     MatrixSub,
     MatrixMul,
     MatrixMulAccumulate,
@@ -549,6 +550,17 @@ impl GpuImplementation {
         }
     }
 
+    pub(crate) fn matrix_column_add() -> Self {
+        use GpuArgumentKind::{U32, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixColumnAdd,
+            argument_kinds: Box::new([
+                Value, U32, Value, U32, Value, U32, Value, U32, U32, U32, U32, U32,
+            ]),
+            output_count: 1,
+        }
+    }
+
     pub(crate) fn matrix_add_sub(subtract: bool) -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
@@ -606,10 +618,10 @@ impl GpuImplementation {
     }
 
     pub(crate) fn modulus_switch() -> Self {
-        use GpuArgumentKind::{U32, Value};
+        use GpuArgumentKind::{U32, U64List, Value};
         Self {
             primitive: GpuNativePrimitive::ModulusSwitch,
-            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32, U32]),
+            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32, U32, U64List]),
             output_count: 1,
         }
     }

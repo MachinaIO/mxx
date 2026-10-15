@@ -962,6 +962,7 @@ pub(crate) fn prepare_compiled_gpu_program(
                 KernelArg::U32(round_scale),
                 KernelArg::U32(source_binding),
                 KernelArg::U32(destination_binding),
+                KernelArg::U64List(_),
             ] = operation.arguments.as_ref()
             else {
                 return Err(invalid("compiled modulus switch has the wrong arguments"));
@@ -1046,12 +1047,17 @@ pub(crate) fn prepare_compiled_gpu_program(
             compiled_raw_matrix_part(source, *source_part, PhysicalEncoding::FullCoeff)?;
         let (_, destination_view, destination_bindings) =
             compiled_raw_matrix_part(destination, *destination_part, PhysicalEncoding::FullCoeff)?;
+        let residues = match operation.arguments.last() {
+            Some(KernelArg::U64List(residues)) if round_scale.is_some() => residues.as_ref(),
+            _ => &[],
+        };
         if source_view.physical_device != operation.device ||
             destination_view.physical_device != operation.device ||
             source_view.row_origin != destination_view.row_origin ||
             source_view.column_origin != destination_view.column_origin ||
             source_view.rows != destination_view.rows ||
-            source_view.columns != destination_view.columns ||
+            source_view.columns * (residues.len() / source_view.limbs.len()).max(1) as u64 !=
+                destination_view.columns ||
             source_bindings.len() != source_view.limbs.len() ||
             destination_bindings.len() != destination_view.limbs.len() ||
             source_binding.checked_add(source_view.limbs.len() as u32).is_none() ||
@@ -1070,6 +1076,7 @@ pub(crate) fn prepare_compiled_gpu_program(
                 source_ty.ring.crt_moduli(),
                 destination_ty.ring.crt_moduli(),
                 round_scale,
+                residues,
             )?,
             (None, Some(divisor_words)) => {
                 if source_ty.ring != destination_ty.ring {
@@ -2622,6 +2629,57 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(scalar_owner));
             builder.retain_owner(Arc::clone(status_owner));
         }
+        GpuNativePrimitive::MatrixColumnAdd => {
+            let [
+                KernelArg::Value(sum_id),
+                KernelArg::U32(sum_part),
+                KernelArg::Value(term_id),
+                KernelArg::U32(term_part),
+                KernelArg::Value(output_id),
+                KernelArg::U32(output_part),
+                KernelArg::Value(index_id),
+                KernelArg::U32(index_part),
+                KernelArg::U32(sum_binding),
+                KernelArg::U32(term_binding),
+                KernelArg::U32(output_binding),
+                KernelArg::U32(index_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled column add has wrong arguments"));
+            };
+            let sum_owner = &owners[sum_id];
+            let term_owner = &owners[term_id];
+            let output_owner = &owners[output_id];
+            let index_owner = &owners[index_id];
+            let (ty, sum, sum_bindings) =
+                compiled_raw_matrix_part(sum_owner, *sum_part, PhysicalEncoding::FullEval)?;
+            let (_, term, term_bindings) =
+                compiled_raw_matrix_part(term_owner, *term_part, PhysicalEncoding::FullEval)?;
+            let (_, output, output_bindings) =
+                compiled_raw_matrix_part(output_owner, *output_part, PhysicalEncoding::FullEval)?;
+            let (index, bytes) =
+                compiled_raw_integer_part(index_owner, *index_part, *index_binding, op.device)?;
+            bind_raw_matrix_part(builder, *sum_binding, &sum_bindings)?;
+            bind_raw_matrix_part(builder, *term_binding, &term_bindings)?;
+            bind_raw_matrix_part(builder, *output_binding, &output_bindings)?;
+            builder.bind_resident_address(index.address, bytes, *index_binding)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, &ty)
+                .map_err(GpuNativeGraphError::Native)?;
+            parameters.emit_raw_matrix_column_add(
+                builder.launch_stream(),
+                &sum,
+                &term,
+                &output,
+                index,
+                *sum_binding,
+                *term_binding,
+                *output_binding,
+            )?;
+            for owner in [sum_owner, term_owner, output_owner, index_owner] {
+                builder.retain_owner(Arc::clone(owner));
+            }
+        }
         GpuNativePrimitive::MatrixIndexedCopy => {
             let [
                 KernelArg::U32(resource_id),
@@ -4138,6 +4196,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(round_scale),
                 KernelArg::U32(source_binding),
                 KernelArg::U32(destination_binding),
+                KernelArg::U64List(residues),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled modulus switch has the wrong arguments"));
@@ -4164,7 +4223,8 @@ pub(crate) fn emit_compiled_gpu_op(
                 source.row_origin != destination.row_origin ||
                 source.column_origin != destination.column_origin ||
                 source.rows != destination.rows ||
-                source.columns != destination.columns
+                source.columns * (residues.len() / source.limbs.len()).max(1) as u64 !=
+                    destination.columns
             {
                 return Err(invalid("compiled modulus switch layouts disagree"));
             }

@@ -3,7 +3,8 @@
 //! This module intentionally contains only the contracts shared by the stage
 //! owners. Public-key preparation, encoding/encryption, and noise evaluation
 //! live in their respective modules; this file does not provide a scheme
-//! facade or an artifact/material wrapper hierarchy.
+//! facade or an artifact/material wrapper hierarchy. Member-group companion loops share each
+//! expansion across the parent digit sets of all branches using that member.
 
 mod dynamic;
 mod encoding;
@@ -2116,12 +2117,60 @@ pub(crate) fn push_digest(tag: &mut mxx_dsl::HashTag, digest: &[u8]) {
         .expect("a constant is a compile-time integer");
 }
 
-/// Artifact role of a Dynamic root site's public action in the
-/// preprocessing production: `part` is `key` (the site's output key, ports
-/// `.0` to `.3`) or `branches` (a LUT's product keys `T_k`, every switched
-/// branch side by side, ports `.0` and `.1`).
+/// Artifact role of a Dynamic root site's public action in preprocessing: `key` names
+/// the output key (ports `.0` to `.3`); `branches` prefixes product-key row families
+/// indexed by internal depth or leaf member group and slot (see [`branch_keys_role`]).
 pub(crate) fn public_action_role(wire: WireId, part: &str) -> String {
     format!("public-action/{wire:?}/{part}")
+}
+
+/// The branch layout of a published product-key family. Internal lanes are branches at
+/// one depth; leaf lanes are switch members, with a separate family for each branch slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BranchGroup {
+    Internal { depth: usize },
+    Leaf { group: usize, slot: usize },
+}
+
+/// Two row families of product keys `T_b`, each lane holding two `1 x m` rows
+/// (`m = 2 * component_columns`). Leaf families are direct fields of the member-group
+/// loop, so publishing a lane does not retain the other members' rows.
+#[derive(Clone)]
+pub(crate) struct BranchKeys {
+    pub(crate) group: BranchGroup,
+    pub(crate) rows: [mxx_dsl::Family<Mat>; 2],
+}
+
+/// Artifact role of product-key row `port`: `branches.d{depth}.internal.{port}` or
+/// `branches.leaf.g{group}.s{slot}.{port}`, under the root site's public-action prefix.
+pub(crate) fn branch_keys_role(wire: WireId, group: BranchGroup, port: usize) -> String {
+    let suffix = match group {
+        BranchGroup::Internal { depth } => format!("d{depth}.internal"),
+        BranchGroup::Leaf { group, slot } => format!("leaf.g{group}.s{slot}"),
+    };
+    format!("{}.{suffix}.{port}", public_action_role(wire, "branches"))
+}
+
+/// The sum of the `count` members of `family`, in the shape a GPU plan fuses into its producing
+/// root parallel loop (members 0 and 1 added, then a loop adding member `index + 2`), so that no
+/// member stays resident.
+pub(crate) fn member_sum<T: mxx_dsl::GraphValue + Clone + 'static>(
+    family: &mxx_dsl::Family<T>,
+    count: usize,
+    add: impl Fn(T, T) -> T + Clone + 'static,
+) -> Result<T, RnsBggError> {
+    if count == 0 {
+        return Err(RnsBggError::Binding("a member sum needs a member"));
+    }
+    let first = family.at(mxx_dsl::Int::constant(0));
+    if count == 1 {
+        return Ok(first);
+    }
+    let first = add(first, family.at(mxx_dsl::Int::constant(1)));
+    let rest = family.clone();
+    Ok(mxx_dsl::iterate(count - 2, first, move |index, state| {
+        Ok(add(state, rest.at(index.add(2))))
+    })?)
 }
 
 /// The public key `B_{a,j}` of digit row `a` of output column `j` of the
@@ -2357,6 +2406,115 @@ pub(crate) fn companion_columns(
             .zip(blocks)
             .map(|(row, block)| row + place.clone().tensor(block))
             .collect())
+    })?)
+}
+
+/// Companion blocks for branches sharing one member. Each companion is expanded once per
+/// `(a, j)` and contracted with every branch's digits. Results are branch-major, with two key
+/// rows and/or one encoding row per branch. Companion read-ahead is shared by the whole group.
+pub(crate) fn companion_block(
+    parameters: &RnsBggParameters,
+    level: usize,
+    output_columns: usize,
+    branches: usize,
+    key_entry: &dyn Fn(usize, usize, IntExpr) -> Result<Mat, RnsBggError>,
+    companion_key: Option<&dyn Fn(IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>>,
+    companion: Option<&dyn Fn(IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
+    public_rows: Option<(usize, &dyn Fn() -> Result<Mat, RnsBggError>)>,
+) -> Result<Vec<Mat>, RnsBggError> {
+    if companion_key.is_none() && companion.is_none() {
+        return Err(RnsBggError::Binding("a companion loop accumulates no row"));
+    }
+    let ring = parameters.ring(level)?;
+    let current = parameters.level(level)?;
+    let base = public_gadget_base(current.base_bits())?;
+    let digits = current.modulus_digits();
+    let first_row = public_rows.as_ref().map_or(0, |(rows, _)| *rows);
+    if first_row > digits {
+        return Err(RnsBggError::Binding("public digit rows exceed one entry's digits"));
+    }
+    let digit_rows = 2 * parameters.component_columns(level)? - first_row;
+    let block = 2 * output_columns;
+    let schema = |_| mxx_dsl::DslError::Schema;
+    let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
+    let mut rows = vec![ring.zero((1, block)); sums * branches];
+    // The public rows' keys `A_{:,a} Dec(top)_{a,:}`: the top row is decomposed once and each
+    // of its digit rows scales one key entry.
+    if let (Some((count, top)), true) = (&public_rows, companion_key.is_some()) {
+        let decomposition = top()?.decompose(base, digits).centered_rebase(&ring);
+        let keys = mxx_dsl::iterate(
+            *count,
+            vec![ring.zero((1, block)); 2 * branches],
+            |a, keys: Vec<Mat>| {
+                let a = a.expression()?;
+                let digit = unit_row(&ring, digits, a.clone()).mul_small_rhs(decomposition.clone());
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(r, key)| {
+                        Ok(key +
+                            key_entry(r / 2, r % 2, a.clone()).map_err(schema)? * digit.clone())
+                    })
+                    .collect()
+            },
+        )?;
+        for (branch, key) in keys.chunks(2).enumerate() {
+            rows[branch * sums..branch * sums + 2].clone_from_slice(key);
+        }
+    }
+    Ok(mxx_dsl::iterate(digit_rows, rows, |row, rows: Vec<Mat>| {
+        let a = (row.expression()? + IntExpr::constant(first_row)).canonicalize();
+        let digits = (0..branches)
+            .map(|branch| {
+                let u0 = key_entry(branch, 0, a.clone())?.decompose(base, digits);
+                let u1 = key_entry(branch, 1, a.clone())?.decompose(base, digits);
+                Ok((u0, u1))
+            })
+            .collect::<Result<Vec<_>, RnsBggError>>()
+            .map_err(schema)?;
+        let read = |j: IntExpr| companion.map(|companion| companion(a.clone(), j)).transpose();
+        // The inner loop accumulates into the outer rows directly (no per-row scratch sums).
+        // Each inner iteration reads the next companion (the first again after the last) and
+        // carries it, so that load overlaps this iteration's work.
+        let mut initial = rows;
+        if let Some((left, right)) = read(IntExpr::constant(0)).map_err(schema)? {
+            initial.extend([left, right]);
+        }
+        let mut rows = mxx_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
+            let j = j.expression()?;
+            let next = IntExpr::Rem(
+                Box::new(j.clone() + IntExpr::constant(1)),
+                Box::new(IntExpr::constant(block)),
+            )
+            .canonicalize();
+            let key =
+                companion_key.map(|key| key(a.clone(), j.clone())).transpose().map_err(schema)?;
+            let current = if let Some((left, right)) = read(next).map_err(schema)? {
+                let current = carried.split_off(sums * branches);
+                carried.extend([left, right]);
+                Some((current[0].clone(), current[1].clone()))
+            } else {
+                None
+            };
+            let mut terms = Vec::with_capacity(sums * branches);
+            for (u0, u1) in &digits {
+                let act = |(left, right): &RnsBggRow| {
+                    left.clone().mul_small_rhs(u0.clone()) + right.clone().mul_small_rhs(u1.clone())
+                };
+                if let Some((top, bottom)) = &key {
+                    terms.extend([act(top), act(bottom)]);
+                }
+                if let Some(current) = &current {
+                    terms.push(act(current));
+                }
+            }
+            let unit = unit_row(&ring, block, j);
+            for (row, term) in carried.iter_mut().zip(terms) {
+                *row = row.clone() + term * unit.clone();
+            }
+            Ok(carried)
+        })?;
+        rows.truncate(sums * branches);
+        Ok(rows)
     })?)
 }
 

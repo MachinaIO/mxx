@@ -23,6 +23,8 @@
 //!   transcript. Monomial products multiply each evaluation slot by the matching twiddle, with no
 //!   NTT of their own. Integer matrix-vector products use one warp per row (`M v`) or chunked
 //!   atomics per column (`v^T M`) and accumulate exactly in `int64`.
+//! - **Invariant digits.** A decomposition used only as small right operands inside loops expands
+//!   and transforms once before the loop; its consumers use ordinary products.
 //! - **Lanes on several devices.** The lanes of an outermost wave loop are spread over the devices:
 //!   lane `l` runs on device `l mod G`. Shared inputs are copied once per loop to each remote
 //!   device, zipped members are copied into the lane inside the template, and a remote lane's
@@ -43,14 +45,14 @@ use crate::{
         ImportDestination, ImportTemplate, IndexedMatrixTableReplay, PhysicalLoweringContext,
         all_predecessors, allocate_compact_value, allocate_deferred_compact_value,
         allocate_scratch_matrix, column_block_view, copy_compact_block_home, copy_matrix_view,
-        device_column_blocks, emit_matrix_operation, full_coeff_value, full_eval_value,
-        hash_tag_resource, lower_centered_rebase_node, lower_crt_recompose_node,
+        device_column_blocks, emit_expand_compact, emit_matrix_operation, full_coeff_value,
+        full_eval_value, hash_tag_resource, lower_centered_rebase_node, lower_crt_recompose_node,
         lower_gadget_trapdoor_node, lower_hash_sample_node, lower_matrix_node,
         lower_preimage_sample_node, lower_rns_conversion_node, lower_sample_matrix_node,
         lower_static_matrix_node, lower_trapdoor_sample_node, matrix_columns_on_device,
-        pack_trapdoor_leaves, physical_matrix, predecessors_for, push_hash_sample,
-        record_node_operations, register_bindings, register_preimage_control_binding,
-        replicate_to_device, root_matrix_operation_identity, trapdoor_leaf_types, value_id,
+        pack_trapdoor_leaves, predecessors_for, push_hash_sample, record_node_operations,
+        register_bindings, register_preimage_control_binding, replicate_to_device,
+        root_matrix_operation_identity, trapdoor_leaf_types, value_id,
     },
     gpu_subgraph_kernel::GpuKernelOperandKind,
     poly::{
@@ -86,7 +88,9 @@ use std::{
 /// Typed owners for native control and integer status nodes. The frame retains
 /// these across sequential executions; erased physical bindings are never
 /// downcast. Direct integer operations share one first-wins status word per
-/// frame, so concurrent branches can only publish the first error.
+/// frame, so concurrent branches can only publish the first error. Static loop
+/// limits remain host-owned at every nesting depth for planner probes; a
+/// nested body resets only its index before each invocation.
 pub(super) enum ControlReset {
     Loop {
         index: Arc<GpuSignedValues>,
@@ -2482,6 +2486,8 @@ fn lower_lazy_int_expr_select(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                static_constants: &mut *ctx.static_constants,
+                identity_small_rhs: ctx.identity_small_rhs,
                 subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
@@ -2551,6 +2557,8 @@ fn lower_lazy_int_expr_select(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                static_constants: &mut *ctx.static_constants,
+                identity_small_rhs: ctx.identity_small_rhs,
                 subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
@@ -3815,9 +3823,27 @@ fn lower_matrix_mul_small_rhs(
     let [left_wire, right_wire] = arguments.as_slice() else {
         return Err("GPU small-RHS multiply needs two inputs".into());
     };
+    let output_wire = WireRef { node: node_id, port: Port(0) };
+    if ctx.identity_small_rhs.expands(scope_id, output_wire) {
+        let right = ctx.wire_ids[right_wire];
+        let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+        let output =
+            allocate_scratch_matrix(ctx, ty.matrix_type().unwrap(), PhysicalEncoding::FullCoeff)?;
+        emit_expand_compact(ctx, right, output)?;
+        ctx.wire_ids.insert(output_wire, output);
+        return Ok(());
+    }
     let left = *ctx.wire_ids.get(left_wire).ok_or("GPU small-RHS left input is missing")?;
     let left = full_eval_value(ctx, left)?;
     let right = *ctx.wire_ids.get(right_wire).ok_or("GPU small-RHS right input is missing")?;
+    if ctx.values[right.0 as usize].encodings.as_ref() == [PhysicalEncoding::FullEval] {
+        let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+        let output =
+            allocate_scratch_matrix(ctx, ty.matrix_type().unwrap(), PhysicalEncoding::FullEval)?;
+        emit_matrix_operation(ctx, GpuImplementation::matrix_mul(false), &[left, right], output)?;
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+        return Ok(());
+    }
     let left_value = &ctx.values[left.0 as usize];
     let right_value = &ctx.values[right.0 as usize];
     let ConcreteWireType::Matrix(left_ty) = &left_value.ty else {
@@ -4318,7 +4344,21 @@ fn lower_gadget_decompose(
         }
     }
     ctx.producer.insert(output, producers);
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    let wire = WireRef { node: node_id, port: Port(0) };
+    let output = if crate::gpu_cost_model::hoist_small_rhs(
+        &ctx.validated.source,
+        scope_id,
+        wire,
+        ctx.identity_small_rhs,
+    ) {
+        let coefficient =
+            allocate_scratch_matrix(ctx, &output_matrix, PhysicalEncoding::FullCoeff)?;
+        emit_expand_compact(ctx, output, coefficient)?;
+        full_eval_value(ctx, coefficient)?
+    } else {
+        output
+    };
+    ctx.wire_ids.insert(wire, output);
     Ok(())
 }
 
@@ -5451,6 +5491,65 @@ fn lower_centered_round_divide(
     Ok(())
 }
 
+/// Add one polynomial to a device-selected column. Carry placement can alias
+/// the output with `sum`; the native kernel then touches only that column.
+pub(super) fn lower_unit_row_add(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    wire: WireRef,
+    sum_wire: WireRef,
+    term_wire: WireRef,
+    column: &IntExpr,
+    env: &ParamEnv,
+) -> Result<(), String> {
+    let sum = full_eval_value(ctx, ctx.wire_ids[&sum_wire])?;
+    let term = full_eval_value(ctx, ctx.wire_ids[&term_wire])?;
+    let column = lower_device_int_expr(ctx, column, env)?;
+    let ty = ctx.values[sum.0 as usize].ty.matrix_type().unwrap().clone();
+    let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
+    let sum_binding = register_bindings(ctx.bindings, ctx.values, sum)?;
+    let term_binding = register_bindings(ctx.bindings, ctx.values, term)?;
+    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    let column_binding = scalar_binding(ctx, column)?;
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::matrix_column_add())
+        .map_err(str::to_owned)?;
+    let operation = ctx.operations.len() as u32;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::Value(sum),
+            KernelArg::U32(0),
+            KernelArg::Value(term),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::Value(column),
+            KernelArg::U32(0),
+            KernelArg::U32(sum_binding),
+            KernelArg::U32(term_binding),
+            KernelArg::U32(output_binding),
+            KernelArg::U32(column_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors: [sum, term, column]
+            .into_iter()
+            .flat_map(|id| all_predecessors(ctx.producer, id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        body: None,
+    });
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
+    ctx.wire_ids.insert(wire, output);
+    Ok(())
+}
+
 /// Copy a validated static matrix window through owner-derived physical views.
 fn lower_matrix_slice(
     ctx: &mut PhysicalLoweringContext<'_>,
@@ -5462,6 +5561,13 @@ fn lower_matrix_slice(
     rows: Option<&mxx_ir_core::node::IndexRange>,
     columns: Option<&mxx_ir_core::node::IndexRange>,
 ) -> Result<(), String> {
+    if crate::gpu_cost_model::unit_row_intermediate(
+        scope,
+        WireRef { node: node_id, port: Port(0) },
+        env,
+    ) {
+        return Ok(());
+    }
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU matrix slice argument is outside its scope".to_owned())?;
@@ -5887,6 +5993,9 @@ fn lower_modulus_conversion(
     env: &ParamEnv,
     round_scale: bool,
 ) -> Result<(), String> {
+    if ctx.wire_ids.contains_key(&WireRef { node: node_id, port: Port(0) }) {
+        return Ok(());
+    }
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU modulus reduction argument is outside its scope".to_owned())?;
@@ -5946,6 +6055,7 @@ fn lower_modulus_conversion(
             KernelArg::U32(u32::from(round_scale)),
             KernelArg::U32(source_binding),
             KernelArg::U32(destination_binding),
+            KernelArg::U64List(Box::new([])),
         ]),
         outputs: Box::new([destination_coeff]),
         device: ctx.device,
@@ -6480,7 +6590,8 @@ fn write_carry_in_place(
         !matches!(
             ctx.implementations.resolve(writer_op.implementation).map(|kind| &kind.primitive),
             Ok(crate::gpu_execution_plan::GpuNativePrimitive::MatrixAdd |
-                crate::gpu_execution_plan::GpuNativePrimitive::MatrixSub)
+                crate::gpu_execution_plan::GpuNativePrimitive::MatrixSub |
+                crate::gpu_execution_plan::GpuNativePrimitive::MatrixColumnAdd)
         )
     {
         return Ok(false);
@@ -6555,17 +6666,14 @@ fn allocate_sequential_carry(
         if planned.encodings.as_ref() != [PhysicalEncoding::FullEval] {
             return Err("GPU matrix carry needs full-Eval encoding".into());
         }
-        let slot = StorageRef::Scratch(
-            u32::try_from(ctx.values.len())
-                .map_err(|_| "too many GPU carry storages".to_owned())?,
+        // Deferred scratch: the Graph compile packs it with other values
+        // whose lifetimes do not overlap, so the carries of separate loops
+        // share memory instead of each holding a native allocation.
+        return crate::gpu_physical_lowering::allocate_scratch_matrix(
+            ctx,
+            ty,
+            PhysicalEncoding::FullEval,
         );
-        let native =
-            ctx.backend.allocate_physical_matrix(ty, ctx.device, PhysicalEncoding::FullEval)?;
-        let (physical, owner) = physical_matrix(ty, PhysicalEncoding::FullEval, slot, native)?;
-        let id = value_id(ctx.values.len())?;
-        ctx.values.push(physical);
-        ctx.owners.insert(id, owner);
-        return Ok(id);
     }
     if matches!(
         planned.ty,
@@ -7002,6 +7110,8 @@ fn lower_sequential_loop(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                static_constants: &mut *ctx.static_constants,
+                identity_small_rhs: ctx.identity_small_rhs,
                 subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
@@ -7050,8 +7160,10 @@ fn lower_sequential_loop(
             } else {
                 for (position, output) in outputs.iter().copied().enumerate() {
                     // An external-I/O body keeps its carried-state copy tail,
-                    // which the host relaunches around each selected import.
+                    // which the host relaunches around each selected import,
+                    // including a body that holds a host-driven loop.
                     if body_ctx.external_io_imports.is_empty() &&
+                        body_ctx.external_io_loops.len() == mark.10 &&
                         body_ctx
                             .ahead_imports
                             .as_ref()
@@ -7114,6 +7226,7 @@ fn lower_sequential_loop(
         ctx.export_templates.truncate(mark.13);
         ctx.hash_resources.retain(|id, _| resource_keys.contains(id));
         ctx.integer_status.retain(|_, id| (id.0 as usize) < first_new);
+        ctx.static_constants.retain(|_, id| (id.0 as usize) < first_new);
         carry_ranges = widened;
         widenings += 1;
     };
@@ -7318,28 +7431,16 @@ fn replay_matrix_owner(
     if planned.parts.iter().any(|part| part.storage != slot) {
         return Err("GPU loop member has multiple storage owners".into());
     }
-    // The owner takes the frozen member's layout at an allocation of its own,
-    // bound by address: a raw buffer of the member's storage size.
+    // The owner takes the frozen member's layout at an arena range of its own,
+    // chosen with the plan's scratch for the member's live span.
     let bytes = ctx
         .owners
         .get(&id)
         .and_then(|owner| owner.storage(slot))
         .map(|storage| storage.bytes)
         .ok_or_else(|| "GPU loop member has no planned storage".to_owned())?;
-    let stream = ctx
-        .backend
-        .parameters_on_device(ctx.device)?
-        .native_launch_stream(ctx.device)
-        .map_err(|error| error.to_string())?;
-    let buffer = Arc::new(
-        crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(
-            &stream,
-            usize::try_from(bytes).map_err(|_| "GPU loop member size exceeds usize")?,
-        )
-        .map_err(|error| error.to_string())?,
-    );
     let storage =
-        BoundStorage { device: ctx.device, address: buffer.as_ptr() as u64, bytes, owner: buffer };
+        crate::gpu_graph_memory::deferred_replay_storage(ctx.device, planned.ty.clone(), bytes);
     GpuResidentValue::new(
         Arc::new(planned.clone()),
         BTreeMap::from([(slot, storage)]),
@@ -7588,6 +7689,9 @@ fn lower_vectorized_parallel_loop(
     }
     Ok(())
 }
+
+/// A constant identity whose readers expand compact operands without reading it.
+pub(super) const UNMATERIALIZED_IDENTITY: PhysicalValueId = PhysicalValueId(u32::MAX - 1);
 
 /// The argument position of a root artifact family that a parallel loop
 /// broadcasts without loading it: the body's family reads import the members
@@ -7982,6 +8086,9 @@ fn lower_parallel_loop(
         for (argument, (source, mode)) in source_ids.iter().zip(&loop_node.input_modes).enumerate()
         {
             if let (LoopInputMode::Broadcast, Some(source)) = (mode, source) {
+                if *source == UNMATERIALIZED_IDENTITY {
+                    continue;
+                }
                 let replica =
                     crate::gpu_physical_lowering::replicate_to_device(ctx, *source, device)?;
                 broadcast_replicas.insert((argument, device), replica);
@@ -8378,7 +8485,7 @@ fn lower_parallel_loop(
                 ctx.wire_ids.insert(left, total);
                 ctx.wire_ids.insert(right, ids[port]);
                 crate::gpu_physical_lowering::lower_matrix_node(
-                    ctx, root, add, add_node, wire_types, &choice,
+                    ctx, root, add, add_node, wire_types, &choice, env,
                 )?;
                 total = *ctx
                     .wire_ids
@@ -8839,6 +8946,10 @@ fn lower_inlined_child(
     }
     let body = (|| {
         for (position, (argument, input)) in arguments.iter().zip(child.inputs()).enumerate() {
+            if ctx.identity_small_rhs.omits(child_scope_id, *input) {
+                ctx.wire_ids.insert(*input, UNMATERIALIZED_IDENTITY);
+                continue;
+            }
             if let Some(NodeKind::Input { artifact: Some(artifact), .. }) =
                 child.node(input.node).map(NodeHandle::kind)
             {
@@ -8927,8 +9038,14 @@ fn lower_inlined_child(
             let device_index = types[input] == ConcreteWireType::ConstantInt &&
                 lane_type(ctx, id) == &ConcreteWireType::Int &&
                 ctx.device_loop_indices.values().any(|active| *active == id);
+            // An exclusively small-RHS loop capture may have been expanded
+            // before the loop while its IR type still carries the digit bound.
+            let expanded_digits = matches!(types[input], ConcreteWireType::Preimage { .. }) &&
+                ctx.values[id.0 as usize].encodings.as_ref() == [PhysicalEncoding::FullEval] &&
+                ctx.values[id.0 as usize].ty.matrix_type() == types[input].matrix_type();
             if ctx.values[id.0 as usize].ty != types[input] &&
                 lane_type(ctx, id) != &types[input] &&
+                !expanded_digits &&
                 !device_index
             {
                 return Err("GPU subgraph input has the wrong concrete type".into());
@@ -9001,7 +9118,15 @@ fn lower_inlined_child(
                 if choice.operation_identity != identity {
                     return Err("GPU child matrix operation differs from its frozen choice".into());
                 }
-                lower_matrix_node(ctx, child, child_node_id, child_node, &types, choice)?;
+                lower_matrix_node(
+                    ctx,
+                    child,
+                    child_node_id,
+                    child_node,
+                    &types,
+                    choice,
+                    child_env,
+                )?;
             } else if matches!(child_node.kind(), NodeKind::ConstantMatrix { .. }) {
                 lower_static_matrix_node(ctx, child, child_node_id, child_node, child_env, &types)?;
             } else if matches!(
@@ -9213,6 +9338,7 @@ mod tests {
             GpuLoopChoice, GpuLoopSiteKey, GpuPlanContract, PhysicalEncoding, PhysicalPart,
             PhysicalView, StorageRef,
         },
+        gpu_physical_lowering::physical_matrix,
         gpu_runtime::GpuRuntime,
         matrix::{
             PolyMatrix as PrimitivePolyMatrix, dcrt_poly::DCRTPolyMatrix,

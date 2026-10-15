@@ -623,6 +623,7 @@ unsafe extern "C" {
         out_driver_version: *mut c_int,
         out_runtime_version: *mut c_int,
         out_context_generation: *mut u64,
+        out_resident_threads: *mut usize,
     ) -> c_int;
     fn gpu_context_fence_releases(ctx: *const GpuContextOpaque) -> c_int;
 
@@ -727,6 +728,19 @@ unsafe extern "C" {
         coefficient_bits_binding: u32,
         destination_binding_base: u32,
         status_binding: u32,
+    ) -> c_int;
+    fn gpu_raw_matrix_column_add(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        sum: *const GpuRawMatrixViewAbi,
+        term: *const GpuRawMatrixViewAbi,
+        output: *const GpuRawMatrixViewAbi,
+        index: *const c_void,
+        encoding: c_int,
+        sum_binding: u32,
+        term_binding: u32,
+        output_binding: u32,
+        index_binding: u32,
     ) -> c_int;
     fn gpu_raw_matrix_dynamic_slice(
         ctx: *mut GpuContextOpaque,
@@ -1355,6 +1369,8 @@ unsafe extern "C" {
         target_moduli: *const u64,
         target_count: usize,
         round_scale: c_int,
+        gadget_residues: *const u64,
+        gadget_digits: usize,
         out_plan: *mut *mut GpuModulusConversionPlanOpaque,
     ) -> c_int;
     fn gpu_raw_centered_rebase_prepare(
@@ -1778,6 +1794,9 @@ pub struct GpuDeviceIdentity {
     pub compute_major: i32,
     pub compute_minor: i32,
     pub total_global_memory: usize,
+    /// Threads the device keeps resident at once: its multiprocessors times the resident threads
+    /// of each.
+    pub resident_threads: usize,
 }
 
 /// Returns stable hardware properties used to scope reusable calibration data.
@@ -1791,6 +1810,7 @@ pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
     let mut driver_version = 0;
     let mut runtime_version = 0;
     let mut context_generation = 0;
+    let mut resident_threads = 0;
     let status = unsafe {
         gpu_device_get_identity(
             device,
@@ -1804,13 +1824,20 @@ pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
             &mut driver_version,
             &mut runtime_version,
             &mut context_generation,
+            &mut resident_threads,
         )
     };
     if status != 0 {
         return Err(last_error_string());
     }
     let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
-    Ok(GpuDeviceIdentity { name, compute_major, compute_minor, total_global_memory })
+    Ok(GpuDeviceIdentity {
+        name,
+        compute_major,
+        compute_minor,
+        total_global_memory,
+        resident_threads,
+    })
 }
 
 /// Returns the CUDA allocator-visible memory counters for one detected device.
@@ -4159,6 +4186,40 @@ impl GpuDCRTPolyParams {
         Ok(())
     }
 
+    /// Add a polynomial to one selected column, preserving every other column.
+    /// Output may alias the sum when lowering has proved carry ownership.
+    pub fn emit_raw_matrix_column_add(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        sum: &GpuRawMatrixView,
+        term: &GpuRawMatrixView,
+        output: &GpuRawMatrixView,
+        index: GpuRawIntegerView,
+        sum_binding: u32,
+        term_binding: u32,
+        output_binding: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if unsafe {
+            gpu_raw_matrix_column_add(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &sum.abi(),
+                &term.abi(),
+                &output.abi(),
+                index.address as *const c_void,
+                index.encoding.native_code(),
+                sum_binding,
+                term_binding,
+                output_binding,
+                index.binding,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
     /// Copy an execution-selected matrix window. Both physical views cover
     /// complete matrices; four resident bounds must match the planned output.
     pub fn emit_raw_matrix_dynamic_slice(
@@ -4865,6 +4926,7 @@ impl GpuDCRTPolyParams {
         source_moduli: &[u64],
         target_moduli: &[u64],
         round_scale: bool,
+        gadget_residues: &[u64],
     ) -> Result<GpuModulusConversionPlan, GpuNativeGraphError> {
         if source_moduli.is_empty() ||
             target_moduli.is_empty() ||
@@ -4885,6 +4947,8 @@ impl GpuDCRTPolyParams {
                 target_moduli.as_ptr(),
                 target_moduli.len(),
                 c_int::from(round_scale),
+                gadget_residues.as_ptr(),
+                gadget_residues.len() / source_moduli.len(),
                 &mut raw,
             )
         } != 0 ||

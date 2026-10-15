@@ -6,6 +6,8 @@
 //!
 //! Lowering turns the validated graph into a `PhysicalFrame`: a compiled program plus the resident
 //! owners, export slots, import templates, control resets, and wave descriptors needed to run it.
+//! Retry controls retain their limit owners so compute trials can run one attempt and restore
+//! the production bound afterwards.
 //!
 //! - **Physical values.** A `PhysicalValue` describes a value as one or more parts, each a view
 //!   (origin, extent, stride) into an input, output, or scratch allocation on one logical device.
@@ -29,6 +31,10 @@
 //!   over its source, with no copy. A concatenation piece written only by elementwise or product
 //!   operations is written straight into its window; the other pieces are copied in by one
 //!   operation. A root output that is a whole scratch matrix is returned in place.
+//! - **Identity expansion.** An identity small-RHS product expands compact coefficients directly;
+//!   identities used only by these products, including captures, have no physical storage.
+//! - **Unit-row updates.** A scalar product with a sliced constant unit row, read only by an
+//!   addition, adds directly to its selected column. Proven loop carries update in place.
 //! - **Preimage retries.** Each preimage column tile is a device loop that derives a per-attempt
 //!   seed, samples a candidate, and checks its cutoff, until acceptance or the frozen attempt bound
 //!   (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`); exhaustion is a device status error.
@@ -213,7 +219,9 @@ pub(crate) struct SampleSeed {
     pub site: [u8; 32],
 }
 
+/// Mutable retry state, including the limit capped to one by compute probes.
 pub(crate) struct PreimageReplay {
+    pub limit: Arc<GpuSignedValues>,
     pub attempt: Arc<GpuPreimageAttempt>,
     pub status: Arc<GpuPreimageStatus>,
     pub planned_max: u32,
@@ -1575,6 +1583,10 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// Errors are first-wins and each replay resets it once, instead of one
     /// host reset and readback per operation.
     pub integer_status: &'a mut BTreeMap<i32, PhysicalValueId>,
+    /// Shared decisions for compact expansion and omitted identity captures.
+    pub identity_small_rhs: &'a crate::gpu_cost_model::IdentitySmallRhs,
+    /// Uploaded constants and evaluation twins, shared per device, type, and payload.
+    pub static_constants: &'a mut BTreeMap<(i32, String, Vec<u8>), PhysicalValueId>,
     /// Kernels that execute registered subgraphs; a call names one by index.
     pub subgraph_kernels: &'a [GpuSubgraphKernel],
 }
@@ -2124,7 +2136,10 @@ pub(super) fn matrix_columns_on_device(
 
 /// The product `left * G` of a one-row `left` and a gadget `G = I_r (x) g`
 /// that is never stored: output column `i * d + t` is `left[i] * g_t`, all
-/// written by one gadget-scale operation.
+/// written by one gadget-scale operation, in the coefficient domain when
+/// [`crate::gpu_cost_model::gadget_product_in_coefficients`] holds and the left
+/// factor is there, and in the evaluation domain otherwise. A sole modulus-switch
+/// reader is fused, so the source-ring digit matrix is never allocated.
 fn lower_gadget_product(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
@@ -2172,11 +2187,25 @@ fn lower_gadget_product(
         .wire_ids
         .get(&left_wire)
         .ok_or_else(|| "GPU gadget product left factor has no physical value".to_owned())?;
-    let left = full_eval_value(ctx, left)?;
+    // The scale of every limb residue commutes with the NTT: a left factor in
+    // the coefficient domain whose product only modulus switches read stays
+    // there, with no transform on either side.
+    let coefficients = ctx.values[left.0 as usize].encodings.as_ref() ==
+        [PhysicalEncoding::FullCoeff] &&
+        crate::gpu_cost_model::gadget_product_in_coefficients(scope, wire);
+    let (left, encoding) = if coefficients {
+        (left, PhysicalEncoding::FullCoeff)
+    } else {
+        (full_eval_value(ctx, left)?, PhysicalEncoding::FullEval)
+    };
     if output_ty.rows != 1 || output_ty.columns != gadget_ty.columns {
         return Err("GPU gadget product shape differs from its factors".into());
     }
-    let output = allocate_scratch_matrix(ctx, &output_ty, PhysicalEncoding::FullEval)?;
+    let fused =
+        coefficients.then(|| crate::gpu_cost_model::fused_gadget_switch(scope, wire)).flatten();
+    let destination_ty =
+        fused.map_or(&output_ty, |switch| wire_types[&switch].matrix_type().unwrap());
+    let output = allocate_scratch_matrix(ctx, destination_ty, encoding)?;
     // Digit-major residues of the gadget row in the output's CRT basis.
     let mut residues = Vec::with_capacity(row.len() * output_ty.ring.crt_moduli().len());
     for coefficient in &row {
@@ -2192,7 +2221,11 @@ fn lower_gadget_product(
     }
     let implementation = ctx
         .implementations
-        .register(GpuImplementation::matrix_gadget_scale())
+        .register(if fused.is_some() {
+            GpuImplementation::modulus_switch()
+        } else {
+            GpuImplementation::matrix_gadget_scale()
+        })
         .map_err(str::to_owned)?;
     let source_binding = register_bindings(ctx.bindings, ctx.values, left)?;
     let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
@@ -2200,18 +2233,31 @@ fn lower_gadget_product(
         .map_err(|_| "too many GPU gadget product operations".to_owned())?;
     ctx.operations.push(CompiledGpuOp {
         implementation,
-        arguments: Box::new([
-            KernelArg::Value(left),
-            KernelArg::U32(0),
-            KernelArg::Value(output),
-            KernelArg::U32(0),
-            KernelArg::U64(
-                u64::try_from(digits).map_err(|_| "GPU gadget digit count exceeds u64")?,
-            ),
-            KernelArg::U64List(residues.into_boxed_slice()),
-            KernelArg::U32(source_binding),
-            KernelArg::U32(output_binding),
-        ]),
+        arguments: if fused.is_some() {
+            Box::new([
+                KernelArg::Value(left),
+                KernelArg::U32(0),
+                KernelArg::Value(output),
+                KernelArg::U32(0),
+                KernelArg::U32(1),
+                KernelArg::U32(source_binding),
+                KernelArg::U32(output_binding),
+                KernelArg::U64List(residues.into_boxed_slice()),
+            ])
+        } else {
+            Box::new([
+                KernelArg::Value(left),
+                KernelArg::U32(0),
+                KernelArg::Value(output),
+                KernelArg::U32(0),
+                KernelArg::U64(
+                    u64::try_from(digits).map_err(|_| "GPU gadget digit count exceeds u64")?,
+                ),
+                KernelArg::U64List(residues.into_boxed_slice()),
+                KernelArg::U32(source_binding),
+                KernelArg::U32(output_binding),
+            ])
+        },
         outputs: Box::new([output]),
         device: ctx.device,
         grid: [1; 3],
@@ -2222,7 +2268,7 @@ fn lower_gadget_product(
     });
     let writers = vec![(ColumnRange { start: 0, end: output_ty.columns }, operation)];
     ctx.producer.insert(output, writers);
-    ctx.wire_ids.insert(wire, output);
+    ctx.wire_ids.insert(fused.unwrap_or(wire), output);
     Ok(())
 }
 
@@ -2233,7 +2279,15 @@ pub(super) fn lower_matrix_node(
     node: &mxx_ir_core::graph::NodeHandle,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
     choice: &GpuNodeChoice,
+    env: &ParamEnv,
 ) -> Result<(), String> {
+    let wire = WireRef { node: node_id, port: Port(0) };
+    if crate::gpu_cost_model::unit_row_intermediate(scope, wire, env) {
+        return Ok(());
+    }
+    if let Some((sum, term, _, _, column)) = crate::gpu_cost_model::unit_row_add(scope, wire, env) {
+        return crate::gpu_physical_control::lower_unit_row_add(ctx, wire, sum, term, &column, env);
+    }
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU matrix arguments are outside the root scope".to_owned())?;
@@ -2897,6 +2951,10 @@ pub(super) fn lower_static_matrix_node(
         return lower_zero_matrix_node(ctx, node_id, wire_types);
     }
     let wire = WireRef { node: node_id, port: Port(0) };
+    if ctx.identity_small_rhs.omits(scope.id(), wire) {
+        ctx.wire_ids.insert(wire, crate::gpu_physical_control::UNMATERIALIZED_IDENTITY);
+        return Ok(());
+    }
     // A gadget read only as the right factor of row products is never
     // stored: each product scales its row by the gadget's entries.
     if lazy_gadget(scope, wire, wire_types) {
@@ -2952,6 +3010,61 @@ fn gadget_digits_per_tower(
     Ok(regular_gadget_digits_per_tower)
 }
 
+/// The evaluation-domain twin of the static constant `id`, or `None` when `id`
+/// is no static constant. A constant is never written, so its transform is the
+/// same at every use: the host transforms it once, in the native NTT slot order
+/// of evaluation artifacts, and uploads the twin for the plan, instead of a
+/// forward NTT at each use, which a loop body would repeat every iteration.
+/// Twins share [`PhysicalLoweringContext::static_constants`] under keys that
+/// prefix the type with `eval`, so a rollback drops them with their constants.
+fn static_evaluation(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    id: PhysicalValueId,
+) -> Result<Option<PhysicalValueId>, String> {
+    let Some((device, ty_key, canonical)) = ctx
+        .static_constants
+        .iter()
+        .find(|(_, constant)| **constant == id)
+        .map(|(key, _)| key.clone())
+    else {
+        return Ok(None);
+    };
+    let key = (device, format!("eval {ty_key}"), canonical);
+    if let Some(&twin) = ctx.static_constants.get(&key) {
+        return Ok(Some(twin));
+    }
+    let ty = ctx.values[id.0 as usize]
+        .ty
+        .matrix_type()
+        .ok_or("GPU static constant is no matrix")?
+        .clone();
+    let gpu = ctx.backend.physical_matrix_parameters(&ty, ctx.device)?;
+    let moduli = ty.ring.crt_moduli().to_vec();
+    let crt_bits = moduli.iter().map(|prime| (u64::BITS - prime.leading_zeros()) as usize).max();
+    let cpu = crate::poly::dcrt::params::DCRTPolyParams::try_new(
+        ty.ring.ring_dimension(),
+        moduli.len(),
+        crt_bits.ok_or("GPU static constant has no CRT limb")?,
+        gpu.base_bits(),
+        Some(moduli),
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let matrix =
+        <crate::matrix::dcrt_poly::DCRTPolyMatrix as crate::matrix::PolyMatrix>::from_compact_bytes(
+            &cpu, &key.2,
+        );
+    let evaluation = matrix.to_eval_artifact();
+    let (twin, native, _) =
+        allocate_matrix_import_destination(ctx, &ty, PhysicalEncoding::FullEval)?;
+    // The owner is new at plan time and has no prior GPU or I/O readers.
+    unsafe {
+        ctx.backend.upload_eval_matrix_import_after_completion(&native, &ty, &evaluation)?;
+    }
+    ctx.static_constants.insert(key, twin);
+    Ok(Some(twin))
+}
+
 fn plan_static_matrix(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: &ConcreteMatrixType,
@@ -2960,12 +3073,18 @@ fn plan_static_matrix(
 ) -> Result<PhysicalValueId, String> {
     let regular_gadget_digits_per_tower = gadget_digits_per_tower(ctx, ty, value, env)?;
     let canonical = encode_static_matrix(ty, value, env, regular_gadget_digits_per_tower)?;
+    // A constant is never written after its upload, so equal constants share one owner.
+    let key = (ctx.device, format!("{ty:?}"), canonical);
+    if let Some(&shared) = ctx.static_constants.get(&key) {
+        return Ok(shared);
+    }
     let (coefficient, native, _) =
         allocate_matrix_import_destination(ctx, ty, PhysicalEncoding::FullCoeff)?;
     // The owner is new at plan time and has no prior GPU or I/O readers.
     unsafe {
-        ctx.backend.upload_physical_matrix_import_after_completion(&native, ty, &canonical)?;
+        ctx.backend.upload_physical_matrix_import_after_completion(&native, ty, &key.2)?;
     }
+    ctx.static_constants.insert(key, coefficient);
     Ok(coefficient)
 }
 
@@ -3505,7 +3624,7 @@ fn emit_compact_pack_into(
 
 /// Expands the compact value `compact` into the full-coefficient matrix `coefficient` of the same
 /// shape. Returns the operation.
-fn emit_expand_compact(
+pub(super) fn emit_expand_compact(
     ctx: &mut PhysicalLoweringContext<'_>,
     compact: PhysicalValueId,
     coefficient: PhysicalValueId,
@@ -3707,7 +3826,9 @@ fn compact_column_view(
 }
 
 /// `id` in full-Eval encoding. A full-Coeff matrix gets one forward NTT that
-/// `ctx.converted` shares with every later consumer; other values pass through.
+/// `ctx.converted` shares with every later consumer; a static constant gets an
+/// evaluation-domain twin uploaded once for the plan (see
+/// [`static_evaluation`]); other values pass through.
 pub(super) fn full_eval_value(
     ctx: &mut PhysicalLoweringContext<'_>,
     id: PhysicalValueId,
@@ -3722,6 +3843,9 @@ pub(super) fn full_eval_value(
         return Ok(converted);
     }
     let ty = ty.clone();
+    if let Some(evaluation) = static_evaluation(ctx, id)? {
+        return Ok(evaluation);
+    }
     let evaluation = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
     emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[id], evaluation)?;
     ctx.converted.insert(id, evaluation);
@@ -4728,6 +4852,8 @@ fn retry_body_context<'b>(
         crt_resource_next: &mut *ctx.crt_resource_next,
         converted,
         integer_status: &mut *ctx.integer_status,
+        static_constants: &mut *ctx.static_constants,
+        identity_small_rhs: ctx.identity_small_rhs,
         subgraph_kernels: ctx.subgraph_kernels,
     }
 }
@@ -4775,7 +4901,8 @@ fn allocate_retry_controls(
         16,
         BoundStorage::from_preimage_status(Arc::clone(&status))?,
     )?;
-    let limit_id = allocate_preimage_control(ctx, 8, BoundStorage::from_signed_values(limit)?)?;
+    let limit_id =
+        allocate_preimage_control(ctx, 8, BoundStorage::from_signed_values(Arc::clone(&limit))?)?;
     // The retry WHILE continues only while the status latch word
     // (`MxxPreimageStatus::reserved`, byte 12) is zero, so the first
     // accepted attempt ends the loop instead of resampling until the bound.
@@ -4794,6 +4921,7 @@ fn allocate_retry_controls(
     let operation =
         u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
     ctx.preimage_replays.push(PreimageReplay {
+        limit,
         attempt,
         status,
         planned_max: max_attempts,
@@ -7684,6 +7812,9 @@ pub(crate) fn plan_physical_graph(
     let mut crt_resource_next = 0u32;
     let mut converted = BTreeMap::new();
     let mut integer_status = BTreeMap::new();
+    let mut static_constants = BTreeMap::new();
+    let identity_small_rhs =
+        crate::gpu_cost_model::IdentitySmallRhs::new(&validated.source, subgraph_kernels);
     // Every root node lowers against the same plan tables.
     macro_rules! root_context {
         () => {
@@ -7729,6 +7860,8 @@ pub(crate) fn plan_physical_graph(
                 crt_resource_next: &mut crt_resource_next,
                 converted: &mut converted,
                 integer_status: &mut integer_status,
+                static_constants: &mut static_constants,
+                identity_small_rhs: &identity_small_rhs,
                 subgraph_kernels,
             }
         };
@@ -7902,7 +8035,15 @@ pub(crate) fn plan_physical_graph(
             let [choice] = choices.as_slice() else {
                 return Err(format!("GPU node {:?} has no unique frozen root choice", node_id));
             };
-            lower_matrix_node(&mut ctx, scope, node_id, node, &checked.wire_types, choice)?;
+            lower_matrix_node(
+                &mut ctx,
+                scope,
+                node_id,
+                node,
+                &checked.wire_types,
+                choice,
+                &validated.bindings,
+            )?;
         } else if matches!(node.kind(), NodeKind::ConstantMatrix { .. }) {
             lower_static_matrix_node(
                 &mut ctx,
@@ -9282,6 +9423,514 @@ mod tests {
         };
         assert_eq!(secret.physical().encodings.len(), 6);
         assert_eq!(secret.physical().parts.len(), 6);
+    }
+
+    /// One-limb transforms `operations` execute, nested bodies included: each
+    /// polynomial of each limb of a transformed value counts once per run, and
+    /// a WHILE body runs its iteration count.
+    fn transform_counts(frame: &PhysicalFrame, operations: &[CompiledGpuOp]) -> (u128, u128) {
+        let mut counts = (0, 0);
+        for op in operations {
+            let primitive =
+                frame.program.implementations.resolve(op.implementation).unwrap().primitive.clone();
+            let inverse = match primitive {
+                crate::gpu_execution_plan::GpuNativePrimitive::ForwardNtt => false,
+                crate::gpu_execution_plan::GpuNativePrimitive::InverseNtt => true,
+                _ => {
+                    if let Some(body) = &op.body {
+                        let runs = match (&primitive, op.arguments.get(6)) {
+                            (
+                                crate::gpu_execution_plan::GpuNativePrimitive::LoopWhile,
+                                Some(KernelArg::U64(count)),
+                            ) => u128::from(*count),
+                            _ => 1,
+                        };
+                        let (forward, inverse) = transform_counts(frame, body);
+                        counts = (counts.0 + runs * forward, counts.1 + runs * inverse);
+                    }
+                    continue;
+                }
+            };
+            let ty = frame.program.values[op.outputs[0].0 as usize].ty.matrix_type().unwrap();
+            let polys = (ty.rows * ty.columns * ty.ring.crt_moduli().len()) as u128;
+            if inverse {
+                counts.1 += polys;
+            } else {
+                counts.0 += polys;
+            }
+        }
+        counts
+    }
+
+    /// A compact key entry expanded as in a dynamic encoding, `(x * G~)` switched
+    /// from `pq` to `q`: the gadget product stays in the coefficient domain of
+    /// the hashed entry, the cost model predicts the transforms the GPU plan
+    /// emits, and the result equals the CPU's.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_coefficient_gadget_product_matches_cpu_and_cost_model() {
+        for bits in [28, 50] {
+            let device = detected_gpu_device_ids()[0];
+            // Four limbs switched to two: two discarded limbs, two kept.
+            let full = DCRTPolyParams::new(32, 4, bits, 8, None, None);
+            let moduli = full.to_crt().0;
+            let single =
+                DCRTPolyParams::try_new(32, 2, bits, 8, Some(moduli[..2].to_vec()), None).unwrap();
+            let gpu_full = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+            let gpu_single = GpuDCRTPolyParams::new_with_gpu(
+                32,
+                moduli[..2].to_vec(),
+                8,
+                gpu_full.gpu_ids().to_vec(),
+                Some(1),
+                Some(&gpu_full),
+                None,
+            );
+            let full_ring =
+                Ring::from_crt_moduli(moduli.iter().copied().map(IntExpr::from).collect(), 32);
+            let single_ring =
+                Ring::from_crt_moduli(moduli[..2].iter().copied().map(IntExpr::from).collect(), 32);
+            let gadget =
+                single_ring.gadget(1, 256, single.modulus_digits()).centered_rebase(&full_ring);
+            let entry = full_ring.hash_matrix(
+                full_ring.bytes_input("key", 32),
+                HashTag::from(b"direct-coefficient-gadget/v1:".as_slice()),
+                (1, 1),
+            );
+            let built = DslContext::new("direct-coefficient-gadget-product")
+                .output("expanded", (entry.clone() * gadget).modulus_switch(&single_ring))
+                .unwrap()
+                .output("reduced", entry.reduce_modulus(&single_ring))
+                .unwrap()
+                .build()
+                .unwrap();
+            let validated = built.validate(&ParamEnv::default()).unwrap();
+            let predicted = crate::gpu_cost_model::gpu_operation_counts(
+                &validated.source,
+                &ParamEnv::default(),
+                None,
+                4,
+            )
+            .unwrap();
+            let key = RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()));
+            let expected = {
+                let result = execute_in_session(
+                    &validated,
+                    &mut cpu_backend([full.clone(), single.clone()]),
+                    BTreeMap::from([("key".to_owned(), key.clone())]),
+                    &mut MemoryArtifactStore::default(),
+                    [0x41; 32],
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let matrix = |name: &str| {
+                    let RuntimeValue::Matrix(matrix) = &result.outputs[name] else {
+                        panic!("CPU output is a matrix");
+                    };
+                    matrix.as_cpu_full().unwrap().clone()
+                };
+                (matrix("expanded"), matrix("reduced"))
+            };
+            let mut runtime =
+                GpuRuntime::new(gpu_backend_on([gpu_full, gpu_single], [device])).unwrap();
+            let inputs = BTreeMap::from([("key".to_owned(), key)]);
+            let mut plan = runtime.plan(validated, &inputs).unwrap();
+            let frame = plan.physical_frame_for_test();
+            assert!(frame.program.operations.iter().all(|op| {
+                frame.program.implementations.resolve(op.implementation).unwrap().primitive !=
+                    crate::gpu_execution_plan::GpuNativePrimitive::MatrixGadgetScale
+            }));
+            assert!(frame.program.operations.iter().any(|op| matches!(op.arguments.last(), Some(KernelArg::U64List(residues)) if !residues.is_empty()) && frame.program.implementations.resolve(op.implementation).unwrap().primitive == crate::gpu_execution_plan::GpuNativePrimitive::ModulusSwitch));
+            let (forward, inverse) = transform_counts(frame, &frame.program.operations);
+            let count = |name: &str| predicted.get(name).copied().unwrap_or(0);
+            assert_eq!((forward, inverse), (count("ntt_forward"), count("ntt_inverse")));
+            // Only the `1 x d` output of two limbs is transformed, as root outputs
+            // are, into the evaluation domain; an evaluation-domain product would
+            // also transform the entry forward and the product back.
+            let digits = single.modulus_digits() as u128;
+            assert_eq!((forward, inverse), (2 * digits + 2, 0), "only the outputs are transformed");
+            let result = runtime
+                .execute_with_artifacts(
+                    &mut plan,
+                    inputs,
+                    &mut MemoryArtifactStore::default(),
+                    [7; 32],
+                )
+                .unwrap();
+            let download =
+                |name: &str| runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+            assert_eq!((download("expanded"), download("reduced")), expected);
+        }
+    }
+
+    /// A static constant multiplied in a sequential loop: its evaluation twin is
+    /// uploaded once, so the loop body transforms nothing, the cost model
+    /// predicts the transforms the GPU plan emits, and the result equals the
+    /// CPU's.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_static_constant_in_a_loop_is_transformed_once_on_the_host() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 2, 28, 8, None, None);
+        let moduli = cpu.to_crt().0;
+        let gpu = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let key = ring.bytes_input("key", 32);
+        let hash_at = |member: IntExpr| {
+            let mut tag = HashTag::from(b"static-constant-loop:".as_slice());
+            tag.push(member);
+            ring.hash_matrix(key.clone(), tag, (1, 1))
+        };
+        let window =
+            ring.constant((1, 1), ConstantMatrix::Rotation { exponent: IntExpr::from(3u8) });
+        let summed = mxx_dsl::iterate(IntExpr::from(3u8), ring.zero((1, 1)), |i, sum| {
+            Ok(sum + hash_at(i.expression()?) * window.clone())
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-static-constant-loop")
+            .output("summed", summed)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let predicted = crate::gpu_cost_model::gpu_operation_counts(
+            &validated.source,
+            &ParamEnv::default(),
+            None,
+            4,
+        )
+        .unwrap();
+        let key = RuntimeValue::Bytes(Arc::from([0x93u8; 32]));
+        let expected = {
+            let result = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::from([("key".to_owned(), key.clone())]),
+                &mut MemoryArtifactStore::default(),
+                [0x52; 32],
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(matrix) = &result.outputs["summed"] else {
+                panic!("CPU sum is a matrix");
+            };
+            matrix.as_cpu_full().unwrap().clone()
+        };
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
+        let inputs = BTreeMap::from([("key".to_owned(), key)]);
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let frame = plan.physical_frame_for_test();
+        let (forward, inverse) = transform_counts(frame, &frame.program.operations);
+        let count = |name: &str| predicted.get(name).copied().unwrap_or(0);
+        assert_eq!((forward, inverse), (count("ntt_forward"), count("ntt_inverse")));
+        // Each iteration transforms its hashed entry of two limbs, never the constant.
+        assert_eq!((forward, inverse), (3 * 2, 0));
+        let result = runtime
+            .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [5; 32])
+            .unwrap();
+        let actual = runtime.download_matrix_output(&result.output("summed").unwrap()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_unit_row_column_add_matches_cpu_and_cost_model() {
+        let width = 5;
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 2, 28, 8, None, None);
+        let moduli = cpu.to_crt().0;
+        let gpu = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let key = ring.bytes_input("key", 32);
+        let hash_at = |member: IntExpr| {
+            let mut tag = HashTag::from(b"static-constant-loop:".as_slice());
+            tag.push(member);
+            ring.hash_matrix(key.clone(), tag, (1, 1))
+        };
+        let summed = mxx_dsl::iterate(width, ring.zero((1, width)), |i, sum| {
+            let start = (IntExpr::constant(width - 1) - i.expression()?).canonicalize();
+            let window = ring
+                .constant(
+                    (1, 2 * width - 1),
+                    ConstantMatrix::UnitRow { index: IntExpr::constant(width - 1) },
+                )
+                .slice(
+                    None,
+                    Some(mxx_ir_core::node::IndexRange {
+                        start: start.clone(),
+                        end: (start + IntExpr::constant(width)).canonicalize(),
+                    }),
+                );
+            Ok(sum + hash_at(i.expression()?) * window)
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-static-constant-loop")
+            .output("summed", summed)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let predicted = crate::gpu_cost_model::gpu_operation_counts(
+            &validated.source,
+            &ParamEnv::default(),
+            None,
+            4,
+        )
+        .unwrap();
+        let key = RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()));
+        let expected = {
+            let result = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::from([("key".to_owned(), key.clone())]),
+                &mut MemoryArtifactStore::default(),
+                [0x52; 32],
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(matrix) = &result.outputs["summed"] else {
+                panic!("CPU sum is a matrix");
+            };
+            matrix.as_cpu_full().unwrap().clone()
+        };
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
+        let inputs = BTreeMap::from([("key".to_owned(), key)]);
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let frame = plan.physical_frame_for_test();
+        let (forward, inverse) = transform_counts(frame, &frame.program.operations);
+        let count = |name: &str| predicted.get(name).copied().unwrap_or(0);
+        assert_eq!((forward, inverse), (count("ntt_forward"), count("ntt_inverse")));
+        // Only each scalar term transforms; no sliced row or product is materialized.
+        assert_eq!((forward, inverse), ((width * 2) as u128, 0));
+        assert_eq!(count("wide_mul"), 0);
+        let body = frame.program.operations.iter().find_map(|op| op.body.as_ref()).unwrap();
+        let update = body
+            .iter()
+            .find(|op| {
+                frame.program.implementations.resolve(op.implementation).unwrap().primitive ==
+                    crate::gpu_execution_plan::GpuNativePrimitive::MatrixColumnAdd
+            })
+            .unwrap();
+        let KernelArg::Value(sum) = update.arguments[0] else { unreachable!() };
+        assert_eq!(
+            storage_address(&frame.owners[&sum]),
+            storage_address(&frame.owners[&update.outputs[0]]),
+            "the loop carry is updated in place"
+        );
+        let result = runtime
+            .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [5; 32])
+            .unwrap();
+        let actual = runtime.download_matrix_output(&result.output("summed").unwrap()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    /// Identity expansion at root and across loop/subgraph captures has no
+    /// square allocation, agrees with the CPU, and transforms only its results.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_identity_small_rhs_matches_cpu_and_cost_model() {
+        let parameter = |name: &str, default| {
+            std::env::var(format!("MXX_TEST_IDENTITY_{name}"))
+                .ok()
+                .map(|value| value.parse::<u32>().unwrap())
+                .unwrap_or(default)
+        };
+        let n = parameter("RING_DIM", 32);
+        let limbs = parameter("CRT_DEPTH", 2);
+        let iterations = parameter("ITERATIONS", 3);
+        let cpu = DCRTPolyParams::new(n, limbs as usize, 28, 8, None, None);
+        let moduli = cpu.to_crt().0;
+        let gpu = GpuDCRTPolyParams::new(n, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), n);
+        let width = cpu.modulus_digits();
+        let key = ring.bytes_input("key", 32);
+        let digits = ring
+            .hash_matrix(key.clone(), HashTag::from(b"identity-rhs".as_slice()), (1, 1))
+            .decompose(256u64, width);
+        let identity = ring.identity(width);
+        let root = identity.clone().mul_small_rhs(digits);
+        // These digits are used only in loops: identity consumers must prevent
+        // the ordinary small-RHS hoist from expanding and transforming them.
+        let digits = ring
+            .hash_matrix(key, HashTag::from(b"identity-loop-rhs".as_slice()), (1, 1))
+            .decompose(256u64, width);
+        let expand = mxx_dsl::Subgraph::<mxx_dsl::Mat, mxx_dsl::Mat>::define(
+            "identity-expand",
+            mxx_dsl::GraphValue::schema(&identity),
+            |left| Ok(left.mul_small_rhs(digits.clone())),
+        )
+        .unwrap();
+        let parallel = mxx_dsl::parallel(iterations, |_| {
+            Ok(identity.clone().mul_small_rhs(digits.clone()) +
+                ring.identity(width).mul_small_rhs(digits.clone()) +
+                expand.call(identity.clone())?)
+        })
+        .unwrap();
+        let sequential = mxx_dsl::iterate(iterations, ring.zero((width, 1)), |_, sum| {
+            Ok(sum + identity.clone().mul_small_rhs(digits.clone()))
+        })
+        .unwrap();
+        let validated = DslContext::new("identity-small-rhs")
+            .output("root", root)
+            .unwrap()
+            .output("parallel", parallel)
+            .unwrap()
+            .output("sequential", sequential)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let predicted = crate::gpu_cost_model::gpu_operation_counts(
+            &validated.source,
+            &ParamEnv::default(),
+            None,
+            4,
+        )
+        .unwrap();
+        assert_eq!(predicted.get("wide_mul").copied().unwrap_or(0), 0);
+        let inputs = BTreeMap::from([(
+            "key".to_owned(),
+            RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>())),
+        )]);
+        let mut cpu_backend = cpu_backend([cpu]);
+        let mut cpu_store = MemoryArtifactStore::default();
+        let seed = rand::random();
+        let mut expected = execute_in_session(
+            &validated,
+            &mut cpu_backend,
+            inputs.clone(),
+            &mut cpu_store,
+            seed,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        // Keep all lanes in one wave so operation counts cover every execution
+        // and logical-device tests actually distribute the parallel body.
+        let mut plan = runtime
+            .plan_with_fixed_geometry_for_test(validated, &inputs, 1, iterations as usize)
+            .unwrap();
+        let frame = plan.physical_frame_for_test();
+        // Checking every physical value also covers static constants and their
+        // evaluation twins, which do not appear as operation outputs.
+        assert!(frame.program.values.iter().all(|value| {
+            value.ty.matrix_type().is_none_or(|ty| (ty.rows, ty.columns) != (width, width))
+        }));
+        assert_eq!(
+            transform_counts(frame, &frame.program.operations),
+            (
+                predicted.get("ntt_forward").copied().unwrap_or(0),
+                predicted.get("ntt_inverse").copied().unwrap_or(0),
+            )
+        );
+        let actual = runtime
+            .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), seed)
+            .unwrap();
+        for name in ["root", "sequential"] {
+            let RuntimeValue::Matrix(matrix) =
+                expected.materialize_output(name, &cpu_backend, &mut cpu_store).unwrap()
+            else {
+                panic!("matrix output")
+            };
+            assert_eq!(
+                runtime.download_matrix_output(&actual.output(name).unwrap()).unwrap(),
+                matrix.as_cpu_full().unwrap().clone(),
+                "{name}"
+            );
+        }
+        let RuntimeValue::IndexedFamily { values, .. } =
+            expected.materialize_output("parallel", &cpu_backend, &mut cpu_store).unwrap()
+        else {
+            panic!("family output")
+        };
+        for (index, value) in values.iter().enumerate() {
+            let RuntimeValue::Matrix(matrix) = value else { panic!("matrix member") };
+            assert_eq!(
+                runtime
+                    .download_matrix_member_output(&actual.output("parallel").unwrap(), index)
+                    .unwrap(),
+                matrix.as_cpu_full().unwrap().clone(),
+                "parallel[{index}]"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_invariant_small_rhs_matches_cpu_and_cost_model() {
+        let iterations = 3;
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 2, 28, 8, None, None);
+        let moduli = cpu.to_crt().0;
+        let gpu = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let digits = cpu.modulus_digits();
+        let key = ring.bytes_input("key", 32);
+        let hash_at = |member: IntExpr| {
+            let mut tag = HashTag::from(b"static-constant-loop:".as_slice());
+            tag.push(member);
+            ring.hash_matrix(key.clone(), tag, (1, digits))
+        };
+        let window = ring
+            .hash_matrix(key.clone(), HashTag::from(b"rhs".as_slice()), (1, 1))
+            .decompose(256u64, digits);
+        let summed = mxx_dsl::iterate(IntExpr::from(iterations), ring.zero((1, 1)), |i, sum| {
+            Ok(sum + hash_at(i.expression()?).mul_small_rhs(window.clone()))
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-static-constant-loop")
+            .output("summed", summed)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let predicted = crate::gpu_cost_model::gpu_operation_counts(
+            &validated.source,
+            &ParamEnv::default(),
+            None,
+            4,
+        )
+        .unwrap();
+        let key = RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()));
+        let expected = {
+            let result = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::from([("key".to_owned(), key.clone())]),
+                &mut MemoryArtifactStore::default(),
+                [0x52; 32],
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(matrix) = &result.outputs["summed"] else {
+                panic!("CPU sum is a matrix");
+            };
+            matrix.as_cpu_full().unwrap().clone()
+        };
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
+        let inputs = BTreeMap::from([("key".to_owned(), key)]);
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let frame = plan.physical_frame_for_test();
+        let (forward, inverse) = transform_counts(frame, &frame.program.operations);
+        let count = |name: &str| predicted.get(name).copied().unwrap_or(0);
+        assert_eq!((forward, inverse), (count("ntt_forward"), count("ntt_inverse")));
+        // The digit matrix transforms once; each left matrix transforms per iteration.
+        assert_eq!((forward, inverse), (((iterations + 1) * digits * 2) as u128, 0));
+        let result = runtime
+            .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [5; 32])
+            .unwrap();
+        let actual = runtime.download_matrix_output(&result.output("summed").unwrap()).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

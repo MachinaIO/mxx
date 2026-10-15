@@ -80,6 +80,32 @@ namespace
         return *result <= limit;
     }
 
+    // A unit-row product contributes to one column. Aliased carry updates
+    // visit only that column; other outputs also copy the unchanged columns.
+    __global__ void raw_column_add_kernel(RawLimbSet sums, RawLimbSet terms,
+        RawLimbSet outputs, const uint64_t *index, int encoding,
+        size_t columns, size_t degree, bool in_place)
+    {
+        uint64_t selected = 0;
+        if (!raw_nonnegative_extent(index, encoding, columns - 1, &selected))
+            selected = columns;
+        if (in_place && selected == columns) return;
+        const auto &sum = sums.limb[blockIdx.y];
+        const auto &term = terms.limb[blockIdx.y];
+        const auto &output = outputs.limb[blockIdx.y];
+        const size_t count = degree * (in_place ? 1 : columns);
+        for (size_t flat = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             flat < count; flat += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const size_t column = in_place ? selected : flat / degree;
+            const size_t coefficient = flat % degree;
+            uint64_t value = raw_matrix_load(sum, column, coefficient, columns);
+            if (column == selected)
+                value = add_mod_u64(value, raw_matrix_load(term, 0, coefficient, 1), sum.modulus);
+            raw_matrix_store(output, column, coefficient, columns, value);
+        }
+    }
+
     __global__ void raw_dynamic_slice_kernel(
         MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
         const uint64_t *row_start_value, int row_start_encoding,
@@ -470,6 +496,37 @@ extern "C" int gpu_raw_matrix_dynamic_slice(GpuContext *ctx, void *stream_raw,
             static_cast<size_t>(destination->columns),
             static_cast<size_t>(source->degree));
         if (result != 0) return result;
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_matrix_column_add(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *sum, const MxxRawMatrixView *term,
+    const MxxRawMatrixView *output, const void *index, int encoding,
+    uint32_t sum_binding, uint32_t term_binding, uint32_t output_binding,
+    uint32_t index_binding)
+{
+    if (mxx_set_device(sum->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    const bool in_place = sum->limbs[0].address == output->limbs[0].address;
+    const size_t count = output->degree * (in_place ? 1 : output->columns);
+    const uint32_t grid = static_cast<uint32_t>(std::min<size_t>((count + 255) / 256, 65535));
+    for (size_t first = 0; first < output->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, output->limb_count - first);
+        RawLimbSet sums{}, terms{}, outputs{};
+        std::vector<MxxGraphPatch> patches{{nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
+            3, 0, sizeof(void *), index_binding, 0}};
+        raw_limb_set(sum, first, limbs, 0, sum_binding, sums, patches);
+        raw_limb_set(term, first, limbs, 1, term_binding, terms, patches);
+        raw_limb_set(output, first, limbs, 2, output_binding, outputs, patches);
+        const int status = mxx_gpu_launch_kernel(ctx, stream, raw_column_add_kernel,
+            dim3(grid, static_cast<uint32_t>(limbs)), dim3(256), 0,
+            patches.data(), patches.size(), sums, terms, outputs,
+            static_cast<const uint64_t *>(index), encoding,
+            static_cast<size_t>(output->columns), static_cast<size_t>(output->degree), in_place);
+        if (status != 0) return status;
     }
     return 0;
 }

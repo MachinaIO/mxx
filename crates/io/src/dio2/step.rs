@@ -734,7 +734,7 @@ fn placed_row(
                 )),
                 Box::new(IntExpr::constant(digits)),
             )),
-            Box::new(IntExpr::Div(
+            Box::new(IntExpr::FloorDiv(
                 Box::new(index.clone()),
                 Box::new(IntExpr::constant(columns * n)),
             )),

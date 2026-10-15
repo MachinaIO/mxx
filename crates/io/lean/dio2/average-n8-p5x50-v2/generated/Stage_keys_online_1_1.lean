@@ -11,7 +11,7 @@ structure Params where
 
 local notation "mxxNat0" => 1809251394327365744250316798798350396453362684746139641520435240552807944993
 local notation "mxxNat1" => 36550556566445887949135852474979514307313305075533710697673106717124183540354
-local notation "mxxNat2" => 95433903093188705880679253512905553662863047506288154511993198866664392756525
+local notation "mxxNat2" => 84715014674746765542951856319120207364894094043218421459706511318570933778708
 local notation "mxxNat3" => 904625697163682872125158399399175198226681342373069820760217620276403972497
 
 /-- The modulus of a matrix type. -/
@@ -1665,9 +1665,8 @@ def parallel_generatedRoot_149 (backend : MxxRuntime.BackendContext) (hashModel 
   ∃ witness : parallel_generatedRoot_149.Witness,
     parallel_generatedRoot_149.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev parallel_generatedRoot_150.constraints_0 (i_0 : Nat) (w_0_0 : Fin 8 → mxxMat0) (w_5_0 : Fin 8 → mxxMat0) (w_9_0 : Fin 8 → mxxMat0) (w_13_0 : Fin 8 → mxxMat0) (w_17_0 : Fin 8 → mxxMat0) (w_21_0 : Fin 8 → mxxMat0) (w_1_0 : Int) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_6_0 : mxxMat0) (w_8_0 : mxxMat0) (w_10_0 : mxxMat0) (w_12_0 : mxxMat0) (w_14_0 : mxxMat0) (w_16_0 : mxxMat0) (w_18_0 : mxxMat0) (w_20_0 : mxxMat0) (w_22_0 : mxxMat0) (w_24_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
-  8 ≠ 0 ∧
-  (Int.ofNat i_0) % 8 = 0 ∧
+abbrev parallel_generatedRoot_150.constraints_0 (w_0_0 : Fin 8 → mxxMat0) (w_5_0 : Fin 8 → mxxMat0) (w_9_0 : Fin 8 → mxxMat0) (w_13_0 : Fin 8 → mxxMat0) (w_17_0 : Fin 8 → mxxMat0) (w_21_0 : Fin 8 → mxxMat0) (w_1_0 : Int) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_6_0 : mxxMat0) (w_8_0 : mxxMat0) (w_10_0 : mxxMat0) (w_12_0 : mxxMat0) (w_14_0 : mxxMat0) (w_16_0 : mxxMat0) (w_18_0 : mxxMat0) (w_20_0 : mxxMat0) (w_22_0 : mxxMat0) (w_24_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+  (8) ≠ 0 ∧
   (8) ≠ 0 ∧
   0 ≤ w_1_0 ∧
   w_1_0 < 8 ∧
@@ -1704,7 +1703,7 @@ def parallel_generatedRoot_150 (backend : MxxRuntime.BackendContext) (_ : MxxRun
   let w_13_0 : Fin 8 → mxxMat0 := inputs.2.2.2.1
   let w_17_0 : Fin 8 → mxxMat0 := inputs.2.2.2.2.1
   let w_21_0 : Fin 8 → mxxMat0 := inputs.2.2.2.2.2.1
-  let w_1_0 : Int := (MxxIR.exactDiv ((Int.ofNat i_0)) (8) + (Int.fmod ((Int.ofNat i_0)) (8)))
+  let w_1_0 : Int := ((Int.fdiv ((Int.ofNat i_0)) (8)) + (Int.fmod ((Int.ofNat i_0)) (8)))
   ∃ (w_2_0 : mxxMat0),
     let w_3_0 : Int := (Int.fmod ((Int.ofNat i_0)) (8))
     let w_4_0 : mxxMat0 := MxxRuntime.multiplyMonomial w_2_0 w_3_0
@@ -1723,7 +1722,7 @@ def parallel_generatedRoot_150 (backend : MxxRuntime.BackendContext) (_ : MxxRun
             ∃ (w_22_0 : mxxMat0),
               let w_23_0 : Int := (Int.fmod ((Int.ofNat i_0)) (8))
               let w_24_0 : mxxMat0 := MxxRuntime.multiplyMonomial w_22_0 w_23_0
-              parallel_generatedRoot_150.constraints_0 i_0 w_0_0 w_5_0 w_9_0 w_13_0 w_17_0 w_21_0 w_1_0 w_2_0 w_4_0 w_6_0 w_8_0 w_10_0 w_12_0 w_14_0 w_16_0 w_18_0 w_20_0 w_22_0 w_24_0 outputs
+              parallel_generatedRoot_150.constraints_0 w_0_0 w_5_0 w_9_0 w_13_0 w_17_0 w_21_0 w_1_0 w_2_0 w_4_0 w_6_0 w_8_0 w_10_0 w_12_0 w_14_0 w_16_0 w_18_0 w_20_0 w_22_0 w_24_0 outputs
 
 abbrev sequential_generatedRoot_169.InputType : Type :=
   mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × (Fin 8 → mxxMat0) × (Fin 8 → mxxMat0) × (Fin 8 → mxxMat0) × (Fin 8 → mxxMat0) × (Fin 8 → mxxMat0) × (Fin 8 → mxxMat0) × Unit

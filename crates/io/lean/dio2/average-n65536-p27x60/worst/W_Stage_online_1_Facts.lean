@@ -13,7 +13,7 @@ noncomputable section
 namespace W_Stage_online_1
 
 local notation "mxxNat0" => 76731521515431686138455054332509004630949788422460187661496907667850637958884
-local notation "mxxNat1" => 23909235865639714854137367363134744207526406269892343697358635194375830958307
+local notation "mxxNat1" => 8847072971945541729266891833991090237858273327536438370930983040524077886174
 local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 270
 local notation "mxxMat1" => Mxx.Primitives.ExactMatrix modulus_0 65536 3 270
 local notation "mxxMat2" => Mxx.Primitives.ExactMatrix modulus_0 65536 2 270

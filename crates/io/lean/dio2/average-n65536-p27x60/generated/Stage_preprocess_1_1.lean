@@ -13,7 +13,7 @@ local notation "mxxNat0" => 4662222278736252225559671242743864015897771943021566
 local notation "mxxNat1" => 34966667090521891691697534320578980119233289572661749111322581056293999333631863706749951226205037258731813033975235880421886188355853612691760742635757734639777110088925268398855525802971213260863115946668447253110267847342147835648991308630750798284189280777490844226542736101225275634281796633314346229417268180970144094013151705539447909488293483742477879658230930231096823578792363056833678376101314143030229295656153923770515332945564395417379854024076729782890141983050429450944513
 local notation "mxxNat2" => 46257986671836252550474863111599275782735705997167105595187164522388936618450486362054622976333747206863960992863072466808120270012431341790141815778554503117205135221807386319319289343514000876350163804446800011927125173046383074243978085376097410230125402695222262674697161300579270891185293462822103865999927697741753124371565277119894630260554921200986361631201334784888506192777396960602887018384030168383740839045120294988077575875902898104242098552684840441948416998410463961145345
 local notation "mxxNat3" => 76731521515431686138455054332509004630949788422460187661496907667850637958884
-local notation "mxxNat4" => 23909235865639714854137367363134744207526406269892343697358635194375830958307
+local notation "mxxNat4" => 8847072971945541729266891833991090237858273327536438370930983040524077886174
 
 /-- The modulus of a matrix type. -/
 abbrev modulus_0 : Nat := mxxNat0
@@ -11952,9 +11952,8 @@ def parallel_generatedRoot_242 (backend : MxxRuntime.BackendContext) (hashModel 
   ∃ witness : parallel_generatedRoot_242.Witness,
     parallel_generatedRoot_242.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev parallel_generatedRoot_243.constraints_0 (i_0 : Nat) (w_0_0 : Fin 20054016 → mxxMat1) (w_5_0 : Fin 20054016 → mxxMat1) (w_9_0 : Fin 20054016 → mxxMat1) (w_13_0 : Fin 20054016 → mxxMat1) (w_1_0 : Int) (w_2_0 : mxxMat1) (w_4_0 : mxxMat1) (w_6_0 : mxxMat1) (w_8_0 : mxxMat1) (w_10_0 : mxxMat1) (w_12_0 : mxxMat1) (w_14_0 : mxxMat1) (w_16_0 : mxxMat1) (outputs : mxxMat1 × mxxMat1 × mxxMat1 × mxxMat1 × Unit) : Prop :=
-  65536 ≠ 0 ∧
-  (Int.ofNat i_0) % 65536 = 0 ∧
+abbrev parallel_generatedRoot_243.constraints_0 (w_0_0 : Fin 20054016 → mxxMat1) (w_5_0 : Fin 20054016 → mxxMat1) (w_9_0 : Fin 20054016 → mxxMat1) (w_13_0 : Fin 20054016 → mxxMat1) (w_1_0 : Int) (w_2_0 : mxxMat1) (w_4_0 : mxxMat1) (w_6_0 : mxxMat1) (w_8_0 : mxxMat1) (w_10_0 : mxxMat1) (w_12_0 : mxxMat1) (w_14_0 : mxxMat1) (w_16_0 : mxxMat1) (outputs : mxxMat1 × mxxMat1 × mxxMat1 × mxxMat1 × Unit) : Prop :=
+  (65536) ≠ 0 ∧
   (65536) ≠ 0 ∧
   0 ≤ w_1_0 ∧
   w_1_0 < 20054016 ∧
@@ -11981,7 +11980,7 @@ def parallel_generatedRoot_243 (backend : MxxRuntime.BackendContext) (_ : MxxRun
   let w_5_0 : Fin 20054016 → mxxMat1 := inputs.2.1
   let w_9_0 : Fin 20054016 → mxxMat1 := inputs.2.2.1
   let w_13_0 : Fin 20054016 → mxxMat1 := inputs.2.2.2.1
-  let w_1_0 : Int := (MxxIR.exactDiv ((Int.ofNat i_0)) (65536) + (306 * (Int.fmod ((Int.ofNat i_0)) (65536))))
+  let w_1_0 : Int := ((Int.fdiv ((Int.ofNat i_0)) (65536)) + (306 * (Int.fmod ((Int.ofNat i_0)) (65536))))
   ∃ (w_2_0 : mxxMat1),
     let w_3_0 : Int := (Int.fmod ((Int.ofNat i_0)) (65536))
     let w_4_0 : mxxMat1 := MxxRuntime.multiplyMonomial w_2_0 w_3_0
@@ -11994,7 +11993,7 @@ def parallel_generatedRoot_243 (backend : MxxRuntime.BackendContext) (_ : MxxRun
         ∃ (w_14_0 : mxxMat1),
           let w_15_0 : Int := (Int.fmod ((Int.ofNat i_0)) (65536))
           let w_16_0 : mxxMat1 := MxxRuntime.multiplyMonomial w_14_0 w_15_0
-          parallel_generatedRoot_243.constraints_0 i_0 w_0_0 w_5_0 w_9_0 w_13_0 w_1_0 w_2_0 w_4_0 w_6_0 w_8_0 w_10_0 w_12_0 w_14_0 w_16_0 outputs
+          parallel_generatedRoot_243.constraints_0 w_0_0 w_5_0 w_9_0 w_13_0 w_1_0 w_2_0 w_4_0 w_6_0 w_8_0 w_10_0 w_12_0 w_14_0 w_16_0 outputs
 
 abbrev sequential_generatedRoot_256.constraints_0 (w_1_0 : Fin 20054016 → mxxMat1) (w_6_0 : Fin 20054016 → mxxMat1) (w_10_0 : Fin 20054016 → mxxMat1) (w_14_0 : Fin 20054016 → mxxMat1) (w_2_0 : Int) (w_3_0 : mxxMat1) (w_4_0 : mxxMat1) (w_7_0 : mxxMat1) (w_8_0 : mxxMat1) (w_11_0 : mxxMat1) (w_12_0 : mxxMat1) (w_15_0 : mxxMat1) (w_16_0 : mxxMat1) (outputs : mxxMat1 × mxxMat1 × mxxMat1 × mxxMat1 × Unit) : Prop :=
   0 ≤ w_2_0 ∧

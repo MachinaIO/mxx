@@ -174,6 +174,8 @@ impl<'a> PublicKeyLowering<'a> {
             finished_bodies: Vec::new(),
             streamed_rhs: BTreeMap::new(),
             prepared_rhs_reads: std::collections::BTreeSet::new(),
+            root_inputs: BTreeMap::new(),
+            root_hash_key: None,
         }
     }
 
@@ -682,7 +684,18 @@ impl<'a> PublicKeyLowering<'a> {
                 self.parameters.dynamic_route(level)?;
                 InputKeySource::Dynamic { setup: setup.clone(), coordinate: binding.input(wire)? }
             }
-            None => InputKeySource::Static { level, knowledge },
+            None => {
+                let root = match self.root_inputs.get(&wire) {
+                    Some(tag) => Some((
+                        tag.clone(),
+                        self.root_hash_key
+                            .clone()
+                            .ok_or(RnsBggError::Binding("a root input needs a rooted chain"))?,
+                    )),
+                    None => None,
+                };
+                InputKeySource::Static { level, knowledge, root }
+            }
         })
     }
     /// Produce the compact setup-fixed RHS ciphertext.  Only this source is
@@ -754,8 +767,8 @@ impl<'a> PublicKeyLowering<'a> {
             return Ok(switching_ciphertexts.clone());
         }
         let count = IntExpr::constant(table.input_width());
-        let sigmas = layout
-            .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
+        let sigmas = table
+            .branch_automorphisms(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
         let payload = &self.payload()?.row;
         let columns =
@@ -977,6 +990,11 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             return Err(RnsBggError::Binding("a decoder smudge LUT needs a private input"));
         }
         let source_level = self.workload.level(input.wire)?;
+        if table.automorphism_index().is_some() &&
+            (public || self.parameters.rhs_mode() == RhsMode::Dynamic)
+        {
+            return Err(RnsBggError::Binding("an automorphism table needs a Static private input"));
+        }
         if self.parameters.rhs_mode() == RhsMode::Dynamic {
             // A public LUT is evaluated at its input level only; its output
             // is a finished public encoding.
@@ -1003,9 +1021,8 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             source_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let source_ring = self.parameters.ring(source_level)?;
         let target_ring = self.parameters.ring(next_level)?;
-        let layout = table.input_layout();
-        let sigmas = layout
-            .automorphism_indices(self.parameters.level(source_level)?.ring_dimension() as usize)
+        let sigmas = table
+            .branch_automorphisms(self.parameters.level(source_level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
         // Accumulate the branches sequentially: modular addition is exact and
         // associative, so the sum and its noise bound equal the balanced tree,
@@ -1039,6 +1056,7 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                 let data = lut_public_matrix(
                     self.parameters,
                     self.hash_key.clone(),
+                    self.root_hash_key.clone(),
                     source_level,
                     Int::from(sigma),
                 )
@@ -1069,6 +1087,7 @@ impl PublicKeyLowering<'_> {
         Ok(crate::rns_bgg::public_lut::static_public_lut(
             self.parameters,
             self.hash_key.clone(),
+            self.root_hash_key.clone(),
             level,
             table,
             crate::rns_bgg::dynamic::lut_entries(table, &self.data)?,
@@ -1269,6 +1288,7 @@ mod test {
             dynamic: None,
             current_site: None,
             hash_key,
+            root_hash_key: None,
         };
         let row = ring.input("equal-luts-input", (1, parameters.component_columns(0).unwrap()));
         let mut online_eval_environment = Environment::new();

@@ -225,23 +225,32 @@ fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool)) {
     }
 }
 
+/// `owner` with every storage that views a replaced allocation swapped, or `None` if it views
+/// none.
+fn rebound(
+    owner: &GpuResidentValue,
+    replacements: &BTreeMap<*const (), BoundStorage>,
+) -> Result<Option<GpuResidentValue>, String> {
+    let replaced = owner
+        .storages()
+        .filter_map(|(_, bound)| {
+            let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+            replacements.get(&pointer).map(|new| (pointer, new.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if replaced.is_empty() {
+        return Ok(None);
+    }
+    owner.rebound(&replaced, owner.ready_events()).map_err(str::to_owned)
+}
+
 /// Swap every storage of `owners` that views a replaced allocation.
 fn rebind(
     owners: &mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
     replacements: &BTreeMap<*const (), BoundStorage>,
 ) -> Result<(), String> {
     for owner in owners.values_mut() {
-        let replaced = owner
-            .storages()
-            .filter_map(|(_, bound)| {
-                let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
-                replacements.get(&pointer).map(|new| (pointer, new.clone()))
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        if replaced.is_empty() {
-            continue;
-        }
-        if let Some(rebound) = owner.rebound(&replaced, owner.ready_events())? {
+        if let Some(rebound) = rebound(owner, replacements)? {
             *owner = Arc::new(rebound);
         }
     }
@@ -293,7 +302,7 @@ pub(crate) fn plan_graph_scratch(
                 group_of.insert(id, pointer);
             }
         };
-    for (&id, owner) in &frame.owners {
+    for (&id, owner) in frame.owners.iter() {
         let physical = &frame.program.values[id.0 as usize];
         let packable = owner.storages().count() == 1 && !frame.scratch_protected.contains(&id);
         // Full matrices, and compact scratch (whose producer writes every byte
@@ -547,7 +556,7 @@ pub(crate) fn plan_graph_scratch(
     persistent.extend(pack_arena(backend, arena)?);
     let sizes = plan.place(starts, frame.program.operations.len());
     plan.pools = allocate_buffers(backend, &sizes)?;
-    rebind(&mut frame.owners, &persistent)?;
+    frame.owners.rebind(|_, owner| rebound(owner, &persistent))?;
     for wave in &mut frame.waves {
         rebind(&mut wave.owner_bindings, &persistent)?;
     }
@@ -843,7 +852,7 @@ impl GraphScratchPlan {
             for id in &allocation.members {
                 let owner = frame
                     .owners
-                    .get_mut(id)
+                    .get(id)
                     .ok_or_else(|| invalid("Graph scratch owner is missing"))?;
                 let (_, current) = owner
                     .storages()
@@ -856,7 +865,7 @@ impl GraphScratchPlan {
                 if let Some(rebound) =
                     owner.rebound(&replaced, owner.ready_events()).map_err(invalid)?
                 {
-                    *owner = Arc::new(rebound);
+                    frame.owners.insert(*id, Arc::new(rebound));
                 }
             }
         }

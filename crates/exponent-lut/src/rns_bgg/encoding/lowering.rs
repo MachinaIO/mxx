@@ -513,11 +513,11 @@ impl EncodingLowering<'_> {
     ) -> Result<(Family<Mat>, Family<Mat>), RnsBggError> {
         let ring = self.parameters.ring(level)?;
         let columns = self.parameters.component_columns(level)?;
-        let layout = table.input_layout();
+        let key = table.helper_family_key();
         let member = |port: usize| {
             ring.family_artifact_input(
                 self.encryption.clone(),
-                self.encryption_artifact_name(format!("lut-helper/{level}/{layout:?}.{port}")),
+                self.encryption_artifact_name(format!("lut-helper/{level}/{key}.{port}")),
                 count,
                 (1, columns),
                 ArtifactAvailability::Transferred,
@@ -527,7 +527,13 @@ impl EncodingLowering<'_> {
     }
 
     fn lut_public_data(&self, level: usize, sigma: Int) -> Result<RnsBggMatrix, RnsBggError> {
-        super::public_key::lut_public_matrix(self.parameters, self.hash_key.clone(), level, sigma)
+        super::public_key::lut_public_matrix(
+            self.parameters,
+            self.hash_key.clone(),
+            self.root_hash_key.clone(),
+            level,
+            sigma,
+        )
     }
 
     fn rhs_decomposition(
@@ -571,10 +577,7 @@ impl EncodingLowering<'_> {
             return Ok((switching, material.1.clone(), material.2.clone()));
         }
         let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
-        let sigmas = table
-            .input_layout()
-            .automorphism_indices(ring_dimension)
-            .map_err(|_| RnsBggError::Lut)?;
+        let sigmas = table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         let switching =
             if switching { self.lut_switching(level, lut_id, table)?.0 } else { Vec::new() };
         let helper = self.lut_helpers(level, table, sigmas.len())?;
@@ -635,7 +638,7 @@ impl EncodingLowering<'_> {
             .parameters
             .lut_output_columns(decomposition_level, table.output_representation())?;
         let sigma_indices =
-            input_layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+            table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         let families = (0..4)
             .map(|port| {
                 decomposition_ring.family_artifact_input(
@@ -926,6 +929,11 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         }
         let level = self.workload.level(input.wire())?;
         let output = self.site()?.output;
+        if table.automorphism_index().is_some() &&
+            (public || self.parameters.rhs_mode() == RhsMode::Dynamic)
+        {
+            return Err(RnsBggError::Binding("an automorphism table needs a Static private input"));
+        }
         let (row, public_key) = match (self.parameters.rhs_mode(), public) {
             (RhsMode::Dynamic, false) => self.dynamic_lut(input, table)?,
             (RhsMode::Dynamic, true) => self.dynamic_public_lut(input, table)?,
@@ -1016,6 +1024,7 @@ impl EncodingLowering<'_> {
         let (row, key) = crate::rns_bgg::public_lut::static_public_lut(
             self.parameters,
             self.hash_key.clone(),
+            self.root_hash_key.clone(),
             level,
             table,
             self.public_lut_entries(table)?,
@@ -1348,6 +1357,7 @@ mod test {
             let mut lowerer = EncodingLowering {
                 parameters: &parameters,
                 hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+                root_hash_key: None,
                 program,
                 workload,
                 preprocess: production.clone(),
@@ -1418,6 +1428,7 @@ mod test {
         let lowerer = |program: &Arc<ExponentLutProgram>, output| EncodingLowering {
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             program: Arc::clone(program),
             workload: Arc::new(RnsBggDerivedWorkload::from_program(program).unwrap()),
             preprocess: production.clone(),
@@ -1566,6 +1577,7 @@ mod test {
         let mut lowerer = EncodingLowering {
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             program,
             workload,
             preprocess: production.clone(),
@@ -1639,6 +1651,7 @@ mod test {
         let mut public_lowerer = EncodingLowering {
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             program: public_program,
             workload: public_workload,
             preprocess: production.clone(),
@@ -1717,6 +1730,7 @@ mod test {
         let mut lowerer = EncodingLowering {
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             program,
             workload,
             preprocess: production.clone(),
@@ -1863,6 +1877,7 @@ mod test {
         let mut lowerer = EncodingLowering {
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             program,
             workload,
             preprocess: ProductionId {
@@ -2063,6 +2078,7 @@ mod test {
         let mut lowerer = EncodingLowering {
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             program,
             workload,
             preprocess: production.clone(),

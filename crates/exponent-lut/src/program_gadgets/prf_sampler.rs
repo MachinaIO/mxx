@@ -21,6 +21,9 @@
 //!   PRF's level, and the PRF's readout LUT and the sampling LUT read it at `z = 0` (`e = 1`, sign
 //!   `+`), giving `h` at the level of the samples.
 //!
+//! - [`PrfDistribution::Sign`]: the uniform sign `(-1)^b` in `{-1, 1}`, a value of every modulus:
+//!   `g` is one on every bin, and no offset is added.
+//!
 //! [`PrfSampler::binary_polynomial`] and [`PrfSampler::cbd_polynomial`] pack `N` samples, one per
 //! member, into one polynomial `sum_o s_o X^o`: each member is placed at `X^o` by a monomial
 //! [`ExponentLutProgramBuilder::mul_small_constant`], which leaves its noise unchanged, and the
@@ -58,6 +61,8 @@ pub enum PrfDistribution {
     Binary { q_min: u64 },
     /// The centered binomial distribution `CBD_eta`, `eta >= 1`.
     Cbd { eta: u32 },
+    /// The uniform sign in `{-1, 1}`.
+    Sign,
 }
 
 impl PrfDistribution {
@@ -72,6 +77,7 @@ impl PrfDistribution {
                 let half = usize::try_from(q_min.div_ceil(2)).map_err(|_| invalid())?;
                 Ok(vec![half; p / 2])
             }
+            Self::Sign => Ok(vec![1; p / 2]),
             Self::Cbd { eta } => {
                 let eta = usize::try_from(eta).map_err(|_| invalid())?;
                 let total = eta
@@ -159,7 +165,7 @@ impl PrfSampler {
             LutOutputRepresentation::Coefficient,
         )?)?;
         let (offset_rhs, offset) = match distribution {
-            PrfDistribution::Cbd { .. } => (Vec::new(), None),
+            PrfDistribution::Cbd { .. } | PrfDistribution::Sign => (Vec::new(), None),
             PrfDistribution::Binary { .. } => {
                 let mut state = prf.initial_input();
                 let offset_rhs = (0..prf.bucket_count())
@@ -204,6 +210,18 @@ impl PrfSampler {
         q_min: u64,
     ) -> Result<(Self, WireId), PrfSamplerError> {
         Self::polynomial(builder, profile, keys, count, PrfDistribution::Binary { q_min })
+    }
+
+    /// The uniform sign polynomial `sum_o (-1)^(b_o) X^o` of the first `count` coefficients (the
+    /// ring dimension by default), one PRF member and key per coefficient (see
+    /// [`Self::polynomial`]).
+    pub fn sign_polynomial(
+        builder: &mut ExponentLutProgramBuilder,
+        profile: SparseLwrPrfProfile,
+        keys: PrfKeys,
+        count: Option<usize>,
+    ) -> Result<(Self, WireId), PrfSamplerError> {
+        Self::polynomial(builder, profile, keys, count, PrfDistribution::Sign)
     }
 
     /// The centered binomial polynomial `sum_o e_o X^o` with `e_o` from
@@ -439,6 +457,18 @@ mod tests {
     }
 
     #[test]
+    fn sign_samples_are_uniform_signs_without_an_offset() {
+        let q = profile().q().unwrap();
+        let (program, sampler) = sampler(&keys(1), PrfDistribution::Sign).unwrap();
+        assert!(sampler.offset_rhs().is_empty());
+        let samples = samples(&program, &sampler);
+        assert_eq!(samples.len(), q);
+        for sign in [-1, 1] {
+            assert_eq!(2 * samples.iter().filter(|sample| **sample == sign).count(), q);
+        }
+    }
+
+    #[test]
     fn binary_samples_shifted_by_the_offset_are_uniform_bits_mod_q_min() {
         let q_min = 1_000_003_u64;
         let (program, sampler) = sampler(&keys(1), PrfDistribution::Binary { q_min }).unwrap();
@@ -605,11 +635,16 @@ mod tests {
     /// With `packed`, the Program instead outputs the polynomial of the
     /// member samples (see [`PrfSampler::polynomial`]; sixteen members use
     /// its default count), which decrypts to sample `o` at coefficient `o`.
+    /// With an automorphism index `k` (packed only), it outputs
+    /// `Aut_k(v)` and `Aut_(k^-1)(Aut_k(v))` of that polynomial `v` (see
+    /// [`crate::program::LutTable::automorphism`]): the second decrypts to
+    /// `v` and the first does not.
     fn check_round_trip(
         distribution: PrfDistribution,
         members: usize,
         packed: bool,
         sigma: Option<bigdecimal::BigDecimal>,
+        automorphism: Option<usize>,
     ) {
         // n = 16, n' = 8, Q = 16, P = 16 over an LWR dimension of four.
         let profile =
@@ -627,7 +662,26 @@ mod tests {
                 distribution,
             )
             .unwrap();
-            (builder.finish(vec![Operand::Scalar(polynomial)]).unwrap(), sampler)
+            let outputs = match automorphism {
+                None => vec![Operand::Scalar(polynomial)],
+                Some(k) => {
+                    let doubled = 2 * profile.ring_dimension().unwrap();
+                    let inverse = (1..doubled).step_by(2).find(|j| j * k % doubled == 1).unwrap();
+                    let mut apply = |input, index| {
+                        let table = crate::program::LutTable::automorphism(
+                            index,
+                            crate::program::LutOutputRepresentation::Coefficient,
+                        )
+                        .unwrap();
+                        let lut = builder.register_lut(table).unwrap();
+                        builder.lut(Operand::Scalar(input), lut).unwrap()
+                    };
+                    let rotated = apply(polynomial, k);
+                    let restored = apply(rotated, inverse);
+                    vec![Operand::Scalar(rotated), Operand::Scalar(restored)]
+                }
+            };
+            (builder.finish(outputs).unwrap(), sampler)
         } else {
             sampler_on(profile, &keys, distribution).unwrap()
         };
@@ -635,7 +689,7 @@ mod tests {
         // The binary offset is the sample at `z = 0`, added as an encoding.
         let offset = match distribution {
             PrfDistribution::Binary { .. } => samples[0],
-            PrfDistribution::Cbd { .. } => 0,
+            PrfDistribution::Cbd { .. } | PrfDistribution::Sign => 0,
         };
         let sample_bound = samples.iter().map(|sample| sample.unsigned_abs()).max().unwrap() +
             offset.unsigned_abs();
@@ -778,6 +832,15 @@ mod tests {
                     sum + plaintext(*value) * DCRTPoly::const_rotate_poly(terminal, o)
                 },
             );
+            if automorphism.is_some() {
+                verify(1, &polynomial, &mut execution, &mut store)
+                    .unwrap_or_else(|error| panic!("{distribution:?}: {error:?}"));
+                assert!(
+                    verify(0, &polynomial, &mut execution, &mut store).is_err(),
+                    "Aut_k must move the packed samples"
+                );
+                return;
+            }
             verify(0, &polynomial, &mut execution, &mut store)
                 .unwrap_or_else(|error| panic!("{distribution:?}: {error:?}"));
             let wrong = polynomial + DCRTPoly::const_one(terminal);
@@ -805,14 +868,14 @@ mod tests {
     #[test]
     fn cbd_round_trips_on_the_cpu() {
         for members in [1, 2] {
-            check_round_trip(PrfDistribution::Cbd { eta: 2 }, members, false, None);
+            check_round_trip(PrfDistribution::Cbd { eta: 2 }, members, false, None, None);
         }
     }
 
     #[test]
     fn binary_round_trips_on_the_cpu() {
         for members in [1, 2] {
-            check_round_trip(PrfDistribution::Binary { q_min: 7 }, members, false, None);
+            check_round_trip(PrfDistribution::Binary { q_min: 7 }, members, false, None, None);
         }
     }
 
@@ -823,7 +886,7 @@ mod tests {
         for distribution in [PrfDistribution::Cbd { eta: 2 }, PrfDistribution::Binary { q_min: 7 }]
         {
             for members in [1, 2] {
-                check_round_trip(distribution, members, false, Some(sigma.clone()));
+                check_round_trip(distribution, members, false, Some(sigma.clone()), None);
             }
         }
     }
@@ -836,9 +899,19 @@ mod tests {
         for distribution in [PrfDistribution::Cbd { eta: 2 }, PrfDistribution::Binary { q_min: 7 }]
         {
             for members in [4, 16] {
-                check_round_trip(distribution, members, true, Some(sigma.clone()));
+                check_round_trip(distribution, members, true, Some(sigma.clone()), None);
             }
         }
+    }
+
+    /// `Aut_k` of the packed sign polynomial (the dio2 helper mask), noise-free and with
+    /// encoding noise of sigma one: `Aut_(k^-1)(Aut_k(v))` decrypts to `v`, `Aut_k(v)` does not.
+    #[test]
+    fn automorphism_of_a_packed_polynomial_round_trips_on_the_cpu() {
+        let k = 3;
+        check_round_trip(PrfDistribution::Sign, 4, true, None, Some(k));
+        let sigma = bigdecimal::BigDecimal::from(1);
+        check_round_trip(PrfDistribution::Sign, 4, true, Some(sigma), Some(k));
     }
 
     #[test]

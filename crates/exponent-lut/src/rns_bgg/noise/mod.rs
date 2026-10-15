@@ -42,12 +42,12 @@ mod evaluator;
 mod refresh;
 mod rules;
 
-pub(crate) use self::decoder::simulate_decoder_noise;
 pub use self::{
     audit::{RnsBggNoiseTrace, RnsBggParameterManifest, RnsBggPlanRequest},
     decoder::RnsBggDecoderNoise,
     refresh::{RefreshSigmaNoise, RnsBggRefreshNoise, simulate_refresh_noise},
 };
+pub(crate) use self::{decoder::simulate_decoder_noise, refresh::mod_down_moments_by};
 
 /// Evaluator-owned noise contracts for one Program lowering.
 ///
@@ -434,6 +434,35 @@ impl RnsBggNoiseValue {
             )]),
             heuristics: NoiseHeuristicLedger::new(),
         })
+    }
+
+    /// A fresh encoding-error carrier of CBD(`eta`) coefficients: bound `eta`, zero mean and
+    /// variance `eta / 2`.
+    pub fn sampled_cbd(eta: u32, source: &[u8], coefficients: &[BigInt]) -> Self {
+        let source = stable_source_id(&(b"rns-bgg/cbd-encoding", source));
+        let moments = zero_mean_moments(
+            NonnegativeRational::new(BigUint::from(eta), BigUint::from(2u8))
+                .expect("positive denominator"),
+        );
+        Self {
+            bound: RnsBggNoiseBound {
+                error: BigUint::from(eta),
+                payload_l1: coefficients.iter().map(|c| c.magnitude()).sum(),
+            },
+            payload_l2_squared: coefficients.iter().map(|c| c.magnitude().pow(2)).sum(),
+            breakdown: Some(Arc::new(NoiseBreakdown::sampled(
+                source,
+                "encoding",
+                moments.clone(),
+                true,
+            ))),
+            moments: Some(moments),
+            provenance: BTreeMap::from([(
+                source,
+                NoiseSourceProvenance { source, route: Vec::new() },
+            )]),
+            heuristics: NoiseHeuristicLedger::new(),
+        }
     }
 
     /// A fresh encoding-error carrier sampled under `contract`: its bound is

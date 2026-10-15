@@ -166,9 +166,103 @@ pub(crate) struct ImportTemplate {
     pub read_ahead: bool,
 }
 
+/// The resident owner of every physical value of a lowering, with the values viewing every
+/// allocation: a lowering that moves an allocation (a concat piece written in place) finds its
+/// views without scanning every owner. Reads see the owner map; every write goes through
+/// [`Self::insert`] or [`Self::rebind`], which keep the views.
+#[derive(Default)]
+pub(crate) struct PhysicalOwners {
+    owners: BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    views: std::collections::HashMap<usize, BTreeSet<PhysicalValueId>>,
+}
+
+impl std::ops::Deref for PhysicalOwners {
+    type Target = BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owners
+    }
+}
+
+impl PhysicalOwners {
+    /// The address of every allocation `owner` views.
+    fn allocations(owner: &GpuResidentValue) -> impl Iterator<Item = usize> + '_ {
+        owner.storages().map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>() as usize)
+    }
+
+    /// Bind `id` to `owner`, returning its previous owner.
+    pub(crate) fn insert(
+        &mut self,
+        id: PhysicalValueId,
+        owner: Arc<GpuResidentValue>,
+    ) -> Option<Arc<GpuResidentValue>> {
+        for allocation in Self::allocations(&owner) {
+            self.views.entry(allocation).or_default().insert(id);
+        }
+        let previous = self.owners.insert(id, owner)?;
+        self.forget(id, &previous);
+        Some(previous)
+    }
+
+    /// Drop the views of `previous`, the former owner of `id`, that its current owner lacks.
+    fn forget(&mut self, id: PhysicalValueId, previous: &GpuResidentValue) {
+        let current = self
+            .owners
+            .get(&id)
+            .map(|owner| Self::allocations(owner).collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        for allocation in Self::allocations(previous) {
+            if !current.contains(&allocation) {
+                if let Some(ids) = self.views.get_mut(&allocation) {
+                    ids.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// The values whose owners view the allocation at `allocation`.
+    pub(crate) fn viewing(
+        &self,
+        allocation: *const (),
+    ) -> impl Iterator<Item = PhysicalValueId> + '_ {
+        self.views.get(&(allocation as usize)).into_iter().flatten().copied()
+    }
+
+    /// Replace the owner of every value `id` by `rebind(id, owner)` where it returns a new owner.
+    pub(crate) fn rebind(
+        &mut self,
+        mut rebind: impl FnMut(
+            PhysicalValueId,
+            &Arc<GpuResidentValue>,
+        ) -> Result<Option<GpuResidentValue>, String>,
+    ) -> Result<(), String> {
+        let replaced = self
+            .owners
+            .iter()
+            .filter_map(|(id, owner)| {
+                rebind(*id, owner).transpose().map(|owner| owner.map(|owner| (*id, owner)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (id, owner) in replaced {
+            self.insert(id, Arc::new(owner));
+        }
+        Ok(())
+    }
+
+    /// Keep the owners of the values `keep` accepts.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&PhysicalValueId) -> bool) {
+        let removed = self.owners.keys().filter(|id| !keep(id)).copied().collect::<Vec<_>>();
+        for id in removed {
+            if let Some(previous) = self.owners.remove(&id) {
+                self.forget(id, &previous);
+            }
+        }
+    }
+}
+
 pub(crate) struct PhysicalFrame {
     pub program: CompiledGpuProgram,
-    pub owners: BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    pub owners: PhysicalOwners,
     pub slots: Vec<Arc<GpuExportSlot>>,
     pub device: i32,
     pub input_ids: BTreeMap<String, PhysicalValueId>,
@@ -1036,14 +1130,12 @@ impl PhysicalFrame {
         }
         if !replaced.is_empty() {
             let inputs = self.input_ids.values().copied().collect::<BTreeSet<_>>();
-            for (id, owner) in self.owners.iter_mut() {
-                if inputs.contains(id) {
-                    continue;
+            self.owners.rebind(|id, owner| {
+                if inputs.contains(&id) {
+                    return Ok(None);
                 }
-                if let Some(rebound) = owner.rebound(&replaced, &ready).map_err(str::to_owned)? {
-                    *owner = Arc::new(rebound);
-                }
-            }
+                owner.rebound(&replaced, &ready).map_err(str::to_owned)
+            })?;
         }
         Ok(())
     }
@@ -1100,11 +1192,7 @@ impl PhysicalFrame {
                 replaced.insert(pointer, crate::backend::BoundStorage::from_device_bytes(fresh)?);
             }
         }
-        for owner in self.owners.values_mut() {
-            if let Some(rebound) = owner.rebound(&replaced, &[]).map_err(str::to_owned)? {
-                *owner = Arc::new(rebound);
-            }
-        }
+        self.owners.rebind(|_, owner| owner.rebound(&replaced, &[]).map_err(str::to_owned))?;
         self.check_return_outputs()
     }
 
@@ -1288,7 +1376,7 @@ pub(super) fn value_id(count: usize) -> Result<PhysicalValueId, String> {
 
 pub(super) fn matrix_column_view(
     values: &mut Vec<PhysicalValue>,
-    owners: &mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    owners: &mut PhysicalOwners,
     source: PhysicalValueId,
     range: ColumnRange,
 ) -> Result<PhysicalValueId, String> {
@@ -1509,7 +1597,7 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub logical: &'a FrozenGpuPlan,
     pub device: i32,
     pub values: &'a mut Vec<PhysicalValue>,
-    pub owners: &'a mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    pub owners: &'a mut PhysicalOwners,
     pub wire_ids: &'a mut BTreeMap<WireRef, PhysicalValueId>,
     pub implementations: &'a mut GpuImplementationRegistry,
     pub operations: &'a mut Vec<CompiledGpuOp>,
@@ -2038,7 +2126,7 @@ pub(super) fn replicate_to_device(
 fn allocate_device_matrix(
     backend: &GpuDcrtBackend,
     values: &mut Vec<PhysicalValue>,
-    owners: &mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    owners: &mut PhysicalOwners,
     ty: &ConcreteMatrixType,
     encoding: PhysicalEncoding,
     device: i32,
@@ -7172,7 +7260,7 @@ pub(crate) fn plan_physical_graph(
     let mut values = Vec::<PhysicalValue>::new();
     let mut real_owners = Vec::<Arc<GpuDeviceReal>>::new();
     let mut indexed_tables = Vec::<IndexedMatrixTableReplay>::new();
-    let mut owners = BTreeMap::<PhysicalValueId, Arc<GpuResidentValue>>::new();
+    let mut owners = PhysicalOwners::default();
     let mut input_ids = BTreeMap::new();
     let mut integer_input_owners = BTreeMap::new();
     let mut real_input_owners = BTreeMap::new();

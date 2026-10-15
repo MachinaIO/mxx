@@ -258,10 +258,39 @@ impl RnsBggPayloadSecret {
 }
 
 impl RnsBggMaskSecret {
+    /// The mask secret `(s_bar, 1)` whose `s_bar` is the sampled `1 x 1` polynomial `value` of
+    /// the ring of level zero of `parameters`, read by every stage through a fresh graph input:
+    /// a mask a scheme samples itself (Diamond iO 2 samples a binary one).
+    pub fn from_sampled(
+        parameters: &RnsBggParameters,
+        value: RuntimeValue,
+    ) -> Result<Self, RnsBggError> {
+        let ring = parameters.ring(0)?;
+        let name = format!("rns-bgg/secret/{:032x}", rand::random::<u128>());
+        Ok(Self {
+            row: (ring.input(name.clone(), (1, 1)), ring.identity(1)),
+            binding: Some(SecretBinding { name, value }),
+        })
+    }
+
     /// The graph input through which every stage reads this sampled secret,
     /// or `None` for a secret given as a graph expression.
     pub fn input_name(&self) -> Option<&str> {
         self.binding.as_ref().map(|binding| binding.name.as_str())
+    }
+
+    /// The secret row `(s_bar, 1)` at level zero, as graph expressions that
+    /// read the sampled polynomial through [`Self::input_name`].
+    pub fn row(&self) -> &RnsBggRow {
+        &self.row
+    }
+
+    /// Bind the sampled secret to its graph input in `runtime`, for a graph
+    /// that reads [`Self::row`].
+    pub fn bind_runtime(&self, runtime: &mut BTreeMap<String, RuntimeValue>) {
+        if let Some(binding) = &self.binding {
+            binding.bind(runtime);
+        }
     }
 
     /// Re-express the same sampled coefficients in a requested RNS level.
@@ -493,6 +522,9 @@ pub struct EncodingLowering<'a> {
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
+    /// The root hash key input of a rooted chain, created in the stage's root scope (see
+    /// [`super::RnsBggRoot::hash_key_input`]).
+    pub(crate) root_hash_key: Option<Bytes>,
     /// Dynamic: each RHS's digit-companion family, imported where the
     /// Program is bound so a Program family body reads its members in place.
     pub(crate) rhs_companions: BTreeMap<RhsId, Family<RnsBggRow>>,
@@ -574,6 +606,23 @@ pub struct RnsEncryptBuild<'a> {
     /// Bind the inputs' plaintexts by their shapes only, whatever the stage is given (see
     /// `RnsEncryptBuild::with_inputs_by_shape`).
     inputs_by_shape: bool,
+    /// An imported encryption: the root tag of every input, whose re-targeted root row the
+    /// stage publishes instead of an encoding (see `RnsEncryptBuild::bind_root_rows`).
+    root_rows: Option<BTreeMap<WireId, String>>,
+}
+
+/// The graph input of port `port` (`0` or `1`) of the root row tagged `tag` that an imported
+/// encryption reads (see `RnsEncryptBuild::bind_root_rows`): a `1 x m_0` row at the root
+/// modulus, or the family of the members' rows of a family input.
+pub fn root_row_input_name(tag: &str, port: usize) -> String {
+    format!("rns-bgg/root-row/{tag}.{port}")
+}
+
+/// The graph input of port `port` of the root helper rows of the LUT helper family `key`
+/// ([`crate::program::LutTable::helper_family_key`]) that an imported encryption reads: the
+/// family of the root helper rows of the table's branch automorphisms, in branch order.
+pub fn root_helper_input_name(key: &str, port: usize) -> String {
+    format!("rns-bgg/root-helper/{key}.{port}")
 }
 
 /// Online evaluation builder with no backend, secrets, or plaintexts.
@@ -618,6 +667,11 @@ pub struct RnsOnlineEvalBuild<'a> {
     /// Bind the Program's data by their shapes only (see
     /// `RnsOnlineEvalBuild::with_inputs_by_shape`).
     inputs_by_shape: bool,
+    /// The root tags of the Program's inputs (see `RnsOnlineEvalBuild::with_root_inputs`).
+    root_inputs: BTreeMap<WireId, String>,
+    /// Outputs a composing caller adds to the stage graph (see `RnsOnlineEvalBuild::add_output`).
+    #[allow(clippy::type_complexity)]
+    extra_outputs: Vec<Box<dyn FnOnce(DslContext) -> Result<DslContext, mxx_dsl::DslError>>>,
     /// The integer data of the Program and of its bound children, by graph
     /// input name: the Program's given data ([`RnsOnlineEvalBuild::with_data`])
     /// and the children's resident inputs holding the entries preprocessing

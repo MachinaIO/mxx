@@ -278,9 +278,8 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             .checked_add(1)
             .ok_or(RnsBggError::Parameters("LUT decomposition level overflow"))?;
         self.parameters.level(decomposition_level)?;
-        let layout = table.input_layout();
         let ring_dimension = self.parameters.level(evaluation_level)?.ring_dimension() as usize;
-        let sigmas = layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+        let sigmas = table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         let mut sources = BTreeMap::new();
         for sigma in sigmas {
             let a = stable_source_id(&(b"rns-bgg/lut/A", evaluation_level, sigma));
@@ -301,7 +300,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 evaluation_level,
                 decomposition_level,
                 lut,
-                layout,
+                table.input_layout(),
                 sigma,
             ));
             sources.entry(b).or_insert_with(|| NoiseSourceProvenance {
@@ -730,11 +729,8 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         // Helper and B-key errors are sampled per automorphism; a repeated
         // automorphism reuses its sample, so only distinct ones add linearly.
         let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
-        let automorphisms = table
-            .input_layout()
-            .automorphism_indices(ring_dimension)
-            .map_err(|_| RnsBggError::Lut)?
-            .len();
+        let automorphisms =
+            table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?.len();
         let branch_squares = if automorphisms == branches {
             BigUint::from(branches)
         } else {
@@ -1505,6 +1501,13 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             return Err(RnsBggError::Parameters("a decoder smudge LUT needs a private input"));
         }
         let level = self.level(input.0)?;
+        if table.automorphism_index().is_some() &&
+            (public || self.parameters.rhs_mode() == RhsMode::Dynamic)
+        {
+            return Err(RnsBggError::Parameters(
+                "an automorphism table needs a Static private input",
+            ));
+        }
         if self.parameters.rhs_mode() == RhsMode::Dynamic {
             let value = if public {
                 self.dynamic_public_lut(input, table)?
@@ -1520,8 +1523,11 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         let wire = self.site()?.output;
         // Exponent outputs are signed monomials, irrespective of the
         // numeric exponent stored in the table.  Coefficient outputs instead
-        // carry the table's integer coefficient bound.
+        // carry the table's integer coefficient bound. `Aut_k` returns `sigma_k` of its input,
+        // whose coefficients are a signed permutation of the input's, so it keeps the input's
+        // payload norm.
         let output_payload_l1 = match table.output_representation() {
+            _ if table.automorphism_index().is_some() => input.1.bound.payload_l1.clone(),
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
             crate::program::LutOutputRepresentation::Coefficient => {
                 BigUint::from(table.max_output())

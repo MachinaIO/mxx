@@ -49,7 +49,16 @@ impl<'a> RnsPreprocessBuild<'a> {
             hash_namespace: None,
             refresh: None,
             inputs_by_shape: false,
+            root_inputs: BTreeMap::new(),
         }
+    }
+
+    /// This builder reading every input of `root_inputs` from the root object of its tag on
+    /// a rooted chain (see [`crate::rns_bgg::RnsBggRoot`]): its key is the re-targeted root
+    /// key of the tag. Online evaluation must be given the same tags.
+    pub fn with_root_inputs(mut self, root_inputs: BTreeMap<WireId, String>) -> Self {
+        self.root_inputs = root_inputs;
+        self
     }
 
     /// Make this builder a refresh child that samples its public matrices
@@ -409,7 +418,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         // column).
         let actions = self
             .parameters
-            .refresh_actions(level, a_prime, declaration)
+            .refresh_actions(level, a_prime, declaration.output_prime(), declaration.reference())
             .map_err(ApiError::scheme)?;
         let top = refresh_combination(
             (one.0.0, one.0.1),
@@ -646,6 +655,8 @@ impl<'a> RnsPreprocessBuild<'a> {
         );
         evaluator.output_use = self.output_use;
         evaluator.dynamic = self.dynamic.clone();
+        evaluator.root_inputs = self.root_inputs.clone();
+        evaluator.root_hash_key = self.parameters.root_hash_key_input();
         // Every data family is a graph input named under the builder's
         // namespace, with the builder's values unless bound by shape only.
         let name = |family| crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family);
@@ -802,6 +813,12 @@ impl<'a> RnsPreprocessBuild<'a> {
         // Plaintext RHS graph handles stay for lowering: a loop that reads an
         // RHS family member prepares its compact ciphertext there.
         self.runtime.insert(hash_key_input, RuntimeValue::Bytes(sampling_key.as_slice().into()));
+        if let Some(root) = self.parameters.root() {
+            self.runtime.insert(
+                root.hash_key_input_name(),
+                RuntimeValue::Bytes(root.hash_key().as_slice().into()),
+            );
+        }
         if let Some(binding) = payload.and_then(|payload| payload.binding.as_ref()) {
             binding.bind(&mut self.runtime);
         }

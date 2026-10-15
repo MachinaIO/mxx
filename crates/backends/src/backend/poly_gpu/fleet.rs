@@ -684,6 +684,11 @@ pub(crate) struct GpuPreparedNativeResources {
 }
 
 impl GpuPreparedNativeResources {
+    /// Whether this program's indexed matrix copies read the table `resource_id`.
+    pub(crate) fn uses_indexed_matrix(&self, resource_id: u32) -> bool {
+        self.indexed_matrices.contains_key(&resource_id)
+    }
+
     pub(crate) fn allocation_ranges(&self) -> Result<Vec<(i32, u64, usize)>, GpuNativeGraphError> {
         let mut ranges = Vec::new();
         for (device, plan) in self.modulus_conversions.values() {
@@ -927,6 +932,9 @@ pub(crate) fn prepare_compiled_gpu_program(
 ) -> Result<GpuPreparedNativeResources, GpuNativeGraphError> {
     let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
     let mut modulus_conversions = BTreeMap::new();
+    // The indexed matrix tables this program's copies read: a launch prepares the descriptors
+    // of its own tables only, whose candidate views it rebuilds every launch.
+    let mut used_indexed_matrices = BTreeMap::new();
     let mut pending = program.operations.iter().collect::<Vec<_>>();
     while let Some(operation) = pending.pop() {
         if let Some(body) = operation.body.as_ref() {
@@ -936,6 +944,15 @@ pub(crate) fn prepare_compiled_gpu_program(
             .implementations
             .resolve(operation.implementation)
             .map_err(|message| invalid(message))?;
+        if implementation.primitive == GpuNativePrimitive::MatrixIndexedCopy {
+            let Some(KernelArg::U32(resource_id)) = operation.arguments.first() else {
+                return Err(invalid("compiled indexed matrix copy has wrong arguments"));
+            };
+            let table = indexed_matrices
+                .get(resource_id)
+                .ok_or_else(|| invalid("indexed matrix descriptor table is missing"))?;
+            used_indexed_matrices.insert(*resource_id, Arc::clone(table));
+        }
         if !matches!(
             implementation.primitive,
             GpuNativePrimitive::ModulusSwitch |
@@ -1852,7 +1869,7 @@ pub(crate) fn prepare_compiled_gpu_program(
         statistical,
         gq,
         cutoff,
-        indexed_matrices: indexed_matrices.clone(),
+        indexed_matrices: used_indexed_matrices,
     })
 }
 

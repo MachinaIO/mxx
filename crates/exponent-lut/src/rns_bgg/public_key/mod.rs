@@ -149,6 +149,11 @@ pub struct PublicKeyLowering<'a> {
     streamed_rhs: BTreeMap<RhsId, Option<Family<RnsBggMatrix>>>,
     /// RHS families read from the materials prepared at binding.
     prepared_rhs_reads: std::collections::BTreeSet<RhsId>,
+    /// The root tag of every input read from a root object of a rooted chain (see
+    /// [`super::RnsBggRoot`]); other inputs keep their hash-sampled keys.
+    pub(crate) root_inputs: BTreeMap<WireId, String>,
+    /// The root hash key input of a rooted chain, created in the stage's root scope.
+    pub(crate) root_hash_key: Option<Bytes>,
 }
 
 /// Preprocessing stage adapter using the common stage lifecycle.
@@ -181,6 +186,8 @@ pub struct RnsPreprocessBuild<'a> {
     /// Bind the Program's RHS plaintexts and data by their shapes only, whatever the stage is
     /// given (see `RnsPreprocessBuild::with_inputs_by_shape`).
     inputs_by_shape: bool,
+    /// The root tags of the Program's inputs (see `RnsPreprocessBuild::with_root_inputs`).
+    root_inputs: BTreeMap<WireId, String>,
 }
 
 /// A refresh part prepared by preprocessing: its lowered children, the production and manifest

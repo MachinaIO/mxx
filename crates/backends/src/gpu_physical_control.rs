@@ -462,7 +462,29 @@ pub(super) fn wave_family_member(
     source: &GpuResidentValue,
     index: usize,
 ) -> Result<Arc<GpuResidentValue>, String> {
-    let (selected, bindings) = wave_member_layout(source.physical(), index)?;
+    wave_selected_member(source, static_family_physical(source.physical(), index)?)
+}
+
+/// The members `indices` of a resident family rebased as in [`wave_family_member`], selected in
+/// one pass over the family's parts (a loop over every member of a family stored as one part per
+/// member would otherwise scan every part for every member).
+pub(super) fn wave_family_members(
+    source: &GpuResidentValue,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<Arc<GpuResidentValue>>, String> {
+    static_family_physicals(source.physical(), indices)?
+        .into_iter()
+        .map(|selected| wave_selected_member(source, selected))
+        .collect()
+}
+
+/// Rebase the member `selected` of `source` (a static selection of it) as in
+/// [`wave_family_member`].
+fn wave_selected_member(
+    source: &GpuResidentValue,
+    selected: PhysicalValue,
+) -> Result<Arc<GpuResidentValue>, String> {
+    let (selected, bindings) = wave_member_layout(selected)?;
     let mut storage = BTreeMap::new();
     for (old_slot, slot, offset) in bindings {
         let mut bound = source
@@ -492,10 +514,8 @@ pub(super) fn wave_family_member(
 }
 
 fn wave_member_layout(
-    family: &PhysicalValue,
-    index: usize,
+    mut selected: PhysicalValue,
 ) -> Result<(PhysicalValue, Vec<(StorageRef, StorageRef, u64)>), String> {
-    let mut selected = static_family_physical(family, index)?;
     let mut bindings = Vec::with_capacity(selected.parts.len());
     for (part_index, part) in selected.parts.iter_mut().enumerate() {
         let slot = StorageRef::Input(
@@ -2955,8 +2975,10 @@ fn lower_dynamic_matrix_member(
     let encoding = encoding.clone();
     let source = Arc::clone(source);
     let mut candidates = Vec::with_capacity(count);
-    for member_index in 0..count {
-        let selected = static_family_member(&source, member_index)?;
+    let members = static_family_physicals(source.physical(), 0..count)?;
+    for (member_index, member) in members.into_iter().enumerate() {
+        let selected =
+            source.with_physical_view(Arc::new(member)).map(Arc::new).map_err(str::to_owned)?;
         if selected.wire_type() != &expected ||
             selected.physical().encodings.as_ref() != [encoding.clone()]
         {
@@ -6101,8 +6123,13 @@ fn lower_concat(
     if let Some(index) = zero {
         written.push((ColumnRange { start: 0, end: output_ty.columns }, index));
     }
+    // The reads of every wire of the scope, counted once for all pieces.
+    let mut readers = BTreeMap::<WireRef, usize>::new();
+    for argument in scope.nodes().iter().filter_map(|node| scope.arguments(node)).flatten() {
+        *readers.entry(argument).or_default() += 1;
+    }
     for (wire, source, rows, columns) in inputs {
-        let writers = concat_piece_writers(ctx, scope, scope_id, &arguments, wire, source);
+        let writers = concat_piece_writers(ctx, scope_id, (&arguments, &readers), wire, source);
         let owner = Arc::clone(
             ctx.owners
                 .get(&output_id)
@@ -6240,12 +6267,12 @@ fn lower_concat(
 /// piece can be written straight into its output window: elementwise or
 /// product operations of this scope that write only views of the piece's own
 /// unshared scratch allocations, which nothing but this concat reads.
-/// Returns every value viewing the piece's allocations with the writers.
+/// Returns every value viewing the piece's allocations with the writers. `readers` counts the
+/// reads of every wire of the scope.
 fn concat_piece_writers(
     ctx: &PhysicalLoweringContext<'_>,
-    scope: &GraphScope,
     scope_id: &FrozenGraphScopeId,
-    concat_arguments: &[WireRef],
+    (concat_arguments, readers): (&[WireRef], &BTreeMap<WireRef, usize>),
     wire: WireRef,
     source: PhysicalValueId,
 ) -> Option<(Vec<PhysicalValueId>, Vec<(ColumnRange, u32)>)> {
@@ -6257,14 +6284,7 @@ fn concat_piece_writers(
     {
         return None;
     }
-    let readers = scope
-        .nodes()
-        .iter()
-        .filter_map(|node| scope.arguments(node))
-        .flatten()
-        .filter(|argument| *argument == wire)
-        .count();
-    if readers != 1 {
+    if readers.get(&wire) != Some(&1) {
         return None;
     }
     let value = ctx.values.get(source.0 as usize)?;
@@ -6274,19 +6294,15 @@ fn concat_piece_writers(
     if storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_))) {
         return None;
     }
-    let allocations = storages
+    let own = storages
         .iter()
         .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
         .collect::<Vec<_>>();
-    let aliases = ctx
-        .owners
+    let aliases = own
         .iter()
-        .filter(|(_, other)| {
-            other
-                .storages()
-                .any(|(_, bound)| allocations.contains(&Arc::as_ptr(&bound.owner).cast::<()>()))
-        })
-        .map(|(id, _)| *id)
+        .flat_map(|allocation| ctx.owners.viewing(*allocation))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     // Every aliasing value is a view within the piece with its strides; a
     // piece that is itself a view into a larger value (one row of a product)
@@ -7095,7 +7111,7 @@ fn lower_sequential_loop(
         }
         let first_new = mark.0;
         ctx.values.truncate(first_new);
-        ctx.owners.retain(|id, _| (id.0 as usize) < first_new);
+        ctx.owners.retain(|id| (id.0 as usize) < first_new);
         ctx.producer.retain(|id, _| (id.0 as usize) < first_new);
         ctx.family_member_producers.retain(|(id, _), _| (id.0 as usize) < first_new);
         ctx.trapdoor_public_ids.retain(|id, _| (id.0 as usize) < first_new);
@@ -7302,10 +7318,15 @@ fn lower_sequential_loop(
     Ok(())
 }
 
-fn replay_matrix_owner(
+/// Byte alignment of every later-wave member in its loop's member arena.
+const REPLAY_ALIGNMENT: u64 = 256;
+
+/// The storage slot and bytes of loop member `id`, which a later wave's owner takes at an
+/// allocation of its own.
+fn replay_layout(
     ctx: &PhysicalLoweringContext<'_>,
     id: PhysicalValueId,
-) -> Result<Arc<GpuResidentValue>, String> {
+) -> Result<(crate::gpu_execution_plan::StorageRef, u64), String> {
     let planned = ctx
         .values
         .get(id.0 as usize)
@@ -7318,28 +7339,41 @@ fn replay_matrix_owner(
     if planned.parts.iter().any(|part| part.storage != slot) {
         return Err("GPU loop member has multiple storage owners".into());
     }
-    // The owner takes the frozen member's layout at an allocation of its own,
-    // bound by address: a raw buffer of the member's storage size.
     let bytes = ctx
         .owners
         .get(&id)
         .and_then(|owner| owner.storage(slot))
         .map(|storage| storage.bytes)
         .ok_or_else(|| "GPU loop member has no planned storage".to_owned())?;
-    let stream = ctx
-        .backend
-        .parameters_on_device(ctx.device)?
-        .native_launch_stream(ctx.device)
-        .map_err(|error| error.to_string())?;
-    let buffer = Arc::new(
-        crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(
-            &stream,
-            usize::try_from(bytes).map_err(|_| "GPU loop member size exceeds usize")?,
-        )
-        .map_err(|error| error.to_string())?,
-    );
-    let storage =
-        BoundStorage { device: ctx.device, address: buffer.as_ptr() as u64, bytes, owner: buffer };
+    Ok((slot, bytes))
+}
+
+/// The owner of a later wave's loop member `id`: the frozen member's layout at the next range of
+/// the loop's member arena `arena` (one allocation for every later-wave member of the loop, so a
+/// loop of many waves allocates once), bound by address; `cursor` advances past it.
+fn replay_matrix_owner(
+    ctx: &PhysicalLoweringContext<'_>,
+    id: PhysicalValueId,
+    arena: &Option<Arc<crate::poly::dcrt::gpu::GpuDeviceBuffer>>,
+    cursor: &mut u64,
+) -> Result<Arc<GpuResidentValue>, String> {
+    let (slot, bytes) = replay_layout(ctx, id)?;
+    let arena = arena.as_ref().ok_or_else(|| "GPU loop member arena is missing".to_owned())?;
+    let end = cursor
+        .checked_add(bytes)
+        .filter(|end| *end <= arena.len() as u64)
+        .ok_or_else(|| "GPU loop member arena is too small".to_owned())?;
+    let storage = BoundStorage {
+        device: ctx.device,
+        address: arena.as_ptr() as u64 + *cursor,
+        bytes,
+        owner: Arc::clone(arena) as Arc<dyn std::any::Any + Send + Sync>,
+    };
+    *cursor = end.div_ceil(REPLAY_ALIGNMENT) * REPLAY_ALIGNMENT;
+    let planned = ctx
+        .values
+        .get(id.0 as usize)
+        .ok_or_else(|| "GPU loop member has no physical metadata".to_owned())?;
     GpuResidentValue::new(
         Arc::new(planned.clone()),
         BTreeMap::from([(slot, storage)]),
@@ -8447,6 +8481,52 @@ fn lower_parallel_loop(
     if ctx.device_body && !body_imports.is_empty() {
         return Err("GPU device body artifact import needs an on-demand region boundary".into());
     }
+    // Every later wave's members take ranges of one arena, allocated once for the loop.
+    let later_waves =
+        if ctx.device_body { 0 } else { (0..count).step_by(width).count().saturating_sub(1) };
+    let mut wave_bytes = 0u64;
+    for ids in &result_ids {
+        for (port, id) in ids.iter().copied().enumerate() {
+            if !(streamed_ports[port] || summed_ports[port]) {
+                let (_, bytes) = replay_layout(ctx, id)?;
+                wave_bytes += bytes.div_ceil(REPLAY_ALIGNMENT) * REPLAY_ALIGNMENT;
+            }
+        }
+    }
+    let arena = if later_waves > 0 && wave_bytes > 0 {
+        let stream = ctx
+            .backend
+            .parameters_on_device(ctx.device)?
+            .native_launch_stream(ctx.device)
+            .map_err(|error| error.to_string())?;
+        let bytes = usize::try_from(wave_bytes * later_waves as u64)
+            .map_err(|_| "GPU loop member arena exceeds usize".to_owned())?;
+        Some(Arc::new(
+            crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(&stream, bytes)
+                .map_err(|error| error.to_string())?,
+        ))
+    } else {
+        None
+    };
+    let mut cursor = 0u64;
+    // Every member a Zip lane selects over the waves, `offset..offset + count` of its source.
+    let zip_members = if ctx.device_body {
+        Vec::new()
+    } else {
+        zip_lanes
+            .iter()
+            .map(|(offset, _, _, source_id)| {
+                let source = ctx
+                    .owners
+                    .get(source_id)
+                    .ok_or_else(|| "GPU Zip root family owner is missing".to_owned())?;
+                let end = offset
+                    .checked_add(count)
+                    .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+                wave_family_members(source, *offset..end)
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
     for wave_start in (0..count).step_by(width).filter(|_| !ctx.device_body) {
         let active_lanes = (count - wave_start).min(width);
         let mut wave = PhysicalWave {
@@ -8476,17 +8556,15 @@ fn lower_parallel_loop(
                     .map_err(|_| "GPU parallel device index exceeds u64".to_owned())?,
             ));
         }
-        for (offset, lane, id, source_id) in &zip_lanes {
-            let source = ctx
-                .owners
-                .get(source_id)
-                .ok_or_else(|| "GPU Zip root family owner is missing".to_owned())?;
-            let member_index = wave_start
+        for ((offset, lane, id, source_id), members) in zip_lanes.iter().zip(&zip_members) {
+            let position = wave_start
                 .checked_add(*lane)
                 .map(|index| index.min(count - 1))
-                .and_then(|index| index.checked_add(*offset))
                 .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
-            let selected = wave_family_member(source, member_index)?;
+            let member_index = position
+                .checked_add(*offset)
+                .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+            let selected = Arc::clone(&members[position]);
             if selected.physical().as_ref() != &ctx.values[id.0 as usize] {
                 return Err("GPU Zip member layout changes between waves".into());
             }
@@ -8578,7 +8656,7 @@ fn lower_parallel_loop(
                             .ok_or_else(|| "GPU first-wave output owner is missing".to_owned())?,
                     )
                 } else {
-                    replay_matrix_owner(ctx, id)?
+                    replay_matrix_owner(ctx, id, &arena, &mut cursor)?
                 };
                 // A streamed or summed member keeps its owner in every wave,
                 // so no wave rebinds it and its memory stays plan scratch.
@@ -8670,8 +8748,14 @@ fn bind_template_aliases(
     if replaced.is_empty() {
         return Ok(());
     }
-    for index in template_values {
-        let id = value_id(index)?;
+    // Only a template value viewing a replaced allocation can be rebound: the owners' view index
+    // gives them without scanning the template.
+    let candidates = replaced
+        .keys()
+        .flat_map(|allocation| ctx.owners.viewing(*allocation))
+        .filter(|id| template_values.contains(&(id.0 as usize)))
+        .collect::<BTreeSet<_>>();
+    for id in candidates {
         if wave.owner_bindings.contains_key(&id) {
             continue;
         }
@@ -9116,15 +9200,29 @@ fn lower_inlined_child(
 }
 
 fn static_family_physical(physical: &PhysicalValue, index: usize) -> Result<PhysicalValue, String> {
+    static_family_physicals(physical, index..index + 1)?
+        .pop()
+        .ok_or_else(|| "GPU static family index is out of range".to_owned())
+}
+
+/// The members `indices` of a resident family, as views of its parts. One pass over the parts
+/// selects every member, so selecting all the members of a family of `m` members split into `p`
+/// parts costs `O(p + m)` rather than `O(p m)`.
+fn static_family_physicals(
+    physical: &PhysicalValue,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<PhysicalValue>, String> {
     let ConcreteWireType::IndexedFamily { element, count } = &physical.ty else {
         return Err("GPU static family selection requires a resident family".into());
     };
-    if index >= *count {
+    if indices.end > *count {
         return Err("GPU static family index is out of range".into());
     }
-    let index = u64::try_from(index)
+    let first = u64::try_from(indices.start)
         .map_err(|_| "GPU static family index exceeds physical coordinates".to_owned())?;
-    let mut parts = Vec::new();
+    let last = u64::try_from(indices.end)
+        .map_err(|_| "GPU static family index exceeds physical coordinates".to_owned())?;
+    let mut members = vec![Vec::new(); indices.len()];
     for part in physical.parts.iter() {
         let start = *part
             .view
@@ -9139,37 +9237,42 @@ fn static_family_physical(physical: &PhysicalValue, index: usize) -> Result<Phys
         let end = start
             .checked_add(extent)
             .ok_or_else(|| "GPU family view range overflows".to_owned())?;
-        if index < start || index >= end {
-            continue;
-        }
         let stride = *part
             .view
             .byte_strides
             .first()
             .ok_or_else(|| "GPU family part has no family stride".to_owned())?;
-        let displacement = (index - start)
-            .checked_mul(stride)
-            .ok_or_else(|| "GPU family member offset overflows".to_owned())?;
-        let mut selected = part.clone();
-        selected.view.byte_offset = selected
-            .view
-            .byte_offset
-            .checked_add(displacement)
-            .ok_or_else(|| "GPU family member address overflows".to_owned())?;
-        selected.view.origin = selected.view.origin[1..].to_vec().into_boxed_slice();
-        selected.view.extent = selected.view.extent[1..].to_vec().into_boxed_slice();
-        selected.view.byte_strides = selected.view.byte_strides[1..].to_vec().into_boxed_slice();
-        parts.push(selected);
+        for index in start.max(first)..end.min(last) {
+            let displacement = (index - start)
+                .checked_mul(stride)
+                .ok_or_else(|| "GPU family member offset overflows".to_owned())?;
+            let mut selected = part.clone();
+            selected.view.byte_offset = selected
+                .view
+                .byte_offset
+                .checked_add(displacement)
+                .ok_or_else(|| "GPU family member address overflows".to_owned())?;
+            selected.view.origin = selected.view.origin[1..].to_vec().into_boxed_slice();
+            selected.view.extent = selected.view.extent[1..].to_vec().into_boxed_slice();
+            selected.view.byte_strides =
+                selected.view.byte_strides[1..].to_vec().into_boxed_slice();
+            members[(index - first) as usize].push(selected);
+        }
     }
-    if parts.is_empty() {
-        return Err("GPU family member has no resident physical part".into());
-    }
-    Ok(PhysicalValue {
-        ty: element.as_ref().clone(),
-        encodings: physical.encodings.clone(),
-        parts: parts.into_boxed_slice(),
-        integer_ranges: physical.integer_ranges.clone(),
-    })
+    members
+        .into_iter()
+        .map(|parts| {
+            if parts.is_empty() {
+                return Err("GPU family member has no resident physical part".to_owned());
+            }
+            Ok(PhysicalValue {
+                ty: element.as_ref().clone(),
+                encodings: physical.encodings.clone(),
+                parts: parts.into_boxed_slice(),
+                integer_ranges: physical.integer_ranges.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Resolve a child scope's bindings without mutating the enclosing scope.
@@ -9578,8 +9681,10 @@ mod tests {
         assert_eq!(selected.parts[0].view.byte_offset, 16);
         assert_eq!(selected.parts[0].view.extent.as_ref(), &[1, 1]);
         assert!(static_family_physical(&family, 3).is_err());
-        let (first_wave, first_bindings) = wave_member_layout(&family, 0).unwrap();
-        let (last_wave, last_bindings) = wave_member_layout(&family, 2).unwrap();
+        let (first_wave, first_bindings) =
+            wave_member_layout(static_family_physical(&family, 0).unwrap()).unwrap();
+        let (last_wave, last_bindings) =
+            wave_member_layout(static_family_physical(&family, 2).unwrap()).unwrap();
         assert_eq!(first_wave, last_wave);
         assert_eq!(first_bindings[0].2, 0);
         assert_eq!(last_bindings[0].2, 16);

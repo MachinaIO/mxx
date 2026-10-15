@@ -234,6 +234,7 @@ pub(crate) fn static_public_lut_identity(
 pub(crate) fn static_public_lut(
     parameters: &RnsBggParameters,
     hash_key: Bytes,
+    root_hash_key: Option<Bytes>,
     level: usize,
     table: &crate::program::LutTable,
     values: super::dynamic::LutEntries<'_>,
@@ -271,7 +272,13 @@ pub(crate) fn static_public_lut(
         return Ok(initial);
     }
     let public = |sigma: IntExpr| {
-        super::public_key::lut_public_matrix(parameters, hash_key.clone(), level, Int::from(sigma))
+        super::public_key::lut_public_matrix(
+            parameters,
+            hash_key.clone(),
+            root_hash_key.clone(),
+            level,
+            Int::from(sigma),
+        )
     };
     let helper_row = |position: IntExpr| {
         helpers.map(|(top, bottom)| {

@@ -456,6 +456,14 @@ impl LutOutputRepresentation {
 /// embeds the values in the LUT switching ciphertexts and needs them; the online evaluation of
 /// a LUT on a private payload reads only the shape and the largest output value, which bounds a
 /// coefficient output.
+///
+/// An *automorphism table* ([`LutTable::automorphism`]) is the one-branch LUT `Aut_k`: its only
+/// branch is the automorphism `sigma_k` with switching coefficient `1`, so a private input `mu`
+/// under `(s, r)` becomes the encoding of `sigma_k(mu)` under the same mask and payload secrets
+/// (the routed input is switched back to `r` by the branch's switching ciphertext and to `s` by
+/// the level's helper of `sigma_k`). The substitution is a ring automorphism, so `mu` may be any
+/// plaintext: unlike a Walsh LUT, the table also reads a coefficient wire, which is a raw carrier
+/// in the state form of its level, and returns a coefficient wire at that level.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LutTable {
     input_width: usize,
@@ -466,6 +474,8 @@ pub struct LutTable {
     values_digest: [u8; 32],
     max_output: usize,
     output_representation: LutOutputRepresentation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automorphism: Option<usize>,
 }
 
 /// The output values of a [`LutTable`].
@@ -509,9 +519,66 @@ impl LutTable {
             values_digest,
             max_output,
             output_representation,
+            automorphism: None,
         };
         validate_table(&table)?;
         Ok(table)
+    }
+
+    /// The automorphism table `Aut_k` (see [`LutTable`]) for the odd index `k`, returning its
+    /// input in `output_representation`: one branch on the one-member layout, whose Walsh
+    /// coefficient is `1` (the value `1` for a coefficient output, the exponent `0` for an
+    /// exponent output). The output of a coefficient input keeps the input's coefficient bound.
+    pub fn automorphism(
+        k: usize,
+        output_representation: LutOutputRepresentation,
+    ) -> Result<Self, ProgramValidationError> {
+        if k % 2 == 0 {
+            return Err(ProgramValidationError::InvalidLut);
+        }
+        let (output_width, value) = match output_representation {
+            LutOutputRepresentation::Coefficient => (2, 1),
+            LutOutputRepresentation::Exponent(layout) => (layout.width(), 0),
+        };
+        let mut table = Self::new(
+            1,
+            ExpLayout { stride_log2: 0, width_log2: 0 },
+            output_width,
+            vec![value],
+            output_representation,
+        )?;
+        table.automorphism = Some(k);
+        Ok(table)
+    }
+
+    /// The index `k` of an automorphism table, `None` for a Walsh LUT.
+    pub fn automorphism_index(&self) -> Option<usize> {
+        self.automorphism
+    }
+
+    /// The automorphism of every branch at ring dimension `ring_dimension`, in branch order: the
+    /// input layout's automorphisms for a Walsh LUT, `[k mod 2n]` for `Aut_k`.
+    pub fn branch_automorphisms(&self, ring_dimension: usize) -> Result<Vec<usize>, LayoutError> {
+        match self.automorphism {
+            None => self.input_layout.automorphism_indices(ring_dimension),
+            Some(k) => {
+                self.input_layout.validate(ring_dimension)?;
+                let modulus = ring_dimension
+                    .checked_mul(2)
+                    .ok_or(LayoutError::RingDimensionOverflow(ring_dimension))?;
+                Ok(vec![k % modulus])
+            }
+        }
+    }
+
+    /// The name of the helper family this table's branches read at a level: its input layout
+    /// for a Walsh LUT (every LUT of one layout shares the helpers of its automorphisms), the
+    /// automorphism for `Aut_k`.
+    pub fn helper_family_key(&self) -> String {
+        match self.automorphism {
+            None => format!("{:?}", self.input_layout),
+            Some(k) => format!("Aut({k})"),
+        }
     }
 
     /// A unary table whose values are entries `offset..offset + input_width` of the integer
@@ -537,6 +604,7 @@ impl LutTable {
             values_digest: digest.finalize().into(),
             max_output: output_width.checked_sub(1).ok_or(ProgramValidationError::InvalidLut)?,
             output_representation,
+            automorphism: None,
         };
         validate_table(&table)?;
         Ok(table)
@@ -1264,16 +1332,35 @@ fn derive_body_metadata(
             }
             Step::Lut { input, table, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
-                if input.coefficient() {
-                    return Err(ProgramValidationError::InvalidStructure(
-                        "LUT input cannot be a coefficient output".into(),
-                    ));
-                }
                 let table = luts
                     .get(table.0 as usize)
                     .ok_or(ProgramValidationError::InvalidLutId(*table))?;
-                let coefficient_bound =
-                    table.output_representation.is_coefficient().then_some(table.max_output as u64);
+                let coefficient_bound = match table.automorphism {
+                    // `Aut_k` keeps the representation of its input and the coefficient
+                    // magnitudes of a coefficient input (a signed permutation of them).
+                    Some(_) => {
+                        if input.coefficient() != table.output_representation.is_coefficient() ||
+                            input.knowledge != AttributeKnowledge::PrivatePayload
+                        {
+                            return Err(ProgramValidationError::InvalidStructure(
+                                "an automorphism table keeps a private input's representation"
+                                    .into(),
+                            ));
+                        }
+                        input.coefficient_bound
+                    }
+                    None => {
+                        if input.coefficient() {
+                            return Err(ProgramValidationError::InvalidStructure(
+                                "LUT input cannot be a coefficient output".into(),
+                            ));
+                        }
+                        table
+                            .output_representation
+                            .is_coefficient()
+                            .then_some(table.max_output as u64)
+                    }
+                };
                 WireMetadata { knowledge: input.knowledge, coefficient_bound }
             }
             Step::MulSmallConstant { input, coefficients, .. } => {

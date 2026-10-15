@@ -568,6 +568,26 @@ impl NoiseMoments {
         }
     }
 
+    /// Moments of a sum of `count` products of a value with these moments by independent
+    /// uniform digits of variance `digit_variance` (zero mean), such as the digits of the
+    /// decomposition of a uniform matrix: zero-mean, with variance
+    /// `count (Var + (|mean| + radius)^2) digit_variance`.
+    pub fn uniform_digit_action(
+        &self,
+        count: &BigUint,
+        digit_variance: &NonnegativeRational,
+    ) -> Self {
+        Self {
+            mean_numerator: BigInt::zero(),
+            mean_denominator: BigUint::one(),
+            mean_radius: NonnegativeRational::zero(),
+            variance: self
+                .second_moment_bound()
+                .scaled(count)
+                .scaled_ratio(&digit_variance.numerator, &digit_variance.denominator),
+        }
+    }
+
     /// Uniform integer interval starting at `lower` with positive `size`.
     /// The support contract is established by parameter construction.
     pub fn uniform_interval(lower: BigInt, size: BigUint) -> Self {

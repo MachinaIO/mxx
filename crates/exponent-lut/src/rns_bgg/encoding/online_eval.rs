@@ -88,8 +88,35 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_namespace: None,
             pending_refresh: None,
             inputs_by_shape: false,
+            root_inputs: BTreeMap::new(),
+            extra_outputs: Vec::new(),
             runtime: BTreeMap::new(),
         }
+    }
+
+    /// Add the graph output `name` holding `value`, a value (a matrix or a family of matrices)
+    /// a composing caller computed from the lowered Program outputs it was given (see
+    /// [`crate::api::online_eval`]): the stage returns it beside the Program outputs, which stay
+    /// as preprocessing resolved them.
+    pub fn add_output<V: mxx_dsl::GraphValue + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        value: V,
+    ) {
+        let name = name.into();
+        self.extra_outputs.push(Box::new(move |graph: DslContext| graph.output(name, value)));
+    }
+
+    /// Bind the value of the graph input `name` that a composing caller's computation reads.
+    pub fn bind_runtime_input(&mut self, name: impl Into<String>, value: RuntimeValue) {
+        self.runtime.insert(name.into(), value);
+    }
+
+    /// This builder reading the inputs of `root_inputs` under the root keys of their tags, as
+    /// their preprocessing did (see `RnsPreprocessBuild::with_root_inputs`).
+    pub fn with_root_inputs(mut self, root_inputs: BTreeMap<WireId, String>) -> Self {
+        self.root_inputs = root_inputs;
+        self
     }
 
     /// Bind every integer data family of the child Program `program` to the
@@ -547,6 +574,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             artifact_prefix: Some(prefix),
             current_site: None,
             hash_key,
+            root_hash_key: self.parameters.root_hash_key_input(),
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
             data,
@@ -705,7 +733,20 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     )
                 }
                 None => {
-                    (InputKeySource::Static { level, knowledge }, format!("input-{wire:?}"), level)
+                    let root = match self.root_inputs.get(wire) {
+                        Some(tag) => Some((
+                            tag.clone(),
+                            self.parameters.root_hash_key_input().ok_or_else(|| {
+                                ApiError::input("a root input needs a rooted chain")
+                            })?,
+                        )),
+                        None => None,
+                    };
+                    (
+                        InputKeySource::Static { level, knowledge, root },
+                        format!("input-{wire:?}"),
+                        level,
+                    )
                 }
             };
             let ring = self.parameters.ring(ring_level).map_err(ApiError::scheme)?;
@@ -933,7 +974,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // The output prime's row is decoded at once: its smudge child sums each column's
         // members into its column, and the preimage has one column per decoded column.
         let decoder = declaration.decoder();
-        let actions = self.parameters.refresh_actions(level, a_prime, declaration)?;
+        let actions = self.parameters.refresh_actions(
+            level,
+            a_prime,
+            declaration.output_prime(),
+            declaration.reference(),
+        )?;
         let decoded = refresh_combination(one, target_row, fresh_row, &actions)?;
         let (smudge_outputs, child_manifests) = lower(&mut smudge)?;
         manifests.extend(child_manifests);
@@ -1173,6 +1219,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             artifact_prefix: None,
             current_site: None,
             hash_key,
+            root_hash_key: self.parameters.root_hash_key_input(),
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
             data,
@@ -1236,9 +1283,15 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
             self.hash_key.clone(),
         )];
+        if let Some(root) = self.parameters.root() {
+            hash_keys.push((root.hash_key_input_name(), root.hash_key().to_vec()));
+        }
         if let Some((row, child_keys)) = refreshed {
             graph = graph.output("refresh", row).map_err(ApiError::scheme)?;
             hash_keys.extend(child_keys);
+        }
+        for output in std::mem::take(&mut self.extra_outputs) {
+            graph = output(graph).map_err(ApiError::scheme)?;
         }
         for (index, output) in outputs.into_iter().enumerate() {
             // A decoded output is its plaintext modulo `q_(L+1)`, not an

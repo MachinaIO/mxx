@@ -712,7 +712,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         lut: LutId,
         table: &LutTable,
         input: &RnsBggNoiseValue,
-        input_terms: NoiseBreakdown,
+        input_terms: &NoiseBreakdown,
         coefficient_output: bool,
     ) -> Result<NoiseBreakdown, RnsBggError> {
         let branches = table.input_width();
@@ -1566,9 +1566,16 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             .contributions("lut-input")
             .map(|input_terms| {
                 if terminal_coefficient {
-                    return Ok(input_terms);
+                    return Ok(input_terms.into_owned());
                 }
-                self.lut_contributions(level, lut, table, &input.1, input_terms, coefficient_output)
+                self.lut_contributions(
+                    level,
+                    lut,
+                    table,
+                    &input.1,
+                    &input_terms,
+                    coefficient_output,
+                )
             })
             .transpose()?;
         let material = self.lut_material_provenance(level, lut, table, true)?;

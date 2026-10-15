@@ -127,7 +127,9 @@ impl Dio2Parameters {
         self.prf.lwr_dimension
     }
 
-    /// `m_v = v log2 Q`: the label matrix has `m_v + 1` columns.
+    /// `m_v = v log2 Q`: the full label matrix has `m_v + 1` columns. Noise-representative
+    /// plans do not shrink this dimension: sampler multiplicities and joint event counts
+    /// still use all `label_rows() * (label_width() + 1)` label targets.
     pub fn label_width(&self) -> usize {
         self.label_rows() * self.label_modulus().ilog2() as usize
     }

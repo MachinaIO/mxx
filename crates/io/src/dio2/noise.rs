@@ -23,7 +23,8 @@
 //!   public product `[P_0 | P_1] G^-1(K_j) + alpha c_j` with the mask (`2 m n B/2` times the
 //!   label's error plus `||alpha||_1` times the mask's);
 //! - `f Z`: the exact `l1` of `G^-1(Q_q)` times the CBD row's error;
-//! - `u`: the smudge row's error;
+//! - `u`: the sum of weight-one smudge digit rows' errors after re-targeting digit `r` to `P^r 2^-1
+//!   mod Q`; the gains are gadget-inverse norms, not multiplication by `P^r`;
 //! - `e_b K_pre`: `n 2 (w_0 + 2)` products of CBD(1) hint errors and preimage coefficients.
 //!
 //! The output decoder of the last step decodes `Q_q z + u` for the first prime `q`, with spacing
@@ -36,24 +37,24 @@
 
 use super::{
     Dio2Error, Dio2Parameters, StreamingFunction, anchor_columns, preimage_bound,
-    refresh::carrier,
-    step::{ChainKeys, ChainProgram, StepPlan, Target},
+    refresh::{carrier, smudge_weights},
+    step::{ChainKeys, ChainProgram, NoiseTargets, StepPlan, Target},
 };
 use mxx_backends::poly::PolyParams;
 use mxx_exponent_lut::{
-    api::noise_simulate,
     decoder::simulation::AverageCaseConfig,
-    noise_utils::{NoiseCorrelation, NoiseMoments, NonnegativeRational},
+    noise_utils::{NoiseCorrelation, NoiseDependencyNode, NoiseMoments, NonnegativeRational},
     program::{InputBinding, Operand},
     rns_bgg::{
-        RefreshSigmaNoise, RnsBggDerivedWorkload, RnsBggForm, RnsBggNoiseBindings, RnsBggNoiseRhs,
-        RnsBggNoiseValue, RnsBggParameters, RnsBggRefreshNoise, RnsNoiseBuild,
+        RefreshSigmaNoise, RnsBggDerivedWorkload, RnsBggError, RnsBggForm, RnsBggNoiseBindings,
+        RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggRefreshNoise,
     },
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 /// The average-case model of an evaluation of `function`: failure probability `2^-failure_exponent`
 /// for all of its decoded coefficients together.
@@ -64,9 +65,9 @@ pub fn average_model(failure_exponent: u32) -> AverageCaseConfig {
 /// The decoded coefficients of one evaluation of `function`: `2 |targets| |P| w_0 n` per
 /// refreshing step, and the output decoder's `n`.
 pub fn decoded_coefficients(function: &StreamingFunction, plan: &StepPlan) -> BigUint {
-    let n = plan.ring_dimension;
+    let n = BigUint::from(plan.ring_dimension);
     let refreshing = function.stream_length().saturating_sub(1);
-    BigUint::from(refreshing * plan.smudges() * plan.columns * n + n)
+    BigUint::from(refreshing) * BigUint::from(plan.smudges()) * BigUint::from(plan.columns) * &n + n
 }
 
 /// Whether every decoder of every evaluation of `function` on `parameters` decodes exactly and
@@ -91,8 +92,21 @@ pub fn simulate_noise(
     function: &StreamingFunction,
     average: Option<&AverageCaseConfig>,
 ) -> Result<Vec<RnsBggRefreshNoise>, Dio2Error> {
+    simulate_noise_targets(parameters, function, average, NoiseTargets::Full)
+}
+
+/// Simulate either every decoder or one representative per target class. Representative mode
+/// preserves the maximal accepted error and the joint decoded-coefficient count of the full
+/// plan; see [`NoiseTargets::Representative`] for the public-product monotonicity argument.
+/// It changes only noise simulation, never the obfuscation/evaluation/claim Programs.
+pub fn simulate_noise_targets(
+    parameters: &Dio2Parameters,
+    function: &StreamingFunction,
+    average: Option<&AverageCaseConfig>,
+    targets: NoiseTargets,
+) -> Result<Vec<RnsBggRefreshNoise>, Dio2Error> {
     parameters.validate()?;
-    let plan = StepPlan::new(parameters, function)?;
+    let plan = StepPlan::for_noise(parameters, function, targets)?;
     let z_squared = average
         .map(|config| {
             config
@@ -155,14 +169,14 @@ impl StepNoise<'_> {
             let keys = ChainKeys {
                 sigma: None,
                 cbd: None,
-                smudge: shape("smudge", plan.output_smudge_members())?,
+                smudge: shape("smudge", plan.noise_smudge_members(true))?,
             };
             ChainProgram::last(self.parameters, function, plan, step, x, &keys)?
         } else {
             let keys = ChainKeys {
                 sigma: Some(shape("sigma", plan.ring_dimension)?),
                 cbd: Some(shape("cbd", plan.cbd_members())?),
-                smudge: shape("smudge", plan.smudge_members())?,
+                smudge: shape("smudge", plan.noise_smudge_members(false))?,
             };
             ChainProgram::refreshing(self.parameters, function, plan, step, x, &keys)?
         };
@@ -183,10 +197,18 @@ impl StepNoise<'_> {
                 },
             )?)
         };
-        let half = [(&modulus + 1u8) / 2u8];
         let state = self.chain_parameters.form_weights(level, RnsBggForm::State)?;
         let public = self.chain_parameters.form_weights(level, RnsBggForm::Public)?;
         let outs = &program.outputs;
+        let smudge = sum(
+            &outs
+                .smudge
+                .iter()
+                .zip(smudge_weights(self.parameters, &modulus))
+                .map(|(output, weight)| retarget(*output, &[weight]))
+                .collect::<Result<Vec<_>, _>>()?,
+            NoiseCorrelation::Unknown,
+        );
         let identity = |target: usize, component: usize, prime: usize| {
             let mut digest = Sha256::new();
             digest.update(b"mxx-io/dio2/decoder/v1");
@@ -203,7 +225,7 @@ impl StepNoise<'_> {
         };
         if last {
             let cofactor = &modulus / self.parameters.primes[0];
-            let terms = [retarget(outs.state, &[cofactor.clone()])?, retarget(outs.smudge, &half)?];
+            let terms = [retarget(outs.state, &[cofactor.clone()])?, smudge];
             return Ok(vec![self.decoder(identity(0, 0, 0), &terms, cofactor)?]);
         }
         let missing = || Dio2Error::Parameters("a refreshing step has every refresh output");
@@ -230,7 +252,7 @@ impl StepNoise<'_> {
                 moments.uniform_digit_action(&block, &digit_variance)
             })
         };
-        let mut noises = Vec::with_capacity(plan.smudges());
+        let mut noises = Vec::with_capacity(2 * plan.targets.len() * plan.primes);
         for (index, target) in plan.targets.iter().enumerate() {
             for component in 0..2 {
                 let target_error = match target {
@@ -244,7 +266,11 @@ impl StepNoise<'_> {
                     )?)?,
                     Target::Helper(_) => mask[1].clone(),
                     Target::Label { row, column } => {
-                        let output = outs.labels[row * (plan.label_width + 1) + column];
+                        let label_index = match plan.noise_targets {
+                            NoiseTargets::Full => row * (plan.label_width + 1) + column,
+                            NoiseTargets::Representative => 0,
+                        };
+                        let output = outs.labels[label_index];
                         let label = retarget(output, &public)?;
                         let alpha = &outputs[output].bound.payload_l1;
                         let digits = &block * 2u8;
@@ -271,7 +297,7 @@ impl StepNoise<'_> {
                         one(&omega),
                         target_term.clone(),
                         scaled(&fresh, &z_l1, |moments| moments.scaled(&z_l1)),
-                        retarget(outs.smudge, &half)?,
+                        smudge.clone(),
                     ];
                     noises.push(self.decoder(
                         identity(index, component, prime),
@@ -333,11 +359,10 @@ impl StepNoise<'_> {
             .expect("positive denominator"))
     }
 
-    /// The simulated value of every output of `program` on step inputs of CBD(1) error: one
+    /// Trace every output of `program` on step inputs of CBD(1) error: one
     /// sample per root object (the inputs reading one root object share its error), and every
-    /// family member its own sample. With the average-case model, the Program's evaluation
-    /// budget is audited too.
-    fn lower(&self, program: &ChainProgram) -> Result<Vec<RnsBggNoiseValue>, Dio2Error> {
+    /// family member its own sample. The caller audits the full evaluation event budget.
+    fn trace(&self, program: &ChainProgram) -> Result<RnsBggNoiseTrace, Dio2Error> {
         let one = [BigInt::one()];
         let inputs = program
             .program
@@ -367,15 +392,40 @@ impl StepNoise<'_> {
             .collect::<Vec<_>>();
         let bindings = RnsBggNoiseBindings::from_inputs(&program.program, &inputs, &rhs)?
             .with_selector_families(&selectors)?;
-        if let Some(config) = self.average {
-            self.chain_parameters.audit_evaluation(&program.program, &bindings, Some(config))?;
+        Ok(self.chain_parameters.audit_evaluation(&program.program, &bindings, None)?.0)
+    }
+
+    /// Lower and audit once, using the full evaluation event budget even when label products
+    /// are represented by only their maximal-noise member.
+    fn lower(&self, program: &ChainProgram) -> Result<Vec<RnsBggNoiseValue>, Dio2Error> {
+        let trace = self.trace(program)?;
+        if let Some(config) = self.average.filter(|config| config.allow_average_acceptance) {
+            let events = self.evaluation_events(program, &trace)?;
+            let correction = config
+                .tail_correction_bits
+                .checked_mul(2)
+                .ok_or(Dio2Error::Parameters("invalid average-case tail correction"))?;
+            let z_squared = config
+                .z_squared_for_events(&events)
+                .map_err(|_| Dio2Error::Parameters("invalid average-case event count"))?
+                .scaled(&(BigUint::one() << correction));
+            let workload = RnsBggDerivedWorkload::from_program(&program.program)?;
+            for (wire, value) in &trace.wires {
+                let moments = value
+                    .moments
+                    .as_ref()
+                    .ok_or(Dio2Error::Parameters("average-case input moment model is missing"))?;
+                let level = workload.level(*wire)?;
+                let limit = NonnegativeRational::new(
+                    self.chain_parameters.level(level)?.modulus().as_ref().clone(),
+                    BigUint::from(4u8),
+                )
+                .expect("positive denominator");
+                if !moments.fits(&limit, &z_squared) {
+                    return Err(RnsBggError::Budget("evaluation noise").into());
+                }
+            }
         }
-        let workload = RnsBggDerivedWorkload::from_program(&program.program)?;
-        let trace = noise_simulate(
-            &program.program,
-            RnsNoiseBuild::new(self.chain_parameters, &program.program, &workload, &bindings)?,
-            |_, outputs| Ok(outputs),
-        )?;
         if trace.outputs.len() != program.program.outputs().len() ||
             program
                 .program
@@ -386,6 +436,51 @@ impl StepNoise<'_> {
             return Err(Dio2Error::Parameters("a step outputs fixed wires"));
         }
         Ok(trace.outputs)
+    }
+
+    /// The exact physical event budget of the full Program, not just its representatives.
+    /// Root and CBD family multiplicities are already full in the trace. Omitted scalar label
+    /// products each add `2 n w_0` events, with no alignment or coefficient
+    /// normalization on the equal-modulus public path. This restores the same evaluation-audit
+    /// tail multiplier as `RnsBggParameters::audit_evaluation` on the uncompressed Program.
+    /// For representative smudge digits, multiply the builder-identified operation events of
+    /// the PRF and digit row by `d`, but not shared input bindings or PRF row reductions. The
+    /// existing audit records a PRF row reduction's fixed row-width count, independent of its
+    /// outer member count; all other PRF operations and all placed-row operations scale with
+    /// `d`. No other operations depend on the smudge row.
+    fn evaluation_events(
+        &self,
+        program: &ChainProgram,
+        trace: &RnsBggNoiseTrace,
+    ) -> Result<BigUint, Dio2Error> {
+        let coordinates = BigUint::from(self.plan.ring_dimension) *
+            2u8 *
+            BigUint::from(self.chain_parameters.component_columns(0)?);
+        let mut events = trace.node_event_counts.values().sum::<BigUint>() +
+            BigUint::from(program.omitted_label_products) * coordinates;
+        if self.plan.noise_targets == NoiseTargets::Representative && self.plan.smudge_digits > 1 {
+            let mut visited = BTreeSet::new();
+            for (wire, node) in &trace.dependencies.wires {
+                if !program.representative_smudge_ranges.iter().any(|range| range.contains(wire)) ||
+                    !visited.insert(node.0) ||
+                    matches!(trace.dependencies.nodes[node.0], NoiseDependencyNode::Binding(_))
+                {
+                    continue;
+                }
+                if program.representative_smudge_ranges[0].contains(wire) &&
+                    matches!(
+                        trace.dependencies.nodes[node.0],
+                        NoiseDependencyNode::Reduction { .. }
+                    )
+                {
+                    continue;
+                }
+                if let Some(count) = trace.node_event_counts.get(&node.0) {
+                    events += count * BigUint::from(self.plan.smudge_digits - 1);
+                }
+            }
+        }
+        Ok(events.max(BigUint::one()))
     }
 }
 
@@ -430,6 +525,89 @@ mod tests {
     use super::*;
     use crate::dio2::test_support::toy;
 
+    /// Representatives preserve both maxima (worst and average case), the full decoder event
+    /// count, the PRF families' member counts, and the exact evaluation-audit event budget.
+    #[test]
+    fn representative_targets_preserve_toy_noise_and_counts() {
+        for (label_rows, digits, encoding_sigma) in [(1, 1, 0), (2, 3, 4), (1, 60, 4)] {
+            let (mut parameters, function) = toy();
+            parameters.smudge_digits = digits;
+            parameters.prf.lwr_dimension = label_rows;
+            parameters.encoding_error_sigma = encoding_sigma.into();
+            let full = StepPlan::new(&parameters, &function).unwrap();
+            let representative =
+                StepPlan::for_noise(&parameters, &function, NoiseTargets::Representative).unwrap();
+            assert!(representative.targets.len() < full.targets.len());
+            assert_eq!(representative.full_target_count, full.targets.len());
+            assert_eq!(representative.blocks(), full.blocks());
+            assert_eq!(representative.cbd_members(), full.cbd_members());
+            assert_eq!(representative.smudge_members(), full.smudge_members());
+            assert_eq!(
+                decoded_coefficients(&function, &representative),
+                decoded_coefficients(&function, &full)
+            );
+            let average = average_model(100);
+            for model in [None, Some(&average)] {
+                let complete = simulate_noise(&parameters, &function, model).unwrap();
+                let reduced = simulate_noise_targets(
+                    &parameters,
+                    &function,
+                    model,
+                    NoiseTargets::Representative,
+                )
+                .unwrap();
+                let maximum = |noises: &[RnsBggRefreshNoise]| {
+                    noises.iter().flat_map(|noise| noise.accepted_errors()).max().unwrap().clone()
+                };
+                assert!(reduced.len() < complete.len());
+                assert_eq!(maximum(&complete), maximum(&reduced));
+                assert_eq!(
+                    complete.iter().all(RnsBggRefreshNoise::fits),
+                    reduced.iter().all(RnsBggRefreshNoise::fits)
+                );
+                assert_eq!(
+                    complete.iter().all(|noise| noise.hides(100)),
+                    reduced.iter().all(|noise| noise.hides(100))
+                );
+            }
+            let chain_parameters = parameters.chain(&parameters.root([0; 32]).unwrap()).unwrap();
+            for step in 0..function.stream_length() {
+                for chunk in 0..1usize << function.eval_chunk_bits {
+                    let x = (0..function.eval_chunk_bits)
+                        .map(|bit| chunk >> bit & 1 == 1)
+                        .collect::<Vec<_>>();
+                    let events = |plan: &StepPlan| {
+                        let shape = |role: &str, members| {
+                            parameters.prf.declared_shape(0, role, members).unwrap()
+                        };
+                        let last = step + 1 == function.stream_length();
+                        let keys = ChainKeys {
+                            sigma: (!last).then(|| shape("sigma", plan.ring_dimension)),
+                            cbd: (!last).then(|| shape("cbd", plan.cbd_members())),
+                            smudge: shape("smudge", plan.noise_smudge_members(last)),
+                        };
+                        let program = if last {
+                            ChainProgram::last(&parameters, &function, plan, step, &x, &keys)
+                        } else {
+                            ChainProgram::refreshing(&parameters, &function, plan, step, &x, &keys)
+                        }
+                        .unwrap();
+                        let simulation = StepNoise {
+                            parameters: &parameters,
+                            chain_parameters: &chain_parameters,
+                            plan,
+                            average: None,
+                            z_squared: None,
+                        };
+                        let trace = simulation.trace(&program).unwrap();
+                        simulation.evaluation_events(&program, &trace).unwrap()
+                    };
+                    assert_eq!(events(&full), events(&representative));
+                }
+            }
+        }
+    }
+
     /// The toy parameters decode exactly in the worst case and under the average-case model.
     #[test]
     fn toy_parameters_decode_exactly() {
@@ -452,5 +630,20 @@ mod tests {
         eprintln!("worst (error, spacing, smudge) bits: {:?}", log(&worst));
         eprintln!("average (error, spacing, smudge) bits: {:?}", log(&average));
         assert!(worst.iter().chain(&average).all(RnsBggRefreshNoise::fits));
+    }
+
+    /// Smudge ranges beyond i64 payload bounds use scalar re-targeting in both decoder kinds.
+    #[test]
+    fn large_smudge_digit_counts_simulate() {
+        let (mut parameters, function) = toy();
+        parameters.smudge_digits = std::env::var("MXX_IO_DIO2_TEST_SMUDGE_DIGITS")
+            .map_or(60, |value| value.parse().unwrap());
+        let worst = simulate_noise(&parameters, &function, None).unwrap();
+        let average = simulate_noise(&parameters, &function, Some(&average_model(40))).unwrap();
+        assert!(!worst.is_empty());
+        assert_eq!(worst.len(), average.len());
+        let smudge =
+            BigUint::from(parameters.prf.output_modulus).pow(parameters.smudge_digits as u32) / 2u8;
+        assert!(worst.iter().chain(&average).all(|noise| noise.smudge == smudge));
     }
 }

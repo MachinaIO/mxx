@@ -15,6 +15,7 @@ pub mod noise;
 pub mod params;
 pub mod refresh;
 pub mod scheme;
+mod search;
 pub mod step;
 #[cfg(test)]
 mod test_support;

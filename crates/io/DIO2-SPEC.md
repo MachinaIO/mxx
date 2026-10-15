@@ -749,13 +749,30 @@ Choices the implementation makes within the specification:
 - **Decoded keys.** The obfuscator obtains every part's decoded key by running the same composed
   evaluation on zero rows (keys do not depend on rows), then samples the preimages under the
   step's anchor. Hence keys and rows can never diverge.
-- **Smudge weights.** The smudge PRFs place `P^digit` in the Program and the weight `2^-1` is a
-  re-targeting of each smudge row to the scalar form `2^-1`.
+- **Smudge weights.** The step Program outputs one weight-one row per smudge digit `r`.
+  Both refresh and output decoders re-target each digit row and its key to the BigInt scalar
+  form `P^r 2^-1 mod Q` at the decoding level, then sum the digits. The noise simulation uses
+  the same re-targetings. Thus the smudge range `P^d` is not limited by small-constant payload
+  bounds; for `d = 1`, the exported graphs are unchanged.
 - **Output.** The last step decodes the state monomial modulo the first prime (§15);
   `Dio2::evaluate` returns the final state.
 - **Noise.** `crates/io/src/dio2/noise.rs` simulates every decoder of an evaluation (worst case
   and the average-case model of §9 with one tail multiplier for all decoded coefficients) and
-  checks `fits` and `hides`.
+  checks `fits` and `hides`. The production parameter search explicitly selects noise-only
+  representative targets: every non-label target, and a maximal-leaf label product per chunk.
+  The public-product rule `E_out = A E_left + ||mu_left||_1 E_right`, with `A >= 1` and monomial
+  `||mu_left||_1 = 1`, makes the balanced label product's noise monotone in its (at least two)
+  leaves. Thus its maximum decoder error is unchanged. This does not replace any real label
+  output: obfuscation, evaluation, and exported claim graphs still use the full plan.
+  `StepPlan::full_target_count`, full sampler member counts, and `decoded_coefficients` retain
+  the complete matrix's counts. The internal evaluation audit also restores the exact omitted
+  scalar-product event count (`2 n w_0` per product), so neither average-case tail multiplier
+  benefits from the reduction. In representative mode the identically bounded weight-one
+  smudge digits also share one modeled row, re-targeted with every actual digit weight and
+  summed with unknown covariance as before. Builder-owned wire intervals identify the PRF
+  member operations and placed-row events that scale with the exact digit count; shared
+  bindings and the audit's fixed-width inner PRF reductions remain unchanged. This
+  avoids `members * bucket_width` overflow in large PRF shapes without shrinking any bound.
 - **Execution.** `Dio2<E, S>` runs on any stage executor and store. The end-to-end test
   (`crates/io/tests/gpu_round_trip.rs`) runs on the GPU runtime.
 

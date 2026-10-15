@@ -12,8 +12,8 @@
 //!   public multiplication of the label products by `E^sigma` (spec §6.5);
 //! - for every part and every prime `q` of `Q_0`, the decoded row `d = Sigma X - c_j Y + f Z` and
 //!   its key (spec §6.7), plus the smudge of the part and prime (the smudge row re-targeted to the
-//!   scalar form `2^-1`, see [`super::step::ChainProgram`]). The CBD noise `f` of a part is shared
-//!   by its primes, so the residues recombine to one row.
+//!   scalar form `P^r / 2` for each digit `r`, then summed, see [`super::step::ChainProgram`]). The
+//!   CBD noise `f` of a part is shared by its primes, so the residues recombine to one row.
 //!
 //! In [`ComposeMode::Keys`] (the obfuscator's run on zero rows) it outputs the decoded key
 //! `[K_0; K_1]` of every part and prime, whose preimage under the anchor the obfuscator samples.
@@ -136,10 +136,13 @@ impl StepCompose<'_> {
         let level = self.parameters.decoding_level();
         let ring = self.chain_parameters.ring(level)?;
         let modulus: BigUint = self.chain_parameters.level(level)?.modulus().as_ref().clone();
-        // The smudge rows are re-targeted to the scalar `2^-1` (the weight of the odd digits), and
+        // The smudge digit rows are re-targeted to `P^r / 2` (the weights of the odd digits), and
         // the halved weights leave `2^-1` in every coefficient of the decoded row; removing it
         // from every coefficient centers the smudge (`mxx_exponent_lut::decoder::decoding`).
-        let half = self.chain_parameters.scalar(level, BigInt::from((&modulus + 1u8) / 2u8))?;
+        let weights = smudge_weights(self.parameters, &modulus)
+            .into_iter()
+            .map(|weight| Ok(self.chain_parameters.scalar(level, BigInt::from(weight))?))
+            .collect::<Result<Vec<_>, Dio2Error>>()?;
         let half_coefficients =
             ring.all_coefficients((1, 1), IntExpr::constant((&modulus + 1u8) / 2u8));
         let state_form = self.chain_parameters.form(level, RnsBggForm::State)?;
@@ -177,15 +180,32 @@ impl StepCompose<'_> {
             )
         };
         let component_one = |encoding: Encoding| (encoding.0.1, (encoding.1.0.1, encoding.1.1.1));
+        let smudge = |first: IntExpr, blocks: usize| -> Result<(Mat, (Mat, Mat)), Dio2Error> {
+            let mut digits = outs.smudge.iter().zip(&weights).map(|(output, weight)| {
+                Ok::<_, Dio2Error>(component_one(blocks_of(
+                    *output,
+                    first.clone(),
+                    blocks,
+                    weight,
+                )?))
+            });
+            let mut total =
+                digits.next().ok_or(Dio2Error::Parameters("a smudge has at least one digit"))??;
+            for digit in digits {
+                let digit = digit?;
+                total = (total.0 + digit.0, (total.1.0 + digit.1.0, total.1.1 + digit.1.1));
+            }
+            Ok(total)
+        };
         if outs.private.is_none() {
             // The last step: the output decoder of the state modulo the first prime `q`, at the
             // decoding level, in the scalar form `Q_q`.
             let q = self.parameters.primes[0];
             let cofactor = self.chain_parameters.scalar(level, BigInt::from(&modulus / q))?;
             let selected = self.retarget(&workload, outputs, outs.state, cofactor)?;
-            let smudge = blocks_of(outs.smudge, IntExpr::constant(0), 1, &half)?;
-            let row = selected.0.1 + smudge.0.1;
-            let key = (selected.1.0.1 + smudge.1.0.1, selected.1.1.1 + smudge.1.1.1);
+            let smudge = smudge(IntExpr::constant(0), 1)?;
+            let row = selected.0.1 + smudge.0;
+            let key = (selected.1.0.1 + smudge.1.0, selected.1.1.1 + smudge.1.1);
             match self.mode {
                 ComposeMode::Keys => builder.add_output(
                     OUTPUT_KEY_OUTPUT,
@@ -349,8 +369,7 @@ impl StepCompose<'_> {
                 columns,
                 &public_form,
             )?);
-            let smudge = component_one(blocks_of(
-                outs.smudge,
+            let smudge = smudge(
                 IntExpr::Mul(
                     Box::new(IntExpr::Add(
                         Box::new(IntExpr::Mul(
@@ -363,8 +382,7 @@ impl StepCompose<'_> {
                 )
                 .canonicalize(),
                 columns,
-                &half,
-            )?);
+            )?;
             let actions = self.chain_parameters.refresh_actions(
                 level,
                 a_primes.at(part.clone()),
@@ -509,6 +527,22 @@ impl StepCompose<'_> {
     fn preimage_bound(&self) -> Result<BigUint, Dio2Error> {
         super::preimage_bound(self.parameters)
     }
+}
+
+/// The decoder weights `P^r 2^-1 mod Q` for weight-one smudge digit rows, in digit order.
+/// `Q` is the odd decoding modulus; both the composed rows/keys and their noise simulation
+/// use these BigUint weights instead of putting powers of `P` in small-constant instructions.
+pub(super) fn smudge_weights(parameters: &Dio2Parameters, modulus: &BigUint) -> Vec<BigUint> {
+    let half = (modulus + 1u8) / 2u8;
+    let base = BigUint::from(parameters.prf.output_modulus);
+    let mut weight = half;
+    (0..parameters.smudge_digits)
+        .map(|_| {
+            let current = weight.clone();
+            weight = &weight * &base % modulus;
+            current
+        })
+        .collect()
 }
 
 /// The level and form of the lowered output `output` of `program`: a private wire in the state

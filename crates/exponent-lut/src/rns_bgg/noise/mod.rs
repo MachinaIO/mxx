@@ -6,6 +6,13 @@
 //! from conditional average-case moments. Fresh encoding errors use the
 //! configured Gaussian sigma and runtime cutoff; a decoder adds the unmask
 //! error of its trapdoor preimage (see the `decoder` submodule).
+//!
+//! Source-aware propagation retains at most 256 normalized contributions and
+//! 4096 member coordinates per breakdown. Larger decompositions become one
+//! opaque moment envelope: it stays coherent with all later errors and cannot
+//! justify coefficient-energy gains or independence across family members.
+//! This can loosen the audit, never establish a new independence assumption.
+//! Below these limits, source-aware arithmetic is unchanged.
 #![warn(missing_docs)]
 use super::{RhsMode, RnsBggError, RnsBggParameters, workload::RnsBggDerivedWorkload};
 use crate::{
@@ -30,7 +37,7 @@ use mxx_ir_core::{IntExpr, ParamEnv};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use crate::noise_utils::{NoiseBreakdown, ReductionCounts, SampleCoordinate};
 
@@ -345,7 +352,9 @@ pub struct RnsBggNoiseValue {
     pub provenance: BTreeMap<[u8; 32], NoiseSourceProvenance>,
     /// Conservative assumptions used while composing moments.
     pub heuristics: NoiseHeuristicLedger,
-    /// Source-aware contributions whose total is `moments`. `None` means
+    /// Source-aware contributions whose total is `moments`. Large source
+    /// lists are conservatively compacted to an opaque coherent envelope;
+    /// small lists retain their original arithmetic. `None` means
     /// only the total envelope is known; it is then treated as one opaque
     /// contribution, coherent with every other.
     #[serde(skip)]
@@ -520,10 +529,13 @@ impl RnsBggNoiseValue {
 
     /// The source-aware contributions of this value. A value that only has
     /// total moments is one opaque contribution, coherent with every other.
-    fn contributions(&self, origin: &'static str) -> Option<NoiseBreakdown> {
+    /// Borrow an existing breakdown; only the total-only fallback allocates.
+    fn contributions(&self, origin: &'static str) -> Option<Cow<'_, NoiseBreakdown>> {
         match (&self.breakdown, &self.moments) {
-            (Some(breakdown), Some(_)) => Some(breakdown.as_ref().clone()),
-            (None, Some(moments)) => Some(NoiseBreakdown::opaque(origin, moments.clone())),
+            (Some(breakdown), Some(_)) => Some(Cow::Borrowed(breakdown.as_ref())),
+            (None, Some(moments)) => {
+                Some(Cow::Owned(NoiseBreakdown::opaque(origin, moments.clone())))
+            }
             (_, None) => None,
         }
     }
@@ -768,6 +780,18 @@ pub struct RnsNoiseBuild<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_noise_contributions_borrow_existing_breakdowns() {
+        let mut input = value(&[1]);
+        input.moments = Some(zero_mean_moments(NonnegativeRational::zero()));
+        input.breakdown = Some(Arc::new(NoiseBreakdown::empty()));
+        let contributions = input.contributions("test").unwrap();
+        assert!(matches!(contributions, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(contributions.as_ref(), input.breakdown.as_ref().unwrap().as_ref(),));
+        input.breakdown = None;
+        assert!(matches!(input.contributions("test"), Some(Cow::Owned(_))));
+    }
 
     pub(super) fn value(payload: &[i64]) -> RnsBggNoiseValue {
         RnsBggNoiseValue::public(

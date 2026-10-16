@@ -93,7 +93,7 @@ impl BudgetShape {
 }
 
 /// The budget of one candidate, with every derived multiplier and width.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct StatisticalBudget {
     /// `log(1 / ε_LHL)`.
     pub lhl_bits: f64,

@@ -47,18 +47,32 @@ theorem run_correct {model : HashModel} {external : GeneratedClaim.ExternalInput
   obtain ⟨hhelpE, hcompE, hrhsE, hstate, hstateB⟩ := encrypt_explicit h4 hsec hs
   -- Preprocessing.
   obtain ⟨pw, pbody⟩ := h5
-  have G := Stage_preprocess.generatedRoot.facts ⟨_, pw⟩ pbody
-  have hout5 := G.c21.hout
+  let pctx : Stage_preprocess.generatedRoot.Ctx Backend.backend model ω [5]
+      GeneratedClaim.stage_5_params := ⟨(external.input_5, external.input_0, external.input_6, ()), pw⟩
+  have G := Stage_preprocess.generatedRoot.facts pctx pbody
+  have hout5 := G.c26.hout
   subst hout5
   -- Online evaluation.
   obtain ⟨ow, obody⟩ := h7
   have F := Stage_online_eval.generatedRoot.facts ⟨_, ow⟩ obody
-  have hout7 := F.c6.hout
+  have hout7 := F.c10.hout
   subst hout7
   -- The requirement.
   obtain ⟨hx8, ht8, ht2, v, hv0, hv4, hchain⟩ := requirement_facts hreq hrq
   -- The chain.
-  have hout := chain_all F G rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl hs
+  have hout := chain_all F G rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    rfl rfl rfl rfl
+    (leafFamilies_eta (fun slot ↦ preLeafT_0 pctx slot 0))
+    (leafFamilies_eta (fun slot ↦ preLeafT_0 pctx slot 1))
+    rfl rfl rfl rfl
+    (leafFamilies_eta (fun slot ↦ preLeafT_1 pctx slot 0))
+    (leafFamilies_eta (fun slot ↦ preLeafT_1 pctx slot 1))
+    rfl rfl rfl rfl
+    (leafFamilies_eta (fun slot ↦ preLeafT_2 pctx slot 0))
+    (leafFamilies_eta (fun slot ↦ preLeafT_2 pctx slot 1))
+    rfl rfl rfl rfl
+    (leafFamilies_eta (fun slot ↦ preLeafT_3 pctx slot 0))
+    (leafFamilies_eta (fun slot ↦ preLeafT_3 pctx slot 1)) hs
     (eB := fun i j ↦ attrErr ω [3] i j) (ez0 := fun i ↦ rhsCompErr ω [4] i) (ez := fun i ↦ compErr ω [4] i)
     ⟨stateErr ω [4], hstateB, fun j ↦ by have := hstate j; rw [message_one] at this; exact this⟩ hxb
     (fun i j ↦ by
@@ -78,9 +92,9 @@ theorem run_correct {model : HashModel} {external : GeneratedClaim.ExternalInput
   -- The anchors.
   obtain ⟨Eb, hEb, hW⟩ := anchor_round hs hbQ heb hr hBQ
   obtain ⟨Ec, hEc, hC⟩ := anchor_compact hs hbQ heb
-  have hbits := decrypt_bits (A := keyOf (Stage_preprocess.generatedRoot.w_246_0 ⟨_, pw⟩,
-      Stage_preprocess.generatedRoot.w_246_1 ⟨_, pw⟩, Stage_preprocess.generatedRoot.w_246_2 ⟨_, pw⟩,
-      Stage_preprocess.generatedRoot.w_246_3 ⟨_, pw⟩, ()))
+  have hbits := decrypt_bits (A := keyOf (Stage_preprocess.generatedRoot.w_540_0 ⟨_, pw⟩,
+      Stage_preprocess.generatedRoot.w_546_0 ⟨_, pw⟩, Stage_preprocess.generatedRoot.w_552_0 ⟨_, pw⟩,
+      Stage_preprocess.generatedRoot.w_558_0 ⟨_, pw⟩, ()))
     hs (fun k ↦ by have := hmb k; omega) hem hcm hEb (by unfold roundedAnchor; exact hW) hEc (by unfold compressedAnchor; exact hC) hp'b
       (fun i ↦ (hsC i).2.2) (fun i ↦ (hsI i).2.2) (fun q ↦ (hsv q).2.2) hkFb
       (fun i ↦ by

@@ -66,8 +66,17 @@ programs adjusted to it, and exports the claim to `<parameter id>/generated`.
 | `average-w2-n8192-crt4x42` | The same class, `n = 2^13`, four 42-bit primes (`Q ≈ 2^168`), 21-bit digits, 137/141-bit security, failure `2^-128` | `average-w2-n8192-crt4x42/PeCertificate.lean` |
 | `average-w2-n32768-crt6x30-compact` | The same class with compact fresh encodings, `n = 2^15`, six 30-bit primes (`Q ≈ 2^180`, `P ≈ 2^180`), 15-bit digits, 318-bit encryption security at `PQ` (the trapdoor estimate saturates at `u32::MAX`), failure `2^-128` | `average-w2-n32768-crt6x30-compact/PeCertificate.lean` |
 | `average-w128-n65536-crt22x32-compact` | The four-digit decimal range class `PeClass::decimal_range(4)` (`(4, 16, 8, 4)`, `W = 128`), which the time window predicate of `test_gpu_pe_time_window` also uses; `n = 2^16`, 22 32-bit primes (`Q ≈ 2^704`, `P ≈ 2^704`), 16-bit digits, LUT radix 16, statistical TrapGen (`m_B = 501`), compact encodings, 128-bit encryption security at `PQ`, failure `2^-128`. Every run meeting the requirement decrypts correctly (the worst-case phase error is below `Q / 4`), so the bad set is empty | `average-w128-n65536-crt22x32-compact/PeCertificate.lean` (written by hand and by the `gen_*.py` scripts of the row, not by `generator/gen.py`) |
+| `average-w256-n32768-crt15x24-compact` | The date class `PeClass::date()` (`(2, 32, 8, 2)`, `W = 256`); `n = 2^15`, 15 24-bit CRT primes (`log2 Q ≈ 354.97`) and 15 compact-extension primes (`log2 P ≈ 338.85`), 12-bit digits (30 digits), LUT radix 16, statistical TrapGen (`m_B = 295`), compact encodings, average-case noise target `2^-128`. The proof uses the exact deterministic cutoff bound for both lookups; its phase error is below `Q / 4`, so the bad set is empty | `average-w256-n32768-crt15x24-compact/PeCertificate.lean` (row-local generators specialize the proven W128 architecture) |
 
 ## The claim
+
+The date row also covers the bounded-memory stage wiring: `Stage_keygen_helpers` publishes
+packed helper columns per row, key generation streams the anchor preimages, and decoding
+accumulates the anchor and helper families with sequential loops. Its row-local templates
+preserve the mathematical proof layers while adapting these stage interfaces. Run
+`python3 gen_all.py` from `average-w256-n32768-crt15x24-compact` after exporting. The generator
+factors the 256 identical helper-scatter index tables into one definition in
+`generated/Stage_keygen.lean`; unfolding that definition recovers the exported proposition.
 
 `GeneratedClaim.CorrectnessClaim` states that, for every hash model and external inputs, the tapes
 with a run that meets the input contract and the requirement and whose decrypted message differs
@@ -177,6 +186,7 @@ MXX_PE_ROUND_TRIP_MIN_LOG_RING_DIMENSION=13 MXX_PE_ROUND_TRIP_MAX_LOG_RING_DIMEN
 | `average-w2-n8192-crt4x42` | `CRT_BITS=42`, `BASE_BITS=21` |
 | `average-w2-n32768-crt6x30-compact` | `MIN_LOG_RING_DIMENSION=15`, `MAX_LOG_RING_DIMENSION=15`, `COMPACT_ENCODINGS=1` |
 | `average-w128-n65536-crt22x32-compact` | `ATTRIBUTE_LENGTH=4`, `ALPHABET_SIZE=16`, `STATE_WIDTH=8`, `MAX_STEPS=4`, `MIN_LOG_RING_DIMENSION=15`, `MAX_LOG_RING_DIMENSION=16`, `CRT_BITS=32`, `BASE_BITS=16`, `MAX_CRT_DEPTH=40`, `LUT_RADIX=16`, `COMPACT_ENCODINGS=1`, no `TRAPDOOR_INSTANTIATION` (statistical), `EXPORT_ONLY=1`; `test_gpu_pe_time_window` exports the same claim (`-- test_gpu_pe_time_window`) |
+| `average-w256-n32768-crt15x24-compact` | `ATTRIBUTE_LENGTH=2`, `ALPHABET_SIZE=32`, `STATE_WIDTH=8`, `MAX_STEPS=2`, `MIN_LOG_RING_DIMENSION=15`, `MAX_LOG_RING_DIMENSION=15`, `CRT_BITS=24`, `BASE_BITS=12`, `MAX_CRT_DEPTH=40`, `LUT_RADIX=16`, `COMPACT_ENCODINGS=1`, no `TRAPDOOR_INSTANTIATION` (statistical), `NOISE_MODEL=average`, `EXPORT_ONLY=1`; use `-- test_gpu_pe_date` and set the export ID to this row |
 
 Write and check the proof of the exported claim:
 

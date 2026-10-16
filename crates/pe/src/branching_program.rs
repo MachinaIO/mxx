@@ -105,6 +105,13 @@ impl PeClass {
         Self::new(digits, DECIMAL_ALPHABET, DECIMAL_STATES, digits)
     }
 
+    /// The class of the date programs ([`BranchingProgram::date_range`]): the month and the day
+    /// as two attribute symbols of 5 bits (`Bx = 32`), one lookup step each, and the 7 states of
+    /// the date comparison padded to `Bz = 8`, so `W = 256`.
+    pub fn date() -> Result<Self, PeError> {
+        Self::new(2, DATE_ALPHABET, DATE_STATES, 2)
+    }
+
     /// A class whose step `i` has kind `steps[i]`, `T_max = steps.len() <= 64`.
     /// Every step applies a table; the last one's coefficient is the output.
     pub fn with_steps(
@@ -289,7 +296,7 @@ impl PeClass {
         let program = builder.finish(vec![Operand::Scalar(state)]).map_err(invalid)?;
         let binding =
             RnsBggDynamicBinding::new(BTreeMap::from([(initial, INITIAL_STATE_COORDINATE)]), rhs);
-        Ok(CompiledPredicate { program, binding, reads, tables })
+        Ok(CompiledPredicate { class: *self, program, binding, reads, tables })
     }
 }
 
@@ -311,7 +318,65 @@ const DECIMAL_STATES: usize = 8;
 /// The rejecting state of the decimal range programs, which absorbs the padding states.
 const DECIMAL_REJECT: usize = 4;
 
+/// The alphabet of the date programs: 5-bit symbols for the month and the day.
+const DATE_ALPHABET: usize = 32;
+/// The state width of the date programs: `EQ_EQ`, `GT_EQ`, `EQ_LT`, the three `GT_LT` states of
+/// 31, 30, and 29 days, and `REJ`, padded to a power of two.
+const DATE_STATES: usize = 8;
+/// The rejecting state of the date programs.
+const DATE_REJECT: usize = 6;
+/// The days of each month `1..=12`, February with 29.
+const MONTH_DAYS: [usize; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
 impl BranchingProgram {
+    /// The program of [`PeClass::date`] that accepts (`F(x) = 0`) exactly the dates `x = (month,
+    /// day)` that are calendar dates (`1 <= month <= 12`, `1 <= day <=` the month's days,
+    /// February with 29) and lie in `[low, high]` in lexicographic order, for calendar dates
+    /// `low <= high` given as `(month, day)` (a range that crosses the new year is two keys).
+    ///
+    /// The first step reads the month and records whether it equals `low`'s or `high`'s month:
+    /// states `0 = (EQ, EQ)`, `1 = (GT, EQ)`, `2 = (EQ, LT)`, and, for a month strictly between
+    /// them, which is not determined by the key, its number of days: `3`, `4`, `5` for 31, 30,
+    /// and 29 days. A month outside `1..=12` or the range reaches `6 = REJ`; the padding state
+    /// `7` rejects. The second step reads the day and outputs `0` exactly when it is at least 1,
+    /// at most the month's days, and within the endpoints the state compares against.
+    pub fn date_range(low: (usize, usize), high: (usize, usize)) -> Result<Self, PeError> {
+        let valid = |(month, day): (usize, usize)| {
+            (1..=12).contains(&month) && (1..=MONTH_DAYS[month - 1]).contains(&day)
+        };
+        if !valid(low) || !valid(high) || low > high {
+            return Err(PeError::Predicate("the range is not of calendar dates low <= high"));
+        }
+        let days = |month: usize| MONTH_DAYS[month - 1];
+        let month = |z: usize, m: usize| -> usize {
+            if z != 0 || !(low.0..=high.0).contains(&m) {
+                return DATE_REJECT;
+            }
+            match (m == low.0, m == high.0) {
+                (true, true) => 0,
+                (false, true) => 1,
+                (true, false) => 2,
+                (false, false) => 3 + (31 - days(m)),
+            }
+        };
+        let day = |z: usize, d: usize| -> usize {
+            let (last, within) = match z {
+                0 => (days(low.0), (low.1..=high.1).contains(&d)),
+                1 => (days(high.0), d <= high.1),
+                2 => (days(low.0), d >= low.1),
+                3..=5 => (31 - (z - 3), true),
+                _ => return 1,
+            };
+            usize::from(!(within && (1..=last).contains(&d)))
+        };
+        let table = |step: &dyn Fn(usize, usize) -> usize| {
+            (0..DATE_STATES * DATE_ALPHABET)
+                .map(|u| step(u % DATE_STATES, u / DATE_STATES))
+                .collect::<Vec<_>>()
+        };
+        Self::new(PeClass::date()?, vec![0, 1], vec![table(&month), table(&day)])
+    }
+
     /// The program of [`PeClass::decimal_range`] that accepts (`F(x) = 0`) exactly the
     /// attributes `x = (x_1, ..., x_D)` of `digits = D` decimal digits, most significant first,
     /// that match `[1-9][0-9]{D-1}` and whose value `N(x)` satisfies `low <= N(x) <= high`, for
@@ -561,13 +626,29 @@ impl BranchingProgram {
 
 /// A compiled branching program: the Exponent-LUT Program and its mapping to
 /// the setup coordinates.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(into = "PeClass", try_from = "PeClass")]
 pub struct CompiledPredicate {
+    class: PeClass,
     pub(crate) program: ExponentLutProgram,
     pub(crate) binding: RnsBggDynamicBinding,
     /// The data families of the reads and of the tables.
     reads: DataId,
     tables: DataId,
+}
+
+// Recompile the canonical program rather than deserialize its validated internal graph.
+impl From<CompiledPredicate> for PeClass {
+    fn from(compiled: CompiledPredicate) -> Self {
+        compiled.class
+    }
+}
+
+impl TryFrom<PeClass> for CompiledPredicate {
+    type Error = PeError;
+    fn try_from(class: PeClass) -> Result<Self, Self::Error> {
+        class.compile()
+    }
 }
 
 impl CompiledPredicate {
@@ -799,6 +880,83 @@ mod tests {
         }
         for (low, high) in [(1200, 1100), (2400, 2400), (960, 1000), (0, 2360)] {
             assert!(BranchingProgram::time_window(low, high).is_err(), "{low} {high}");
+        }
+    }
+
+    /// The date range program of the specification's test vectors (`[01-15, 03-15]`), in the
+    /// clear and through the Program data, and every 2-symbol attribute for ranges at the edges
+    /// and at random against the calendar and the range directly.
+    #[test]
+    fn date_range_programs_check_the_calendar_and_the_range() {
+        let accepts = |low: (usize, usize), high: (usize, usize), x: &[usize]| {
+            (1..=12).contains(&x[0]) &&
+                (1..=MONTH_DAYS[x[0] - 1]).contains(&x[1]) &&
+                (low..=high).contains(&(x[0], x[1]))
+        };
+        let program = BranchingProgram::date_range((1, 15), (3, 15)).unwrap();
+        let class = *program.class();
+        assert_eq!(class, PeClass::date().unwrap());
+        assert_eq!(class.lookup_width(), 256);
+        let compiled = class.compile().unwrap();
+        let data = program.data(&compiled);
+        data.validate(compiled.program()).unwrap();
+        let tables = data.values(compiled.tables()).unwrap();
+        let through_luts = |attribute: &[usize]| {
+            attribute.iter().enumerate().fold(0, |z, (i, x)| tables[i * 256 + z + 8 * x])
+        };
+        for (attribute, expected) in [
+            ([1, 15], 0),
+            ([3, 15], 0),
+            ([2, 10], 0),
+            ([2, 29], 0),
+            ([1, 31], 0),
+            ([1, 14], 1),
+            ([3, 16], 1),
+            ([4, 1], 1),
+            ([2, 30], 1),
+            ([2, 0], 1),
+            ([0, 20], 1),
+            ([13, 1], 1),
+        ] {
+            assert_eq!(program.evaluate(&attribute).unwrap(), expected, "{attribute:?}");
+            assert_eq!(through_luts(&attribute), expected, "{attribute:?}");
+        }
+        let dates = (1..=12)
+            .flat_map(|month| (1..=MONTH_DAYS[month - 1]).map(move |day| (month, day)))
+            .collect::<Vec<_>>();
+        let mut ranges = vec![
+            ((1, 1), (12, 31)),
+            ((1, 1), (1, 1)),
+            ((12, 31), (12, 31)),
+            ((2, 29), (3, 1)),
+            ((4, 30), (5, 1)),
+            ((1, 15), (3, 15)),
+            ((6, 1), (6, 30)),
+        ];
+        let mut seed = 0x2026_u64;
+        let mut date = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            dates[(seed >> 33) as usize % dates.len()]
+        };
+        ranges.extend((0..300).map(|_| {
+            let (a, b) = (date(), date());
+            (a.min(b), a.max(b))
+        }));
+        for (low, high) in ranges {
+            let program = BranchingProgram::date_range(low, high).unwrap();
+            for value in 0..1 << 10 {
+                let attribute = [value >> 5, value & 31];
+                assert_eq!(
+                    program.evaluate(&attribute).unwrap(),
+                    usize::from(!accepts(low, high, &attribute)),
+                    "[{low:?}, {high:?}] {attribute:?}"
+                );
+            }
+        }
+        for (low, high) in
+            [((3, 1), (2, 1)), ((2, 30), (3, 1)), ((0, 1), (1, 1)), ((1, 1), (13, 1))]
+        {
+            assert!(BranchingProgram::date_range(low, high).is_err(), "{low:?} {high:?}");
         }
     }
 }

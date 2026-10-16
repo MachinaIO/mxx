@@ -304,10 +304,11 @@ pub struct RnsOutputCarrier {
 }
 
 /// Validated modulus-chain and encoding-noise parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RnsBggParameters {
     levels: Vec<DCRTPolyParams>,
     drops: Vec<BigUint>,
+    #[serde(with = "crate::noise_utils::bigdecimal_string")]
     encoding_error_sigma: BigDecimal,
     encoding_error_bound: BigUint,
     operations_per_drop: usize,

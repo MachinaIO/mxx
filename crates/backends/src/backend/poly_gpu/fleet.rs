@@ -63,7 +63,7 @@ use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -6186,6 +6186,11 @@ impl RawExportFragment {
     /// Byte offset of `coordinate` within this fragment and the element width
     /// of the view that covers it.
     fn locate(&self, coordinate: &[u64]) -> Result<Option<(u64, u32)>, String> {
+        Ok(self.locate_view(coordinate)?.map(|(offset, view)| (offset, view.element_bytes)))
+    }
+
+    /// Locate the covering view as well as its offset, for bulk reads.
+    fn locate_view(&self, coordinate: &[u64]) -> Result<Option<(u64, &PhysicalView)>, String> {
         'views: for view in &self.views {
             if view.origin.len() != coordinate.len() {
                 continue;
@@ -6207,7 +6212,7 @@ impl RawExportFragment {
             {
                 return Err("raw export element is outside its fragment".into());
             }
-            return Ok(Some((offset, view.element_bytes)));
+            return Ok(Some((offset, view)));
         }
         Ok(None)
     }
@@ -6555,20 +6560,10 @@ fn raw_matrix_limb<R: Read + Seek + ?Sized>(
     scratch: &mut Vec<u8>,
 ) -> Result<(), String> {
     for fragment in layout.fragments.iter().filter(|fragment| fragment.leaf == leaf) {
-        let Some((offset, width)) = fragment.locate(&[row, column, limb, 0])? else {
+        let Some((offset, view)) = fragment.locate_view(&[row, column, limb, 0])? else {
             continue;
         };
-        let view = fragment
-            .views
-            .iter()
-            .find(|view| {
-                view.origin.len() == 4 &&
-                    (0..3).all(|axis| {
-                        let value = [row, column, limb][axis];
-                        view.origin[axis] <= value && value < view.origin[axis] + view.extent[axis]
-                    })
-            })
-            .ok_or("raw matrix limb has no covering view")?;
+        let width = view.element_bytes;
         let count = residues.len() as u64;
         if !matches!(width, 4 | 8) || view.origin[3] != 0 || view.extent[3] != count {
             return Err("raw matrix limb view does not cover its coefficients".into());
@@ -6783,6 +6778,47 @@ pub(crate) fn zero_artifact_payload(
     }
 }
 
+/// Read a compact coefficient region in canonical axis order with one seek/read
+/// when a single view covers it contiguously. Otherwise leave the byte fallback to the caller.
+fn raw_compact_region<R: Read + Seek + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    coordinate: &[u64],
+    extent: &[u64],
+    output: &mut [u8],
+) -> Result<bool, String> {
+    for fragment in
+        layout.fragments.iter().filter(|fragment| fragment.leaf == RawExportLeaf::Value(0))
+    {
+        let Some((offset, view)) = fragment.locate_view(coordinate)? else {
+            continue;
+        };
+        if view.element_bytes != 1 {
+            continue;
+        }
+        let mut stride = 1;
+        for axis in (0..extent.len()).rev() {
+            if coordinate[axis] + extent[axis] > view.origin[axis] + view.extent[axis] ||
+                (extent[axis] > 1 && view.byte_strides[axis] != stride)
+            {
+                return Ok(false);
+            }
+            stride *= extent[axis];
+        }
+        if offset + output.len() as u64 > fragment.raw_bytes {
+            return Err("raw compact region is outside its fragment".into());
+        }
+        source
+            .seek(SeekFrom::Start(fragment.raw_offset + offset))
+            .map_err(|error| error.to_string())?;
+        source.read_exact(output).map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Stream compact entries with bulk reads of contiguous entries or coefficient
+/// planes, preserving the canonical coefficient/limb/byte order.
 fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
@@ -6806,41 +6842,61 @@ fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         return Err("small matrix raw encoding does not match its bound".into());
     }
     let coefficient_width = magnitude_bytes + 1;
+    let n = matrix.ring.ring_dimension() as usize;
+    let per_limb = bound_domain == mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb;
+    let limbs = if per_limb { matrix.ring.crt_depth() } else { 1 };
+    let mut sink = BufWriter::with_capacity(64 * 1024, sink);
     sink.write_all(&header).map_err(|error| error.to_string())?;
-    let mut output = Vec::with_capacity(64 * 1024);
+    let mut output = vec![0; n * limbs * coefficient_width];
+    let mut plane = Vec::new();
     for row in 0..matrix.rows as u64 {
         for column in 0..matrix.columns as u64 {
-            for coefficient in 0..u64::from(matrix.ring.ring_dimension()) {
-                let limb_count = match bound_domain {
-                    mxx_ir_core::types::CoefficientBoundDomain::Global => 1,
-                    mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb => {
-                        matrix.ring.crt_depth()
+            let mut coordinate = vec![row, column, 0];
+            let mut extent = vec![1, 1, n as u64];
+            if per_limb {
+                coordinate.push(0);
+                extent.push(limbs as u64);
+            }
+            coordinate.push(0);
+            extent.push(coefficient_width as u64);
+            if !raw_compact_region(layout, source, &coordinate, &extent, &mut output)? {
+                plane.resize(n * coefficient_width, 0);
+                if per_limb {
+                    extent[3] = 1;
+                }
+                for limb in 0..limbs {
+                    if per_limb {
+                        coordinate[3] = limb as u64;
                     }
-                };
-                for limb in 0..limb_count as u64 {
-                    for byte in 0..coefficient_width as u64 {
-                        let global = [row, column, coefficient, byte];
-                        let per_limb = [row, column, coefficient, limb, byte];
-                        let coordinate: &[u64] = match bound_domain {
-                            mxx_ir_core::types::CoefficientBoundDomain::Global => &global,
-                            mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb => &per_limb,
-                        };
-                        output.push(raw_export_byte(
-                            layout,
-                            source,
-                            RawExportLeaf::Value(0),
-                            coordinate,
-                        )?);
-                        if output.len() == output.capacity() {
-                            sink.write_all(&output).map_err(|error| error.to_string())?;
-                            output.clear();
+                    coordinate[2] = 0;
+                    *coordinate.last_mut().unwrap() = 0;
+                    if !raw_compact_region(layout, source, &coordinate, &extent, &mut plane)? {
+                        for coefficient in 0..n {
+                            coordinate[2] = coefficient as u64;
+                            for byte in 0..coefficient_width {
+                                *coordinate.last_mut().unwrap() = byte as u64;
+                                plane[coefficient * coefficient_width + byte] = raw_export_byte(
+                                    layout,
+                                    source,
+                                    RawExportLeaf::Value(0),
+                                    &coordinate,
+                                )?;
+                            }
                         }
+                    }
+                    for coefficient in 0..n {
+                        let at = (coefficient * limbs + limb) * coefficient_width;
+                        output[at..at + coefficient_width].copy_from_slice(
+                            &plane[coefficient * coefficient_width..
+                                (coefficient + 1) * coefficient_width],
+                        );
                     }
                 }
             }
+            sink.write_all(&output).map_err(|error| error.to_string())?;
         }
     }
-    sink.write_all(&output).map_err(|error| error.to_string())?;
+    sink.flush().map_err(|error| error.to_string())?;
     u64::try_from(header.len() + payload_len)
         .map_err(|_| "small matrix artifact length overflows u64".into())
 }
@@ -7750,6 +7806,199 @@ impl GpuDcrtBackend {
 mod tests {
     use super::*;
     use mxx_ir_core::ParamEnv;
+
+    fn compact_export_fixture(
+        per_limb: bool,
+        layout_kind: usize,
+        n: u32,
+        rows: usize,
+    ) -> (PhysicalExport, ConcreteMatrixType, Vec<u8>) {
+        use mxx_ir_core::types::CoefficientBoundDomain;
+        let ring = mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
+            crt_moduli: vec![
+                mxx_ir_core::IntExpr::constant(65537),
+                mxx_ir_core::IntExpr::constant(786433),
+            ],
+            ring_dimension: n,
+        })
+        .resolve(&ParamEnv::default())
+        .unwrap();
+        let matrix = ConcreteMatrixType { ring, rows, columns: 2 };
+        let limbs = if per_limb { 2 } else { 1 };
+        let width = 3;
+        let step = if layout_kind == 2 { 2 } else { 1 };
+        let entry = n as u64 * limbs * width * step;
+        let mut fragments = Vec::new();
+        // Separate row fragments, nonzero file and view offsets, and two views per fragment.
+        for row in 0..rows as u64 {
+            let mut views = Vec::new();
+            for column in 0..2 {
+                let mut origin = vec![row, column, 0];
+                let mut extent = vec![1, 1, n as u64];
+                let mut strides = vec![
+                    2 * entry,
+                    entry,
+                    if per_limb && layout_kind != 1 { limbs * width * step } else { width * step },
+                ];
+                if per_limb {
+                    origin.push(0);
+                    extent.push(limbs);
+                    strides.push(if layout_kind == 1 { n as u64 * width } else { width * step });
+                }
+                origin.push(0);
+                extent.push(width);
+                strides.push(step);
+                views.push(PhysicalView {
+                    byte_offset: 7 + column * entry,
+                    origin: origin.into(),
+                    extent: extent.into(),
+                    byte_strides: strides.into(),
+                    element_bytes: 1,
+                });
+            }
+            if layout_kind == 3 {
+                views = views
+                    .into_iter()
+                    .flat_map(|mut first| {
+                        first.extent[2] = u64::from(n) / 2;
+                        let mut second = first.clone();
+                        second.origin[2] = first.extent[2];
+                        second.byte_offset += first.extent[2] * first.byte_strides[2];
+                        [first, second]
+                    })
+                    .collect();
+            }
+            fragments.push(RawExportFragment {
+                leaf: RawExportLeaf::Value(0),
+                part: row as u32,
+                raw_offset: row * (7 + 2 * entry),
+                raw_bytes: 7 + 2 * entry,
+                views: views.into(),
+            });
+        }
+        let total = rows as u64 * (7 + 2 * entry);
+        let mut raw = vec![0; total as usize];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut raw);
+        let domain = if per_limb {
+            CoefficientBoundDomain::PerCrtLimb
+        } else {
+            CoefficientBoundDomain::Global
+        };
+        let layout = PhysicalExport {
+            physical: Arc::new(PhysicalValue {
+                ty: ConcreteWireType::SmallMatrix {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: BigInt::from(65535),
+                    bound_domain: domain,
+                },
+                encodings: vec![if per_limb {
+                    PhysicalEncoding::CompactCoeffPerCrtLimb { magnitude_bytes: 2 }
+                } else {
+                    PhysicalEncoding::CompactCoeff { magnitude_bytes: 2 }
+                }]
+                .into(),
+                parts: Box::new([]),
+                integer_ranges: BTreeMap::new(),
+            }),
+            public: None,
+            fragments: fragments.into(),
+            raw_total_bytes: total,
+        };
+        (layout, matrix, raw)
+    }
+
+    #[test]
+    fn raw_small_matrix_bulk_matches_byte_reads() {
+        use mxx_ir_core::types::CoefficientBoundDomain;
+        struct CountReads {
+            source: std::io::Cursor<Vec<u8>>,
+            reads: usize,
+            seeks: usize,
+        }
+        impl Read for CountReads {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.source.read(bytes)
+            }
+        }
+        impl Seek for CountReads {
+            fn seek(&mut self, at: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.source.seek(at)
+            }
+        }
+        for per_limb in [false, true] {
+            for kind in 0..4 {
+                let (mut layout, matrix, raw) = compact_export_fixture(per_limb, kind, 8, 2);
+                let domain = if per_limb {
+                    CoefficientBoundDomain::PerCrtLimb
+                } else {
+                    CoefficientBoundDomain::Global
+                };
+                let limbs = if per_limb { 2 } else { 1 };
+                for tag in [0, 1] {
+                    let (mut expected, _, _) =
+                        small_matrix_header(&matrix, &BigInt::from(65535), domain, tag).unwrap();
+                    let mut source = std::io::Cursor::new(raw.clone());
+                    for row in 0..2 {
+                        for column in 0..2 {
+                            for coefficient in 0..8 {
+                                for limb in 0..limbs {
+                                    for byte in 0..3 {
+                                        let mut coordinate = vec![row, column, coefficient];
+                                        if per_limb {
+                                            coordinate.push(limb);
+                                        }
+                                        coordinate.push(byte);
+                                        expected.push(
+                                            raw_export_byte(
+                                                &layout,
+                                                &mut source,
+                                                RawExportLeaf::Value(0),
+                                                &coordinate,
+                                            )
+                                            .unwrap(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut source = CountReads {
+                        source: std::io::Cursor::new(raw.clone()),
+                        reads: 0,
+                        seeks: 0,
+                    };
+                    let mut actual = Vec::new();
+                    Arc::make_mut(&mut layout.physical).ty = if tag == 0 {
+                        ConcreteWireType::SmallMatrix {
+                            matrix: matrix.clone(),
+                            max_coefficient_bound: BigInt::from(65535),
+                            bound_domain: domain,
+                        }
+                    } else {
+                        ConcreteWireType::Preimage {
+                            matrix: matrix.clone(),
+                            max_coefficient_bound: BigInt::from(65535),
+                            bound_domain: domain,
+                        }
+                    };
+                    let length = transcode_raw_artifact(&layout, &mut source, &mut actual).unwrap();
+                    assert_eq!(actual, expected);
+                    assert_eq!(length as usize, expected.len());
+                    let calls = if kind >= 2 {
+                        4 * 8 * limbs as usize * 3
+                    } else if kind == 1 {
+                        4 * limbs as usize
+                    } else {
+                        4
+                    };
+                    assert_eq!(source.reads, calls);
+                    assert_eq!(source.seeks, calls);
+                }
+            }
+        }
+    }
 
     #[test]
     fn raw_matrix_view_uses_each_limb_part_layout() {

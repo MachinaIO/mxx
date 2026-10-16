@@ -24,18 +24,22 @@ theorem chain_step2 {model : HashModel} {tape : SampleTape} {opath ppath : List 
     {pctx : Stage_preprocess.generatedRoot.Ctx Backend.backend model tape ppath pparams} {pout : _}
     (G : Stage_preprocess.generatedRoot.Facts pctx pout)
     (hkey : Stage_online_eval.generatedRoot.w_11_0 octx = Stage_preprocess.generatedRoot.w_3_0 pctx)
-    (htab : Stage_online_eval.generatedRoot.w_38_0 octx = Stage_preprocess.generatedRoot.w_54_0 pctx)
+    (htab : Stage_online_eval.generatedRoot.w_38_0 octx = Stage_preprocess.generatedRoot.w_43_0 pctx)
     (hpos : Stage_online_eval.generatedRoot.w_13_0 octx = Stage_preprocess.generatedRoot.w_0_0 pctx)
-    (hA : aKey_2 octx = keyOf (Stage_preprocess.generatedRoot.w_126_0 pctx,
-      Stage_preprocess.generatedRoot.w_126_1 pctx, Stage_preprocess.generatedRoot.w_126_2 pctx,
-      Stage_preprocess.generatedRoot.w_126_3 pctx, ()))
+    (hA : aKey_2 octx = keyOf (Stage_preprocess.generatedRoot.w_264_0 pctx,
+      Stage_preprocess.generatedRoot.w_270_0 pctx, Stage_preprocess.generatedRoot.w_276_0 pctx,
+      Stage_preprocess.generatedRoot.w_282_0 pctx, ()))
     (hM : mKey_2 octx = preM_2 pctx)
-    (hT0 : Stage_online_eval.generatedRoot.w_157_0 octx = Stage_preprocess.generatedRoot.w_171_0 pctx)
-    (hT1 : Stage_online_eval.generatedRoot.w_158_0 octx = Stage_preprocess.generatedRoot.w_172_0 pctx)
+    (hTI0 : Stage_online_eval.generatedRoot.w_287_0 octx = Stage_preprocess.generatedRoot.w_320_0 pctx)
+    (hTI1 : Stage_online_eval.generatedRoot.w_288_0 octx = Stage_preprocess.generatedRoot.w_320_1 pctx)
+    (hTL0 : Stage_online_eval.generatedRoot.w_305_0 octx = Stage_preprocess.generatedRoot.w_321_0 pctx)
+    (hTL1 : Stage_online_eval.generatedRoot.w_306_0 octx = Stage_preprocess.generatedRoot.w_321_1 pctx)
+    (hT20 : leafFamilies0_2 octx = fun slot ↦ preLeafT_2 pctx slot 0)
+    (hT21 : leafFamilies1_2 octx = fun slot ↦ preLeafT_2 pctx slot 1)
     {s : ErrorPoly N} (hs : polyNorm s ≤ 1) {v B : Nat}
     (henc : Rel s (aKey_2 octx)
       (fun j ↦ reducePoly Q N ((((1 : Nat) : Int) : ErrorPoly N) * Xe v * unitPair s j) • g0)
-      ![Stage_online_eval.generatedRoot.w_119_0 octx, Stage_online_eval.generatedRoot.w_119_1 octx] B)
+      ![Stage_online_eval.generatedRoot.w_253_0 octx, Stage_online_eval.generatedRoot.w_259_0 octx] B)
     (p : Fin 4) (hp : Stage_online_eval.generatedRoot.w_13_0 octx 2 = p) {xv : Nat}
     {eB : Fin 2 → ErrorMatrix N 1 44}
     (hrhs : ∀ j, reducePoly Q N s • ![rhsTop model (Stage_online_eval.generatedRoot.w_11_0 octx) p 0,
@@ -56,7 +60,7 @@ theorem chain_step2 {model : HashModel} {tape : SampleTape} {opath ppath : List 
     (hhelp : ∀ (i : Fin 37) (k : Nat) (hk : Odd k), kHelp i = k →
       Rel s (helperKey model (Stage_online_eval.generatedRoot.w_11_0 octx) k)
         (fun j ↦ reducePoly Q N ((((1 : Nat) : Int) : ErrorPoly N) * unitPair (substitution k hk s) j) • g0)
-        ![Stage_online_eval.generatedRoot.w_55_0 octx i, Stage_online_eval.generatedRoot.w_56_0 octx i] 31)
+        ![Stage_online_eval.generatedRoot.w_45_0 octx i, Stage_online_eval.generatedRoot.w_46_0 octx i] 31)
     {ez : Fin 85184 → Fin 2 → ErrorMatrix N 1 1}
     (hcomp : ∀ i : Fin 85184,
       RelE (substitution (kSw (i / 3872)) (kSw_odd ⟨i / 3872, by omega⟩) s)
@@ -64,38 +68,59 @@ theorem chain_step2 {model : HashModel} {tape : SampleTape} {opath ppath : List 
           ((44 + (i / 88) % 44 : Nat) : Int))
         (fun j _ _ ↦ reducePoly PQ N (((P : Nat) : Int) *
           (entryDigit (joinedEntry ![switchBot model (Stage_online_eval.generatedRoot.w_11_0 octx)
-                (Stage_online_eval.generatedRoot.w_55_0 octx) (Stage_online_eval.generatedRoot.w_56_0 octx)
+                (Stage_online_eval.generatedRoot.w_45_0 octx) (Stage_online_eval.generatedRoot.w_46_0 octx)
                 ⟨i / 3872, by omega⟩ 0,
               switchBot model (Stage_online_eval.generatedRoot.w_11_0 octx)
-                (Stage_online_eval.generatedRoot.w_55_0 octx) (Stage_online_eval.generatedRoot.w_56_0 octx)
+                (Stage_online_eval.generatedRoot.w_45_0 octx) (Stage_online_eval.generatedRoot.w_46_0 octx)
                 ⟨i / 3872, by omega⟩ 1] ⟨i % 88, by omega⟩)
             ⟨(i / 88) % 44, by omega⟩ *
             unitPair (substitution (kSw (i / 3872)) (kSw_odd ⟨i / 3872, by omega⟩) s) j)))
-        ![Stage_online_eval.generatedRoot.w_60_0 octx i, Stage_online_eval.generatedRoot.w_61_0 octx i]
+        ![Stage_online_eval.generatedRoot.w_50_0 octx i, Stage_online_eval.generatedRoot.w_51_0 octx i]
         (ez i) ∧ ∀ j, CoeffBound (ez i j) 31)
     (ht : ∀ j : Fin 128, 0 ≤ Stage_online_eval.generatedRoot.w_38_0 octx ⟨256 + j, by omega⟩ ∧
       Stage_online_eval.generatedRoot.w_38_0 octx ⟨256 + j, by omega⟩ < 2 * N)
     (he : v + xv < 128) :
-    Rel s (keyOf (Stage_preprocess.generatedRoot.w_186_0 pctx, Stage_preprocess.generatedRoot.w_186_1 pctx,
-        Stage_preprocess.generatedRoot.w_186_2 pctx, Stage_preprocess.generatedRoot.w_186_3 pctx, ()))
+    Rel s (keyOf (Stage_preprocess.generatedRoot.w_402_0 pctx, Stage_preprocess.generatedRoot.w_408_0 pctx,
+        Stage_preprocess.generatedRoot.w_414_0 pctx, Stage_preprocess.generatedRoot.w_420_0 pctx, ()))
       (fun j ↦ (reducePoly Q N (unitPair s j) *
         tableMono (Stage_online_eval.generatedRoot.w_38_0 octx) 256 (by norm_num) ⟨v + xv, he⟩) • g0)
-      ![Stage_online_eval.generatedRoot.w_168_0 octx, Stage_online_eval.generatedRoot.w_168_1 octx]
+      ![Stage_online_eval.generatedRoot.w_372_0 octx, Stage_online_eval.generatedRoot.w_378_0 octx]
       (Bstep B) := by
-  have hA0 := G.c10.h129_0
-  have hA1 := G.c10.h130_0
+  have hA0 := G.c13.h285_0
+  have hA1 := G.c13.h286_0
   obtain ⟨hMf, hT1f, hrest⟩ := pre_root2 G
-    (A := keyOf (Stage_preprocess.generatedRoot.w_126_0 pctx, Stage_preprocess.generatedRoot.w_126_1 pctx,
-      Stage_preprocess.generatedRoot.w_126_2 pctx, Stage_preprocess.generatedRoot.w_126_3 pctx, ()))
+    (A := keyOf (Stage_preprocess.generatedRoot.w_264_0 pctx, Stage_preprocess.generatedRoot.w_270_0 pctx,
+      Stage_preprocess.generatedRoot.w_276_0 pctx, Stage_preprocess.generatedRoot.w_282_0 pctx, ()))
     hA0 hA1 p (by rw [← hpos]; exact hp)
-  obtain ⟨hT2f, hkeyEq⟩ := hrest (data1_2 octx) (data2_2 octx) hkey hT0 hT1 hkey hT0 hT1
+  have hslot (leaf : Fin 105) :
+      chunkSlot (leafLocation2 leaf).1 (leafLocation2 leaf).2.1 =
+        ⟨1 + leaf.val % 15, by omega⟩ := by
+    apply Fin.ext
+    simp only [chunkSlot, leafLocation2]
+    omega
+  have hT20' : (data2_2 octx).T0 = groupedPreLeafRows (preLeafT_2 pctx) 0 := by
+    funext leaf
+    change leafFamilies0_2 octx
+      (chunkSlot (leafLocation2 leaf).1 (leafLocation2 leaf).2.1)
+        (leafLocation2 leaf).2.2 = _
+    rw [hT20, hslot]
+    rfl
+  have hT21' : (data2_2 octx).T1 = groupedPreLeafRows (preLeafT_2 pctx) 1 := by
+    funext leaf
+    change leafFamilies1_2 octx
+      (chunkSlot (leafLocation2 leaf).1 (leafLocation2 leaf).2.1)
+        (leafLocation2 leaf).2.2 = _
+    rw [hT21, hslot]
+    rfl
+  obtain ⟨hT2f, hkeyEq⟩ := hrest (data1_2 octx) (data2_2 octx)
+    hkey hTI0 hTI1 hTL0 hTL1 hkey hT20' hT21'
   have R := online_root2 F hs henc p hp hrhs heB hcomp0
     (by rw [hM, hkey, hA]; exact hMf)
     hhelp hcomp
-    (by rw [hM, hkey]; exact hT1f (data1_2 octx) hkey hT0 hT1)
+    (by rw [hM, hkey]; exact hT1f (data1_2 octx) hkey hTI0 hTI1 hTL0 hTL1)
     (by rw [hkey]; exact hT2f)
     ht he
-  rw [hkeyEq, ← hM, show (fun k ↦ branchCoef (Stage_preprocess.generatedRoot.w_54_0 pctx) 256 k (by norm_num)) =
+  rw [hkeyEq, ← hM, show (fun k ↦ branchCoef (Stage_preprocess.generatedRoot.w_43_0 pctx) 256 k (by norm_num)) =
     (fun k ↦ branchCoef (Stage_online_eval.generatedRoot.w_38_0 octx) 256 k (by norm_num)) by rw [htab]]
   exact R
 

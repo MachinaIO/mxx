@@ -418,10 +418,14 @@ impl<S: SessionStore> StageExecution<S> for CpuExecution {
     }
 }
 
+/// Serialization restores internal handles written by this crate; referenced store
+/// productions must remain available. It is not an untrusted-input format.
+///
 /// Connection metadata for one completed artifact production.
 ///
 /// The application owns the manifest and descriptor. Large payloads remain in
 /// the `SessionStore` and are imported lazily by concrete builders.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StageArtifacts<D> {
     pub(crate) production: ProductionId,
     pub(crate) manifest: Manifest,

@@ -15,7 +15,9 @@
 //! when `F(x) = 0`; its coefficients are rounded to bits. The contraction is
 //! accumulated by blocks: the anchor blocks as `sigma_i((b - B^(2)) k~_i)`
 //! with the stored inverse-coordinate blocks, the helper blocks against
-//! their extension coordinates, and the output block. Decryption reads no
+//! their extension coordinates (one compact matrix per row, helpers in columns),
+//! and the output block. Family members are imported inside the sequential contractions,
+//! retaining only the current member and read-ahead rather than all group rows. Decryption reads no
 //! secret: not `s` or the trapdoor.
 //!
 //! With compact encodings (the manuscript's Appendix C), the ciphertext carries
@@ -29,7 +31,7 @@
 use crate::{
     PeCiphertext, PeError, PePredicateKey, PePublicKey,
     encryption::{ANCHOR_ENCODING, MESSAGE_ENCODING},
-    keygen::{COMPRESSED_KEY, Group, HELPER_KEY, OUTPUT_KEY, anchor_key},
+    keygen::{COMPRESSED_KEY, Group, HELPER_KEY, OUTPUT_KEY, anchor_keys},
 };
 use mxx_backends::{RuntimeValue, SessionStore, poly::PolyParams};
 use mxx_dsl::{DslContext, Int, Mat};
@@ -191,14 +193,6 @@ pub(crate) fn phase_graph(
     let (_, d_2) = public_key.message_row(hash_key.clone())?;
     let key_production = key.key().production().clone();
     let cutoff = num_bigint::BigInt::from(parameters.key_cutoff().clone());
-    let helper_keys = ring.small_matrix_family_artifact_input(
-        key_production.clone(),
-        HELPER_KEY,
-        w * p,
-        (width, 1),
-        cutoff.clone(),
-        ArtifactAvailability::Transferred,
-    );
     // `sum_i sigma_i(b'' - B''^(2)) v''_i` with compact encodings.
     let compressed = match public_key.compressed_anchor_rows(hash_key.clone())? {
         Some((_, second_row)) => {
@@ -231,27 +225,42 @@ pub(crate) fn phase_graph(
         Mat::concat(ConcatAxis::Columns, vec![ring.zero((1, columns)), rns.public_gadget(0)?]);
     let setup = public_key.setup();
     let masked = anchor - second;
-    let anchors = group.elements.iter().enumerate().fold(ring.zero((1, 1)), |sum, (row, i)| {
-        sum + masked
-            .clone()
-            .mul_small_rhs(anchor_key(&ring, parameters, key, row))
-            .ring_automorphism(IntExpr::constant(*i))
-    });
-    let helpers = mxx_dsl::iterate(w * p, ring.zero((1, 1)), |pair, sum| {
-        let pair = pair.expression()?;
-        let quotient = IntExpr::FloorDiv(Box::new(pair.clone()), Box::new(IntExpr::constant(p)))
-            .canonicalize();
-        let k_index =
-            IntExpr::Rem(Box::new(pair.clone()), Box::new(IntExpr::constant(p))).canonicalize();
-        let i = Group::select(&group.elements, quotient);
-        let k = Group::select(&group.helpers, k_index.clone());
-        let public =
-            setup.helper_key(rns, hash_key.clone(), k).map_err(|_| mxx_dsl::DslError::Schema)?;
-        let member = Int::evaluate(k_index);
-        let helper = read_helper(&helper_rows, member);
-        let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
-        let value = (helper - public_second_row).ring_automorphism(i) + gadget_second_row.clone();
-        Ok(sum + value.mul_small_rhs(helper_keys.at(Int::evaluate(pair))))
+    let anchor_keys = anchor_keys(&ring, parameters, key);
+    let anchors = mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+        let i = Group::select(&group.elements, row.expression()?);
+        Ok(sum + masked.clone().mul_small_rhs(anchor_keys.at(row)).ring_automorphism(i))
+    })?;
+    let helper_keys = ring.small_matrix_family_artifact_input(
+        key.helpers().production().clone(),
+        HELPER_KEY,
+        w,
+        (width, p),
+        num_bigint::BigInt::from(parameters.key_cutoff().clone()),
+        ArtifactAvailability::Transferred,
+    );
+    // Read a compact row once and consume its helper columns sequentially.
+    let helpers = mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+        let own = helper_keys.at(row.clone());
+        let i = Group::select(&group.elements, row.expression()?);
+        mxx_dsl::iterate(p, sum, |k_index, sum| {
+            let k_expr = k_index.expression()?;
+            let k = Group::select(&group.helpers, k_expr.clone());
+            let public = setup
+                .helper_key(rns, hash_key.clone(), k)
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+            let helper = read_helper(&helper_rows, k_index);
+            let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
+            let value = (helper - public_second_row).ring_automorphism(i.clone()) +
+                gadget_second_row.clone();
+            let contribution = value.mul_small_rhs(own.clone()).slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: k_expr.clone(),
+                    end: k_expr + IntExpr::constant(1),
+                }),
+            );
+            Ok(sum + contribution)
+        })
     })?;
     let outputs = (output_row - output_second_row).mul_small_rhs(output_key_block);
     let phase = message - d_2 - (anchors + compressed + helpers + outputs);
@@ -260,6 +269,7 @@ pub(crate) fn phase_graph(
         (ciphertext.prelude().production(), ciphertext.prelude().manifest()),
         (ciphertext.packages().production(), ciphertext.packages().manifest()),
         (key.key().production(), key.key().manifest()),
+        (key.helpers().production(), key.helpers().manifest()),
         (key.evaluation().production(), key.evaluation().manifest()),
     ] {
         manifests.insert(production.clone(), manifest.clone());

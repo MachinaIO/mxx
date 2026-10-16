@@ -98,8 +98,7 @@ theorem encrypt_switch {model : HashModel} {tape : SampleTape} {path : List Nat}
       substituteMatrix (kSw b) (kSw_odd ⟨b, hb⟩) (hf0 ⟨36 - b, by omega⟩) ∧
     outputs.2.2.2.1 = substituteMatrix (kSw b) (kSw_odd ⟨b, hb⟩) (helperKey model key (kInv b) 1 1) -
       substituteMatrix (kSw b) (kSw_odd ⟨b, hb⟩) (hf1 ⟨36 - b, by omega⟩) := by
-  obtain ⟨w1, w2, w3, w4, w5, w6, w9, w10, w12, w13, w15, w16, -, -, h1, -, -, h2, -, -, h3, -, -, h4,
-    -, -, h5, -, -, h6, -, -, -, -, h9, -, -, h10, -, -, h12, -, -, h13, -, -, h15, -, -, h16, hout⟩ := h
+  obtain ⟨w1, w2, w3, w4, w5, w6, w9, w10, w12, w13, w15, w16, ⟨-, -, h1, -, -, h2, -, -, h3, -, -, h4, -, -, h5, -, -, h6, -, -, -, -, h9, -, -, h10, -, -, h12, -, -, h13⟩, -, -, h15, -, -, h16, hout⟩ := h
   have hk := kInv_cast b hb
   rw [← hk] at h1 h3 h5 h12
   have e1 : w1 = helperKey model key (kInv b) 0 0 := helperKey_read (c := 0) (by norm_num) h1
@@ -199,11 +198,7 @@ theorem encrypt_companion {model : HashModel} {tape : SampleTape} {path : List N
           unitPair (substitution (kSw (i / 3872)) (kSw_odd ⟨i / 3872, by omega⟩) sm) j)))
       ![outputs.1, outputs.2.1] (compErr tape path i) ∧
     ∀ j, CoeffBound (compErr tape path i j) 31 := by
-  obtain ⟨w1, w2, w4, w7, w8, w13, w16, w18, w19, w20, w22, w24, w25, w26, w27, w28, w29, w31, w35, w37,
-    w39, w45, -, -, -, h1, h2, -, -, -, -, -, -, h4, h7, -, -, -, -, -, -, h8, -, -, -, -, -, -, -, -, -,
-    -, -, -, -, -, h13, -, -, h16, -, -, h18, h19, -, -, -, -, -, -, -, -, h20, -, -, h22, -, -, h24, h25,
-    -, -, -, -, -, -, -, -, h26, h27, -, -, -, -, -, -, -, -, -, -, -, -, h28, h29, h31, h35, -, -, -, -,
-    -, -, h37, -, -, -, -, -, -, h39, h45, hout⟩ := h
+  obtain ⟨w1, w2, w4, w7, w8, w13, w16, w18, w19, w20, w22, w24, w25, w26, w27, w28, w29, w31, w35, w37, w39, w45, ⟨-, -, -, h1, h2, -, -, -, -, -, -, h4, h7, -, -, -, -, -, -, h8, -, -, -, -, -, -, -, -, -, -, -, -⟩, ⟨-, -, h13, -, -, h16, -, -, h18, h19, -, -, -, -, -, -, -, -, h20, -, -, h22, -, -, h24, h25, -, -, -, -, -, -⟩, ⟨-, -, h26, h27, -, -, -, -, -, -, -, -, -, -, -, -, h28, h29, h31, h35, -, -, -, -, -, -, h37, -, -, -, -, -⟩, -, h39, h45, hout⟩ := h
   have hb : i / 3872 < 22 := by omega
   have hfb : Int.fdiv (Int.ofNat i) 3872 = Int.ofNat (i / 3872) := by
     rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]; simp only [Int.ofNat_eq_natCast]; omega
@@ -326,10 +321,7 @@ theorem encrypt_rhsCompanion {model : HashModel} {tape : SampleTape} {path : Lis
         (entryDigit (joinedEntry ![Y0, Y1] ⟨i % 88, by omega⟩) ⟨(i / 88) % 44, by omega⟩ * unitPair sm j)))
       ![outputs.1, outputs.2.1] (rhsCompErr tape path i) ∧
     ∀ j, CoeffBound (rhsCompErr tape path i j) 31 := by
-  obtain ⟨w1, w3, w6, w7, w12, w15, w17, w18, w19, w22, w23, w24, w25, w26, w28, w32, w34, w36, w42, h1,
-    -, -, -, -, h3, h6, -, -, -, -, h7, -, -, -, -, -, -, -, -, -, -, -, -, -, -, h12, -, -, h15, -, -,
-    h17, h18, -, -, -, -, -, -, -, -, h19, h22, -, -, -, -, -, -, -, -, h23, h24, -, -, -, -, -, -, -,
-    -, -, -, -, -, h25, h26, h28, h32, -, -, -, -, h34, -, -, -, -, h36, h42, hout⟩ := h
+  obtain ⟨w1, w3, w6, w7, w12, w15, w17, w18, w19, w22, w23, w24, w25, w26, w28, w32, w34, w36, w42, ⟨h1, -, -, -, -, h3, h6, -, -, -, -, h7, -, -, -, -, -, -, -, -, -, -, -, -, -, -, h12, -, -, h15, -, -⟩, ⟨h17, h18, -, -, -, -, -, -, -, -, h19, h22, -, -, -, -, -, -, -, -, h23, h24, -, -, -, -, -, -, -, -, -, -⟩, -, -, h25, h26, h28, h32, -, -, -, -, h34, -, -, -, -, h36, h42, hout⟩ := h
   have hfb : Int.fdiv (Int.ofNat i) 3872 = ((i / 3872 : Nat) : Int) := by
     rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]; simp only [Int.ofNat_eq_natCast]; omega
   have hjj : Int.fmod (Int.ofNat i) 88 = ((i % 88 : Nat) : Int) := by

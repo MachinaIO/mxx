@@ -25,6 +25,12 @@
 //! coordinates, sampled with `v` at the key width: `v''_i` (`m_c D` per row)
 //! and `v_iota` (one per row). The block `I_W` serves only the security
 //! proof; decryption's row is zero there.
+//!
+//! Helper samples are streamed in one compact matrix per group row before contraction.
+//! Each contraction lane reads one row and contributes a
+//! `W x 1` scalar residual column to a fused sum. Only the selected helper
+//! column of each product contributes; no expanded extension family is retained. Compressed lanes
+//! likewise export compact blocks and retain only their scalar residual contributions.
 use crate::{
     BranchingProgram, CompiledPredicate, PeError, PeMasterSecretKey, PePublicKey, setup::digest,
 };
@@ -32,20 +38,23 @@ use mxx_backends::{
     SessionStore,
     poly::{PolyParams, dcrt::poly::DCRTPoly},
 };
-use mxx_dsl::{DslContext, Int, Mat, Preimage, Ring};
+use mxx_dsl::{DslContext, Int, Mat, Ring, SmallMatrix};
 use mxx_exponent_lut::{
     api::{self, PlaintextInputs, StageArtifacts, StageExecution, StageGraph},
     program::{Operand, ProgramData, RhsId, WireId},
     rns_bgg::{RnsBggPreprocessOnlineEvalDescriptor, RnsOutputUse, RnsPreprocessBuild},
 };
-use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
+use mxx_ir_core::{
+    IntExpr, ParamEnv,
+    artifact::ArtifactAvailability,
+    node::{ConcatAxis, IndexRange},
+};
 use std::collections::BTreeMap;
 
-/// The anchor blocks `k~_i` in the key production: one preimage artifact
-/// `{ANCHOR_KEY}/{row}` per row of `H` (see [`anchor_key`]).
+/// The anchor samples `k~_i`, stored as a streamed bounded-matrix family
+/// indexed by the row of `H` (see [`anchor_keys`]).
 pub(crate) const ANCHOR_KEY: &str = "mxx-pe/key/anchor";
-/// The helper blocks `v_(i,k)` (a family, member `i |P| + k`), stored as compact bounded
-/// matrices like the anchor blocks.
+/// The helper blocks `v_(i,k)`: one compact `width x |P|` matrix per row `i`.
 pub(crate) const HELPER_KEY: &str = "mxx-pe/key/helper";
 /// The output block `v_F`, stored as a compact bounded matrix.
 pub(crate) const OUTPUT_KEY: &str = "mxx-pe/key/output";
@@ -55,8 +64,12 @@ pub(crate) const COMPRESSED_KEY: &str = "mxx-pe/key/compressed";
 /// With compact encodings, the block `v_iota` of `I_W` (a family of `W` members of `1 x 1`).
 pub(crate) const IDENTITY_KEY: &str = "mxx-pe/key/identity";
 
+/// Serialization restores internal handles written by this crate; referenced store
+/// productions must remain available. It is not an untrusted-input format.
+///
 /// A key for one predicate: the class Program with the predicate as its data,
-/// the public evaluation artifacts, and the key production.
+/// the public evaluation artifacts, and the key and helper productions.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PePredicateKey {
     public_key: [u8; 32],
     predicate: BranchingProgram,
@@ -64,6 +77,7 @@ pub struct PePredicateKey {
     data: ProgramData,
     evaluation: StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
     key: StageArtifacts<()>,
+    helpers: StageArtifacts<()>,
     commitment: [u8; 32],
 }
 
@@ -90,9 +104,14 @@ impl PePredicateKey {
         &self.evaluation
     }
 
-    /// The key production.
+    /// The anchor, output, and compressed key blocks. Helpers are in [`Self::helpers`].
     pub const fn key(&self) -> &StageArtifacts<()> {
         &self.key
+    }
+
+    /// The streamed compact helper matrices, indexed by row, with helper `k` in column `k`.
+    pub const fn helpers(&self) -> &StageArtifacts<()> {
+        &self.helpers
     }
 
     /// The commitment to the setup, the predicate, its output layout, the
@@ -113,13 +132,13 @@ impl PePredicateKey {
 /// The canonical group `H` of the class, its inverses, the automorphisms
 /// `P` with a published helper (`H \ {1}`, or `J_B` under a LUT radix `B`,
 /// see [`mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::helper_automorphisms`]),
-/// and, for row `i` and `k` in `P`, the row `i k^-1` whose helper block
-/// `(i k^-1, k)` places `-G^(1)` in row `i`.
+/// and, for row `i` and `k` in `P`, the destination row `i k` of the
+/// negative gadget term of helper block `(i, k)`.
 pub(crate) struct Group {
     pub(crate) elements: Vec<usize>,
     pub(crate) inverses: Vec<usize>,
     pub(crate) helpers: Vec<usize>,
-    pub(crate) sources: Vec<usize>,
+    pub(crate) destinations: Vec<usize>,
 }
 
 impl Group {
@@ -135,16 +154,12 @@ impl Group {
             elements.iter().position(|element| *element == value).ok_or(PeError::Mismatch)
         };
         let helpers = setup.helper_automorphisms();
-        let helper_inverses = helpers
+        let destinations = elements
             .iter()
-            .map(|k| setup.automorphism_inverse(*k))
-            .collect::<Result<Vec<_>, _>>()?;
-        let sources = elements
-            .iter()
-            .flat_map(|i| helper_inverses.iter().map(move |k_inverse| i * k_inverse % order))
+            .flat_map(|i| helpers.iter().map(move |k| i * k % order))
             .map(position)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { elements, inverses, helpers, sources })
+        Ok(Self { elements, inverses, helpers, destinations })
     }
 
     pub(crate) fn width(&self) -> usize {
@@ -164,20 +179,29 @@ impl Group {
     }
 }
 
-/// The anchor block `k~_row` of `key`, from its key production.
-pub(crate) fn anchor_key(
+/// The anchor blocks `k~_row` of `key` (one member per row of `H`), from its key production.
+pub(crate) fn anchor_keys(
     ring: &Ring,
     parameters: &crate::PeParameters,
     key: &PePredicateKey,
-    row: usize,
-) -> Preimage {
-    ring.preimage_artifact_input(
+) -> mxx_dsl::Family<SmallMatrix> {
+    ring.small_matrix_family_artifact_input(
         key.key().production().clone(),
-        format!("{ANCHOR_KEY}/{row}"),
+        ANCHOR_KEY,
+        parameters.class().lookup_width(),
         (parameters.anchor_columns(), 1),
         num_bigint::BigInt::from(parameters.key_cutoff().clone()),
         ArtifactAvailability::Transferred,
     )
+}
+
+/// Completed key-generation stages from one setup and predicate. Restore only state
+/// serialized by this crate, with its original artifact store intact.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct PeKeygenCheckpoint {
+    identity: Option<([u8; 32], [u8; 32])>,
+    evaluation: Option<StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>>,
+    helpers: Option<StageArtifacts<()>>,
 }
 
 /// `KeyGen(msk, F)`.
@@ -192,6 +216,34 @@ where
     E: StageExecution<S>,
     S: SessionStore,
 {
+    keygen_resumable(
+        public_key,
+        master,
+        predicate,
+        execution,
+        store,
+        &mut PeKeygenCheckpoint::default(),
+        |_| Ok(()),
+    )
+}
+
+/// Generate a predicate key, skipping completed preprocessing and helper sampling.
+/// `checkpoint` must belong to this setup and predicate. `save` runs after each
+/// newly completed stage and must durably save the state before returning success.
+/// Runtime plans are rebuilt. On success the stage handles move into the returned key.
+pub fn keygen_resumable<E, S>(
+    public_key: &PePublicKey,
+    master: &PeMasterSecretKey,
+    predicate: &BranchingProgram,
+    execution: &mut E,
+    store: &mut S,
+    checkpoint: &mut PeKeygenCheckpoint,
+    mut save: impl FnMut(&PeKeygenCheckpoint) -> Result<(), PeError>,
+) -> Result<PePredicateKey, PeError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+{
     let parameters = public_key.parameters();
     if predicate.class() != parameters.class() || master.public_key() != public_key.identity() {
         return Err(PeError::Mismatch);
@@ -199,21 +251,33 @@ where
     let compiled = predicate.class().compile()?;
     let data = predicate.data(&compiled);
     let rns = parameters.rns();
-    let (_, evaluation) = api::preprocess(
-        compiled.program(),
-        &ParamEnv::default(),
-        &PlaintextInputs::<RhsId, DCRTPoly>::new(),
-        None,
-        public_key.hash_key(),
-        RnsPreprocessBuild::new(rns, *public_key.context())
-            .with_output_use(RnsOutputUse::Gadget)
-            .with_dynamic_setup(public_key.setup(), compiled.binding().clone())?
-            .with_data(data.clone()),
-        execution,
-        store,
-        |_, outputs| Ok(outputs),
-        |_| Ok(()),
-    )?;
+    let identity = (*public_key.identity(), data.commitment());
+    if checkpoint.identity.is_some_and(|saved| saved != identity) {
+        return Err(PeError::Mismatch);
+    }
+    checkpoint.identity = Some(identity);
+    if checkpoint.evaluation.is_none() {
+        let (_, evaluation) = api::preprocess(
+            compiled.program(),
+            &ParamEnv::default(),
+            &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            None,
+            public_key.hash_key(),
+            RnsPreprocessBuild::new(rns, *public_key.context())
+                .with_output_use(RnsOutputUse::Gadget)
+                .with_dynamic_setup(public_key.setup(), compiled.binding().clone())?
+                .with_data(data.clone()),
+            execution,
+            store,
+            |_, outputs| Ok(outputs),
+            |_| Ok(()),
+        )?;
+        checkpoint.evaluation = Some(evaluation);
+        save(checkpoint)?;
+    } else {
+        tracing::info!("restored PE preprocess");
+    }
+    let evaluation = checkpoint.evaluation.as_ref().unwrap();
     let output = match compiled.program().outputs() {
         [Operand::Scalar(wire)] => *wire,
         _ => return Err(PeError::Mismatch),
@@ -244,36 +308,20 @@ where
     let gaussian_of =
         |rows: usize| ring.small_gaussian((rows, 1), key_sigma.clone(), key_cutoff.clone());
     let gaussian = || gaussian_of(width);
-    // The one extension sample `v`, shared by every row.
-    // Each block is stored compactly; the products below read it as a full matrix `I v`.
-    let helpers = mxx_dsl::parallel(w * p, |_| {
-        let block = gaussian();
-        let full = ring.identity(width).mul_small_rhs(block.clone());
-        Ok((block, full))
-    })?;
-    let stored_helpers = helpers.field(|(block, _)| block)?;
-    let helpers = helpers.field(|(_, full)| full)?;
     let output_block = gaussian();
-    // The extension blocks of `B''` and `I_W` with compact encodings.
+    // Each compressed lane exports its compact samples and only a scalar contribution.
     let compressed_width = parameters.compressed_anchor_width();
     let compressed = public_key
         .compressed_anchor_rows(hash_key.clone())?
         .map(|(first_row, _)| {
-            let blocks = mxx_dsl::parallel(w, |_| {
+            mxx_dsl::parallel(w, |row| {
                 let block = gaussian_of(compressed_width);
-                let full = ring.identity(compressed_width).mul_small_rhs(block.clone());
-                Ok((block, full))
-            })?;
-            let identity = mxx_dsl::parallel(w, |_| {
-                let block = gaussian_of(1);
-                let full = ring.identity(1).mul_small_rhs(block.clone());
-                Ok((block, full))
-            })?;
-            Ok::<_, PeError>((
-                first_row,
-                (blocks.field(|(block, _)| block)?, blocks.field(|(_, full)| full)?),
-                (identity.field(|(block, _)| block)?, identity.field(|(_, full)| full)?),
-            ))
+                let identity = gaussian_of(1);
+                let i = Group::select(&group.elements, row.expression()?);
+                let residual = first_row.clone().ring_automorphism(i).mul_small_rhs(block.clone()) +
+                    ring.identity(1).mul_small_rhs(identity.clone());
+                Ok((block, identity, residual))
+            })
         })
         .transpose()?;
     let gadget_first_row = Mat::concat(
@@ -283,38 +331,99 @@ where
     // Only row `1` carries the target `d_1` and the output block `A_F^(1) v_F`.
     let first = d_1 - output_first_row.mul_small_rhs(output_block.clone());
     let setup = public_key.setup();
-    // Row `i`'s target `sigma_i^-1(u_i)` in a parallel loop; its preimage
-    // under `B^(1)` is one existing sampler call per row.
+    // Sample and export one compact row before contraction. This production
+    // boundary avoids retaining W * p digit columns and publishes only W artifacts.
+    let sampled = mxx_dsl::parallel(w, |_| {
+        Ok(ring.small_gaussian((width, p), key_sigma.clone(), key_cutoff.clone()))
+    })?;
+    let sampled = DslContext::new("mxx-pe/keygen-helpers")
+        .transferred_output(HELPER_KEY, sampled)?
+        .build()?;
+    let nonce: [u8; 32] = rand::random();
+    if checkpoint.helpers.is_none() {
+        let helper_artifacts = api::execute_artifacts(
+            StageGraph::new(sampled, BTreeMap::new(), BTreeMap::new()),
+            &ParamEnv::default(),
+            (),
+            digest(b"mxx-pe/keygen-helpers", &[public_key.identity(), &nonce]),
+            execution,
+            store,
+            |_| Ok(()),
+        )?;
+        checkpoint.helpers = Some(helper_artifacts);
+        save(checkpoint)?;
+    } else {
+        tracing::info!("restored PE keygen-helpers");
+    }
+    let helper_artifacts = checkpoint.helpers.as_ref().unwrap();
+    let blocks = ring.small_matrix_family_artifact_input(
+        helper_artifacts.production().clone(),
+        HELPER_KEY,
+        w,
+        (width, p),
+        num_bigint::BigInt::from(key_cutoff.clone()),
+        ArtifactAvailability::Transferred,
+    );
+    // Contract a stored row once. Its positive terms go to row i and its
+    // negative gadget terms to row i*k, so no partner-row import is needed.
+    let contributions = mxx_dsl::parallel(w, |row| {
+        let own = blocks.at(row.clone());
+        let row = row.expression()?;
+        let gadget_products = gadget_first_row.clone().mul_small_rhs(own.clone());
+        let column = |index: IntExpr| {
+            Mat::concat(
+                ConcatAxis::Rows,
+                (0..w)
+                    .map(|position| {
+                        Int::evaluate(index.clone())
+                            .equal(Int::constant(position))
+                            .to_int()
+                            .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                    })
+                    .collect(),
+            )
+        };
+        let own_column = column(row.clone());
+        mxx_dsl::iterate(p, ring.zero((w, 1)), |k, sum| {
+            let k = k.expression()?;
+            let helper = setup
+                .helper_key(rns, hash_key.clone(), Group::select(&group.helpers, k.clone()))
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+            let first_row = Mat::concat(ConcatAxis::Columns, vec![helper.0.0, helper.0.1]);
+            let selected =
+                Some(IndexRange { start: k.clone(), end: k.clone() + IntExpr::constant(1) });
+            let positive = first_row
+                .ring_automorphism(Group::select(&group.elements, row.clone()))
+                .mul_small_rhs(own.clone())
+                .slice(None, selected.clone());
+            let negative = gadget_products.clone().slice(None, selected);
+            let destination = Group::select(
+                &group.destinations,
+                (row.clone() * IntExpr::constant(p) + k).canonicalize(),
+            );
+            Ok(sum + own_column.clone() * positive - column(destination) * negative)
+        })
+    })?;
+    let residuals = match w {
+        1 => contributions.at(Int::constant(0)),
+        count => {
+            let first = contributions.at(Int::constant(0)) + contributions.at(Int::constant(1));
+            mxx_dsl::iterate(count - 2, first, |index, sum| {
+                Ok(sum + contributions.at(index.add(2)))
+            })?
+        }
+    };
+    // Row targets retain only scalar residuals, never full extension vectors.
+    let compressed_residuals =
+        compressed.as_ref().map(|blocks| blocks.field(|(_, _, r)| r)).transpose()?;
     let targets = mxx_dsl::parallel(w, |row| {
         let row = row.expression()?;
-        let i = Group::select(&group.elements, row.clone());
-        let residual = mxx_dsl::iterate(p, ring.zero((1, 1)), |k_index, sum| {
-            let k_index = k_index.expression()?;
-            let k = Group::select(&group.helpers, k_index.clone());
-            let helper = setup
-                .helper_key(rns, hash_key.clone(), k)
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
-            let helper_first_row = Mat::concat(ConcatAxis::Columns, vec![helper.0.0, helper.0.1])
-                .ring_automorphism(i.clone());
-            let own = helpers.at(Int::evaluate(
-                (row.clone() * IntExpr::constant(p) + k_index.clone()).canonicalize(),
-            ));
-            let source = Group::select(
-                &group.sources,
-                (row.clone() * IntExpr::constant(p) + k_index.clone()).canonicalize(),
-            );
-            let switched =
-                helpers.at(Int::evaluate((source * IntExpr::constant(p) + k_index).canonicalize()));
-            Ok(sum + helper_first_row * own - gadget_first_row.clone() * switched)
-        })?;
-        // `sigma_i(B''^(1)) v''_i + v_iota,i` with compact encodings.
-        let residual = match &compressed {
-            Some((first_row, (_, blocks), (_, identity))) => {
-                let own = Int::evaluate(row.clone());
-                residual +
-                    first_row.clone().ring_automorphism(i.clone()) * blocks.at(own.clone()) +
-                    identity.at(own)
-            }
+        let residual = residuals.clone().slice(
+            Some(IndexRange { start: row.clone(), end: row.clone() + IntExpr::constant(1) }),
+            None,
+        );
+        let residual = match &compressed_residuals {
+            Some(contributions) => residual + contributions.at(Int::evaluate(row.clone())),
             None => residual,
         };
         let indicator = Int::evaluate(IntExpr::Select {
@@ -325,18 +434,17 @@ where
         Ok((indicator * first.clone() - residual)
             .ring_automorphism(Group::select(&group.inverses, row)))
     })?;
-    let mut graph = DslContext::new("mxx-pe/keygen");
-    for row in 0..w {
-        let anchor = trapdoor.sample_preimage(targets.at(Int::constant(row)), (m_b, 1));
-        graph = graph.transferred_output(format!("{ANCHOR_KEY}/{row}"), anchor)?;
-    }
-    let mut graph = graph
-        .transferred_output(HELPER_KEY, stored_helpers)?
-        .transferred_output(OUTPUT_KEY, output_block)?;
-    if let Some((_, (blocks, _), (identity, _))) = compressed {
+    let anchors = mxx_dsl::parallel(w, |row| {
+        // Parallel exports accept bounded matrices. Rebasing to the same ring
+        // preserves the sample and its bound, using the compact forwarding path.
+        Ok(trapdoor.sample_preimage(targets.at(row), (m_b, 1)).centered_rebase(&ring))
+    })?;
+    let graph = DslContext::new("mxx-pe/keygen").transferred_output(ANCHOR_KEY, anchors)?;
+    let mut graph = graph.transferred_output(OUTPUT_KEY, output_block)?;
+    if let Some(blocks) = compressed {
         graph = graph
-            .transferred_output(COMPRESSED_KEY, blocks)?
-            .transferred_output(IDENTITY_KEY, identity)?;
+            .transferred_output(COMPRESSED_KEY, blocks.field(|(block, _, _)| block)?)?
+            .transferred_output(IDENTITY_KEY, blocks.field(|(_, identity, _)| identity)?)?;
     }
     let graph = graph.build()?;
     let (trapdoor_production, trapdoor_manifest) = master.trapdoor_production().clone();
@@ -347,6 +455,7 @@ where
             runtime,
             BTreeMap::from([
                 (trapdoor_production, trapdoor_manifest),
+                (helper_artifacts.production().clone(), helper_artifacts.manifest().clone()),
                 (evaluation.production().clone(), evaluation.manifest().clone()),
                 // `B_Q^(1)`, whose decompression the compact blocks read.
                 public_key.anchor_production().clone(),
@@ -389,8 +498,9 @@ where
         predicate: predicate.clone(),
         compiled,
         data,
-        evaluation,
+        evaluation: checkpoint.evaluation.take().unwrap(),
         key,
+        helpers: checkpoint.helpers.take().unwrap(),
         commitment,
     })
 }
@@ -400,6 +510,75 @@ mod tests {
     use super::*;
     use crate::{PeClass, setup::setup, test_support::*};
     use mxx_backends::{MemoryArtifactStore, poly::Poly};
+
+    #[test]
+    fn handles_restore_and_resume_keygen() {
+        fn restore<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+            let bytes = serde_json::to_vec(value).unwrap();
+            let restored = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                serde_json::to_value(&restored).unwrap()
+            );
+            restored
+        }
+        let class = PeClass::new(1, 2, 2, 1).unwrap();
+        let parameters = restore(&parameters(class));
+        let mut execution = execution(&parameters);
+        let mut store = MemoryArtifactStore::default();
+        let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+        let public_key = restore(&public_key);
+        let master = restore(&master);
+        let predicate = equals(class, &[0]);
+        let mut progress = PeKeygenCheckpoint::default();
+        // Simulate a process stopping immediately after each durable stage write.
+        for _ in 0..2 {
+            let result = keygen_resumable(
+                &public_key,
+                &master,
+                &predicate,
+                &mut execution,
+                &mut store,
+                &mut progress,
+                |_| Err(PeError::Graph("interrupted".into())),
+            );
+            assert!(matches!(result, Err(PeError::Graph(_))));
+            progress = restore(&progress);
+        }
+        let other = equals(class, &[1]);
+        assert!(matches!(
+            keygen_resumable(
+                &public_key,
+                &master,
+                &other,
+                &mut execution,
+                &mut store,
+                &mut progress,
+                |_| Ok(())
+            ),
+            Err(PeError::Mismatch)
+        ));
+        let key = keygen_resumable(
+            &public_key,
+            &master,
+            &predicate,
+            &mut execution,
+            &mut store,
+            &mut progress,
+            |_| panic!("all intermediate stages were restored"),
+        )
+        .unwrap();
+        let key = restore(&key);
+        let message =
+            (0..parameters.level().ring_dimension()).map(|_| rand::random()).collect::<Vec<bool>>();
+        let ciphertext =
+            crate::encrypt(&public_key, &[0], &message, &mut execution, &mut store).unwrap();
+        let ciphertext = restore(&ciphertext);
+        assert_eq!(
+            crate::decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap(),
+            message
+        );
+    }
 
     /// SampleLeft: the key satisfies `M_F k = d_1 delta_1` exactly. Each row
     /// `i` of `M_F` is rebuilt from its blocks, independently of the
@@ -450,10 +629,10 @@ mod tests {
         let production = key.key().production().clone();
         let cutoff = num_bigint::BigInt::from(parameters.key_cutoff().clone());
         let helpers = ring.small_matrix_family_artifact_input(
-            production.clone(),
+            key.helpers.production().clone(),
             HELPER_KEY,
-            w * p,
-            (width, 1),
+            w,
+            (width, p),
             cutoff.clone(),
             ArtifactAvailability::Transferred,
         );
@@ -503,12 +682,17 @@ mod tests {
         );
         let first = public_key.anchor_row().unwrap();
         let (d_1, _) = public_key.message_row(hash_key.clone()).unwrap();
-        let helper = |row: usize, k: usize| helpers.at(Int::constant(row * p + k));
+        let helper = |left: Mat, row: usize, k: usize| {
+            left.mul_small_rhs(helpers.at(Int::constant(row))).slice(
+                None,
+                Some(IndexRange { start: IntExpr::constant(k), end: IntExpr::constant(k + 1) }),
+            )
+        };
         let mut graph = DslContext::new("mxx-pe/test-sample-left");
         for (row, i) in group.elements.iter().enumerate() {
             let mut value = first
                 .clone()
-                .mul_small_rhs(anchor_key(&ring, &parameters, &key, row))
+                .mul_small_rhs(anchor_keys(&ring, &parameters, &key).at(Int::constant(row)))
                 .ring_automorphism(IntExpr::constant(*i));
             for (k_index, k) in group.helpers.iter().enumerate() {
                 let public =
@@ -517,11 +701,10 @@ mod tests {
                 let helper_first_row =
                     Mat::concat(ConcatAxis::Columns, vec![public.0.0, public.0.1])
                         .ring_automorphism(IntExpr::constant(*i));
-                value = value + helper_first_row.mul_small_rhs(helper(row, k_index));
+                value = value + helper(helper_first_row, row, k_index);
                 for (source, j) in group.elements.iter().enumerate() {
                     if j * k % order == *i {
-                        value =
-                            value - gadget_first_row.clone().mul_small_rhs(helper(source, k_index));
+                        value = value - helper(gadget_first_row.clone(), source, k_index);
                     }
                 }
             }
@@ -545,6 +728,7 @@ mod tests {
                 runtime,
                 BTreeMap::from([
                     (key.key().production().clone(), key.key().manifest().clone()),
+                    (key.helpers.production().clone(), key.helpers.manifest().clone()),
                     (evaluation, key.evaluation().manifest().clone()),
                     public_key.anchor_production().clone(),
                 ]),

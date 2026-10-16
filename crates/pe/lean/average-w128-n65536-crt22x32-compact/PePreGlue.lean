@@ -1,11 +1,13 @@
-import PeOnlineGlue
+import PeStepData
 import PePreBase
 
 /-!
 # Shared glue for the preprocessing root
 
-Single-iteration loops, the selection of the attribute position, the halves of a concatenation,
-and the product key rows of one position from its top step and key loop.
+Single-iteration loops, the selection of the attribute position, the product key rows of one
+position from its top step and key loop, and the assembly of the per-lane results of a LUT depth
+(the first-depth key rows of every branch, the parent keys of the second depth, and the output key
+from the member sums).
 -/
 
 namespace PeProof
@@ -35,41 +37,11 @@ theorem familyStatic_four {f : Fin 4 → Int} {o : Int} {k : Nat} (hk : k < 4)
   have e : q = ⟨k, hk⟩ := Fin.ext (by simp only; omega)
   rw [ho, e]
 
-theorem concat_left {a b : Nat} {x : ExactMatrix Q N 1 a} {y : ExactMatrix Q N 1 b}
-    {T : ExactMatrix Q N 1 (a + b)} (h : concatColumns x y T) (c : Nat) (hc : c < a) :
-    T 0 ⟨c, by omega⟩ = x 0 ⟨c, hc⟩ := by
-  rw [h 0 ⟨c, by omega⟩, dif_pos hc]
-
-theorem concat_right {a b : Nat} {x : ExactMatrix Q N 1 a} {y : ExactMatrix Q N 1 b}
-    {T : ExactMatrix Q N 1 (a + b)} (h : concatColumns x y T) (c : Nat) (hc : c < b) :
-    T 0 ⟨a + c, by omega⟩ = y 0 ⟨c, hc⟩ := by
-  rw [h 0 ⟨a + c, by omega⟩, dif_neg (by simp)]
-  exact congrArg (y 0) (Fin.ext (by simp))
-
-theorem rowBlock_concat_left {x : ExactMatrix Q N 1 1936} {y : ExactMatrix Q N 1 9240}
-    {T : ExactMatrix Q N 1 11176} (h : concatColumns x y T) (b : Nat) (hb : b < 22) :
-    rowBlock T b (by omega) = rowBlock x b (by omega) := by
-  funext r l
-  rw [Subsingleton.elim r 0]
-  exact concat_left h _ (by omega)
-
-theorem rowBlock_concat_right {x : ExactMatrix Q N 1 1936} {y : ExactMatrix Q N 1 9240}
-    {T : ExactMatrix Q N 1 11176} (h : concatColumns x y T) (l : Nat) (hl : l < 105) :
-    rowBlock T (22 + l) (by omega) = rowBlock y l (by omega) := by
-  funext r c
-  rw [Subsingleton.elim r 0]
-  have := concat_right h (88 * l + c) (by omega)
-  show T 0 ⟨88 * (22 + l) + c, by omega⟩ = y 0 ⟨88 * l + c, by omega⟩
-  rw [← this]
-  exact congrArg (T 0) (Fin.ext (by simp only; omega))
-
-/-- The entry `a < 44` of the joined key row `r` is the key entry. -/
-theorem key_row_entry {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
-    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
-    (r : Fin 2) (a : Fin 44) : ![A0, A1] r 0 ⟨a, by omega⟩ = A r 0 0 a := by
-  fin_cases r
-  · exact concat_left hA0 a a.isLt
-  · exact concat_left hA1 a a.isLt
+theorem familyStatic_eq {α : Type} {count : Nat} {f : Fin count → α} {o : α} {k : Nat} (hk : k < count)
+    (h : familyGetStatic f (k : Int) o) : o = f ⟨k, hk⟩ := by
+  obtain ⟨q, hq, ho⟩ := h
+  have e : q = ⟨k, hk⟩ := Fin.ext (by simp only; omega)
+  rw [ho, e]
 
 /-- The product key rows of one position: the top step from zero rows, then the key loop. -/
 theorem pos_rows {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
@@ -89,99 +61,118 @@ theorem pos_rows {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMa
   exact congrArg (fun x ↦ ∑ a, comp r jj a + x)
     (Finset.sum_congr rfl fun a _ ↦ by rw [key_row_entry hA0 hA1])
 
-/-- The first-depth LUT key rows at block `b` and column `jj`. -/
-theorem lut_T1 {model : HashModel} {key : ByteArray} {M : Fin 2 → Fin 2 → ExactMatrix Q N 1 44}
-    {A0 A1 : ExactMatrix Q N 1 88}
-    (hA0 : concatColumns (M 0 0) (M 0 1) A0) (hA1 : concatColumns (M 1 0) (M 1 1) A1)
-    {t0 t1 f0 f1 z : ExactMatrix Q N 1 1936} (hz : z = 0)
-    (htop : ∀ (r : Fin 2) (p : Fin 1936), ![t0, t1] r 0 p = ![z, z] r 0 p +
-      ∑ a : Fin 44, substitution (kSw ((p : Nat) / 88)) (kSw_odd ⟨(p : Nat) / 88, by omega⟩)
-        (![A0, A1] r 0 ⟨a, by omega⟩) *
-        rowDigits (switchTopRow model key ⟨(p : Nat) / 88, by omega⟩) a ⟨(p : Nat) % 88, by omega⟩)
-    (hkey : ∀ (r : Fin 2) (p : Fin 1936), ![f0, f1] r 0 p = ![t0, t1] r 0 p +
-      ∑ a, lutKeyCompanionSum model key ⟨(p : Nat) / 88, by omega⟩ M r ⟨(p : Nat) % 88, by omega⟩ a)
+/-- The key rows of first-depth branch `b` for the incoming key `M`: the LUT key companion sums
+plus the routed public top term. -/
+noncomputable def lutTRow (model : HashModel) (key : ByteArray) (b : Fin 22)
+    (M : Fin 2 → Fin 2 → ExactMatrix Q N 1 44) (r : Fin 2) (jj : Fin 88) : ExactPoly Q N :=
+  ∑ a, lutKeyCompanionSum model key b M r jj a +
+    ∑ a : Fin 44, substitution (kSw b) (kSw_odd b) (M r 0 0 a) * rowDigits (switchTopRow model key b) a jj
+
+/-- The key rows of every first-depth branch from the key rows of the internal-branch lanes and
+the leaf lanes. -/
+theorem branch_rows {model : HashModel} {key : ByteArray} {M : Fin 2 → Fin 2 → ExactMatrix Q N 1 44}
+    (d1 : BranchData) {TI0 TI1 : Fin 15 → ExactMatrix Q N 1 88} {TL0 TL1 : Fin 7 → ExactMatrix Q N 1 88}
+    (hI : ∀ (b : Fin 15) (r : Fin 2) (jj : Fin 88), ![TI0 b, TI1 b] r 0 jj = lutTRow model key ⟨b, by omega⟩ M r jj)
+    (hL : ∀ (m : Fin 7) (r : Fin 2) (jj : Fin 88), ![TL0 m, TL1 m] r 0 jj =
+      lutTRow model key ⟨15 + m, by omega⟩ M r jj)
+    (h0 : d1.TI0 = TI0) (h1 : d1.TI1 = TI1) (h2 : d1.TL0 = TL0) (h3 : d1.TL1 = TL1)
     (b : Fin 22) (r : Fin 2) (jj : Fin 88) :
-    ![f0, f1] r 0 ⟨88 * (b : Nat) + jj, by omega⟩ =
-      ∑ a, lutKeyCompanionSum model key b M r jj a +
-      ∑ a : Fin 44, substitution (kSw b) (kSw_odd b) (M r 0 0 a) * rowDigits (switchTopRow model key b) a jj := by
-  have h0 : ![z, z] r 0 ⟨88 * (b : Nat) + jj, by omega⟩ = 0 := by subst hz; fin_cases r <;> rfl
-  rw [hkey, htop, h0, zero_add, add_comm]
+    ![d1.Tb0 b b.isLt, d1.Tb1 b b.isLt] r 0 jj = lutTRow model key b M r jj := by
   obtain ⟨bv, hb⟩ := b
-  obtain ⟨jv, hj⟩ := jj
-  have hdiv : (88 * bv + jv) / 88 = bv := by omega
-  have hmod : (88 * bv + jv) % 88 = jv := by omega
-  simp only [hdiv, hmod, key_row_entry hA0 hA1]
+  by_cases hlt : bv < 15
+  · have e := hI ⟨bv, hlt⟩ r jj
+    simp only [BranchData.Tb0, BranchData.Tb1, dif_pos hlt, h0, h1]
+    exact e
+  · have e := hL ⟨bv - 15, by omega⟩ r jj
+    simp only [BranchData.Tb0, BranchData.Tb1, dif_neg hlt, h2, h3]
+    rw [e]
+    exact congrArg (fun c : Fin 22 ↦ lutTRow model key c M r jj) (Fin.ext (by simp only; omega))
 
-/-- The second-depth LUT key rows at leaf `l` and column `jj`, for parent keys `Kf`. -/
-theorem lut_T2 {model : HashModel} {key : ByteArray} {K00 K01 K10 K11 : Fin 15 → ExactMatrix Q N 1 44}
-    {Kf : Fin 15 → Fin 2 → Fin 2 → ExactMatrix Q N 1 44}
-    (hK : ∀ e : Fin 15, parentKeys K00 K01 K10 K11 e = Kf e)
-    {t0 t1 f0 f1 z : ExactMatrix Q N 1 9240} (hz : z = 0)
-    (htop : ∀ (r : Fin 2) (p : Fin 9240), ![t0, t1] r 0 p = ![z, z] r 0 p +
-      ∑ a : Fin 44, substitution (kSw (15 + (p : Nat) / 88 / 15)) (kSw_odd (member2 ((p : Nat) / 88) (by omega)))
-        (![K00, K10] r ⟨(p : Nat) / 88 % 15, by omega⟩ 0 a) *
-        rowDigits (switchTopRow model key (member2 ((p : Nat) / 88) (by omega))) a ⟨(p : Nat) % 88, by omega⟩)
-    (hkey : ∀ (r : Fin 2) (p : Fin 9240), ![f0, f1] r 0 p = ![t0, t1] r 0 p +
-      ∑ a, lutKeyCompanionSum model key (member2 ((p : Nat) / 88) (by omega))
-        (parentKeys K00 K01 K10 K11 ⟨(p : Nat) / 88 % 15, by omega⟩) r ⟨(p : Nat) % 88, by omega⟩ a)
-    (l : Fin 105) (r : Fin 2) (jj : Fin 88) :
-    ![f0, f1] r 0 ⟨88 * (l : Nat) + jj, by omega⟩ =
-      ∑ a, lutKeyCompanionSum model key (member2 l l.isLt) (Kf ⟨l % 15, by omega⟩) r jj a +
-      ∑ a : Fin 44, substitution (kSw (15 + l / 15)) (kSw_odd (member2 l l.isLt))
-        (Kf ⟨l % 15, by omega⟩ r 0 0 a) * rowDigits (switchTopRow model key (member2 l l.isLt)) a jj := by
-  have h0 : ![z, z] r 0 ⟨88 * (l : Nat) + jj, by omega⟩ = 0 := by subst hz; fin_cases r <;> rfl
-  have hKr : ∀ e : Fin 15, ![K00, K10] r e = Kf e r 0 := by
-    intro e
-    rw [← hK e]
-    fin_cases r <;> rfl
-  rw [hkey, htop, h0, zero_add, add_comm]
-  simp only [hKr, ← hK]
-  obtain ⟨lv, hl⟩ := l
-  obtain ⟨jv, hj⟩ := jj
-  have hdiv : (88 * lv + jv) / 88 = lv := by omega
-  have hmod : (88 * lv + jv) % 88 = jv := by omega
-  simp only [hdiv, hmod]
+/-- The key of internal branch `b`, from the internal key rows. -/
+theorem key1_int {model : HashModel} {key : ByteArray} (d1 : BranchData)
+    {TI0 TI1 : Fin 15 → ExactMatrix Q N 1 88} (hk : d1.key = key) (h0 : d1.TI0 = TI0) (h1 : d1.TI1 = TI1)
+    (b : Fin 15) (r j : Fin 2) :
+    d1.key1 model ⟨b, by omega⟩ r j = pairMul (helperKey model key (kSw b) r) (actionDigits (TI0 b) (TI1 b) j) := by
+  simp only [BranchData.key1, BranchData.Tb0, BranchData.Tb1, dif_pos b.isLt, hk, h0, h1]
 
-/-- The output key of a step from its preprocessing sums. -/
-theorem pre_sum {model : HashModel} {key : ByteArray} {M : Fin 2 → Fin 2 → ExactMatrix Q N 1 44}
-    (d1 : BranchData) (d2 : Leaf2Data) (coef : Nat → ExactMatrix Q N 1 1)
-    {x0 x1 : ExactMatrix Q N 1 1936} {y0 y1 : ExactMatrix Q N 1 9240}
-    (hd1k : d1.key = key) (hd10 : concatColumns x0 y0 d1.T0) (hd11 : concatColumns x1 y1 d1.T1)
-    (hd2k : d2.key = key) (hd20 : concatColumns x0 y0 d2.T0) (hd21 : concatColumns x1 y1 d2.T1)
+/-- The key of first-depth leaf `15 + m`, from the leaf key rows. -/
+theorem key1_leaf {model : HashModel} {key : ByteArray} (d1 : BranchData)
+    {TL0 TL1 : Fin 7 → ExactMatrix Q N 1 88} (hk : d1.key = key) (h2 : d1.TL0 = TL0) (h3 : d1.TL1 = TL1)
+    (m : Fin 7) (r j : Fin 2) :
+    d1.key1 model ⟨15 + m, by omega⟩ r j =
+      pairMul (helperKey model key (kSw (15 + m)) r) (actionDigits (TL0 m) (TL1 m) j) := by
+  have hn : ¬ (15 + (m : Nat) < 15) := by omega
+  have hm : (⟨15 + (m : Nat) - 15, by omega⟩ : Fin 7) = m := Fin.ext (by simp)
+  simp only [BranchData.key1, BranchData.Tb0, BranchData.Tb1, dif_neg hn, hk, h2, h3, hm]
+
+/-- The key of second-depth leaf `l`, from the second-depth key rows. -/
+theorem key2_eq {model : HashModel} {key : ByteArray} (d2 : Leaf2Data)
+    {T0 T1 : Fin 105 → ExactMatrix Q N 1 88} (hk : d2.key = key) (h0 : d2.T0 = T0) (h1 : d2.T1 = T1)
+    (l : Fin 105) (r j : Fin 2) :
+    d2.key2 model l r j =
+      pairMul (helperKey model key (kSw (15 + l / 15)) r) (actionDigits (T0 l) (T1 l) j) := by
+  simp only [Leaf2Data.key2, Leaf2Data.Tb0, Leaf2Data.Tb1, hk, h0, h1]
+
+/-- The switched keys of the internal lanes are the parent keys `key1` of the second depth. -/
+theorem parent_keys {model : HashModel} {key : ByteArray} (d1 : BranchData)
+    {TI0 TI1 : Fin 15 → ExactMatrix Q N 1 88} (hk : d1.key = key) (h0 : d1.TI0 = TI0) (h1 : d1.TI1 = TI1)
     {K00 K01 K10 K11 : Fin 15 → ExactMatrix Q N 1 44}
-    (hK : ∀ (b : Fin 15) (r j : Fin 2), ![![K00 b, K01 b], ![K10 b, K11 b]] r j =
-      pairMul (helperKey model key (kSw b) r) (actionDigits (rowBlock x0 b (by omega)) (rowBlock x1 b (by omega)) j))
-    {s0 s1 s2 s3 : KeyState}
-    (h0 : ∀ r j, keyOf s0 r j = M r j * scalarV (coef 1))
-    (h1 : ∀ r j, keyOf s1 r j = keyOf s0 r j +
-      ∑ b : Fin 15, keyOf (K00 b, K01 b, K10 b, K11 b, ()) r j * scalarV (coef (kSw b)))
-    (h2 : ∀ r j, keyOf s2 r j = keyOf s1 r j + ∑ i : Fin 7,
-      pairMul (helperKey model key (kSw (15 + i)) r)
-        (actionDigits (rowBlock x0 (15 + i) (by omega)) (rowBlock x1 (15 + i) (by omega)) j) *
-        scalarV (coef (kSw (15 + i))))
-    (h3 : ∀ r j, keyOf s3 r j = keyOf s2 r j + ∑ i : Fin 105,
-      pairMul (helperKey model key (kSw (15 + i / 15)) r)
-        (actionDigits (rowBlock y0 i (by omega)) (rowBlock y1 i (by omega)) j) * scalarV (coef (kLeaf2 i))) :
-    keyOf s3 = stepKey model M d1 d2 coef := by
+    (hK : ∀ (e : Fin 15) (r j : Fin 2), ![![K00 e, K01 e], ![K10 e, K11 e]] r j =
+      pairMul (helperKey model key (kSw e) r) (actionDigits (TI0 e) (TI1 e) j))
+    (e : Fin 15) : parentKeys K00 K01 K10 K11 e = d1.key1 model ⟨e, by omega⟩ := by
   funext r j
-  unfold stepKey
-  rw [h3, h2, h1, h0]
-  have e1 : ∀ b : Fin 15, keyOf (K00 b, K01 b, K10 b, K11 b, ()) r j = d1.key1 model ⟨b, by omega⟩ r j := by
-    intro b
-    rw [show keyOf (K00 b, K01 b, K10 b, K11 b, ()) r j = ![![K00 b, K01 b], ![K10 b, K11 b]] r j from rfl, hK]
-    unfold BranchData.key1 BranchData.Tb0 BranchData.Tb1
-    rw [hd1k, rowBlock_concat_left hd10 b (by omega), rowBlock_concat_left hd11 b (by omega)]
-  have e2 : ∀ i : Fin 7, pairMul (helperKey model key (kSw (15 + i)) r)
-      (actionDigits (rowBlock x0 (15 + i) (by omega)) (rowBlock x1 (15 + i) (by omega)) j) =
-      d1.key1 model ⟨15 + i, by omega⟩ r j := by
-    intro i
-    unfold BranchData.key1 BranchData.Tb0 BranchData.Tb1
-    rw [hd1k, rowBlock_concat_left hd10 (15 + i) (by omega), rowBlock_concat_left hd11 (15 + i) (by omega)]
-  have e3 : ∀ i : Fin 105, pairMul (helperKey model key (kSw (15 + i / 15)) r)
-      (actionDigits (rowBlock y0 i (by omega)) (rowBlock y1 i (by omega)) j) = d2.key2 model i r j := by
-    intro i
-    unfold Leaf2Data.key2 Leaf2Data.Tb0 Leaf2Data.Tb1
-    rw [hd2k, rowBlock_concat_right hd20 i (by omega), rowBlock_concat_right hd21 i (by omega)]
-  simp only [e1, e2, e3]
+  rw [key1_int d1 hk h0 h1 e r j, ← hK e r j]
+  rfl
+
+/-- The initial state of a member sum: members `0` and `1` added. -/
+theorem member_init {n : Nat} {f00 f01 f10 f11 : Fin (n + 2) → ExactMatrix Q N 1 44}
+    {a0 a1 b0 b1 c0 c1 d0 d1 : ExactMatrix Q N 1 44}
+    (ha0 : familyGetStatic f00 0 a0) (ha1 : familyGetStatic f00 1 a1)
+    (hb0 : familyGetStatic f01 0 b0) (hb1 : familyGetStatic f01 1 b1)
+    (hc0 : familyGetStatic f10 0 c0) (hc1 : familyGetStatic f10 1 c1)
+    (hd0 : familyGetStatic f11 0 d0) (hd1 : familyGetStatic f11 1 d1) (r j : Fin 2) :
+    keyOf (matrixAdd a0 a1, matrixAdd b0 b1, matrixAdd c0 c1, matrixAdd d0 d1, ()) r j =
+      ![![f00 0, f01 0], ![f10 0, f11 0]] r j + ![![f00 1, f01 1], ![f10 1, f11 1]] r j := by
+  rw [familyStatic_eq (k := 0) (by omega) ha0, familyStatic_eq (k := 1) (by omega) ha1,
+    familyStatic_eq (k := 0) (by omega) hb0, familyStatic_eq (k := 1) (by omega) hb1,
+    familyStatic_eq (k := 0) (by omega) hc0, familyStatic_eq (k := 1) (by omega) hc1,
+    familyStatic_eq (k := 0) (by omega) hd0, familyStatic_eq (k := 1) (by omega) hd1]
+  fin_cases r <;> fin_cases j <;> rfl
+
+/-- The output key of a step from the product key term and the three member sums: the explicit
+form of `stepKey`. -/
+theorem pre_sum {model : HashModel} {M : Fin 2 → Fin 2 → ExactMatrix Q N 1 44}
+    (d1 : BranchData) (d2 : Leaf2Data) (coef : Nat → ExactMatrix Q N 1 1)
+    {XI00 XI01 XI10 XI11 : Fin 15 → ExactMatrix Q N 1 44} {XL00 XL01 XL10 XL11 : Fin 7 → ExactMatrix Q N 1 44}
+    {XM00 XM01 XM10 XM11 : Fin 105 → ExactMatrix Q N 1 44}
+    (hI : ∀ (b : Fin 15) (r j : Fin 2), ![![XI00 b, XI01 b], ![XI10 b, XI11 b]] r j =
+      d1.key1 model ⟨b, by omega⟩ r j * scalarV (coef (kSw b)))
+    (hL : ∀ (m : Fin 7) (r j : Fin 2), ![![XL00 m, XL01 m], ![XL10 m, XL11 m]] r j =
+      d1.key1 model ⟨15 + m, by omega⟩ r j * scalarV (coef (kSw (15 + m))))
+    (hM : ∀ (l : Fin 105) (r j : Fin 2), ![![XM00 l, XM01 l], ![XM10 l, XM11 l]] r j =
+      d2.key2 model l r j * scalarV (coef (kLeaf2 l)))
+    {s : KeyState}
+    (hs : ∀ r j, keyOf s r j = M r j * scalarV (coef 1) +
+      ∑ b, ![![XI00 b, XI01 b], ![XI10 b, XI11 b]] r j + ∑ m, ![![XL00 m, XL01 m], ![XL10 m, XL11 m]] r j +
+      ∑ l, ![![XM00 l, XM01 l], ![XM10 l, XM11 l]] r j) (r j : Fin 2) :
+    keyOf s r j = M r j * scalarV (coef 1) +
+      ∑ b : Fin 15, d1.key1 model ⟨b, by omega⟩ r j * scalarV (coef (kSw b)) +
+      ∑ i : Fin 7, d1.key1 model ⟨15 + i, by omega⟩ r j * scalarV (coef (kSw (15 + i))) +
+      ∑ l : Fin 105, d2.key2 model l r j * scalarV (coef (kLeaf2 l)) := by
+  rw [hs]
+  simp only [hI, hL, hM]
+
+/-- Grouping leaves by member preserves the sum: slot zero is the first-depth leaf,
+and slot `1 + parent` is second-depth leaf `parent + 15 * member`. -/
+theorem grouped_leaf_sum {α : Type} [AddCommMonoid α]
+    (first : Fin 7 → α) (second : Fin 105 → α) :
+    (∑ member : Fin 7, (first member +
+      ∑ parent : Fin 15, second ⟨parent + 15 * member, by omega⟩)) =
+      (∑ member : Fin 7, first member) + ∑ leaf : Fin 105, second leaf := by
+  rw [Finset.sum_add_distrib]
+  congr 1
+  rw [← (finProdFinEquiv : Fin 7 × Fin 15 ≃ Fin 105).sum_comp,
+    Fintype.sum_prod_type]
+  rfl
 
 end PeProof

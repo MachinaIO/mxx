@@ -1,0 +1,14 @@
+/-!
+# Grouped preprocessing leaf finishing proofs
+
+`gen_pre.py` emits one `PePreLaneM{s}G{g}Group.lean` per step/group (omitting `G0`),
+and merges the four groups in `PePreLaneM{s}.lean`. The `leaf_rows`, `leaf_finish`,
+`leaf_member_sum`, `leaf_lane`, and `merged_leaf` functions generate these proofs.
+The final step uses constant coefficient tables, so these scopes are generated
+from the exported facts rather than instantiated from the old per-leaf template.
+
+Each group has seven member lanes and four local slots. The sixteen-slot view consists
+of the first-depth leaf followed by its fifteen second-depth leaves. Second-depth leaf
+`l` is in group `(1 + l % 15) / 4`, local slot `(1 + l % 15) % 4`, member `l / 15`.
+`merged_leaf` preserves the flattened slot interface and reassociates all four group sums.
+-/

@@ -4,6 +4,10 @@ set_option maxRecDepth 16384
 set_option maxHeartbeats 2000000
 set_option linter.unusedVariables false
 
+-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a
+-- projection against its field type expands it at the ring dimension.
+attribute [local irreducible] Mxx.Primitives.negacyclicModulus
+
 noncomputable section
 
 namespace Ideal
@@ -34,7 +38,8 @@ structure generatedRoot.Facts {tape : MxxRuntime.SampleTape} {path : List Nat} {
 theorem generatedRoot.facts {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) {outputs : Fin 65536 → Int}
     (h : generatedRoot.body tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
-  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) h
+  have t0 := h
+  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
   ⟨r0⟩
 
 end Ideal

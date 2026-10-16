@@ -11,9 +11,9 @@
 //!   the encryption's own prelude samples it from the bound plaintext, or an enclosing scheme's
 //!   prelude does), and the digit companions `z_{a,j} = s (B_{a,j} - d_{a,j} G) + eps` of the
 //!   private digit rows of `d = Dec_G(C)` (the digits of `a` are public);
-//! - for every nonidentity automorphism `k` of the setup, the helper `h_k = s H_k - s_k G + e_h`
-//!   and the digit companions, under `s_k = (sigma_k(s_bar), 1)`, of the switching ciphertext `C_k`
-//!   that every reader derives from the helper of `k^-1` (see
+//! - for every nonidentity automorphism `k` of the setup, the prelude samples the helper `h_k = s
+//!   H_k - s_k G + e_h` and the digit companions, under `s_k = (sigma_k(s_bar), 1)`, of the
+//!   switching ciphertext `C_k` that every reader derives from the helper of `k^-1` (see
 //!   [`crate::rns_bgg::dynamic::automorphism_ciphertext`]); `C_k` itself is not published.
 //!
 //! None of these names a Program, a LUT, or a logical level, so one
@@ -77,7 +77,9 @@ impl<'a> RnsEncryptBuild<'a> {
     /// ([`RnsBggDynamicSetup::rhs_bottom`]). A coordinate without a plaintext
     /// takes its bottom rows from the prelude production bound with
     /// [`EncryptBuild::bind_prelude`], which must export them under
-    /// [`RnsBggDynamicSetup::rhs_bottom_role`]. `session` is a fresh public
+    /// [`RnsBggDynamicSetup::rhs_bottom_role`]. A supplied prelude must also export
+    /// [`Self::automorphism_helpers`] under [`RnsBggDynamicSetup::automorphism_helper_role`].
+    /// `session` is a fresh public
     /// identifier of this encryption request, retained only to resume it: it
     /// selects the sampling session, so every encryption under one setup
     /// draws its own secret-dependent material.
@@ -145,7 +147,7 @@ impl<'a> RnsEncryptBuild<'a> {
     /// plaintext ([`RnsBggDynamicSetup::rhs_bottom`]) into `graph`, the
     /// encryption prelude, under `name`, a family from one root `parallel`.
     /// With no in-graph consumer, each family is an export-only streamed port.
-    /// Returns whether any row was exported.
+    /// Also exports the automorphism helpers; returns whether any row was exported.
     pub(super) fn dynamic_rhs_bottoms(
         &self,
         mut graph: DslContext,
@@ -192,6 +194,16 @@ impl<'a> RnsEncryptBuild<'a> {
             .map_err(ApiError::scheme)?;
             exported = true;
         }
+        if !setup.helper_automorphisms().is_empty() {
+            graph = graph
+                .transferred_output(
+                    name(AUTOMORPHISM_HELPER_ROLE.to_owned()),
+                    self.automorphism_helpers(setup, payload, hash_key)
+                        .map_err(ApiError::scheme)?,
+                )
+                .map_err(ApiError::scheme)?;
+            exported = true;
+        }
         Ok((graph, exported))
     }
 
@@ -222,37 +234,50 @@ impl<'a> RnsEncryptBuild<'a> {
                 coordinate: *coordinate,
                 member: family.then_some(member),
             };
-            // The gadget ciphertexts: the setup's public top rows over the
-            // bottom rows the prelude production exports.
+            // Only private bottom rows need companions. Read them directly
+            // from the prelude without materializing a public-top family.
             let (prelude, _) = self.prelude.as_ref().ok_or_else(|| {
                 ApiError::input("Dynamic RHS ciphertexts need the prelude production")
             })?;
-            let ciphertexts = match public_top_ciphertexts(
-                self.parameters,
-                &setup,
-                hash_key,
-                prelude,
-                *coordinate,
-                members.map(IntExpr::constant),
-                &name,
-            )
-            .map_err(ApiError::scheme)?
-            {
-                PublicTopCiphertexts::Scalar(ciphertext) => PackageCiphertexts::Scalar(ciphertext),
-                PublicTopCiphertexts::Family { tops, bottoms } => {
-                    PackageCiphertexts::Rows { tops, bottoms }
-                }
+            let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+            let columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
+            let role = RnsBggDynamicSetup::rhs_bottom_role(*coordinate, family);
+            let bottoms = members.map(|count| {
+                [0, 1].map(|port| {
+                    ring.family_artifact_input(
+                        prelude.clone(),
+                        name(format!("{role}.{port}")),
+                        count,
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                })
+            });
+            let bottom = |member: Int, _: IntExpr| {
+                Ok(match &bottoms {
+                    Some(rows) => (rows[0].at(member.clone()), rows[1].at(member)),
+                    None => {
+                        let port = |port| {
+                            ring.artifact_input(
+                                prelude.clone(),
+                                name(format!("{role}.{port}")),
+                                (1, columns),
+                                ArtifactAvailability::Transferred,
+                            )
+                        };
+                        (port(0), port(1))
+                    }
+                })
             };
             let companions = self
                 .companion_encodings(
                     &setup,
                     members.unwrap_or(1),
-                    &|member| ciphertexts.member(member),
+                    &bottom,
+                    &|member| member,
                     &package,
                     &secret,
                     hash_key,
-                    super::automorphism_public_rows(self.parameters, 0)
-                        .map_err(ApiError::scheme)?,
                 )
                 .map_err(ApiError::scheme)?;
             graph = graph
@@ -265,8 +290,22 @@ impl<'a> RnsEncryptBuild<'a> {
         if automorphisms.is_empty() {
             return Ok(graph);
         }
-        let helpers =
-            self.automorphism_helpers(&setup, &payload, hash_key).map_err(ApiError::scheme)?;
+        let (prelude, _) = self
+            .prelude
+            .as_ref()
+            .ok_or_else(|| ApiError::input("Dynamic helpers need the prelude production"))?;
+        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
+        let helpers = [0, 1].map(|port| {
+            ring.family_artifact_input(
+                prelude.clone(),
+                name(format!("{AUTOMORPHISM_HELPER_ROLE}.{port}")),
+                setup.helper_automorphisms().len(),
+                (1, columns),
+                ArtifactAvailability::Transferred,
+            )
+        });
+        let helper = |member: Int| (helpers[0].at(member.clone()), helpers[1].at(member));
         let inverses = automorphisms
             .iter()
             .map(|k| setup.automorphism_inverse(*k))
@@ -277,21 +316,8 @@ impl<'a> RnsEncryptBuild<'a> {
             .map(|k| setup.helper_member(*k))
             .collect::<Result<Vec<_>, _>>()
             .map_err(ApiError::scheme)?;
-        // Every `C_k` once, from the helper of `k^-1`; the companion lanes
-        // read the member of their package.
-        let ciphertexts = mxx_dsl::parallel(automorphisms.len(), |member| {
-            let member = member.expression()?;
-            automorphism_ciphertext(
-                self.parameters,
-                &setup,
-                hash_key.clone(),
-                select(&automorphisms, member.clone()),
-                select(&inverses, member.clone()),
-                helpers.at(Int::evaluate(select(&inverse_members, member))),
-            )
-            .map_err(|_| DslError::Schema)
-        })
-        .map_err(ApiError::scheme)?;
+        // Derive C_k only in its companion lane. Keeping all C_k here would
+        // retain a full digit row for every switching automorphism.
         let automorphed_secret = |member: IntExpr| {
             let secret = reduce_secret(self.parameters, &payload, 0)?;
             Ok((secret.0.ring_automorphism(select(&automorphisms, member)), secret.1))
@@ -300,15 +326,28 @@ impl<'a> RnsEncryptBuild<'a> {
             .companion_encodings(
                 &setup,
                 automorphisms.len(),
-                &|member| ciphertexts.at(member),
+                &|helper_member, member| {
+                    let k = select(&automorphisms, member.clone());
+                    let inverse = select(&inverses, member);
+                    let public = setup.helper_key(self.parameters, hash_key.clone(), inverse)?.1;
+                    let row = helper(helper_member);
+                    Ok((
+                        (public.0 - row.0).ring_automorphism(k.clone()),
+                        (public.1 - row.1).ring_automorphism(k),
+                    ))
+                },
+                &|member| select(&inverse_members, member),
                 &|member| RnsBggPackage::Automorphism(select(&automorphisms, member)),
                 &automorphed_secret,
                 hash_key,
-                super::automorphism_public_rows(self.parameters, 0).map_err(ApiError::scheme)?,
             )
             .map_err(ApiError::scheme)?;
         graph = graph
-            .transferred_output(name(AUTOMORPHISM_HELPER_ROLE.to_owned()), helpers)
+            .transferred_output(
+                name(AUTOMORPHISM_HELPER_ROLE.to_owned()),
+                mxx_dsl::parallel(setup.helper_automorphisms().len(), |member| Ok(helper(member)))
+                    .map_err(ApiError::scheme)?,
+            )
             .map_err(ApiError::scheme)?
             .transferred_output(name(AUTOMORPHISM_COMPANION_ROLE.to_owned()), companions)
             .map_err(ApiError::scheme)?;
@@ -401,7 +440,10 @@ impl<'a> RnsEncryptBuild<'a> {
     /// of the setup ([`RnsBggDynamicSetup::helper_automorphisms`]), member `i`
     /// for the `i`-th, with its error under the setup's helper contract.
     /// `s_k G = (sigma_k(s_bar) g, g)`.
-    fn automorphism_helpers(
+    /// Export this family from the encryption prelude under
+    /// [`RnsBggDynamicSetup::automorphism_helper_role`]. Companion lanes then
+    /// import only their selected helper, including when a scheme supplies the prelude.
+    pub fn automorphism_helpers(
         &self,
         setup: &RnsBggDynamicSetup,
         payload: &RnsBggRow,
@@ -430,11 +472,11 @@ impl<'a> RnsEncryptBuild<'a> {
     }
 
     /// The digit companions of `members` packages: member `t`'s gadget
-    /// ciphertext is `ciphertext(t)`, its package `package(t)`, and its
-    /// payload secret `secret(t)`. Only the digit rows `a >= first_row` have
-    /// companions (an automorphism package's leading rows are public, see
-    /// [`super::automorphism_public_rows`]); with `r = m - first_row` of them,
-    /// element `(t r + a - first_row) m + j` (the order
+    /// private bottom row is `ciphertext_bottom(selected_member, t)`, its package `package(t)`, and
+    /// its payload secret `secret(t)`. With the Dynamic setup's equal basis,
+    /// `first_row = D`; only the digit rows `a >= first_row` have companions (an automorphism
+    /// package's leading rows are public, see [`super::automorphism_public_rows`]); with `r = m
+    /// - first_row` of them, element `(t r + a - first_row) m + j` (the order
     /// [`super::companion_columns`] reads) is
     /// `z_{a,j} = s' B_{a,j} - d_{a,j} s' G + eps` for the digit
     /// `d_{a,j} = Dec_G(C)_{a,j}`, with its error under the setup's companion
@@ -444,11 +486,11 @@ impl<'a> RnsEncryptBuild<'a> {
         &self,
         setup: &RnsBggDynamicSetup,
         members: usize,
-        ciphertext: &dyn Fn(Int) -> RnsBggMatrix,
+        ciphertext_bottom: &dyn Fn(Int, IntExpr) -> Result<RnsBggRow, RnsBggError>,
+        ciphertext_index: &dyn Fn(IntExpr) -> IntExpr,
         package: &dyn Fn(IntExpr) -> RnsBggPackage,
         secret: &dyn Fn(IntExpr) -> Result<RnsBggRow, RnsBggError>,
         hash_key: &Bytes,
-        first_row: usize,
     ) -> Result<Family<RnsBggRow>, RnsBggError> {
         let parameters = self.parameters;
         let ring = parameters.ring(0)?;
@@ -459,40 +501,29 @@ impl<'a> RnsEncryptBuild<'a> {
         let digits = current.modulus_digits();
         let columns = parameters.component_columns(0)?;
         let width = 2 * columns;
-        let rows = width - first_row;
+        let first_row = columns;
+        let rows = columns;
         let count = rows * width;
         let gadget = parameters.public_gadget(0)?;
         let contract = &setup.distributions().companion;
         let compact = setup.compact_ring(parameters, 0)?;
         let p = crate::rns_bgg::dynamic::compact_modulus(setup);
-        // Member `lane / count` of the ciphertexts is read through this outer
-        // index family, the Gather form a wave importer reads ahead when the
-        // ciphertexts are an imported family. One scalar loop computes it,
-        // so the graph does not grow with the lane count.
-        let member_of = mxx_dsl::parallel(IntExpr::constant(members * count), |lane| {
-            Ok(Int::evaluate(quotient(&lane.expression()?, count)))
-        })
-        .map_err(graph)?;
+        // Derive the selected artifact member in the lane. A root index family
+        // over all digit companions would retain one index view per occurrence.
         mxx_dsl::parallel(IntExpr::constant(members * count), |lane| {
             let schema = |_| DslError::Schema;
-            let member_index = member_of.at(lane.clone());
             let index = lane.expression()?;
             let member = quotient(&index, count);
+            let member_index = Int::evaluate(ciphertext_index(member.clone()));
             let a = (remainder(quotient(&index, width), rows) + IntExpr::constant(first_row))
                 .canonicalize();
             let j = remainder(index, width);
-            let ciphertext = ciphertext(member_index);
-            let [top, bottom] = [&ciphertext.0, &ciphertext.1].map(super::join_row);
-            // Digit row `a` is digit `a mod D` of entry `a / D` of the stacked
-            // column `j`.
-            let entry_digits = super::row_entry(
-                &Mat::concat(
-                    mxx_ir_core::node::ConcatAxis::Columns,
-                    vec![super::row_entry(&top, j.clone()), super::row_entry(&bottom, j.clone())],
-                ),
-                quotient(&a, digits),
-            )
-            .decompose(base, digits);
+            // The public top digit rows have no companion. Select only the
+            // bottom entry, avoiding a resident public-top family and a
+            // top/bottom dynamic selection in every companion lane.
+            let bottom = ciphertext_bottom(member_index, member.clone()).map_err(schema)?;
+            let entry_digits =
+                super::row_entry(&super::join_row(&bottom), j.clone()).decompose(base, digits);
             let digit = super::unit_row(&ring, digits, remainder(a.clone(), digits))
                 .mul_small_rhs(entry_digits);
             if let (Some(compact), Some(p)) = (&compact, &p) {
@@ -546,25 +577,6 @@ fn stored_companion(
     match setup.compact_extension() {
         Some(_) => crate::rns_bgg::dynamic::expand_compact_row(parameters, setup, 0, row),
         None => Ok(row),
-    }
-}
-
-/// The gadget ciphertexts of one RHS coordinate, read by member.
-enum PackageCiphertexts {
-    Scalar(RnsBggMatrix),
-    /// A family of top rows and a family of bottom rows.
-    Rows {
-        tops: Family<RnsBggRow>,
-        bottoms: Family<RnsBggRow>,
-    },
-}
-
-impl PackageCiphertexts {
-    fn member(&self, member: Int) -> RnsBggMatrix {
-        match self {
-            Self::Scalar(ciphertext) => ciphertext.clone(),
-            Self::Rows { tops, bottoms } => (tops.at(member.clone()), bottoms.at(member)),
-        }
     }
 }
 

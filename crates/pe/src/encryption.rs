@@ -11,13 +11,14 @@
 //!   setup (`RnsBggDynamicSetup::rhs_public_top`), with a fresh `e_t` from `chi`, both `1 x m`, so
 //!   `s C_t = X^(Bz x_t) s G + e_t`, if a lookup step reads it. Since `a_t` is public, the digit
 //!   rows of `a_t` need no companion, which halves the companions of every package;
+//! - the automorphism helpers `h_k`, streamed one per lane for the companion stage;
 //! - the message component `c_m = s d^T + e_m + floor(q/2) m = s_bar d_1 + d_2 + e_m + floor(q/2)
 //!   m` for binary coefficients `m`.
 //!
 //! The prelude samples `c_t` with the Dynamic setup's `rhs_bottom` and exports
 //! it under the setup's bottom-row role, and the exponent-lut Dynamic encryption, bound to the
 //! prelude and to the same secret and session, adds the initial state `c_0 = s (A_0 -
-//! G) + e_0`, the attribute packages' digit companions, the helpers `h_k`,
+//! G) + e_0`, the attribute packages' digit companions, a streamed copy of the helpers `h_k`,
 //! and the companions of the derived `C_k`. Neither production exports `s`
 //! or any sampling transcript.
 use crate::{PeError, PePublicKey, setup::digest};
@@ -45,8 +46,12 @@ pub(crate) const MESSAGE_ENCODING: &str = "mxx-pe/message-encoding";
 const ATTRIBUTE_INPUT: &str = "mxx-pe/attribute-exponents";
 const MESSAGE_INPUT: &str = "mxx-pe/message-coefficients";
 
+/// Serialization restores internal handles written by this crate; referenced store
+/// productions must remain available. It is not an untrusted-input format.
+///
 /// A ciphertext: the prelude production (`b`, every `C_t`, `c_m`) and the
 /// Dynamic package production, both of one encryption session.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PeCiphertext {
     public_key: [u8; 32],
     prelude: StageArtifacts<()>,
@@ -224,6 +229,14 @@ where
         error_over(&anchor_ring, m_b)?;
     let mut context = context.transferred_output(ANCHOR_ENCODING, anchor)?;
     let setup = public_key.setup();
+    if !setup.helper_automorphisms().is_empty() {
+        // Export each helper before companion lanes need it; no W-by-digit
+        // family of helpers or derived switching ciphertexts stays resident.
+        let helpers = RnsEncryptBuild::new(parameters.rns(), *public_key.context())
+            .automorphism_helpers(setup, secret.row(), &hash_key)?;
+        context =
+            context.transferred_output(RnsBggDynamicSetup::automorphism_helper_role(), helpers)?;
+    }
     for (coordinate, family) in exponents {
         let bottoms = mxx_dsl::parallel(family.count().clone(), |member| {
             // The bottom row `X^v s G - s_bar a_t + e_t` of `C_t = [a_t; ...]`, whose top row

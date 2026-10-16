@@ -145,6 +145,18 @@ local notation "mxxMat75" => Mxx.Primitives.ExactMatrix modulus_0 65536 2 1080
 local notation "mxxMat76" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 1080
 local notation "mxxMat77" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 810
 
+def parallel_generatedRoot_13511 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : Fin 16779536 → mxxMat0) (outputs : mxxMat0) : Prop :=
+  let _params := params
+  let _backend := backend
+  let w_0_0 : Fin 16779536 → mxxMat0 := inputs
+  let w_1_0 : Int := (MxxIR.selectInt ((Int.ofNat i_0)) [(8389640)])
+  let w_2_0 : Int := 2
+  let w_3_0 : Int := (w_1_0 * w_2_0)
+  let w_4_0 : Int := 1
+  let w_5_0 : Int := (w_3_0 + w_4_0)
+  ∃ (w_6_0 : mxxMat0),
+    parallel_generatedRoot_13511.constraints_0 i_0 w_0_0 w_5_0 w_6_0 outputs
+
 abbrev parallel_generatedRoot_13512.constraints_0 (i_0 : Nat) (w_0_0 : Fin 16779536 → mxxMat0) (w_5_0 : Int) (w_6_0 : mxxMat0) (outputs : mxxMat0) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 1 ∧
@@ -53581,18 +53593,6 @@ noncomputable def generatedRoot.w_3104_0  (ctx : generatedRootCtx) : mxxMat6 :=
 
 noncomputable def generatedRoot.w_3105_0  (ctx : generatedRootCtx) : mxxMat6 :=
   ctx.witness.w_3105_0
-
-noncomputable def generatedRoot.w_3106_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixMul (generatedRoot.w_3100_0 ctx) (generatedRoot.w_3105_0 ctx)
-
-noncomputable def generatedRoot.w_3107_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  ctx.witness.w_3107_0
-
-noncomputable def generatedRoot.w_3108_0  (ctx : generatedRootCtx) : mxxMat1 :=
-  (MxxRuntime.matrixPolynomial [(1)] : mxxMat1)
-
-noncomputable def generatedRoot.w_3109_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixMulScalarRight (generatedRoot.w_3107_0 ctx) (generatedRoot.w_3108_0 ctx)
 
 
 end

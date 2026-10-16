@@ -150,6 +150,18 @@ set_option linter.unusedVariables false
 variable {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params}
 local notation "generatedRootCtx" => (generatedRoot.Ctx backend hashModel params)
 
+noncomputable def generatedRoot.w_3106_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixMul (generatedRoot.w_3100_0 ctx) (generatedRoot.w_3105_0 ctx)
+
+noncomputable def generatedRoot.w_3107_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  ctx.witness.w_3107_0
+
+noncomputable def generatedRoot.w_3108_0  (ctx : generatedRootCtx) : mxxMat1 :=
+  (MxxRuntime.matrixPolynomial [(1)] : mxxMat1)
+
+noncomputable def generatedRoot.w_3109_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarRight (generatedRoot.w_3107_0 ctx) (generatedRoot.w_3108_0 ctx)
+
 noncomputable def generatedRoot.w_3110_0  (ctx : generatedRootCtx) : mxxMat6 :=
   ctx.witness.w_3110_0
 

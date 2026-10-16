@@ -145,6 +145,57 @@ set_option linter.unusedVariables false
 variable {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {params : Params}
 local notation "generatedRootCtx" => (generatedRoot.Ctx backend hashModel params)
 
+noncomputable def generatedRoot.w_4659_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  ctx.witness.w_4659_0
+
+noncomputable def generatedRoot.w_4660_0  (ctx : generatedRootCtx) : mxxMat3 :=
+  ctx.witness.w_4660_0
+
+noncomputable def generatedRoot.w_4661_0  (ctx : generatedRootCtx) : mxxMat5 :=
+  ctx.witness.w_4661_0
+
+noncomputable def generatedRoot.w_4662_0  (ctx : generatedRootCtx) : mxxMat5 :=
+  ctx.witness.w_4662_0
+
+noncomputable def generatedRoot.w_4663_0  (ctx : generatedRootCtx) : mxxMat2 :=
+  MxxRuntime.matrixMul (generatedRoot.w_4644_0 ctx) (generatedRoot.w_4662_0 ctx)
+
+noncomputable def generatedRoot.w_4664_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  ctx.witness.w_4664_0
+
+noncomputable def generatedRoot.w_4665_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  ctx.witness.w_4665_0
+
+noncomputable def generatedRoot.w_4666_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixAdd (generatedRoot.w_4664_0 ctx) (generatedRoot.w_4665_0 ctx)
+
+noncomputable def generatedRoot.w_4667_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixAdd (generatedRoot.w_4634_1 ctx) (generatedRoot.w_4666_0 ctx)
+
+noncomputable def generatedRoot.w_4668_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  ctx.witness.w_4668_0
+
+noncomputable def generatedRoot.w_4669_0  (ctx : generatedRootCtx) : mxxMat1 :=
+  (MxxRuntime.matrixPolynomial [(1)] : mxxMat1)
+
+noncomputable def generatedRoot.w_4670_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixMulScalarRight (generatedRoot.w_4668_0 ctx) (generatedRoot.w_4669_0 ctx)
+
+noncomputable def generatedRoot.w_4671_0  (ctx : generatedRootCtx) : mxxMat6 :=
+  ctx.witness.w_4671_0
+
+noncomputable def generatedRoot.w_4672_0  (ctx : generatedRootCtx) : mxxMat6 :=
+  ctx.witness.w_4672_0
+
+noncomputable def generatedRoot.w_4673_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixMul (generatedRoot.w_4667_0 ctx) (generatedRoot.w_4672_0 ctx)
+
+noncomputable def generatedRoot.w_4674_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  ctx.witness.w_4674_0
+
+noncomputable def generatedRoot.w_4675_0  (ctx : generatedRootCtx) : mxxMat1 :=
+  (MxxRuntime.matrixPolynomial [(1)] : mxxMat1)
+
 noncomputable def generatedRoot.w_4676_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixMulScalarRight (generatedRoot.w_4674_0 ctx) (generatedRoot.w_4675_0 ctx)
 

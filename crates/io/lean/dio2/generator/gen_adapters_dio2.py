@@ -8,6 +8,10 @@ average-case package and writes, into its `proof/` directory,
   `Dio2Proof.Comp` (refresh_top's `GenIface` keeps its own bundles under the same names);
 - `Gen_<Module>_Scopes.lean`: the adapters, whose bundle references name `Dio2Proof.Comp`.
 
+Variant names retain the parameter-independent foundation's signatures. New source shapes
+(including sampled switching noise and arbitrary dynamic-read widths) receive new variants;
+their adapters keep every source premise and never identify them with a noiseless bundle.
+
 Usage: gen_adapters_dio2.py <average package> [<Module>…]   (default: all logical `W_Stage_*`)
 """
 import os
@@ -80,6 +84,10 @@ GA.BUNDLE_ROLES |= {'lut.key-table.flat', 'lut.member.flat', 'lut.key-member.fla
 
 pkg, modules = sys.argv[1], sys.argv[2:]
 proof = os.path.join(pkg, 'proof')
+if '--output-dir' in modules:
+    position = modules.index('--output-dir')
+    proof = modules[position + 1]
+    del modules[position:position + 2]
 gdir = os.path.join(pkg, 'worst')
 metadata = dio2_meta.extract(Path(pkg))
 if not modules:
@@ -100,6 +108,30 @@ for f in failures:
     print('  BUNDLE FAIL', *f)
 if failures:
     raise SystemExit('Cannot generate all computation bundles')
+foundation = Path(here, '../average-n8-p5x50-v2/proof/Dio2Comp.lean').read_text()
+stable = {}
+pattern = (r'^/-- Computation bundle of role `([^`]+)` \(variant (\d+)\):[^\n]*\n'
+           r'def [\w.]+ (.*?) :=\n  (.*?)(?=\n/--|\nend Dio2Proof.Comp)')
+for match in re.finditer(pattern, foundation, re.M | re.S):
+    role, index, head, body = match.groups()
+    variants = stable.setdefault(role, [])
+    if int(index) != len(variants):
+        raise SystemExit('Foundation computation variants are not contiguous for ' + role)
+    variants.append(head + '\n' + body.strip())
+renamed = {}
+for role, variants in V.by_role.items():
+    preserved = stable.setdefault(role, [])
+    for index, text in enumerate(variants):
+        normalized = re.sub(r'\s+', '', text)
+        target = next((position for position, old in enumerate(preserved)
+                       if re.sub(r'\s+', '', old) == normalized), None)
+        if target is None:
+            target = len(preserved)
+            preserved.append(text)
+        renamed[GA.comp_name(role, index)] = GA.comp_name(role, target)
+for key, (name, bundle) in list(V.scope.items()):
+    V.scope[key] = renamed[name], bundle
+V.by_role = stable
 iface = open(os.path.join(generic, 'GenIface.lean')).read()
 section = V.lean()
 section = section[section.index('\n', section.index('-- BEGIN GENERATED COMP')) + 1:

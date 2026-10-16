@@ -6,6 +6,7 @@ Usage (from the repository root)::
   python3 crates/io/lean/dio2/generator/gen_noise_cert.py --preset toy --out DIR
   python3 crates/io/lean/dio2/generator/gen_noise_cert.py --preset production --out DIR
   python3 crates/io/lean/dio2/generator/gen_noise_cert.py --params params.json --out DIR
+  python3 crates/io/lean/dio2/generator/gen_noise_cert.py --package PACKAGE --sharp --out DIR
 
 The JSON manifest records the actual primes, quotients, CRT basis, dimensions,
 cutoffs and layout. The toy profile mirrors Dio2Online0Assembly0 and Dio2Noise,
@@ -13,9 +14,11 @@ including the duplicated arithmetic in Dio2Complete. Every expression evaluation
 and every decoder inequality gets its own theorem over closed Nat arithmetic.
 No native_decide, external solver, or axiom is used.
 
-With --sharp --metadata FILE, production emits the conservative monomial-cell
-certificate (conditional on the symbolic stage premises). Metadata supplies
-exported dimensions and routing; the manifest supplies noise cutoffs and PRF P.
+With --sharp, Dio2Noise.lean contains the conservative monomial-cell certificate,
+conditional on the symbolic stage premises. --package extracts dio2_meta metadata
+and reads sampler cutoffs from its fingerprinted sources. It supports both toy
+and production rows without preset dimensions or PRF identities. Alternatively,
+--metadata FILE validates the geometry against an explicit parameter manifest.
 
 IMPORTANT: without --sharp the production profile cannot pass the literal toy norm recurrence.
 Even 34 buckets of width ONE, unit imported noise, and ZERO preprocessing noise
@@ -101,7 +104,7 @@ def validate(p: dict) -> None:
         raise ValueError('gadget columns disagree with prime digits')
     if not p['bucket_widths'] or min(p['bucket_widths']) < 1:
         raise ValueError('empty PRF or bucket')
-    if len(p['bucket_widths']) != (2 if p['prf_h'] == 1 else p['prf_h'] + 3):
+    if 'prf_h' in p and len(p['bucket_widths']) != (2 if p['prf_h'] == 1 else p['prf_h'] + 3):
         raise ValueError('bucket count disagrees with PrfSettings::parameters')
     for i, (q, quotient, basis) in enumerate(zip(p['primes'], p['quotients'], p['crt_basis'], strict=True)):
         if quotient*q != q0 or basis % q != 1:
@@ -418,35 +421,85 @@ def sharp_certificate(c: Certificate, p: dict):
                 c.compare(prefix + f'{target}_p{j}', ref('left_' + target), f'quotient{j}')
 
 
+def package_parameters(package: Path, data: dict) -> dict:
+    """Extract sharp parameters from metadata and its fingerprinted sampler sources.
+
+    No preset dimensions or PRF identities are used. The metadata currently omits
+    sampler cutoffs; read these from exactly the source files it fingerprints.
+    """
+    import hashlib
+    v = data['views']['generated']
+    layout, = [x for x in data['backend_layouts'] if x['modulus'] == v['Q0']]
+    if layout['droppedModuli'] != 0:
+        raise ValueError('sharp certificate requires a constant modulus')
+    tables = v['lut_tables']['preprocess_0_0']
+    readouts = [t['values'] for t in tables if len(t['values']) >= 2 and
+                t['values'][0] == 1 and t['values'][1] == 1 and
+                t['values'] == [2 * (i // t['values'].count(1)) + 1
+                                for i in range(len(t['values']))]]
+    P, = {max(t) + 1 for t in readouts}
+    preimage_cutoffs, gaussian_cutoffs = set(), set()
+    for name, digest in data['sources'].items():
+        if not name.startswith('worst/W_Stage_') or '_Facts' in name:
+            continue
+        path = package / name
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError(f'export changed since metadata extraction: {name}')
+        source = raw.decode()
+        if 'preimages_' in name:
+            preimage_cutoffs.update(map(int, re.findall(r'Int.toNat \((\d+)\)', source)))
+        if 'preprocess_' in name:
+            gaussian_cutoffs.update(map(int, re.findall(
+                r'gaussianSample \(\([^)]*\)\) \((\d+)\)', source)))
+    cutoff, = preimage_cutoffs
+    # Exact-zero samples are represented by matrixZero, not gaussianSample.
+    gaussian = max(gaussian_cutoffs, default=0)
+    qs = v['primes']
+    p = dict(profile='metadata', imported_bound=1, switch_bound=0,
+             prf_P=P, preimage_cutoff=cutoff, exported_gaussian_cutoff=gaussian,
+             crt_basis=[a * pow(a, -1, q) for q in qs for a in [v['Q0'] // q]])
+    return p
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--preset', choices=['toy','production'])
     group.add_argument('--params', type=Path)
+    group.add_argument('--package', type=Path, help='extract all sharp parameters from an export')
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--sharp', action='store_true', help='use a3 monomial-cell envelope')
     parser.add_argument('--metadata', type=Path, help='dio2_meta.py JSON (sharp mode only)')
     args = parser.parse_args()
     if args.metadata and not args.sharp:
         parser.error('--metadata requires --sharp')
-    p = preset(args.preset) if args.preset else json.loads(args.params.read_text())
+    if args.package:
+        if not args.sharp:
+            parser.error('--package requires --sharp')
+        from dio2_meta import extract
+        data = extract(args.package)
+        args.out.mkdir(parents=True, exist_ok=True)
+        args.metadata = args.out / 'metadata.json'
+        args.metadata.write_text(json.dumps(data, indent=2) + '\n')
+        p = package_parameters(args.package, data)
+    else:
+        p = preset(args.preset) if args.preset else json.loads(args.params.read_text())
     if args.sharp:
-        if p['profile'] == 'toy':
-            parser.error('--sharp requires production parameters; toy mode is unchanged')
         p = sharp_parameters(p, args.metadata)
     validate(p)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out/'parameters.json').write_text(json.dumps(p,indent=2)+'\n')
     c = Certificate()
     constants(c,p)
-    if p['profile'] == 'toy':
+    if p['profile'] == 'toy' and not args.sharp:
         toy_certificate(c,p)
         toy_regression(c,args.out)
         c.write(args.out,'ToyNoiseCertificate')
         return 0
     if args.sharp:
         sharp_certificate(c,p)
-        c.write(args.out,'SharpNoiseCertificate')
+        c.write(args.out,'Dio2Noise')
         worst = max(r['log2_left'] for r in c.rows)
         margin = min(r['log2_quotient'] - r['log2_left'] for r in c.rows)
         print(f'Sharp: {len(c.rows)} inequalities; max log2(left)={worst:.9f}; min margin={margin:.9f} bits')

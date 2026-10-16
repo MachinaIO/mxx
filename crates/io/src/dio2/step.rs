@@ -790,7 +790,9 @@ fn public_product(
 pub struct LabelProducts {
     seed: [u8; 32],
     width: usize,
-    /// The maximum padded leaf count; only the logarithm of this determines graph depth.
+    /// The leaf slots of every column: the label rows `m_v` (at least two), a bound on every
+    /// column's selected-row count that holds by construction, so the forest multiplies exactly
+    /// the selected rows without a bound that depends on the hashed selector table.
     pub max_leaves: usize,
     /// Binary field width of an input row index.
     pub index_bits: usize,
@@ -843,16 +845,11 @@ impl LabelProducts {
         })
     }
 
-    /// Retain the fixed seed and exact maximum column size, without embedding the selector table.
+    /// Retain the fixed seed, without embedding the selector table.
     pub fn new(parameters: &Dio2Parameters, x: &[bool]) -> Self {
         let width = parameters.label_width();
         let index_bits = (usize::BITS - (width - 1).leading_zeros()) as usize;
-        let transition = label_transition(parameters, x);
-        let mut max_leaves = 2;
-        for column in 0..=width {
-            max_leaves = max_leaves.max(transition.iter().filter(|row| row[column]).count());
-        }
-        Self { seed: label_transition_seed(x), width, max_leaves, index_bits }
+        Self { seed: label_transition_seed(x), width, max_leaves: width.max(2), index_bits }
     }
 
     /// One shared public computation of all packed columns and their unpadded leaf counts.

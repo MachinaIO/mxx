@@ -140,6 +140,40 @@ local notation "mxxMat71" => Mxx.Primitives.ExactMatrix modulus_0 65536 2 544
 local notation "mxxMat72" => Mxx.Primitives.ExactMatrix modulus_0 65536 2 536
 local notation "mxxMat73" => Mxx.Primitives.ExactMatrix modulus_0 65536 2 1080
 
+abbrev parallel_generatedRoot_11082.constraints_0 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (w_0_0 : mxxMat0) (w_1_0 : mxxMat0) (w_25_0 : mxxMat7) (w_27_0 : mxxMat0) (w_2_0 : mxxMat14) (w_5_0 : mxxMat3) (w_6_0 : mxxMat5) (w_7_0 : mxxMat5) (w_10_0 : mxxMat0) (w_11_0 : mxxMat0) (w_12_0 : mxxMat65) (w_16_0 : mxxMat65) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_20_0 : mxxMat6) (w_21_0 : mxxMat6) (w_24_0 : mxxMat0) (w_26_0 : mxxMat11) (w_28_0 : mxxMat16) (w_29_0 : mxxMat16) (w_31_0 : mxxMat16) (w_32_0 : mxxMat17) (w_33_0 : mxxMat17) (w_34_0 : mxxMat11) (w_35_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat12) (w_38_0 : mxxMat12) (w_39_0 : mxxMat1) (w_40_0 : mxxMat0) : Prop :=
+  MxxRuntime.concatColumns w_0_0 w_1_0 w_2_0 ∧
+  MxxRuntime.gadgetDecomposeRuns backend 64 270 w_5_0 w_6_0 ∧
+  MxxRuntime.compactCenteredRebaseRuns 32 w_6_0 w_7_0 ∧
+  MxxRuntime.gadgetMatrixRuns backend 64 270 w_10_0 ∧
+  MxxRuntime.centeredRebaseRuns w_10_0 w_11_0 ∧
+  MxxRuntime.modulusReduceRuns w_11_0 w_12_0 ∧
+  MxxRuntime.centeredRebaseRuns w_16_0 w_17_0 ∧
+  MxxRuntime.gadgetDecomposeRuns backend 64 270 w_19_0 w_20_0 ∧
+  MxxRuntime.compactCenteredRebaseRuns 32 w_20_0 w_21_0 ∧
+  0 ≤ (0) ∧
+  (0) < 270 ∧
+  0 ≤ 0 ∧
+  0 < 1 ∧
+  1 ≤ 1 ∧
+  0 ≤ (72900 * (Int.ofNat i_0)) ∧
+  (72900 * (Int.ofNat i_0)) < (72900 + (72900 * (Int.ofNat i_0))) ∧
+  (72900 + (72900 * (Int.ofNat i_0))) ≤ 1223228174400 ∧
+  MxxRuntime.sliceMatrix w_25_0 0 1 (72900 * (Int.ofNat i_0)) (72900 + (72900 * (Int.ofNat i_0))) w_26_0 ∧
+  MxxRuntime.blockDiagonalRuns 270 w_27_0 w_28_0 ∧
+  MxxRuntime.centeredRebaseRuns w_28_0 w_29_0 ∧
+  MxxRuntime.gadgetDecomposeRuns backend 64 270 w_31_0 w_32_0 ∧
+  MxxRuntime.compactCenteredRebaseRuns 32 w_32_0 w_33_0 ∧
+  0 ≤ 0 ∧
+  0 < 1 ∧
+  1 ≤ 1 ∧
+  0 ≤ 0 ∧
+  0 < 270 ∧
+  270 ≤ 72900 ∧
+  MxxRuntime.sliceMatrix w_34_0 0 1 0 270 w_35_0 ∧
+  MxxRuntime.gadgetDecomposeRuns backend 64 270 w_36_0 w_37_0 ∧
+  MxxRuntime.compactCenteredRebaseRuns 32 w_37_0 w_38_0 ∧
+  MxxRuntime.tensorRuns w_24_0 w_39_0 w_40_0
+
 abbrev parallel_generatedRoot_11082.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (params : Params) (i_0 : Nat) (inputs : (parallel_generatedRoot_11082.InputType)) (outputs : mxxMat3) (witness : parallel_generatedRoot_11082.Witness) : Prop :=
   let _params := params
   let _backend := backend
@@ -54904,57 +54938,6 @@ noncomputable def generatedRoot.w_4657_0  (ctx : generatedRootCtx) : mxxMat2 :=
 
 noncomputable def generatedRoot.w_4658_0  (ctx : generatedRootCtx) : mxxMat0 :=
   ctx.witness.w_4658_0
-
-noncomputable def generatedRoot.w_4659_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  ctx.witness.w_4659_0
-
-noncomputable def generatedRoot.w_4660_0  (ctx : generatedRootCtx) : mxxMat3 :=
-  ctx.witness.w_4660_0
-
-noncomputable def generatedRoot.w_4661_0  (ctx : generatedRootCtx) : mxxMat5 :=
-  ctx.witness.w_4661_0
-
-noncomputable def generatedRoot.w_4662_0  (ctx : generatedRootCtx) : mxxMat5 :=
-  ctx.witness.w_4662_0
-
-noncomputable def generatedRoot.w_4663_0  (ctx : generatedRootCtx) : mxxMat2 :=
-  MxxRuntime.matrixMul (generatedRoot.w_4644_0 ctx) (generatedRoot.w_4662_0 ctx)
-
-noncomputable def generatedRoot.w_4664_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  ctx.witness.w_4664_0
-
-noncomputable def generatedRoot.w_4665_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  ctx.witness.w_4665_0
-
-noncomputable def generatedRoot.w_4666_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixAdd (generatedRoot.w_4664_0 ctx) (generatedRoot.w_4665_0 ctx)
-
-noncomputable def generatedRoot.w_4667_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixAdd (generatedRoot.w_4634_1 ctx) (generatedRoot.w_4666_0 ctx)
-
-noncomputable def generatedRoot.w_4668_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  ctx.witness.w_4668_0
-
-noncomputable def generatedRoot.w_4669_0  (ctx : generatedRootCtx) : mxxMat1 :=
-  (MxxRuntime.matrixPolynomial [(1)] : mxxMat1)
-
-noncomputable def generatedRoot.w_4670_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixMulScalarRight (generatedRoot.w_4668_0 ctx) (generatedRoot.w_4669_0 ctx)
-
-noncomputable def generatedRoot.w_4671_0  (ctx : generatedRootCtx) : mxxMat6 :=
-  ctx.witness.w_4671_0
-
-noncomputable def generatedRoot.w_4672_0  (ctx : generatedRootCtx) : mxxMat6 :=
-  ctx.witness.w_4672_0
-
-noncomputable def generatedRoot.w_4673_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixMul (generatedRoot.w_4667_0 ctx) (generatedRoot.w_4672_0 ctx)
-
-noncomputable def generatedRoot.w_4674_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  ctx.witness.w_4674_0
-
-noncomputable def generatedRoot.w_4675_0  (ctx : generatedRootCtx) : mxxMat1 :=
-  (MxxRuntime.matrixPolynomial [(1)] : mxxMat1)
 
 
 end

@@ -12,6 +12,8 @@ a fixed hash key, so every export writes the same modules.
 | `average-n8-p5x50/worst` | The worst-case modules renamed `W_*` (`gen_bridge.py`). |
 | `average-n8-p5x50/bridge` | Every average-case run is a worst-case run (`gen_bridge.py`). |
 | `average-n8-p5x50/proof` | The proof of the worst-case claim and the certificate. |
+| `*-n8-p5x50-v2` | The toy claim in the compact export format (symbolic label forests, smudge-digit loop, partitioned modules), with its proof. |
+| `*-n65536-p27x60` | The production claim (ring dimension `2^16`, 27 60-bit primes, gadget base `2^6`, failure `2^-100`). |
 
 The parameters are the toy ring of the GPU round trip: ring dimension 8, five 50-bit primes, gadget
 base `2^12`, six levels of `Q_0`, the evaluator's chunks `x = (0, 1)`. Their simulated decoder error
@@ -61,3 +63,12 @@ and the validity contract of the run.
 The generated proof modules are rewritten by the scripts in `crates/io/lean/dio2/generator`
 (`gen_adapters_dio2.py`, `gen_requirement_dio2.py`, `gen_part_primes.py`, `gen_key_agree0.py`,
 `gen_key_agree_prime.py`); rerun them after regenerating the export.
+
+## The v2 proof
+
+`average-n8-p5x50-v2/proof` proves `Dio2Proof.Complete.dio2_correctness_claim` for the compact
+export without hypotheses. Every theorem quantifies over members, refresh parts, smudge digits and
+coefficients, and every package-dependent module is written by a generator in `generator`
+(metadata from `dio2_meta.py`), so the same generators target the production package. The label
+forest has one leaf slot per label row, so the forest product equals the clear label transition
+without a bound on the hashed selector table.

@@ -591,8 +591,9 @@ evaluator.
    instance's hash domain `(i, x)` (root keys: `i`).
 3. The instance's decoded keys come from the key-only refresh composition on the lowered public
    keys — the same composition the evaluator runs on rows, with the same key helpers — not from
-   an online evaluation; neither the payload `t` nor the mask enters them. The preimages of
-   every part and prime are one parallel loop.
+   an online evaluation; neither the payload `t` nor the mask enters them. One parallel loop over
+   every part and prime computes each decoded key and samples its preimage, so no family of
+   decoded keys is held.
 4. Every per-instance artifact role is published as one family of the instances' values, so the
    evaluator reads instance `(i, x_i)` by its runtime index.
 

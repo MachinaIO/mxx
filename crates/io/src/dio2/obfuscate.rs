@@ -475,11 +475,11 @@ impl Obfuscator<'_> {
                     hash_key: self.root.hash_key_input(),
                     anchor: secrets.anchors.public_matrices().at(step.clone().add(1usize)),
                 };
-                let keys = compose.decoded_keys(&next, (&self.columns, chunk.clone()))?;
-                Leaf::of(mxx_dsl::parallel(keys.count().clone(), |member| {
-                    Ok(trapdoor.sample_preimage(keys.at(member), (anchor, plan.columns)))
-                })?)
-                .expect("one wire")
+                let preimages =
+                    compose.decoded_keys(&next, (&self.columns, chunk.clone()), |key| {
+                        trapdoor.sample_preimage(key, (anchor, plan.columns))
+                    })?;
+                Leaf::of(preimages).expect("one wire")
             }
         };
         let emission = build.emit(DslContext::new("dio2-material"), keys)?;

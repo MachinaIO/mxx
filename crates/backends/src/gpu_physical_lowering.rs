@@ -115,6 +115,9 @@ pub(crate) struct ExportTemplate {
     pub scratch: bool,
     /// Host loop slot and expression added to each exported member index.
     pub member_base: Option<(u32, mxx_ir_core::IntExpr)>,
+    /// For a wave loop nested in a root wave template whose members a parent lane's flattened
+    /// family exports: the parent occurrence times this stride is added to the member index.
+    pub parent_stride: Option<usize>,
 }
 
 /// A canonical artifact is requested only at its first dependent Graph
@@ -2133,6 +2136,11 @@ pub(super) fn replicate_to_device(
     let columns = ctx.values[replica.0 as usize].ty.matrix_type().map_or(1, |ty| ty.columns);
     let whole = ColumnRange { start: 0, end: columns };
     ctx.producer.insert(replica, copies.into_iter().map(|copy| (whole, copy)).collect());
+    // A trapdoor (or trapdoor family) replica keeps its public matrices beside it.
+    if let Some(public) = ctx.trapdoor_public_ids.get(&source).copied() {
+        let public = replicate_to_device(ctx, public, device)?;
+        ctx.trapdoor_public_ids.insert(replica, public);
+    }
     Ok(replica)
 }
 
@@ -3059,7 +3067,7 @@ fn gadget_digits_per_tower(
     Ok(regular_gadget_digits_per_tower)
 }
 
-fn plan_static_matrix(
+pub(super) fn plan_static_matrix(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: &ConcreteMatrixType,
     value: &ConstantMatrix,
@@ -6019,7 +6027,28 @@ pub(super) fn lower_preimage_sample_node(
     let public = *ctx.wire_ids.get(public_wire).ok_or("GPU preimage public input is absent")?;
     let secret = *ctx.wire_ids.get(secret_wire).ok_or("GPU preimage trapdoor input is absent")?;
     let target = *ctx.wire_ids.get(target_wire).ok_or("GPU preimage target input is absent")?;
-    if ctx.trapdoor_public_ids.get(&secret).is_some_and(|paired| *paired != public) {
+    // A trapdoor selected from a family by a runtime index is paired with its own selection of
+    // the public family; the public input selects the paired family at the same index.
+    let selected_pair = || {
+        let selection = |wire: &WireRef| {
+            let node = scope.node(wire.node)?;
+            matches!(node.kind(), NodeKind::FamilyGetDynamic)
+                .then(|| scope.arguments(node))
+                .flatten()
+                .and_then(|arguments| <[WireRef; 2]>::try_from(arguments).ok())
+        };
+        let (Some([secrets, secret_index]), Some([publics, public_index])) =
+            (selection(secret_wire), selection(public_wire))
+        else {
+            return false;
+        };
+        secret_index == public_index &&
+            ctx.wire_ids.get(&secrets).and_then(|family| ctx.trapdoor_public_ids.get(family)) ==
+                ctx.wire_ids.get(&publics)
+    };
+    if ctx.trapdoor_public_ids.get(&secret).is_some_and(|paired| *paired != public) &&
+        !selected_pair()
+    {
         return Err("GPU preimage public input is not paired with its trapdoor".into());
     }
     let public_ty = ctx.values[public.0 as usize]
@@ -7248,6 +7277,7 @@ pub(super) fn emit_artifact_export(
                 streamed: false,
                 scratch: false,
                 member_base: None,
+                parent_stride: None,
             });
         }
     }

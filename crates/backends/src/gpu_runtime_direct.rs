@@ -3985,7 +3985,10 @@ impl GpuRuntime {
                     } else {
                         None
                     };
-                    pump.export_streamed(template, key)
+                    let offset = parent_occurrence
+                        .zip(site.parent_stride)
+                        .map_or(0, |(occurrence, stride)| occurrence * stride);
+                    pump.export_streamed(template, key, offset)
                         .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
                 }
             }

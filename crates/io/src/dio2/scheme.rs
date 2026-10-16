@@ -468,8 +468,10 @@ mod tests {
                 parameters.prf.lwr_dimension = label_rows;
                 parameters.smudge_digits = digits;
                 let function = first_bit_function(eval_bits, steps);
-                let execution =
-                    GraphOnly(CpuExecution::new(cpu_backend(parameters.rings().unwrap())));
+                let execution = GraphOnly(
+                    CpuExecution::new(cpu_backend(parameters.rings().unwrap())),
+                    Vec::new(),
+                );
                 let mut dio2 = Dio2::new(parameters, execution, MemoryArtifactStore::default())
                     .unwrap()
                     .with_inputs_by_shape();
@@ -492,5 +494,58 @@ mod tests {
         );
         eprintln!("graph node counts (obfuscate, evaluate): {counts:?}");
         assert_eq!(counts[0], counts[1]);
+    }
+
+    /// The families and wide matrices a GPU plan of the obfuscation and evaluation graphs would
+    /// hold (graph-only), for the parameter sets of [`graphs_do_not_grow_with_the_parameters`].
+    #[test]
+    fn test_vram_audit_resident_families() {
+        use crate::dio2::test_support::{GraphOnly, residency};
+        for (ring_dimension, primes, label_rows, digits, steps, eval_bits) in
+            [(8u32, 5usize, 1usize, 2usize, 2usize, 1usize), (16, 3, 2, 3, 3, 2)]
+        {
+            let (mut parameters, _) = toy();
+            parameters.ring_dimension = ring_dimension;
+            parameters.primes = mxx_backends::openfhe_guard::gen_modulus_and_warmup(
+                ring_dimension,
+                primes,
+                parameters.crt_bits,
+                None,
+            )
+            .unwrap();
+            parameters.prf.lwr_dimension = label_rows;
+            parameters.smudge_digits = digits;
+            let function = first_bit_function(eval_bits, steps);
+            let execution =
+                GraphOnly(CpuExecution::new(cpu_backend(parameters.rings().unwrap())), Vec::new());
+            let mut dio2 = Dio2::new(parameters.clone(), execution, MemoryArtifactStore::default())
+                .unwrap()
+                .with_inputs_by_shape();
+            let input = Dio2Function {
+                function: function.clone(),
+                y: vec![vec![false; function.obf_chunk_bits]; steps],
+                initial_state: 0,
+            };
+            let obfuscation = dio2.obfuscate_with_hash_key(&input, [7; 32]).unwrap();
+            dio2.evaluate(&obfuscation, &vec![vec![false; eval_bits]; steps]).unwrap();
+            let plan = crate::dio2::step::StepPlan::new(&parameters, &function).unwrap();
+            eprintln!(
+                "AUDIT params n={ring_dimension} primes={primes} label_rows={label_rows} digits={digits} steps={steps} eval_bits={eval_bits} w0={} blocks={} label_width={} automorphisms={}",
+                plan.columns,
+                plan.blocks(),
+                plan.label_width,
+                plan.automorphisms.len()
+            );
+            for (graph, name) in dio2.execution.1.iter().zip(["obfuscate", "evaluate"]) {
+                let row =
+                    1u128 * plan.columns as u128 * primes as u128 * ring_dimension as u128 * 8;
+                for entry in residency(graph, 8 * row) {
+                    eprintln!(
+                        "AUDIT {name} {} {} {} {} {}",
+                        entry.class, entry.scope, entry.node, entry.shape, entry.bytes
+                    );
+                }
+            }
+        }
     }
 }

@@ -18,11 +18,11 @@
 //!   to the scalar form `P^r / 2`. The CBD noise `f` of a part is shared by its primes, so the
 //!   residues recombine to one row.
 //!
-//! [`Compose::decoded_keys`] gives the obfuscator the decoded key `[K_0; K_1]` of every part and
-//! prime; [`Compose::next_rows`] unmasks every part and prime with the anchor hint and its
-//! preimage, rounds it to `y_j mod q`, and sums the residues' CRT terms to the part's row of the
-//! next step input modulo `Q_0`. Parts and primes are loops of the graph: its size does not
-//! depend on the number of labels, primes or smudge digits.
+//! [`Compose::decoded_keys`] hands the obfuscator the decoded key `[K_0; K_1]` of every part and
+//! prime in the loop that computes it; [`Compose::next_rows`] unmasks every part and prime with the
+//! anchor hint and its preimage, rounds it to `y_j mod q`, and sums the residues' CRT terms to the
+//! part's row of the next step input modulo `Q_0`. Parts and primes are loops of the graph: its
+//! size does not depend on the number of labels, primes or smudge digits.
 //!
 //! The output decoder ([`Compose::output_decoded`]) re-targets the state to the scalar form
 //! `Q_q` of the first prime `q` and rounds the unmasked row to the state monomial modulo `q`.
@@ -443,15 +443,17 @@ impl<'a, C: Carrier> Compose<'a, C> {
 }
 
 impl Compose<'_, Key> {
-    /// The decoded key `[K_0; K_1]` (`2 x w_0` at `Q_0`) of every part and prime of the
-    /// refresh to the next step `next` on chunk `chunk` (its label transition `columns`),
-    /// member `p |P| + k` for part `p` and the prime of index `k` in the basis of `Q_0`: what
-    /// the anchor's preimages are sampled for. The label leaves are the step root's keys.
-    pub fn decoded_keys(
+    /// `consume` of the decoded key `[K_0; K_1]` (`2 x w_0` at `Q_0`) of every part and prime of
+    /// the refresh to the next step `next` on chunk `chunk` (its label transition `columns`),
+    /// member `p |P| + k` for part `p` and the prime of index `k` in the basis of `Q_0`: the
+    /// anchor's preimages of the decoded keys. The label leaves are the step root's keys. One
+    /// loop over the members computes each key and consumes it, so no family of keys is held.
+    pub fn decoded_keys<T: mxx_dsl::GraphValue>(
         &self,
         next: &NextStep,
         label_chunk: (&LabelColumns, Int),
-    ) -> Result<Family<Mat>, Dio2Error> {
+        consume: impl Fn(Mat) -> T,
+    ) -> Result<Family<T>, Dio2Error> {
         let plan = self.plan;
         let root = self.chain.root().ok_or(Dio2Error::Input("the step chain has a root"))?;
         let hash_key = root.hash_key_input();
@@ -466,17 +468,13 @@ impl Compose<'_, Key> {
         )?;
         let targets = self.targets(next, label_chunk, leaf, one)?;
         let failure = Failure::default();
-        let keys = mxx_dsl::parallel(plan.blocks(), |part| {
-            let part = failure.keep(self.part(&part, next, &targets))?;
-            mxx_dsl::parallel(plan.primes, |prime| {
-                failure.keep(self.decoded(&part, &prime, &targets).map(key_rows))
-            })
-        });
-        let keys = failure.finish(keys)?;
         let primes = plan.primes;
-        Ok(mxx_dsl::parallel(plan.blocks() * primes, |member| {
-            Ok(keys.at(member.clone().div(primes)).at(member.rem(primes)))
-        })?)
+        let keys = mxx_dsl::parallel(plan.blocks() * primes, |member| {
+            let part = failure.keep(self.part(&member.clone().div(primes), next, &targets))?;
+            let decoded = failure.keep(self.decoded(&part, &member.rem(primes), &targets))?;
+            Ok(consume(key_rows(decoded)))
+        });
+        failure.finish(keys)
     }
 
     /// The decoded key `[K_0; K_1]` (`2 x 1`) of the output decoder.

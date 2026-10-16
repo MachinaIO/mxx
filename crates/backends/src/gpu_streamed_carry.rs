@@ -73,6 +73,18 @@ pub(super) struct StreamingLowering {
     pub families: BTreeMap<PhysicalValueId, StreamedFamily>,
     pub exports: BTreeMap<(FrozenGraphScopeId, WireRef), StreamedExport>,
     pub member_overrides: BTreeMap<(FrozenGraphScopeId, WireRef), PhysicalValueId>,
+    /// Body outputs of a root wave loop that its flattened artifact export names, by body scope
+    /// and output wire: a wave loop producing one exports its members itself.
+    pub nested_exports: BTreeMap<(FrozenGraphScopeId, WireRef), NestedExport>,
+}
+
+/// The flattened export of a root wave loop's family-valued output: the artifact names, the
+/// members of each lane's family (the stride of a parent occurrence), and whether the wave loop
+/// producing the current lane's family exports it.
+pub(super) struct NestedExport {
+    pub names: Vec<String>,
+    pub stride: usize,
+    pub exported: bool,
 }
 
 /// Execution-local key state copied by selected-import factories at their load sites.
@@ -140,6 +152,98 @@ pub(super) fn runtime_base_reads(
         }
     }
     reads
+}
+
+/// Recognize the only reader of the root family `wire` (`n` members, each a family of `k`) as
+/// its flattening `parallel(n k, |m| wire.at(m / k).at(m % k))` whose output is an artifact output
+/// of the graph and nothing else. Returns the flattening loop and `k`: a wave loop producing
+/// `wire` exports member `j` of instance `i` as member `i k + j` of the flattened artifact, so
+/// neither family is ever resident.
+pub(super) fn flattened_family_reader(
+    graph: &Graph,
+    wire: WireRef,
+    ty: &ConcreteWireType,
+    env: &ParamEnv,
+) -> Option<(NodeId, usize)> {
+    let ConcreteWireType::IndexedFamily { element, count } = ty else { return None };
+    let ConcreteWireType::IndexedFamily { count: inner, .. } = element.as_ref() else {
+        return None;
+    };
+    let (count, inner) = (usize::try_from(*count).ok()?, usize::try_from(*inner).ok()?);
+    let root = graph.root_scope();
+    let reads = |node: &NodeHandle, wire: WireRef| {
+        root.arguments(node).is_some_and(|arguments| arguments.contains(&wire))
+    };
+    let mut readers = root.nodes().iter().enumerate().filter(|(_, node)| reads(node, wire));
+    let (position, reader) = readers.next()?;
+    if readers.next().is_some() {
+        return None;
+    }
+    let reader_id = NodeId(position as u64);
+    let NodeKind::ParallelLoop(spec) = reader.kind() else { return None };
+    let reader_arguments = root.arguments(reader)?;
+    if reader_arguments.first() != Some(&wire) ||
+        spec.input_modes.iter().any(|mode| *mode != LoopInputMode::Broadcast) ||
+        reader.output_types().len() != 1
+    {
+        return None;
+    }
+    // An integer constant of the root.
+    let root_constant = |wire: &WireRef| match root.node(wire.node)?.kind() {
+        NodeKind::EvaluateInt(expression) => expression.evaluate(env).ok()?.to_usize(),
+        NodeKind::ConstantInt(value) => value.to_usize(),
+        _ => None,
+    };
+    let flat = crate::gpu_physical_control::finite_loop_count(
+        &FrozenGraphScopeId::Root,
+        reader_id,
+        reader.kind(),
+        env,
+    )
+    .ok()?;
+    if flat != (count as u64).checked_mul(inner as u64)? {
+        return None;
+    }
+    let output = WireRef { node: reader_id, port: Port(0) };
+    if !graph.outputs().values().any(|root| root.value == output && root.availability.is_some()) ||
+        root.nodes().iter().any(|node| reads(node, output))
+    {
+        return None;
+    }
+    let child = graph.scope(&graph.child_scope_id(&FrozenGraphScopeId::Root, reader_id)?)?;
+    let node = |wire: WireRef| child.node(wire.node).map(NodeHandle::kind);
+    let arguments = |wire: WireRef| child.node(wire.node).and_then(|node| child.arguments(node));
+    let lane = |wire: WireRef| {
+        matches!(node(wire), Some(NodeKind::EvaluateInt(IntExpr::LoopIndex(slot)))
+            if *slot == spec.index_slot)
+    };
+    // An integer constant of the body, or a broadcast root constant.
+    let constant = |wire: WireRef| match node(wire)? {
+        NodeKind::EvaluateInt(expression) => expression.evaluate(env).ok()?.to_usize(),
+        NodeKind::ConstantInt(value) => value.to_usize(),
+        NodeKind::Input { .. } => {
+            let position = child.inputs().iter().position(|input| *input == wire)?;
+            root_constant(reader_arguments.get(position).filter(|_| position > 0)?)
+        }
+        _ => None,
+    };
+    // `lane op k`.
+    let by_inner = |wire: WireRef, op: IntBinaryOp| {
+        node(wire) == Some(&NodeKind::IntBinary(op)) &&
+            arguments(wire).is_some_and(|operands| {
+                matches!(operands.as_slice(), [left, right]
+                    if lane(*left) && constant(*right) == Some(inner))
+            })
+    };
+    let [result] = child.outputs() else { return None };
+    let [member, remainder] = arguments(*result)?[..] else { return None };
+    let [family, quotient] = arguments(member)?[..] else { return None };
+    (node(*result) == Some(&NodeKind::FamilyGetDynamic) &&
+        node(member) == Some(&NodeKind::FamilyGetDynamic) &&
+        child.inputs().first() == Some(&family) &&
+        by_inner(quotient, IntBinaryOp::Divide) &&
+        by_inner(remainder, IntBinaryOp::Remainder))
+    .then_some((reader_id, inner))
 }
 
 impl StreamedFamily {

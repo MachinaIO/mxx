@@ -355,6 +355,7 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
         &mut self,
         template: usize,
         scratch_key: Option<ArtifactKey>,
+        member_offset: usize,
     ) -> Result<(), IoPumpError<E>> {
         let Some(mut slot) = self.streamed.get(&template).cloned() else { return Ok(()) };
         let scratch = scratch_key.is_some();
@@ -364,6 +365,8 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                 self.remove_staged(slot.frame, slot.key.clone(), 1)?;
             }
         }
+        // A nested wave's member of its parent occurrence's block of a flattened family.
+        slot.key.index = slot.key.index.map(|index| index + member_offset);
         let handle = (slot.commit_to_session || scratch).then(|| ArtifactHandle {
             key: slot.key.clone(),
             artifact_type: slot.artifact_type.clone(),

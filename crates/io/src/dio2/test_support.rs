@@ -1,6 +1,6 @@
 //! The toy parameters and function of the unit tests.
 
-use super::{Dio2Parameters, StepProgram, StreamingFunction};
+use super::{Dio2Parameters, StreamingFunction};
 use bigdecimal::BigDecimal;
 use mxx_backends::openfhe_guard::gen_modulus_and_warmup;
 use mxx_exponent_lut::{ExpLayout, refresh::PrfSettings};
@@ -39,8 +39,7 @@ pub(crate) fn toy() -> (Dio2Parameters, StreamingFunction) {
     let function =
         StreamingFunction::additive(1, 1, 1, ExpLayout { stride_log2: 1, width_log2: 2 });
     let steps = [vec![1, 0, 1, 0], vec![0, 1, 1, 0]];
-    let function = steps
-        .into_iter()
-        .fold(function.clone(), |acc, table| acc.with_step(StepProgram::table(&function, table)));
+    let function =
+        steps.into_iter().fold(function.clone(), |acc, table| acc.with_step_row(table).unwrap());
     (parameters, function)
 }

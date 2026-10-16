@@ -27,7 +27,7 @@ use mxx_exponent_lut::{
 };
 use mxx_io::{
     Obfuscation,
-    dio2::{Dio2, Dio2Function, Dio2Parameters, StepProgram, StreamingFunction},
+    dio2::{Dio2, Dio2Function, Dio2Parameters, StreamingFunction},
 };
 use mxx_ir_core::{ValidatedGraph, artifact::ProductionId};
 use num_bigint::BigInt;
@@ -69,7 +69,7 @@ fn toy() -> (Dio2Parameters, StreamingFunction) {
         StreamingFunction::additive(1, 1, 1, ExpLayout { stride_log2: 1, width_log2: 2 });
     let function = [vec![1, 0, 1, 0], vec![0, 1, 1, 0]]
         .into_iter()
-        .fold(function.clone(), |acc, table| acc.with_step(StepProgram::table(&function, table)));
+        .fold(function.clone(), |acc, table| acc.with_step_row(table).unwrap());
     (parameters, function)
 }
 

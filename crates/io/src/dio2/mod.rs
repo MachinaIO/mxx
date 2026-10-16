@@ -20,7 +20,7 @@ pub mod step;
 #[cfg(test)]
 mod test_support;
 
-pub use function::{StepProgram, StreamingFunction};
+pub use function::{StepData, StepProgram, StepWires, StreamingFunction};
 pub use params::Dio2Parameters;
 pub use scheme::{Dio2, Dio2Function, Dio2Obfuscation};
 

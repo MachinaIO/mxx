@@ -785,9 +785,15 @@ impl<'a> PublicKeyLowering<'a> {
             tag.push(sigma.clone());
             tag.push("branch");
             tag.push(index.expression()?);
-            lut_switching_ciphertext(self.parameters, level, table, payload, sigma, || {
-                Ok(matrix_from_hash(&target_ring, self.hash_key.clone(), tag, columns).0)
-            })
+            lut_switching_ciphertext(
+                self.parameters,
+                level,
+                table,
+                &self.data,
+                payload,
+                sigma,
+                || Ok(matrix_from_hash(&target_ring, self.hash_key.clone(), tag, columns).0),
+            )
             .map_err(|_| DslError::Schema)
         })
         .map_err(graph)?;

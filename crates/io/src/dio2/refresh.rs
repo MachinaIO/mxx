@@ -139,18 +139,20 @@ impl StepCompose<'_> {
         let form = self.chain_parameters.form(level, RnsBggForm::Public)?;
         let stride = self.parameters.profile()?.layout.stride();
         let (packed_columns, counts) = products.columns();
+        let chunk = mxx_dsl::DslContext::new("dio2/labels")
+            .input::<Int>(super::step::CHUNK_INPUT, mxx_dsl::IntType)?;
         let mut failure = None;
         let labels = mxx_dsl::parallel(self.plan.label_rows * (width + 1), |member| {
             let row = member.clone().div(width + 1);
             let column = member.rem(width + 1);
-            let packed = packed_columns.at(column.clone());
-            let count = counts.at(column);
+            let count = counts.at(chunk.clone().mul(width + 1).add(column.clone()));
             let padded = mxx_dsl::select(
                 count.clone().less(2).to_int(),
                 vec![count.clone(), Int::constant(2)],
             )?;
             let mut current = mxx_dsl::parallel(products.max_leaves, |leaf| {
-                let index = products.index(packed.clone(), leaf.clone())?;
+                let index =
+                    products.index(&packed_columns, chunk.clone(), column.clone(), leaf.clone())?;
                 let input = row.clone().mul(width).add(index.clone());
                 let value = values.at(row.clone().mul(width + 1).add(index).add(1usize));
                 let encoding = (
@@ -863,8 +865,8 @@ mod tests {
             cbd: None,
             smudge: small.prf.declared_shape(0, "output", plan.output_smudge_members()).unwrap(),
         };
-        let mut program = ChainProgram::last(&small, &function, &plan, 1, &[false], &keys).unwrap();
-        program.label_products = Some(LabelProducts::new(parameters, &[false]));
+        let mut program = ChainProgram::last(&small, &function, &plan, &keys).unwrap();
+        program.label_products = Some(LabelProducts::new(parameters, function.eval_chunk_bits));
         plan.columns = parameters.columns().unwrap();
         plan.label_rows = parameters.label_rows();
         plan.label_width = parameters.label_width();

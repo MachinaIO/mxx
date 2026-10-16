@@ -3,18 +3,20 @@
 //!
 //! The step input `S_i` is a set of root objects (rows at `Q_0`, see
 //! [`mxx_exponent_lut::rns_bgg::RnsBggRoot`]): `ONEPRIV` ([`PRIVATE_TAG`]), the state
-//! ([`STATE_TAG`]), the label column `0` with the one-encoding `ONEPUB` as its zero member
+//! ([`STATE_TAG`]), the label column `0` with the one-encoding `ONEPUB` as its last member
 //! ([`PUBLIC_TAG`], the PRF's input family of `v + 1` members), the other label columns
 //! ([`LABEL_TAG`], `v m_v` members, entry `(r, 1 + k)` at `r m_v + k`), the LUT helpers of every
 //! automorphism of [`StepPlan::automorphisms`], and the anchor hint. Every Program input reads
 //! one of them under its root tag, so the samplers' inputs (each PRF builds its own accumulator
-//! and input family) all read the same rows.
+//! and input family) all read the same rows. The evaluator-bit family ([`XBITS_TAG`]) is
+//! derived from `ONEPUB` outside the common body using [`xbits_rows`].
 //!
 //! The Program of a step that is followed by another one ([`ChainProgram::refreshing`]) computes,
-//! besides `Pi_i`, the σ sampler (uniform signs) and its automorphisms, the CBD fresh noise of
+//! besides the common body `Pi` with its selected data row, the σ sampler (uniform signs)
+//! and its automorphisms, the CBD fresh noise of
 //! every refresh part (one PRF, one row of every part's blocks), the smudges of every part and
 //! prime (one PRF, one row of every smudge's columns per digit), and the label products; the last
-//! step's ([`ChainProgram::last`]) computes `Pi_i` and the smudge of the output decoder. The
+//! step's ([`ChainProgram::last`]) computes `Pi` and the smudge of the output decoder. The
 //! Program does not grow with the number of parts. Production label products are described by
 //! [`LabelProducts`] and lowered directly into DSL families by the refresh composer; they are
 //! not scalar Program output ports. Noise-only Programs retain the scalar balanced-tree model.
@@ -22,7 +24,7 @@
 use super::{Dio2Error, Dio2Parameters, StreamingFunction, function::StepWires};
 use mxx_exponent_lut::{
     program::{
-        AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange,
+        AttributeKnowledge, DataId, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange,
         LutOutputRepresentation, LutTable, Operand, RhsId, WireId,
     },
     program_gadgets::{
@@ -45,6 +47,30 @@ pub const PUBLIC_TAG: &str = "dio2/label-0";
 pub const LABEL_TAG: &str = "dio2/label";
 /// Clear row-major labels used by the symbolic public-product family.
 pub const LABEL_VALUES_INPUT: &str = "dio2/current-labels";
+/// Root tag of the public evaluator-bit monomial family, formed outside the common body.
+pub const XBITS_TAG: &str = "dio2/xbits";
+/// Runtime little-endian chunk value selecting the common label matrix's column block.
+pub const CHUNK_INPUT: &str = "dio2/chunk";
+/// Fixed declaration domain shared by every step and chunk.
+pub const UNIFORM_SEED: u64 = 0;
+
+/// Apply a public monomial identically to a root key block or an encoded root row.
+pub fn public_monomial(value: mxx_dsl::Mat, exponent: mxx_dsl::Int) -> mxx_dsl::Mat {
+    value.multiply_monomial(exponent)
+}
+
+/// Form the evaluator-bit family from the ONEPUB row or one of its key blocks. Both roles
+/// use this same helper; the common Program never fixes a chunk's bits in its instructions.
+pub fn xbits_rows(
+    function: &StreamingFunction,
+    one: mxx_dsl::Mat,
+    chunk: mxx_dsl::Int,
+) -> Result<mxx_dsl::Family<mxx_dsl::Mat>, mxx_dsl::DslError> {
+    mxx_dsl::parallel(function.eval_chunk_bits, |bit| {
+        let set = chunk.clone().bit(bit.clone())?.to_int();
+        Ok(public_monomial(one.clone(), (function.x_monomial)(bit, set)?))
+    })
+}
 
 /// A root-row group, without enumerating the members of either label family.
 #[derive(Clone, Debug)]
@@ -187,6 +213,8 @@ pub struct StepPlan {
     /// Production plans lower label products and targets directly as DSL families. Noise-only
     /// plans retain scalar products so the existing exact per-column model remains available.
     pub symbolic_labels: bool,
+    /// Concrete selector retained only by the Rust noise model, never production Programs.
+    noise_transition: Vec<Vec<bool>>,
     /// The automorphisms `K` of every LUT of every step (spec §5), ascending; `1` among them.
     pub automorphisms: Vec<usize>,
     /// The materialized refresh targets; production plans omit the symbolic label range. In
@@ -240,6 +268,7 @@ impl StepPlan {
         let columns = parameters.columns()?;
         let mut plan = Self {
             symbolic_labels,
+            noise_transition: label_transition(parameters, &vec![false; function.eval_chunk_bits]),
             automorphisms: Vec::new(),
             targets: Vec::new(),
             noise_targets,
@@ -252,9 +281,7 @@ impl StepPlan {
             primes: parameters.primes.len(),
             helper_families: BTreeMap::new(),
         };
-        // Probe Programs of every step on declared key shapes give every LUT a step reads: the
-        // automorphisms of the steps' own LUTs (the automorphism tables of the σ sampler only add
-        // members of this set) and every helper family.
+        // The common body has just two kinds: refreshing and final.
         let mut automorphisms = BTreeSet::new();
         let probe_shape = |role: &str, members| {
             parameters
@@ -263,8 +290,7 @@ impl StepPlan {
                 .map_err(|_| Dio2Error::Parameters("the PRF keys do not fit"))
         };
         let (n, d) = (plan.ring_dimension, plan.smudge_digits);
-        for step in 0..function.stream_length() {
-            let blocks = usize::from(step + 1 < function.stream_length());
+        for blocks in [1, 0] {
             let smudge_columns = if blocks == 0 { 1 } else { blocks * plan.primes * columns };
             let digits = match noise_targets {
                 NoiseTargets::Full => d,
@@ -275,15 +301,7 @@ impl StepPlan {
                 cbd: (blocks > 0).then(|| probe_shape("cbd", blocks * columns * n)).transpose()?,
                 smudge: probe_shape("smudge", smudge_columns * n * digits)?,
             };
-            let probe = ChainProgram::build(
-                parameters,
-                function,
-                &plan,
-                step,
-                &vec![false; function.eval_chunk_bits],
-                &keys,
-                blocks,
-            )?;
+            let probe = ChainProgram::build(parameters, function, &plan, &keys, blocks)?;
             for table in probe.program.encryption_inputs().luts() {
                 let branches = table
                     .branch_automorphisms(plan.ring_dimension)
@@ -325,6 +343,12 @@ impl StepPlan {
             .chain((0..anchors).map(Target::Anchor))
             .collect();
         Ok(plan)
+    }
+
+    /// Select a concrete label transition for the noise-only scalar product model.
+    pub(crate) fn noise_for_chunk(&self, parameters: &Dio2Parameters, x: &[bool]) -> Self {
+        assert!(!self.symbolic_labels, "production Programs never specialize on chunks");
+        Self { noise_transition: label_transition(parameters, x), ..self.clone() }
     }
 
     /// Original target ordering: private, public, state, all row-major labels, helpers, anchor.
@@ -425,7 +449,8 @@ impl StepPlan {
     }
 }
 
-/// The key shapes of the PRFs of one Program.
+/// The uniform declared PRF key shapes, shared by every step and chunk of one Program kind.
+/// Coordinate tables and selectors are data; the declaration's domain is not a key-set digest.
 pub struct ChainKeys {
     /// The σ sampler's `n` keys; `None` for the last step.
     pub sigma: Option<PrfKeyShape>,
@@ -461,7 +486,7 @@ pub struct ChainOutputs {
     pub labels: Vec<usize>,
 }
 
-/// The Program of step `i` on input chunk `x`, with the root tag of every input.
+/// The uniform Program of every step/chunk of one kind, with fixed root input tags.
 pub struct ChainProgram {
     /// Fixed public transition for DSL label families; absent in noise-only and final Programs.
     pub label_products: Option<LabelProducts>,
@@ -482,6 +507,8 @@ pub struct ChainProgram {
     pub smudge: SparseLwrPrf,
     /// The obfuscator's bits.
     pub y: RhsId,
+    /// Integer data family bound to the selected function row.
+    pub data: DataId,
 }
 
 impl ChainProgram {
@@ -491,11 +518,9 @@ impl ChainProgram {
         parameters: &Dio2Parameters,
         function: &StreamingFunction,
         plan: &StepPlan,
-        step: usize,
-        x: &[bool],
         keys: &ChainKeys,
     ) -> Result<Self, Dio2Error> {
-        Self::build(parameters, function, plan, step, x, keys, plan.blocks())
+        Self::build(parameters, function, plan, keys, plan.blocks())
     }
 
     /// The Program of the last step, whose state the output decoder reads.
@@ -503,11 +528,9 @@ impl ChainProgram {
         parameters: &Dio2Parameters,
         function: &StreamingFunction,
         plan: &StepPlan,
-        step: usize,
-        x: &[bool],
         keys: &ChainKeys,
     ) -> Result<Self, Dio2Error> {
-        Self::build(parameters, function, plan, step, x, keys, 0)
+        Self::build(parameters, function, plan, keys, 0)
     }
 
     /// The Program with `blocks` refresh part blocks; none for the last step, whose output
@@ -516,8 +539,6 @@ impl ChainProgram {
         parameters: &Dio2Parameters,
         function: &StreamingFunction,
         plan: &StepPlan,
-        step: usize,
-        x: &[bool],
         keys: &ChainKeys,
         blocks: usize,
     ) -> Result<Self, Dio2Error> {
@@ -526,7 +547,7 @@ impl ChainProgram {
         let mut builder = ExponentLutProgramBuilder::new();
         let mut root_inputs = BTreeMap::new();
         let label_products = if !last && plan.symbolic_labels && plan.full_target_count != 0 {
-            Some(LabelProducts::new(parameters, x))
+            Some(LabelProducts::new(parameters, function.eval_chunk_bits))
         } else {
             None
         };
@@ -542,7 +563,7 @@ impl ChainProgram {
         let smudge = SparseLwrPrf::build(
             &mut builder,
             profile,
-            PrfKeys::Shape(keys.smudge.clone()),
+            PrfKeys::Shape(keys.smudge.clone().with_data_tables()),
             LutOutputRepresentation::Coefficient,
         )?;
         root_prf(&smudge, &mut root_inputs);
@@ -552,22 +573,14 @@ impl ChainProgram {
         };
         let state = builder.input(AttributeKnowledge::PrivatePayload)?;
         root_inputs.insert(state, STATE_TAG.to_owned());
-        let x_wires = x
-            .iter()
-            .enumerate()
-            .map(|(bit, set)| {
-                builder
-                    .mul_small_constant(
-                        public.clone(),
-                        vec![1],
-                        IntExpr::constant((function.x_monomial)(bit, *set)),
-                    )
-                    .map(Operand::Scalar)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let x = builder.input_family(
+            IntExpr::constant(function.eval_chunk_bits),
+            AttributeKnowledge::PublicPayload,
+        )?;
+        root_inputs.insert(x, XBITS_TAG.to_owned());
         let y = builder.rhs_family(IntExpr::constant(function.obf_chunk_bits))?;
-        let new_state =
-            function.step(step).build(&mut builder, &StepWires { state, x: x_wires, y })?;
+        let data = builder.data_family(function.data.width, Some(function.data.bound))?;
+        let new_state = function.body.build(&mut builder, &StepWires { state, x, y, data })?;
         let mut outputs = ChainOutputs {
             private: None,
             public: None,
@@ -609,7 +622,7 @@ impl ChainProgram {
             let (sampler, packed) = PrfSampler::sign_polynomial(
                 &mut builder,
                 profile,
-                PrfKeys::Shape(sigma_shape),
+                PrfKeys::Shape(sigma_shape.with_data_tables()),
                 None,
             )?;
             root_prf(sampler.prf(), &mut root_inputs);
@@ -634,7 +647,7 @@ impl ChainProgram {
                 let cbd = PrfSampler::build(
                     &mut builder,
                     profile,
-                    PrfKeys::Shape(shape.clone()),
+                    PrfKeys::Shape(shape.clone().with_data_tables()),
                     PrfDistribution::Cbd { eta: 1 },
                 )?;
                 root_prf(cbd.prf(), &mut root_inputs);
@@ -651,7 +664,7 @@ impl ChainProgram {
                     AttributeKnowledge::PublicPayload,
                 )?;
                 root_inputs.insert(labels, LABEL_TAG.to_owned());
-                let transition = label_transition(parameters, x);
+                let transition = &plan.noise_transition;
                 let (rows, selected_columns) = match plan.noise_targets {
                     NoiseTargets::Full => {
                         (plan.label_rows, (0..=plan.label_width).collect::<Vec<_>>())
@@ -696,6 +709,7 @@ impl ChainProgram {
             cbd: cbd_sampler,
             smudge,
             y,
+            data,
         })
     }
 }
@@ -790,6 +804,7 @@ fn public_product(
 pub struct LabelProducts {
     seed: [u8; 32],
     width: usize,
+    chunks: usize,
     /// The leaf slots of every column: the label rows `m_v` (at least two), a bound on every
     /// column's selected-row count that holds by construction, so the forest multiplies exactly
     /// the selected rows without a bound that depends on the hashed selector table.
@@ -802,9 +817,12 @@ impl LabelProducts {
     /// Read a selected input row from its packed column, using structural bit positions.
     pub fn index(
         &self,
-        packed: mxx_dsl::Int,
+        columns: &mxx_dsl::Family<mxx_dsl::Int>,
+        chunk: mxx_dsl::Int,
+        column: mxx_dsl::Int,
         leaf: mxx_dsl::Int,
     ) -> Result<mxx_dsl::Int, mxx_dsl::DslError> {
+        let packed = columns.at(chunk.mul(self.width + 1).add(column));
         let mut index = mxx_dsl::Int::constant(0);
         for bit in 0..self.index_bits {
             index = index.add(
@@ -824,17 +842,18 @@ impl LabelProducts {
         &self,
         parameters: &Dio2Parameters,
         labels: &mxx_dsl::Family<mxx_dsl::Int>,
+        chunk: mxx_dsl::Int,
     ) -> Result<mxx_dsl::Family<mxx_dsl::Int>, mxx_dsl::DslError> {
         let width = parameters.label_width();
         let (packed_columns, counts) = self.columns();
         mxx_dsl::parallel(parameters.label_rows() * (width + 1), |member| {
             let row = member.clone().div(width + 1);
             let column = member.rem(width + 1);
-            let packed = packed_columns.at(column.clone());
-            let count = counts.at(column);
+            let count = counts.at(chunk.clone().mul(width + 1).add(column.clone()));
             let total =
                 mxx_dsl::iterate(self.max_leaves, mxx_dsl::Int::constant(0), |leaf, total| {
-                    let index = self.index(packed.clone(), leaf.clone())?;
+                    let index =
+                        self.index(&packed_columns, chunk.clone(), column.clone(), leaf.clone())?;
                     let value = labels.at(row.clone().mul(width + 1).add(index).add(1usize));
                     Ok(total.add(mxx_dsl::select(
                         leaf.less(count.clone()).to_int(),
@@ -846,10 +865,16 @@ impl LabelProducts {
     }
 
     /// Retain the fixed seed, without embedding the selector table.
-    pub fn new(parameters: &Dio2Parameters, x: &[bool]) -> Self {
+    pub fn new(parameters: &Dio2Parameters, eval_chunk_bits: usize) -> Self {
         let width = parameters.label_width();
         let index_bits = (usize::BITS - (width - 1).leading_zeros()) as usize;
-        Self { seed: label_transition_seed(x), width, max_leaves: width.max(2), index_bits }
+        Self {
+            seed: label_transition_seed(),
+            width,
+            chunks: 1usize.checked_shl(eval_chunk_bits as u32).expect("addressable chunks"),
+            max_leaves: width.max(2),
+            index_bits,
+        }
     }
 
     /// One shared public computation of all packed columns and their unpadded leaf counts.
@@ -857,17 +882,19 @@ impl LabelProducts {
         mxx_dsl::DslContext::new("dio2/label-columns").sha256_bit_columns(
             self.seed,
             self.width,
-            self.width + 1,
+            self.chunks * (self.width + 1),
             self.index_bits,
         )
     }
 }
 
-/// The label transition `D_x in {0,1}^(m_v x (m_v + 1))` of chunk `x` (spec §3): hashed from
-/// the chunk alone, shared by every step.
+/// The label transition `D_x` (spec §3): column block `val(x)` of the common row-major
+/// `m_v` by `2^c (m_v + 1)` bit matrix, shared by every step and selected little-endian.
 pub fn label_transition(parameters: &Dio2Parameters, x: &[bool]) -> Vec<Vec<bool>> {
     let width = parameters.label_width();
-    let seed = label_transition_seed(x);
+    let seed = label_transition_seed();
+    let columns = (1usize << x.len()) * (width + 1);
+    let base = super::function::chunk_value(x) * (width + 1);
     let mut cached_index = usize::MAX;
     let mut block = [0u8; 32];
     let mut bit = |index: usize| {
@@ -882,15 +909,12 @@ pub fn label_transition(parameters: &Dio2Parameters, x: &[bool]) -> Vec<Vec<bool
         let offset = index % 256;
         block[offset / 8] >> (offset % 8) & 1 == 1
     };
-    (0..width).map(|k| (0..=width).map(|c| bit(k * (width + 1) + c)).collect()).collect()
+    (0..width).map(|k| (0..=width).map(|c| bit(k * columns + base + c)).collect()).collect()
 }
 
-fn label_transition_seed(x: &[bool]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"mxx-io/dio2/label-transition/v1");
-    digest.update((x.len() as u64).to_le_bytes());
-    digest.update(x.iter().map(|bit| u8::from(*bit)).collect::<Vec<_>>());
-    digest.finalize().into()
+/// Fixed domain of the single row-major label bit matrix; chunks select column blocks.
+fn label_transition_seed() -> [u8; 32] {
+    Sha256::digest(b"mxx-io/dio2/label-transition/column-blocks/v1").into()
 }
 
 /// The next label matrix `A_(i+1) = A_i[:, 1..] D_x mod Q` in the clear.
@@ -923,6 +947,128 @@ mod tests {
     use crate::dio2::test_support::toy;
     use mxx_exponent_lut::rns_bgg::RnsBggDerivedWorkload;
 
+    /// All step rows and evaluator chunks share one Program identity per terminal kind.
+    #[test]
+    fn chain_program_id_is_independent_of_step_and_chunk() {
+        let (parameters, function) = toy();
+        let plan = StepPlan::new(&parameters, &function).unwrap();
+        let shape = |role: &str, members| {
+            parameters.prf.declared_shape(UNIFORM_SEED, role, members).unwrap()
+        };
+        for last in [false, true] {
+            let keys = ChainKeys {
+                sigma: (!last).then(|| shape("sigma", plan.ring_dimension)),
+                cbd: (!last).then(|| shape("cbd", plan.cbd_members())),
+                smudge: shape("smudge", plan.noise_smudge_members(last)),
+            };
+            let mut identity = None;
+            for step in 0..function.stream_length() {
+                let mut row_function = function.clone();
+                row_function.data = super::super::StepData::new(
+                    function.data.width,
+                    function.data.bound,
+                    vec![function.step_row(step).to_vec()],
+                )
+                .unwrap();
+                for chunk in 0..1usize << function.eval_chunk_bits {
+                    let program = if last {
+                        ChainProgram::last(&parameters, &row_function, &plan, &keys)
+                    } else {
+                        ChainProgram::refreshing(&parameters, &row_function, &plan, &keys)
+                    }
+                    .unwrap();
+                    let data = mxx_exponent_lut::program::ProgramData::new()
+                        .with(program.data, function.step_row(step).to_vec());
+                    assert_eq!(data.values(program.data).unwrap(), function.step_row(step));
+                    assert!(chunk < 1usize << function.eval_chunk_bits);
+                    if let Some(expected) = &identity {
+                        assert_eq!(program.program.id(), *expected);
+                    } else {
+                        identity = Some(program.program.id());
+                    }
+                    let xbits = program
+                        .root_inputs
+                        .iter()
+                        .find_map(|(wire, tag)| (tag == XBITS_TAG).then_some(*wire))
+                        .unwrap();
+                    assert!(matches!(
+                        program.program.inputs()[&xbits].shape(),
+                        mxx_exponent_lut::program::InputBinding::Family(_)
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The shared root-row/key operation produces the clear monomials for random chunks.
+    #[test]
+    fn xbits_rows_decode_to_monomials() {
+        use mxx_backends::{
+            MemoryArtifactStore,
+            authority::CpuExecution,
+            backend::poly::cpu_backend,
+            poly::{
+                Poly, PolyParams,
+                dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+            },
+        };
+        use mxx_exponent_lut::api::{StageExecution, StageGraph, execute_graph};
+        use rand::Rng;
+        let (_, function) = toy();
+        let bits =
+            std::env::var("MXX_IO_DIO2_XBITS").map_or(3, |value| value.parse::<usize>().unwrap());
+        assert!((1..usize::BITS as usize).contains(&bits));
+        let function = StreamingFunction::additive(1, bits, 1, function.state_layout);
+        let ring_dimension =
+            1u32.checked_shl(bits as u32 + function.state_layout.stride_log2).unwrap();
+        let crt_bits = std::env::var("MXX_IO_DIO2_XBITS_CRT_BITS")
+            .map_or(17, |value| value.parse::<usize>().unwrap());
+        let level = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 4, None, None);
+        let ring = mxx_dsl::Ring::from_crt_moduli(
+            level.to_crt().0.into_iter().map(Into::into).collect(),
+            ring_dimension,
+        );
+        let context = mxx_dsl::DslContext::new("xbits-test");
+        let chunk = context.input::<mxx_dsl::Int>(CHUNK_INPUT, mxx_dsl::IntType).unwrap();
+        let rows = xbits_rows(&function, ring.identity(1), chunk).unwrap();
+        let graph = context.output("rows", rows).unwrap().build().unwrap();
+        let mut execution = CpuExecution::new(cpu_backend([level.clone()]));
+        let maximum = (1usize << bits) - 1;
+        for chunk in [0, maximum, rand::rng().random_range(0..=maximum)] {
+            let result = execute_graph(
+                StageGraph::new(
+                    mxx_dsl::BuiltGraph { graph: graph.graph.clone() },
+                    BTreeMap::from([(
+                        CHUNK_INPUT.to_owned(),
+                        mxx_backends::RuntimeValue::Int(chunk.into()),
+                    )]),
+                    BTreeMap::new(),
+                ),
+                &mxx_ir_core::ParamEnv::default(),
+                &mut execution,
+                &mut MemoryArtifactStore::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let mxx_backends::RuntimeValue::IndexedFamily { values, .. } = &result.outputs["rows"]
+            else {
+                panic!("matrix family")
+            };
+            assert_eq!(values.len(), bits);
+            for (bit, value) in values.iter().enumerate() {
+                let row = <CpuExecution as StageExecution<MemoryArtifactStore>>::download_matrix(
+                    &execution, value,
+                )
+                .unwrap();
+                let expected = DCRTPoly::const_rotate_poly(
+                    &level,
+                    ((chunk >> bit) & 1) * (1usize << bit) * function.state_layout.stride(),
+                );
+                assert_eq!(mxx_backends::matrix::PolyMatrix::entry(&row, 0, 0), expected);
+            }
+        }
+    }
+
     /// All digit counts use the same packed Program output and output identifiers.
     #[test]
     fn test_smudge_digits_share_one_program_output() {
@@ -939,8 +1085,7 @@ mod tests {
                     .declared_shape(0, "smudge", plan.output_smudge_members())
                     .unwrap(),
             };
-            let program =
-                ChainProgram::last(&parameters, &function, &plan, 1, &[false], &keys).unwrap();
+            let program = ChainProgram::last(&parameters, &function, &plan, &keys).unwrap();
             let outputs = (program.outputs.smudge, program.program.outputs().to_vec());
             if let Some(expected) = &expected {
                 assert_eq!(&outputs, expected);
@@ -959,7 +1104,7 @@ mod tests {
             cbd: None,
             smudge: parameters.prf.declared_shape(0, "oversized", usize::MAX).unwrap(),
         };
-        let program = ChainProgram::last(&parameters, &function, &plan, 1, &[false], &keys)
+        let program = ChainProgram::last(&parameters, &function, &plan, &keys)
             .expect("symbolic PRF selector table");
         assert!(
             program
@@ -995,12 +1140,17 @@ mod tests {
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
-                let products = LabelProducts::new(&parameters, &[chunk]);
+                let products = LabelProducts::new(&parameters, 1);
                 let graph = DslContext::new("dio2-symbolic-labels");
                 let input =
                     graph.int_family_input("labels", height * (parameters.label_width() + 1));
                 let graph = graph
-                    .output("next", products.next(&parameters, &input).unwrap())
+                    .output(
+                        "next",
+                        products
+                            .next(&parameters, &input, mxx_dsl::Int::constant(usize::from(chunk)))
+                            .unwrap(),
+                    )
                     .unwrap()
                     .build()
                     .unwrap();
@@ -1038,22 +1188,94 @@ mod tests {
         assert!(node_counts.iter().max().unwrap() < &(node_counts[0] * 2));
     }
 
-    /// Caching a transition hash block preserves the original per-bit hash expansion, including
-    /// block boundaries and rows that straddle them.
+    /// One unchanged graph selects random multi-bit chunks from one SHA-256 column recipe.
+    #[test]
+    fn chunk_label_columns_match_clear_transition() {
+        use mxx_backends::{
+            MemoryArtifactStore, RuntimeValue, authority::CpuExecution, backend::poly::cpu_backend,
+        };
+        use mxx_dsl::DslContext;
+        use mxx_exponent_lut::api::{StageExecution, StageGraph, execute_graph};
+        use rand::Rng;
+        let bits = std::env::var("MXX_IO_DIO2_LABEL_CHUNK_BITS")
+            .map_or(3usize, |value| value.parse().unwrap());
+        let (parameters, _) = toy();
+        let labels = (0..parameters.label_rows())
+            .map(|_| {
+                (0..=parameters.label_width())
+                    .map(|_| rand::rng().random_range(0..parameters.label_modulus()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let graph = DslContext::new("chunk-label-columns");
+        let chunk = graph.input::<mxx_dsl::Int>(CHUNK_INPUT, mxx_dsl::IntType).unwrap();
+        let input = graph
+            .int_family_input("labels", parameters.label_rows() * (parameters.label_width() + 1));
+        let products = LabelProducts::new(&parameters, bits);
+        let graph = graph
+            .output("next", products.next(&parameters, &input, chunk).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let recipes = graph
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter(|node| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::Sha256BitColumns { .. })
+            })
+            .count();
+        assert_eq!(recipes, 1);
+        let mut execution = CpuExecution::new(cpu_backend(parameters.rings().unwrap()));
+        for chunk in [0, (1usize << bits) - 1, rand::rng().random_range(0..1usize << bits)] {
+            let runtime = BTreeMap::from([
+                (
+                    "labels".to_owned(),
+                    RuntimeValue::integer_values(
+                        labels.iter().flatten().copied().map(num_bigint::BigInt::from).collect(),
+                    ),
+                ),
+                (CHUNK_INPUT.to_owned(), RuntimeValue::Int(chunk.into())),
+            ]);
+            let output = execute_graph(
+                StageGraph::new(
+                    mxx_dsl::BuiltGraph { graph: graph.graph.clone() },
+                    runtime,
+                    BTreeMap::new(),
+                ),
+                &mxx_ir_core::ParamEnv::default(),
+                &mut execution,
+                &mut MemoryArtifactStore::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let actual = <CpuExecution as StageExecution<MemoryArtifactStore>>::download_integers(
+                &execution,
+                &output.outputs["next"],
+            )
+            .unwrap();
+            let x = (0..bits).map(|bit| (chunk >> bit) & 1 == 1).collect::<Vec<_>>();
+            let expected = next_labels(&parameters, &labels, &x)
+                .into_iter()
+                .flatten()
+                .map(num_bigint::BigInt::from)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// Column blocks share a single row-major hash expansion, including block boundaries.
     #[test]
     fn label_transition_preserves_hash_expansion() {
         let (mut parameters, _) = toy();
         parameters.prf.lwr_dimension = 8;
         let x = [true];
         let width = parameters.label_width();
-        let mut digest = Sha256::new();
-        digest.update(b"mxx-io/dio2/label-transition/v1");
-        digest.update((x.len() as u64).to_le_bytes());
-        digest.update(x.map(u8::from));
-        let seed: [u8; 32] = digest.finalize().into();
+        let seed = label_transition_seed();
         for (row, values) in label_transition(&parameters, &x).iter().enumerate() {
             for (column, value) in values.iter().enumerate() {
-                let index = row * (width + 1) + column;
+                let index = row * (2 * (width + 1)) + width + 1 + column;
                 let mut digest = Sha256::new();
                 digest.update(seed);
                 digest.update(((index / 256) as u64).to_le_bytes());
@@ -1077,8 +1299,7 @@ mod tests {
             cbd: Some(shape("cbd", plan.cbd_members())),
             smudge: shape("smudge", plan.smudge_members()),
         };
-        let program =
-            ChainProgram::refreshing(&parameters, &function, &plan, 0, &[true], &keys).unwrap();
+        let program = ChainProgram::refreshing(&parameters, &function, &plan, &keys).unwrap();
         assert!(program.outputs.labels.is_empty());
         assert!(program.label_products.is_some());
         assert!(plan.targets.iter().all(|target| !matches!(target, Target::Label { .. })));

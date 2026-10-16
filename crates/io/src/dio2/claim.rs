@@ -452,8 +452,11 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                 read.extend([coefficient, exponent]);
             }
             if step + 1 < x.len() {
-                labels = LabelProducts::new(self.parameters(), chunk)
-                    .next(self.parameters(), &labels)?;
+                labels = LabelProducts::new(self.parameters(), function.eval_chunk_bits).next(
+                    self.parameters(),
+                    &labels,
+                    Int::constant(super::function::chunk_value(chunk) as i64),
+                )?;
             }
         }
         // Every selector row is one-hot.
@@ -500,7 +503,22 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             let y = (0..obf)
                 .map(|bit| bits.at(Int::constant((step * obf + bit) as i64)))
                 .collect::<Vec<_>>();
-            state = function.step(step).ideal(state, chunk, &y)?;
+            let row = mxx_dsl::parallel(function.data.width, |entry| {
+                mxx_dsl::select(
+                    entry,
+                    function
+                        .step_row(step)
+                        .iter()
+                        .map(|value| Int::constant(*value as i64))
+                        .collect(),
+                )
+            })?;
+            state = function.body.ideal(
+                &row,
+                state,
+                Int::constant(super::function::chunk_value(chunk) as i64),
+                &y,
+            )?;
         }
         let ideal = IdealSpec::new(ideal.output("state", state)?.build()?.graph)
             .map_err(ApiError::scheme)?;

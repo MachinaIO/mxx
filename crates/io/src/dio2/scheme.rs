@@ -156,11 +156,6 @@ pub(crate) fn chunk_index(bits: &[bool]) -> usize {
     bits.iter().enumerate().map(|(bit, set)| usize::from(*set) << bit).sum()
 }
 
-/// The chunk of index `index`.
-fn chunk_bits(index: usize, bits: usize) -> Vec<bool> {
-    (0..bits).map(|bit| index >> bit & 1 == 1).collect()
-}
-
 /// `X^exponent` in the negacyclic ring of `parameters`.
 fn monomial(parameters: &DCRTPolyParams, exponent: usize) -> DCRTPoly {
     let dimension = parameters.ring_dimension() as usize;
@@ -342,12 +337,10 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             let chain = parameters.chain(&root)?;
             let mut step_material = Vec::with_capacity(chunks);
             for chunk in 0..chunks {
-                let x = chunk_bits(chunk, function.eval_chunk_bits);
                 let material = self.preprocess(
                     function,
                     &plan,
                     &input.y[step],
-                    &x,
                     keys.get(chunk),
                     (step, chunk),
                     &hash_key,
@@ -618,7 +611,6 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         function: &StreamingFunction,
         plan: &StepPlan,
         y: &[bool],
-        x: &[bool],
         keys: Option<&ChunkKeys>,
         (step, chunk): (usize, usize),
         hash_key: &[u8; 32],
@@ -626,42 +618,22 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         payload: &RnsBggPayloadSecret,
         last: bool,
     ) -> Result<StepMaterial, Dio2Error> {
-        let shape = |layouts: &[PbcGeneratedKeyLayout]| {
-            mxx_exponent_lut::program_gadgets::prf::PrfKeyShape::new(
-                &layouts.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>(),
-            )
+        let shape = |role: &str, members| {
+            self.parameters
+                .prf
+                .declared_shape(super::step::UNIFORM_SEED, role, members)
+                .map_err(|error| Dio2Error::Api(ApiError::scheme(error)))
         };
-        let shape_or_declare =
-            |role: &str, members, layouts: Option<&[PbcGeneratedKeyLayout]>| match layouts {
-                Some(layouts) => shape(layouts).map_err(Dio2Error::from),
-                None => self
-                    .parameters
-                    .prf
-                    .declared_shape(chunk as u64, role, members)
-                    .map_err(|error| Dio2Error::Api(ApiError::scheme(error))),
-            };
         let smudge_keys = keys.map(|keys| if last { &keys.output[..] } else { &keys.smudge[..] });
         let chain_keys = ChainKeys {
-            sigma: (!last)
-                .then(|| {
-                    shape_or_declare("sigma", plan.ring_dimension, keys.map(|keys| &keys.sigma[..]))
-                })
-                .transpose()?,
-            cbd: (!last)
-                .then(|| {
-                    shape_or_declare("cbd", plan.cbd_members(), keys.map(|keys| &keys.cbd[..]))
-                })
-                .transpose()?,
-            smudge: shape_or_declare(
-                if last { "output" } else { "smudge" },
-                plan.noise_smudge_members(last),
-                smudge_keys,
-            )?,
+            sigma: (!last).then(|| shape("sigma", plan.ring_dimension)).transpose()?,
+            cbd: (!last).then(|| shape("cbd", plan.cbd_members())).transpose()?,
+            smudge: shape(if last { "output" } else { "smudge" }, plan.noise_smudge_members(last))?,
         };
         let program = if last {
-            ChainProgram::last(&self.parameters, function, plan, step, x, &chain_keys)?
+            ChainProgram::last(&self.parameters, function, plan, &chain_keys)?
         } else {
-            ChainProgram::refreshing(&self.parameters, function, plan, step, x, &chain_keys)?
+            ChainProgram::refreshing(&self.parameters, function, plan, &chain_keys)?
         };
         let level = chain_parameters.level(0)?.clone();
         let mut rhs: PlaintextInputs<RhsId, DCRTPoly> = BTreeMap::from([(
@@ -673,7 +645,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
                     .collect(),
             ),
         )]);
-        let mut data = ProgramData::new();
+        let mut data = ProgramData::new().with(program.data, function.step_row(step).to_vec());
         let mut merge = |(more, tables): (PlaintextInputs<RhsId, DCRTPoly>, ProgramData),
                          ids: &[mxx_exponent_lut::program::DataId]| {
             rhs.extend(more);
@@ -822,6 +794,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         if self.inputs_by_shape {
             builder = builder.with_inputs_by_shape();
         }
+        builder.bind_runtime_input(super::step::CHUNK_INPUT, RuntimeValue::Int(chunk.into()));
         if material.program.label_products.is_some() {
             if !self.inputs_by_shape {
                 builder.bind_runtime_input(

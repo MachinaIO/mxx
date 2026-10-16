@@ -93,8 +93,10 @@ move to a modulus that divides `Q_{l+1}`.
 ## 3. Parameters and the public function
 
 - Streaming shape: `state_bits`, `obf_chunk_bits`, `eval_chunk_bits`, `stream_length`.
-- **Step programs.** For each `i < stream_length`, a Static `ExponentLutProgram` `Π_i` with this
-  fixed interface:
+- **Uniform step program.** All `i < stream_length` share one Static `ExponentLutProgram`
+  body `Π`, with the same wires, LUT registrations, layouts and data-family shapes. Per-step
+  behavior is data: one public bounded integer row per step, bound to the body's data family.
+  The fixed interface is:
   - input `state`: a private scalar of exponent layout `L_z` with `2^state_bits ≤ 2^{width_log2(L_z)}`;
   - input `xbits`: a public family of `eval_chunk_bits` members;
   - an RHS family `yrhs`, with plaintexts `Enc_i(y_i)` given by a public encoder of the function
@@ -102,8 +104,11 @@ move to a modulus that divides `Q_{l+1}`.
   - output `new_state`: the output of an exponent LUT of layout `L_z` (a signed monomial), plus the
     optional public output wires of §8.
 
-  Distinct steps may share one `Π`. `Π_i` may read only these inputs, so its keys and
-  preprocessing are independent of the evaluation path.
+  The body may read only these inputs and the selected integer row, so its keys and
+  preprocessing are independent of the preceding evaluation path. There are two uniform
+  enclosing Programs: the refreshing kind and the final-output kind; neither specializes its
+  instructions on the step index or evaluator chunk. PRF coordinate tables and selectors are
+  data under one declared key shape per role, not concrete-key commitments in the Program.
 - **Initial state.** `z_0` is chosen by the obfuscator and kept secret.
 - **Lattice parameters.**
   - Ring dimension `n`, base `B`, and the prime set `P` with `Q_0 = ∏ P`.
@@ -113,8 +118,13 @@ move to a modulus that divides `Q_{l+1}`.
   - The sparse-LWR profile (`SparseLwrPrfProfile`): layout, so `Q := Q_exp` (a power of two),
     output modulus `P_out`, LWR dimension `v := ν`, support weight `h`, and the bucket width.
   - `m_v = v log2 Q`.
-- **Label transition.** `D_x = HashBits(hk, "dio2/D", x) ∈ {0,1}^{m_v × (m_v + 1)}`, one matrix per
-  `x ∈ {0,1}^eval_chunk_bits`, shared by every step.
+- **Label transition.** Let `c = eval_chunk_bits` and interpret `x` little-endian. Expand one
+  fixed-domain SHA-256 bit matrix with `m_v` rows and `2^c (m_v + 1)` columns. `D_x` is its
+  column block `x (m_v + 1) .. (x + 1) (m_v + 1)`, shared by every step. Concretely the seed is
+  `SHA256("mxx-io/dio2/label-transition/column-blocks/v1")`; consecutive blocks are
+  `SHA256(seed || u64_le(block_index))`. Bits are read least-significant-bit first in each
+  byte and row-major across the full matrix, not separately hashed per chunk. The DSL retains
+  one constant `Sha256BitColumns` recipe; runtime `x` selects its packed column blocks.
 - **Refresh parameters.**
   - The `TopReference` with `top = next = P`: `Δ_0 = 1` and `G^st_0 = G_{Q_0}` (decision §4.1).
   - The chain depths `depths` of every step chain, with `depths[0] = depths[1] = |P|`.
@@ -336,13 +346,16 @@ preprocessing never depends on the path `x_0 … x_{i−1}`.
 
 ### 6.1 Evaluator bits (proposal step 2)
 
-`XB[b] := mono(x_b) · ONEPUB` for `b < eval_chunk_bits`: a public exponent encoding of `x_b` with
-key `mono(x_b) A'_{i,pub}` and the clear plaintext `mono(x_b)`, which the evaluator attaches. The
+`XB[b] := X^(x_monomial(b, x_b)) · ONEPUB` for `b < eval_chunk_bits`: a public exponent encoding
+with key `X^(x_monomial(b, x_b)) A'_{i,pub}` and that same clear monomial as plaintext. The
+evaluator constructs this family outside `Π` from the public chunk value. One shared graph
+helper applies `multiply_monomial(exponent)` to both the ONEPUB row and its key blocks. The
 exponent form is the default because `MulPublic` accepts only exponent operands (Program
 validation, `crates/exponent-lut/src/program/mod.rs`). A coefficient bit `x_b · ONEPUB`, with key
 `x_b A'_{i,pub}` (the zero row when `x_b = 0`), is allowed only where `Π_i` reads it outside
-`MulPublic`. `P_{i,x}` denotes `Π_i` with these bits fixed. The keys depend on `x`, which is
-allowed because preprocessing is per `(i, x)`.
+`MulPublic`. `P_{i,x}` denotes the common `Π` with its step row and `xbits` inputs bound as data,
+not a Program rebuilt with those bits fixed. The keys depend on `x`, which is allowed because
+preprocessing is per `(i, x)`; the Program identity and declared key shapes do not.
 
 ### 6.2 State transition (proposal step 3)
 

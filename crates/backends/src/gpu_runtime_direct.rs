@@ -190,11 +190,12 @@ use crate::{
     session::{ArtifactHandle, SessionDescriptor, SessionStore},
 };
 use mxx_ir_core::{
-    FrozenGraphScopeId, NodeId, ValidatedGraph,
+    FrozenGraphScopeId, NodeId, ParamEnv, ValidatedGraph,
     artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash},
     visualize::NodeCost,
 };
 use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -898,8 +899,8 @@ impl DirectGraph {
                 GpuPlanError::GraphCompile("external-I/O carry tail exceeds its body".into())
             })?;
             if tail_start < start ||
-                region.carried_ids.is_empty() ||
-                region.carry_copy_ops.is_empty() ||
+                (region.streamed_carries.is_empty() &&
+                    (region.carried_ids.is_empty() || region.carry_copy_ops.is_empty())) ||
                 region.carried_ids.iter().any(|id| !frame.owners.contains_key(id)) ||
                 region.carry_copy_ops.iter().enumerate().any(|(position, &copy)| {
                     copy as usize != tail_start + position ||
@@ -1988,6 +1989,8 @@ pub struct GpuRuntime {
     /// by index slot: a nested loop's host-selected member may depend on the
     /// indices of the loops enclosing it.
     host_loop_indices: BTreeMap<u32, u64>,
+    /// Observer-visible iteration state and a fresh private production for each execution.
+    carry_state: Arc<std::sync::RwLock<crate::gpu_streamed_carry::CarryRuntimeState>>,
 }
 
 /// The limit and measurements of one I/O trial execute.
@@ -2057,6 +2060,15 @@ impl GpuRuntime {
             measured_costs: GpuMeasuredCostCache::default(),
             io_trial: None,
             host_loop_indices: BTreeMap::new(),
+            carry_state: Arc::new(std::sync::RwLock::new(
+                crate::gpu_streamed_carry::CarryRuntimeState {
+                    scratch: ProductionId {
+                        spec_hash: mxx_ir_core::artifact::SpecHash([0; 32]),
+                        execution_nonce: rand::random(),
+                    },
+                    indices: BTreeMap::new(),
+                },
+            )),
             region_launch_seconds: BTreeMap::new(),
         })
     }
@@ -3348,7 +3360,7 @@ impl GpuRuntime {
             .ok_or_else(|| GpuRuntimeError::Artifact("producer I/O window is zero".into()))?;
         // Only a graph that exports artifacts is a producer with a durable
         // session; a consumer that only imports reads the store directly.
-        if plan.frame.export_templates.is_empty() {
+        if plan.frame.export_templates.iter().all(|template| template.scratch) {
             return with_transient_io_pump(store, window, |pump| {
                 self.execute_io(plan, &inputs, execution_nonce, pump, None)
             })
@@ -3385,8 +3397,8 @@ impl GpuRuntime {
     }
 
     /// Run a plan whose artifacts go through `pump`. `persist` names the
-    /// production and manifest whose exports are written and finalized;
-    /// without it nothing is written, as for a consumer or a finalized replay.
+    /// production and manifest whose public exports are written and finalized.
+    /// Private carry generations are written and removed even without persistence.
     fn execute_io<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
         plan: &mut GpuExecutionPlan,
@@ -3396,17 +3408,31 @@ impl GpuRuntime {
         persist: Option<(ProductionId, Manifest)>,
     ) -> Result<GpuExecutionPayload, GpuRuntimeError> {
         let frame = FrameGeneration::new(0, plan.completed_runs);
-        let all = match &persist {
-            Some((production, manifest)) => {
-                planned_export_slots(&plan.frame, manifest, production, frame)?
-            }
-            None => Vec::new(),
+        let scratch = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash(
+                sha2::Sha256::digest(b"mxx/gpu-streamed-carry/v1").into(),
+            ),
+            execution_nonce: rand::random(),
         };
+        {
+            let mut state = self
+                .carry_state
+                .write()
+                .map_err(|_| GpuRuntimeError::Execution("carry state lock poisoned".into()))?;
+            state.scratch = scratch.clone();
+            state.indices.clear();
+        }
+        let all = planned_export_slots(
+            &plan.frame,
+            persist.as_ref().map(|(production, manifest)| (manifest, production)),
+            &scratch,
+            frame,
+        )?;
         // Streamed members are written by the waves that produce them; the
         // observer watches the other slots.
         let mut planned = Vec::with_capacity(all.len());
         let mut streamed = BTreeMap::new();
-        for (index, slot) in all.into_iter().enumerate() {
+        for (index, slot) in all {
             if plan.frame.export_templates[index].streamed {
                 streamed.insert(index, slot);
             } else {
@@ -3414,8 +3440,13 @@ impl GpuRuntime {
             }
         }
         pump.set_streamed_exports(streamed);
-        let requests =
-            planned_import_requests(&self.backend, &plan.frame, frame, self.io_trial.as_ref())?;
+        let requests = planned_import_requests(
+            &self.backend,
+            &plan.frame,
+            frame,
+            self.io_trial.as_ref(),
+            Arc::clone(&self.carry_state),
+        )?;
         let observing = !planned.is_empty() || !requests.is_empty();
         let io_started = Instant::now();
         if observing {
@@ -3429,17 +3460,43 @@ impl GpuRuntime {
         let run = self
             .start_imports(plan, &mut Some(&mut *pump), root_imports, None, &mut BTreeMap::new())
             .and_then(|()| self.execute_waves(plan, inputs, execution_nonce, Some(pump)));
+        let mut scratch_families = plan
+            .frame
+            .external_io_loops
+            .iter()
+            .flat_map(|body| &body.streamed_carries)
+            .map(|carry| (carry.name.clone(), carry.count))
+            .collect::<BTreeMap<_, _>>();
+        for site in plan.frame.export_templates.iter().filter(|site| site.scratch) {
+            let count = site.index.ok_or_else(|| {
+                GpuRuntimeError::Artifact("scratch export has no member index".into())
+            })? + 1;
+            scratch_families
+                .entry(site.name.clone())
+                .and_modify(|previous| *previous = (*previous).max(count))
+                .or_insert(count);
+        }
         let run_finished = Instant::now();
         let trial = self.io_trial.is_some();
-        if observing {
-            let observed = pump
-                .finish_observer(run.is_ok())
-                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()));
-            if let Err(error) = observed {
-                plan.poisoned = true;
-                return Err(error);
-            }
+        let observed = if observing {
+            pump.finish_observer(run.is_ok())
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))
+        } else {
+            Ok(())
+        };
+        let cleanup = scratch_families.into_iter().try_for_each(|(name, count)| {
+            pump.remove_staged(
+                frame,
+                ArtifactKey { production: scratch.clone(), name, index: Some(0) },
+                2 * count,
+            )
+            .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))
+        });
+        if let Err(error) = observed {
+            plan.poisoned = true;
+            return Err(error);
         }
+        let run = run.and_then(|result| cleanup.map(|()| result));
         let exports_drained = Instant::now();
         let result = run?;
         let persisted = persist.is_some() && !trial;
@@ -3519,6 +3576,8 @@ impl GpuRuntime {
     /// `host_loop` is the host-driven loop whose body this range is, not
     /// entered again at its own start. `static_imports` is false after its
     /// first iteration: a loop's fixed imports are read once.
+    /// Selected imports are joined only in the range that issued their request;
+    /// a nested replay must not consume the same completion a second time.
     #[allow(clippy::too_many_arguments)]
     fn run_region_range<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
@@ -3546,8 +3605,35 @@ impl GpuRuntime {
         let mut region = interval.start;
         while region < interval.end {
             let operation = plan.graph.regions[region].start_operation;
+            let selected = plan
+                .frame
+                .external_io_imports
+                .iter()
+                .chain(plan.frame.external_io_loops.iter().flat_map(|body| &body.imports));
+            for import in selected.filter(|import| {
+                import.before_operation == operation &&
+                    (start..operation).contains(&import.request_operation)
+            }) {
+                let pump = pump.as_deref_mut().ok_or_else(|| {
+                    GpuRuntimeError::Artifact("selected import has no I/O pump".into())
+                })?;
+                self.finish_selected_import(
+                    plan,
+                    pump,
+                    FrameGeneration::new(0, plan.completed_runs),
+                    import,
+                )?;
+            }
+            let entering_host =
+                plan.frame.external_io_loops.iter().enumerate().position(|(index, body)| {
+                    body.body_start == operation &&
+                        host_loop != Some(index) &&
+                        !self.host_loop_indices.contains_key(&body.index_slot) &&
+                        body.body_end <= end
+                });
             let candidate = groups.iter().enumerate().find(|(_, group)| {
-                nested(group, operation) &&
+                entering_host.is_none() &&
+                    nested(group, operation) &&
                     match (group.parent_template, active_wave) {
                         (None, None) => true,
                         (Some((site, _)), Some(parent)) => {
@@ -3621,26 +3707,10 @@ impl GpuRuntime {
                 region = plan.graph.region_interval(group.body_start, group.body_end)?.end;
                 continue;
             }
-            if groups.iter().any(|group| nested(group, operation)) {
+            if entering_host.is_none() && groups.iter().any(|group| nested(group, operation)) {
                 return Err(GpuRuntimeError::Execution(
                     "wave region has no reached parent invocation".into(),
                 ));
-            }
-            let frame = FrameGeneration::new(0, plan.completed_runs);
-            // Every selected import of this range's scope planned at this
-            // boundary: of the root or a wave lane, or of the host-driven
-            // loop whose body this range is. Its request was issued once in
-            // this scope, so it finishes here, before a nested loop that
-            // starts here and consumes it.
-            let selected = match host_loop {
-                None => &plan.frame.external_io_imports,
-                Some(loop_index) => &plan.frame.external_io_loops[loop_index].imports,
-            };
-            for import in selected.iter().filter(|import| import.before_operation == operation) {
-                let pump = pump.as_deref_mut().ok_or_else(|| {
-                    GpuRuntimeError::Artifact("selected import has no I/O pump".into())
-                })?;
-                self.finish_selected_import(plan, pump, frame, import)?;
             }
             // The outermost host-driven loop starting here inside this range,
             // other than the one whose body this range is. Loops are sorted
@@ -3648,13 +3718,7 @@ impl GpuRuntime {
             // enclosing loop that starts here too ends after this range, so a
             // loop starting with its body's first operation is entered from
             // that body.
-            if let Some(loop_index) =
-                plan.frame.external_io_loops.iter().enumerate().position(|(index, loop_body)| {
-                    loop_body.body_start == operation &&
-                        host_loop != Some(index) &&
-                        loop_body.body_end <= end
-                })
-            {
+            if let Some(loop_index) = entering_host {
                 let loop_body = &plan.frame.external_io_loops[loop_index];
                 let (body_start, body_end, count, slot) = (
                     loop_body.body_start,
@@ -3673,6 +3737,13 @@ impl GpuRuntime {
                 }
                 for iteration in 0..iterations {
                     self.host_loop_indices.insert(slot, iteration);
+                    self.carry_state
+                        .write()
+                        .map_err(|_| {
+                            GpuRuntimeError::Execution("carry state lock poisoned".into())
+                        })?
+                        .indices
+                        .insert(slot, iteration);
                     let iteration_started = Instant::now();
                     index_owner
                         .upload_u64(&[iteration])
@@ -3704,6 +3775,11 @@ impl GpuRuntime {
                     }
                 }
                 self.host_loop_indices.remove(&slot);
+                self.carry_state
+                    .write()
+                    .map_err(|_| GpuRuntimeError::Execution("carry state lock poisoned".into()))?
+                    .indices
+                    .remove(&slot);
                 region = plan.graph.region_interval(body_start, body_end)?.end;
                 continue;
             }
@@ -3862,7 +3938,54 @@ impl GpuRuntime {
             // wave reuses their slots.
             if let Some(pump) = pump.as_deref_mut() {
                 for template in plan.frame.waves[wave_index].streamed_exports.clone() {
-                    pump.export_streamed(template)
+                    let site = &plan.frame.export_templates[template];
+                    let key = if site.scratch {
+                        let mut index = site.index.ok_or_else(|| {
+                            GpuRuntimeError::Artifact("scratch export has no member".into())
+                        })?;
+                        if let Some((_, base)) = &site.member_base {
+                            let env = ParamEnv {
+                                loop_indices: self
+                                    .host_loop_indices
+                                    .iter()
+                                    .map(|(&slot, &value)| (slot, BigInt::from(value)))
+                                    .collect(),
+                                ..ParamEnv::default()
+                            };
+                            let base = base
+                                .evaluate(&env)
+                                .map_err(|error| {
+                                    GpuRuntimeError::Artifact(format!(
+                                        "scratch export {} with host indices {:?}: {error}",
+                                        site.name, self.host_loop_indices
+                                    ))
+                                })?
+                                .to_usize()
+                                .ok_or_else(|| {
+                                    GpuRuntimeError::Artifact(
+                                        "scratch member base exceeds usize".into(),
+                                    )
+                                })?;
+                            index = index.checked_add(base).ok_or_else(|| {
+                                GpuRuntimeError::Artifact("scratch member index overflows".into())
+                            })?;
+                        }
+                        Some(ArtifactKey {
+                            production: self
+                                .carry_state
+                                .read()
+                                .map_err(|_| {
+                                    GpuRuntimeError::Execution("carry state lock poisoned".into())
+                                })?
+                                .scratch
+                                .clone(),
+                            name: site.name.clone(),
+                            index: Some(index),
+                        })
+                    } else {
+                        None
+                    };
+                    pump.export_streamed(template, key)
                         .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
                 }
             }
@@ -3969,8 +4092,53 @@ impl GpuRuntime {
     ) -> Result<(), GpuRuntimeError> {
         let frame = FrameGeneration::new(0, plan.completed_runs);
         for index in templates {
-            let template = &plan.frame.import_templates[index];
+            let mut template = plan.frame.import_templates[index].clone();
             let mut key = template.key.clone();
+            if let Some((slot, base)) = template.base {
+                if !indices.contains_key(&base) {
+                    let publication = &plan.frame.slots[slot];
+                    let ready = publication.ready()?.ok_or_else(|| {
+                        GpuRuntimeError::Artifact("runtime Zip base was not published".into())
+                    })?;
+                    if ready.header.flags & crate::poly::dcrt::gpu::GPU_EXPORT_SLOT_SUPPRESSED != 0
+                    {
+                        return Err(GpuRuntimeError::Artifact(
+                            "runtime Zip base arithmetic failed".into(),
+                        ));
+                    }
+                    let crate::poly::dcrt::gpu::GpuExportPayload::Host(bytes) = ready.payload
+                    else {
+                        return Err(GpuRuntimeError::Artifact(
+                            "runtime Zip base is not host-mapped".into(),
+                        ));
+                    };
+                    let [crate::gpu_execution_plan::PhysicalEncoding::Signed(encoding)] =
+                        plan.frame.program.values[base.0 as usize].encodings.as_ref()
+                    else {
+                        return Err(GpuRuntimeError::Artifact(
+                            "runtime Zip base is not a scalar integer".into(),
+                        ));
+                    };
+                    let value =
+                        decode_signed_words(*encoding, bytes).map_err(GpuRuntimeError::Artifact)?;
+                    indices.insert(base, vec![value]);
+                    unsafe { publication.reset_after_completion() }?;
+                }
+                let base = indices[&base][0].to_usize().ok_or_else(|| {
+                    GpuRuntimeError::Artifact(
+                        "runtime Zip base is negative or exceeds usize".into(),
+                    )
+                })?;
+                let member = key.index.unwrap_or(0).checked_add(base).ok_or_else(|| {
+                    GpuRuntimeError::Artifact("runtime Zip member overflows".into())
+                })?;
+                if template.descriptor.family_count.is_none_or(|count| member as u128 >= count) {
+                    return Err(GpuRuntimeError::Artifact(
+                        "runtime Zip member is outside its family".into(),
+                    ));
+                }
+                key.index = Some(member);
+            }
             if let Some((family, position)) = template.member {
                 if !indices.contains_key(&family) {
                     let owner = plan.frame.owners.get(&family).ok_or_else(|| {
@@ -3992,6 +4160,23 @@ impl GpuRuntime {
                     },
                 )?);
             }
+            if let Some(family) = &template.carry {
+                let state = self
+                    .carry_state
+                    .read()
+                    .map_err(|_| GpuRuntimeError::Execution("carry state lock poisoned".into()))?;
+                let (resolved, descriptor, staged) = family
+                    .resolve(key.index.unwrap_or(0), &self.host_loop_indices, &state.scratch)
+                    .map_err(|error| {
+                        GpuRuntimeError::Artifact(format!(
+                            "scratch import {} at operation {} with host indices {:?}: {error}",
+                            key.name, template.before_operation, self.host_loop_indices
+                        ))
+                    })?;
+                key = resolved;
+                template.descriptor = descriptor;
+                template.staged = staged;
+            }
             let destination = wave
                 .and_then(|wave| plan.frame.waves[wave].owner_bindings.get(&template.destination))
                 .or_else(|| plan.frame.owners.get(&template.destination))
@@ -4005,7 +4190,7 @@ impl GpuRuntime {
             // destination, and its next use is its first consumer, which
             // waits for this import.
             unsafe {
-                start_import(&self.backend, pump, frame, template, key, destination, emulated_load)
+                start_import(&self.backend, pump, frame, &template, key, destination, emulated_load)
             }
             .map_err(GpuRuntimeError::Artifact)?;
         }
@@ -4166,6 +4351,7 @@ fn planned_import_requests(
     frame: &PhysicalFrame,
     generation: FrameGeneration,
     trial: Option<&IoTrial>,
+    carry_state: Arc<std::sync::RwLock<crate::gpu_streamed_carry::CarryRuntimeState>>,
 ) -> Result<Vec<crate::gpu_runtime_io::PlannedImportRequest>, GpuRuntimeError> {
     frame
         .external_io_imports
@@ -4199,7 +4385,10 @@ fn planned_import_requests(
                 upload_owner: import.upload_owner.clone(),
                 member: None,
                 read_ahead: false,
+                carry: import.carry.clone(),
+                base: None,
             };
+            let state = Arc::clone(&carry_state);
             let (backend, destination) =
                 (backend.clone(), frame.owners.get(&import.destination).cloned());
             Ok(crate::gpu_runtime_io::PlannedImportRequest {
@@ -4211,7 +4400,20 @@ fn planned_import_requests(
                 encoding,
                 operation: {
                     let emulated_load = trial.and_then(|trial| trial.load(&template.descriptor));
-                    Box::new(move |key| {
+                    Box::new(move |mut key| {
+                        let mut template = template.clone();
+                        if let Some(family) = &template.carry {
+                            let state =
+                                state.read().map_err(|_| "carry state lock poisoned".to_owned())?;
+                            let (resolved, descriptor, staged) = family.resolve(
+                                key.index.unwrap_or(0),
+                                &state.indices,
+                                &state.scratch,
+                            )?;
+                            key = resolved;
+                            template.descriptor = descriptor;
+                            template.staged = staged;
+                        }
                         import_operation(
                             &backend,
                             &template,
@@ -4228,26 +4430,45 @@ fn planned_import_requests(
 
 fn planned_export_slots(
     frame: &PhysicalFrame,
-    manifest: &Manifest,
-    production: &ProductionId,
+    manifest: Option<(&Manifest, &ProductionId)>,
+    scratch: &ProductionId,
     generation: FrameGeneration,
-) -> Result<Vec<PlannedExportSlot>, GpuRuntimeError> {
+) -> Result<Vec<(usize, PlannedExportSlot)>, GpuRuntimeError> {
     let slots = frame
         .export_templates
         .iter()
-        .map(|site| {
-            let descriptor = manifest.artifacts.get(&site.name).ok_or_else(|| {
-                GpuRuntimeError::Artifact(format!("missing manifest artifact {}", site.name))
-            })?;
-            let valid_index = match (site.index, descriptor.family_count) {
-                (None, None) => site.occurrence == 0,
-                // A streamed member is the first occurrence of its lane's site.
-                (Some(index), Some(count)) if (index as u128) < count => {
-                    u64::try_from(index).is_ok_and(|index| index == site.occurrence) ||
-                        (site.streamed && site.occurrence == 0)
-                }
-                _ => false,
+        .enumerate()
+        .filter(|(_, site)| site.scratch || manifest.is_some())
+        .map(|(index, site)| {
+            let private_descriptor = mxx_ir_core::artifact::ManifestArtifact {
+                artifact_type: site.artifact_type.clone(),
+                availability: site.availability,
+                family_count: site.index.map(|member| member as u128 + 1),
+                layout: None,
             };
+            let (descriptor, production) = if site.scratch {
+                (&private_descriptor, scratch)
+            } else {
+                let (manifest, production) = manifest.expect("public export has a manifest");
+                (
+                    manifest.artifacts.get(&site.name).ok_or_else(|| {
+                        GpuRuntimeError::Artifact(format!(
+                            "missing manifest artifact {}",
+                            site.name
+                        ))
+                    })?,
+                    production,
+                )
+            };
+            let valid_index = site.scratch ||
+                match (site.index, descriptor.family_count) {
+                    (None, None) => site.occurrence == 0,
+                    (Some(index), Some(count)) if (index as u128) < count => {
+                        u64::try_from(index).is_ok_and(|index| index == site.occurrence) ||
+                            (site.streamed && site.occurrence == 0)
+                    }
+                    _ => false,
+                };
             if !valid_index ||
                 site.artifact_type != descriptor.artifact_type ||
                 site.availability != descriptor.availability
@@ -4262,42 +4483,50 @@ fn planned_export_slots(
             let slot = Arc::clone(frame.slots.get(site.slot).ok_or_else(|| {
                 GpuRuntimeError::Artifact("planned export slot is missing".into())
             })?);
-            Ok(PlannedExportSlot {
-                frame: generation,
-                key: ArtifactKey {
-                    production: production.clone(),
-                    name: site.name.clone(),
-                    index: site.index,
+            Ok((
+                index,
+                PlannedExportSlot {
+                    frame: generation,
+                    key: ArtifactKey {
+                        production: production.clone(),
+                        name: site.name.clone(),
+                        index: site.index,
+                    },
+                    artifact_type: site.artifact_type.clone(),
+                    availability: site.availability,
+                    layout: descriptor.layout.clone(),
+                    slot,
+                    site: site.site,
+                    occurrence: site.occurrence,
+                    raw_offset: fragment.raw_offset,
+                    raw_bytes: fragment.raw_bytes,
+                    final_chunk: site.final_chunk,
+                    payload_kind: artifact_payload_kind(&site.artifact_type).ok_or_else(|| {
+                        GpuRuntimeError::Artifact(
+                            "a nested family artifact has no GPU payload".into(),
+                        )
+                    })?,
+                    export: Arc::clone(&site.export),
+                    commit_to_session: !site.scratch,
                 },
-                artifact_type: site.artifact_type.clone(),
-                availability: site.availability,
-                layout: descriptor.layout.clone(),
-                slot,
-                site: site.site,
-                occurrence: site.occurrence,
-                raw_offset: fragment.raw_offset,
-                raw_bytes: fragment.raw_bytes,
-                final_chunk: site.final_chunk,
-                payload_kind: artifact_payload_kind(&site.artifact_type).ok_or_else(|| {
-                    GpuRuntimeError::Artifact("a nested family artifact has no GPU payload".into())
-                })?,
-                export: Arc::clone(&site.export),
-                commit_to_session: true,
-            })
+            ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut ranges = BTreeMap::<(String, Option<usize>), Vec<(u64, u64, u64)>>::new();
-    for slot in &slots {
+    let mut ranges = BTreeMap::<
+        (String, Option<usize>, bool, Option<(u32, mxx_ir_core::IntExpr)>),
+        Vec<(u64, u64, u64)>,
+    >::new();
+    for (index, slot) in &slots {
+        let site = &frame.export_templates[*index];
         let end = slot.raw_offset.checked_add(slot.raw_bytes).ok_or_else(|| {
             GpuRuntimeError::Artifact("planned export raw range overflows".into())
         })?;
-        ranges.entry((slot.key.name.clone(), slot.key.index)).or_default().push((
-            slot.raw_offset,
-            end,
-            slot.export.raw_total_bytes,
-        ));
+        ranges
+            .entry((slot.key.name.clone(), slot.key.index, site.scratch, site.member_base.clone()))
+            .or_default()
+            .push((slot.raw_offset, end, slot.export.raw_total_bytes));
     }
-    for ((name, index), fragments) in &mut ranges {
+    for ((name, index, _, _), fragments) in &mut ranges {
         fragments.sort_unstable();
         let total = fragments[0].2;
         let mut next = 0;
@@ -4324,7 +4553,7 @@ fn finalized_export_handles(
     production: &ProductionId,
 ) -> Result<BTreeMap<String, Vec<ArtifactHandle>>, GpuRuntimeError> {
     let mut handles = BTreeMap::<String, BTreeMap<Option<usize>, ArtifactHandle>>::new();
-    for site in &frame.export_templates {
+    for site in frame.export_templates.iter().filter(|site| !site.scratch) {
         let descriptor = manifest.artifacts.get(&site.name).ok_or_else(|| {
             GpuRuntimeError::Artifact(format!("missing manifest artifact {}", site.name))
         })?;
@@ -4353,7 +4582,7 @@ fn streamed_family_outputs(
     production: &ProductionId,
 ) -> Result<BTreeMap<String, RuntimeValue>, GpuRuntimeError> {
     let mut outputs = BTreeMap::new();
-    for site in frame.export_templates.iter().filter(|site| site.streamed) {
+    for site in frame.export_templates.iter().filter(|site| site.streamed && !site.scratch) {
         if outputs.contains_key(&site.name) {
             continue;
         }

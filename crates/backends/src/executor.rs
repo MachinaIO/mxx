@@ -1529,6 +1529,32 @@ impl<S: SessionStore> Executor<'_, S> {
         Ok(Some((name, descriptor)))
     }
 
+    /// Release one private family after its final use, retaining its lease on failure.
+    fn release_staged_family(
+        &mut self,
+        production: &ProductionId,
+        name: &str,
+    ) -> Result<(), ExecutionError> {
+        let identity = (production.clone(), name.to_owned());
+        let Some(descriptor) = self.staged_families.get(&identity) else { return Ok(()) };
+        let count = descriptor.family_count.ok_or_else(|| {
+            self.staged_cleanup_error("staged family descriptor has no cardinality")
+        })?;
+        for index in 0..addressable_family_count(count)? {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: name.to_owned(),
+                index: Some(index),
+            };
+            self.artifact_store
+                .remove_staged(&key)
+                .map_err(|error| self.staged_cleanup_error(error))?;
+        }
+        self.staged_families.remove(&identity);
+        Ok(())
+    }
+
+    /// Keep leases only for families reachable from returned values.
     fn cleanup_unreturned_staged_families(
         &mut self,
         outputs: &BTreeMap<String, RuntimeValue>,
@@ -1544,42 +1570,17 @@ impl<S: SessionStore> Executor<'_, S> {
                 leases.push(StagedFamilyLease { production, name, descriptor });
                 continue;
             }
-            let Some(count) = descriptor.family_count else {
-                return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
-            };
-            let count = addressable_family_count(count)?;
-            for index in 0..count {
-                let key = ArtifactKey {
-                    production: production.clone(),
-                    name: name.clone(),
-                    index: Some(index),
-                };
-                if let Err(error) = self.artifact_store.remove_staged(&key) {
-                    return Err(self.staged_cleanup_error(error));
-                }
-            }
+            self.release_staged_family(&production, &name)?;
         }
         self.staged_families.clear();
         Ok(leases)
     }
 
+    /// Release all private families, including after a failed execution.
     fn cleanup_all_staged_families(&mut self) -> Result<(), ExecutionError> {
         let staged = self.staged_families.clone();
-        for ((production, name), descriptor) in staged {
-            let Some(count) = descriptor.family_count else {
-                return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
-            };
-            let count = addressable_family_count(count)?;
-            for index in 0..count {
-                let key = ArtifactKey {
-                    production: production.clone(),
-                    name: name.clone(),
-                    index: Some(index),
-                };
-                if let Err(error) = self.artifact_store.remove_staged(&key) {
-                    return Err(self.staged_cleanup_error(error));
-                }
-            }
+        for ((production, name), _) in staged {
+            self.release_staged_family(&production, &name)?;
         }
         self.staged_families.clear();
         Ok(())

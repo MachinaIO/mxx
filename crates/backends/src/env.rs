@@ -10,7 +10,7 @@ pub fn cuda_stream_pool_size() -> usize {
         .unwrap_or(32)
 }
 
-/// `MXX_GPU_LOGICAL_DEVICES`: comma-separated physical CUDA device ids, one per
+/// `MXX_GPU_LOGICAL_DEVICES`: comma-separated physical GPU device ids, one per
 /// logical GPU device. `0,0` exposes two logical devices on physical GPU 0, so
 /// multi-device plans can be exercised on one GPU. Unset: every detected device
 /// is its own logical device.

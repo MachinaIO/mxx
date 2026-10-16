@@ -33,7 +33,7 @@ fn gpu_rings(parameters: &crate::PeParameters) -> Vec<GpuDCRTPolyParams> {
 /// and the unauthorized decryption returns a rounded phase, which this test
 /// does not constrain.
 #[test]
-#[ignore = "requires a CUDA GPU"]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
     authorized_key_decrypts_on_the_gpu(class, parameters(class), None, &equality_programs);
@@ -49,7 +49,7 @@ fn equality_programs(class: PeClass, attribute: &[usize]) -> [BranchingProgram; 
 /// digits (`W = 128`): the key for a range containing the attribute's value decrypts, and the key
 /// for a range above it does not.
 #[test]
-#[ignore = "requires a CUDA GPU"]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_decimal_range_decrypts_on_the_gpu() {
     let class = PeClass::decimal_range(2).unwrap();
     let parameters = crate::test_support::correct_parameters(class, |parameters| parameters);
@@ -66,7 +66,7 @@ fn test_gpu_decimal_range_decrypts_on_the_gpu() {
 /// branch `25 = 17 * 9` of two nonzero digits reads compact companions in both
 /// switches, all on the GPU with the `q` and `pq` rings registered.
 #[test]
-#[ignore = "requires a CUDA GPU"]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
     let parameters = crate::test_support::correct_parameters(class, |parameters| {
@@ -119,7 +119,7 @@ fn authorized_key_decrypts_on_the_gpu(
 /// centered coefficient, next to `log2 E_F`, `log2 E_PE`, and the average-case bias and standard
 /// deviation of [`crate::noise::simulate_average`].
 #[test]
-#[ignore = "requires a CUDA GPU; measures noise"]
+#[ignore = "requires a supported GPU; measures noise"]
 fn test_gpu_measured_noise_against_the_bounds() {
     use crate::{
         PeParameterRequest, PeParameters,

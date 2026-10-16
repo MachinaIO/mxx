@@ -276,9 +276,18 @@ fn rebind(
     replacements: &BTreeMap<*const (), BoundStorage>,
 ) -> Result<(), String> {
     for owner in owners.values_mut() {
-        if let Some(rebound) = rebound(owner, replacements)? {
-            *owner = Arc::new(rebound);
-        }
+        rebind_owner(owner, replacements)?;
+    }
+    Ok(())
+}
+
+/// Materialize a replay destination using the same allocation spans as its views.
+fn rebind_owner(
+    owner: &mut Arc<GpuResidentValue>,
+    replacements: &BTreeMap<*const (), BoundStorage>,
+) -> Result<(), String> {
+    if let Some(rebound) = rebound(owner, replacements)? {
+        *owner = Arc::new(rebound);
     }
     Ok(())
 }
@@ -370,6 +379,11 @@ pub(crate) fn plan_graph_scratch(
                     replay_writes.push((pointer, wave.body_start as usize));
                 }
             }
+        }
+        // Parent destinations installed into a nested occurrence are host-bound
+        // replay owners too. Their allocations must remain live for the plan.
+        for (_, id, owner) in &wave.nested_owner_bindings {
+            collect(*id, owner, false, false, true);
         }
     }
     for (index, op) in frame.program.operations.iter().enumerate() {
@@ -616,6 +630,9 @@ pub(crate) fn plan_graph_scratch(
     frame.owners.rebind(|_, owner| rebound(owner, &persistent))?;
     for wave in &mut frame.waves {
         rebind(&mut wave.owner_bindings, &persistent)?;
+        for (_, _, owner) in &mut wave.nested_owner_bindings {
+            rebind_owner(owner, &persistent)?;
+        }
     }
     Ok(plan)
 }

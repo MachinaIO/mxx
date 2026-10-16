@@ -24,6 +24,7 @@ pub mod artifact;
 pub mod authority;
 pub mod backend;
 #[cfg(feature = "gpu")]
+#[path = "gpu_device_artifact.rs"]
 pub mod device_artifact;
 pub mod executor;
 pub mod gpu_cost_model;

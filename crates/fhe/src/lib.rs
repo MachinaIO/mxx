@@ -33,6 +33,8 @@ mod params;
 #[cfg(all(test, feature = "gpu"))]
 mod tests_gpu;
 mod tfhe;
+#[cfg(feature = "gpu")]
+mod tfhe_gpu;
 pub mod utils;
 
 pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvHybridParams, BgvParams};

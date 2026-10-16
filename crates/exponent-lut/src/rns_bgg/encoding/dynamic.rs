@@ -2461,7 +2461,7 @@ mod test {
     /// neighbours, `pq - 1`, `(pq +- 1)/2`) and for a hashed compact key entry.
     #[cfg(feature = "gpu")]
     #[test]
-    #[ignore = "requires a CUDA GPU"]
+    #[ignore = "requires a supported GPU"]
     #[serial_test::serial(dcrt_runtime)]
     fn compact_expansion_agrees_on_the_cpu_and_the_gpu() {
         use mxx_backends::{

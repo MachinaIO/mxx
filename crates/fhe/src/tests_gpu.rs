@@ -15,6 +15,7 @@ use num_integer::Integer;
 use std::collections::BTreeMap;
 
 #[test]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_integer_family_permutation_across_waves() {
     let width = std::env::var("MXX_GPU_MAX_PARALLEL_INSTANCES")
         .ok()
@@ -95,6 +96,7 @@ fn input(values: &[i64]) -> RuntimeValue {
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_compiled_matrix_product_rebinds_sources() {
     let common = common();
     let n = common.ring.ring_dimension() as usize;
@@ -155,6 +157,7 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let common = common();
     let n = common.ring.ring_dimension() as usize;
@@ -323,6 +326,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_fhe_bgv_short_slot_inputs() {
     let common = common();
     let n = common.ring.ring_dimension() as usize;
@@ -382,6 +386,7 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     let common = common();
     let n = common.ring.ring_dimension() as usize;

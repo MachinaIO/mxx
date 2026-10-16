@@ -46,6 +46,8 @@ pub(crate) mod gpu_runtime_import;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_runtime_io;
 pub mod gpu_schedule;
+#[cfg(feature = "gpu")]
+mod gpu_streamed_carry;
 pub mod gpu_subgraph_kernel;
 #[path = "gpu_runtime_metrics.rs"]
 pub mod gpu_warmup;

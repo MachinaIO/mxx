@@ -97,6 +97,7 @@ pub enum IoPumpError<E: std::error::Error + 'static> {
 
 /// One statically bounded write occurrence. The mapped payload owner remains
 /// alive through the worker's file write, even if the Graph has completed.
+#[derive(Clone)]
 pub(crate) struct PlannedExportSlot {
     pub(crate) frame: FrameGeneration,
     pub(crate) key: ArtifactKey,
@@ -350,9 +351,20 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
     /// its publication, and rearm the slot for the next wave, which writes
     /// another member into it. A template this execute does not write (a
     /// consumer, or a finalized replay) is skipped.
-    pub(crate) fn export_streamed(&mut self, template: usize) -> Result<(), IoPumpError<E>> {
-        let Some(slot) = self.streamed.remove(&template) else { return Ok(()) };
-        let handle = slot.commit_to_session.then(|| ArtifactHandle {
+    pub(crate) fn export_streamed(
+        &mut self,
+        template: usize,
+        scratch_key: Option<ArtifactKey>,
+    ) -> Result<(), IoPumpError<E>> {
+        let Some(mut slot) = self.streamed.get(&template).cloned() else { return Ok(()) };
+        let scratch = scratch_key.is_some();
+        if let Some(key) = scratch_key {
+            slot.key = key;
+            if slot.raw_offset == 0 {
+                self.remove_staged(slot.frame, slot.key.clone(), 1)?;
+            }
+        }
+        let handle = (slot.commit_to_session || scratch).then(|| ArtifactHandle {
             key: slot.key.clone(),
             artifact_type: slot.artifact_type.clone(),
             availability: slot.availability,
@@ -386,6 +398,27 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                 actual: completion.frame(),
             });
         }
+        if scratch && slot.final_chunk {
+            self.core
+                .client
+                .try_publish(
+                    slot.frame,
+                    handle.expect("scratch export has a handle"),
+                    slot.payload_kind,
+                    Arc::clone(&slot.export),
+                )
+                .map_err(IoPumpError::Submit)?
+                .wait()
+                .map_err(IoPumpError::Worker)?;
+            unsafe { slot.slot.reset_after_completion() }
+                .map_err(|error| IoPumpError::Observer(error.to_string()))?;
+            return Ok(());
+        }
+        if scratch {
+            unsafe { slot.slot.reset_after_completion() }
+                .map_err(|error| IoPumpError::Observer(error.to_string()))?;
+            return Ok(());
+        }
         if let Some(handle) = handle {
             self.pending_publishes.entry(handle.key.clone()).or_insert((
                 slot.frame,
@@ -398,6 +431,22 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
         // finished reading it.
         unsafe { slot.slot.reset_after_completion() }
             .map_err(|error| IoPumpError::Observer(error.to_string()))
+    }
+
+    /// Join removal of private scratch, including after a failed iteration.
+    pub(crate) fn remove_staged(
+        &mut self,
+        frame: FrameGeneration,
+        key: ArtifactKey,
+        count: usize,
+    ) -> Result<(), IoPumpError<E>> {
+        self.core
+            .client
+            .try_remove_staged(frame, key, count)
+            .map_err(IoPumpError::Submit)?
+            .wait()
+            .map_err(IoPumpError::Worker)?;
+        Ok(())
     }
 
     /// Begin observing the preallocated write slots and the import request

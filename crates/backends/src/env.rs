@@ -1,5 +1,23 @@
 //! Environment-variable helpers for native primitives and execution backends.
 
+/// `MXX_TEST_STREAMED_MEMBERS`: family cardinality for streamed-carry unit tests (default: 8).
+#[cfg(test)]
+pub(crate) fn test_streamed_members() -> usize {
+    positive_usize("MXX_TEST_STREAMED_MEMBERS", 8).expect("valid streamed test cardinality")
+}
+
+/// `MXX_TEST_STREAMED_STEPS`: sequential iterations in carry unit tests (default: 3).
+#[cfg(test)]
+pub(crate) fn test_streamed_steps() -> usize {
+    positive_usize("MXX_TEST_STREAMED_STEPS", 3).expect("valid streamed test iterations")
+}
+
+/// `MXX_TEST_STREAMED_RING_DIMENSION`: power-of-two test ring dimension (default: 8).
+#[cfg(test)]
+pub(crate) fn test_streamed_ring_dimension() -> usize {
+    positive_usize("MXX_TEST_STREAMED_RING_DIMENSION", 8).expect("valid streamed test ring")
+}
+
 /// `MXX_CUDA_STREAM_POOL_SIZE`: number of reusable compute streams owned by
 /// each GPU context and device. Default: 32.
 pub fn cuda_stream_pool_size() -> usize {

@@ -159,6 +159,13 @@ impl<'scope, E: std::error::Error + 'static> IoRequest<'scope, E> {
 }
 
 pub(crate) enum IoCommand<E: std::error::Error + 'static> {
+    /// Release a contiguous private generation after all its GPU and I/O users have joined.
+    RemoveStaged {
+        frame: FrameGeneration,
+        key: ArtifactKey,
+        count: usize,
+        reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
+    },
     Import {
         frame: FrameGeneration,
         key: ArtifactKey,
@@ -314,6 +321,15 @@ pub struct ProducerIoClient<'scope, E: std::error::Error + 'static> {
 }
 
 impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
+    /// Remove private carry members without publishing them into a producer session.
+    pub(crate) fn try_remove_staged(
+        &self,
+        frame: FrameGeneration,
+        key: ArtifactKey,
+        count: usize,
+    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
+        self.core.submit_with(|reply| IoCommand::RemoveStaged { frame, key, count, reply })
+    }
     pub(crate) fn observer_sender(&self) -> SyncSender<IoCommand<E>> {
         self.core.sender.clone()
     }
@@ -495,6 +511,7 @@ where
     while let Ok(command) = receiver.recv() {
         let started = std::time::Instant::now();
         let (kind, bytes) = match &command {
+            IoCommand::RemoveStaged { .. } => ("remove_staged", 0),
             IoCommand::Import { .. } => ("import", 0),
             IoCommand::ExportSlot { raw_bytes, key, .. } => {
                 *raw_by_key
@@ -728,6 +745,18 @@ where
                         }
                     }
                 }
+            }
+            IoCommand::RemoveStaged { frame, key, count, reply } => {
+                let start = key.index.unwrap_or(0);
+                let result = (0..count).try_for_each(|offset| {
+                    let index = start.checked_add(offset).ok_or_else(|| {
+                        IoWorkerError::InvalidExport("scratch removal index overflows".into())
+                    })?;
+                    store
+                        .remove_staged(&ArtifactKey { index: Some(index), ..key.clone() })
+                        .map_err(IoWorkerError::Store)
+                });
+                let _ = reply.send(result.map(|()| IoCompletion::Exported { frame }));
             }
             IoCommand::Commit { frame, handle, reply } => {
                 if failed {

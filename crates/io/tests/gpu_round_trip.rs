@@ -1,8 +1,9 @@
 #![cfg(feature = "gpu")]
 
 //! The Diamond iO 2 round trip on the GPU runtime: a two-step streaming function is obfuscated
-//! with random obfuscator chunks and initial state, and its obfuscation is evaluated on every
-//! evaluator input against the clear function.
+//! (one obfuscation graph, executed once) with random obfuscator chunks and initial state, and
+//! its obfuscation is evaluated (one evaluation graph per input) on every evaluator input against
+//! the clear function. Round trips run only on the GPU.
 //!
 //! The parameters are the smallest noise-free ones of the implementation's first validation
 //! (`crates/io/DIO2-SPEC.md`, §13): the preprocessing ciphertexts have no error, so the only

@@ -5,6 +5,7 @@
 #include "openfhe/core/math/nbtheory.h"
 #include "openfhe/core/lattice/trapdoor.h"
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <sstream>
 
@@ -272,17 +273,31 @@ void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli
     }
 
 namespace {
+// The parameters of the exact CRT ring of `dimension` over `moduli`, built once per basis.
+// Building them finds a primitive root of unity per prime (a factorization of `q - 1`), so a
+// caller that converts many polynomials into one basis must not rebuild them per polynomial.
 std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters_for_basis(
     uint32_t dimension, rust::Slice<const uint64_t> moduli) {
     if (dimension < 2 || (dimension & (dimension - 1)) || moduli.empty())
         throw std::invalid_argument("invalid exact CRT ring");
+    using Key = std::pair<uint32_t, std::vector<uint64_t>>;
+    static std::mutex mutex;
+    static std::map<Key, std::shared_ptr<lbcrypto::DCRTPoly::Params>> cache;
+    Key key{dimension, std::vector<uint64_t>(moduli.begin(), moduli.end())};
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (auto found = cache.find(key); found != cache.end())
+            return found->second;
+    }
     std::vector<lbcrypto::NativeInteger> primes, roots;
     for (const auto modulus : moduli) {
         primes.emplace_back(modulus);
         roots.push_back(lbcrypto::RootOfUnity<lbcrypto::NativeInteger>(2 * dimension, primes.back()));
     }
-    return std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(
-        2 * dimension, primes, roots);
+    std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters =
+        std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(2 * dimension, primes, roots);
+    std::lock_guard<std::mutex> lock(mutex);
+    return cache.emplace(std::move(key), std::move(parameters)).first->second;
 }
 }
 

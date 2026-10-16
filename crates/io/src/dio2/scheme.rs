@@ -409,33 +409,6 @@ mod tests {
     use mxx_backends::{MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend};
     use rand::Rng;
 
-    /// One obfuscation of the toy function with random obfuscator bits and initial state,
-    /// evaluated on random evaluator bits, gives the clear function's final state.
-    #[test]
-    fn obfuscation_evaluates_to_the_clear_function() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .try_init();
-        let (parameters, function) = toy();
-        let mut rng = rand::rng();
-        let steps = function.stream_length();
-        let bits = |count: usize, rng: &mut rand::rngs::ThreadRng| {
-            (0..steps)
-                .map(|_| (0..count).map(|_| rng.random()).collect())
-                .collect::<Vec<Vec<bool>>>()
-        };
-        let y = bits(function.obf_chunk_bits, &mut rng);
-        let x = bits(function.eval_chunk_bits, &mut rng);
-        let initial_state = rng.random_range(0..1usize << function.state_bits);
-        let execution = CpuExecution::new(cpu_backend(parameters.rings().unwrap()));
-        let mut dio2 = Dio2::new(parameters, execution, MemoryArtifactStore::default()).unwrap();
-        let obfuscation = dio2
-            .obfuscate(&Dio2Function { function: function.clone(), y: y.clone(), initial_state })
-            .unwrap();
-        let state = dio2.evaluate(&obfuscation, &x).unwrap();
-        assert_eq!(state, function.evaluate(initial_state, &x, &y));
-    }
-
     /// A uniform table function on `eval_bits` evaluator bits whose body reads evaluator bit 0
     /// and obfuscator bit 0: its Program is the same for every chunk width.
     fn first_bit_function(eval_bits: usize, steps: usize) -> StreamingFunction {

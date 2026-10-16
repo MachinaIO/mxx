@@ -64,6 +64,14 @@ pub fn parallel<T: GraphValue>(
 /// Repeatedly computes a new state, returning only the final state.
 ///
 /// The state keeps one schema across iterations, and a zero count returns the initial state.
+///
+/// On the GPU, matrix and small-matrix family carries are streamed through private artifact
+/// storage with two alternating generations. Read them only member-wise (parallel Zip/Gather
+/// lanes or static/dynamic family selection), and return each family from a top-level parallel
+/// loop in the body or unchanged. Such a carry cannot be a root graph output or be consumed as
+/// a whole family; unsupported uses are GPU planning errors. Integer families stay resident.
+/// The CPU releases obsolete staged generations after every iteration, except when another
+/// live value, an invariant, or trace capture still references them.
 pub fn iterate<S: GraphValue>(
     count: impl Into<IntExpr>,
     initial: S,

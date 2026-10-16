@@ -2029,6 +2029,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     let mut child_path = path.to_vec();
                     child_path
                         .push(InstantiationFrame { call: node.id, loop_index: Some(index as u64) });
+                    let previous = carried;
                     carried = self
                         .execute_instance(
                             &child_id,
@@ -2038,6 +2039,36 @@ impl<S: SessionStore> Executor<'_, S> {
                             parent_placement,
                         )?
                         .outputs;
+                    if self.trace.is_none() {
+                        let mut retained = BTreeMap::new();
+                        for value in carried.iter().chain(&invariants) {
+                            collect_staged_families(value, &mut retained);
+                        }
+                        let schedule = &self
+                            .validated
+                            .scope(scope_id)
+                            .expect("validated sequential parent")
+                            .liveness;
+                        for (wire, value) in values.iter() {
+                            if schedule.retained.contains(wire) ||
+                                schedule
+                                    .last_use
+                                    .get(wire)
+                                    .is_some_and(|last| *last > node.id.0 as usize)
+                            {
+                                collect_staged_families(value, &mut retained);
+                            }
+                        }
+                        let mut expired = BTreeMap::new();
+                        for value in &previous {
+                            collect_staged_families(value, &mut expired);
+                        }
+                        for ((production, name), _) in expired {
+                            if !retained.contains_key(&(production.clone(), name.clone())) {
+                                self.release_staged_family(&production, &name)?;
+                            }
+                        }
+                    }
                 }
                 self.set_placement(parent_placement)?;
                 for (port, value) in carried.into_iter().enumerate() {
@@ -2553,6 +2584,157 @@ mod tests {
         types::CoefficientBoundDomain,
     };
     use num_bigint::BigInt;
+
+    /// Sequential family updates equal an unrolled graph and retain at most two generations.
+    #[test]
+    fn sequential_loop_streams_matrix_family_carry() {
+        let members = crate::env::test_streamed_members();
+        let steps = crate::env::test_streamed_steps();
+        let parameters = DCRTPolyParams::new(
+            crate::env::test_streamed_ring_dimension().try_into().unwrap(),
+            1,
+            20,
+            4,
+            None,
+            None,
+        );
+        let ring = ring(&parameters);
+        let offset = usize::from(rand::random::<u16>());
+        let initial =
+            parallel(members, |member| Ok(ring.polynomial([member.expression()? + offset])))
+                .unwrap();
+        let carried = mxx_dsl::iterate(steps, initial.clone(), |iteration, state| {
+            parallel(members, |member| {
+                Ok(state.at(&member) +
+                    ring.polynomial([iteration.expression()? + member.expression()? + 1]))
+            })
+        })
+        .unwrap();
+        let mut unrolled = initial;
+        for iteration in 0..steps {
+            unrolled = parallel(members, |member| {
+                Ok(unrolled.at(&member) +
+                    ring.polynomial([IntExpr::constant(iteration + 1) + member.expression()?]))
+            })
+            .unwrap();
+        }
+        let build = |family: Family<Mat>| {
+            DslContext::new("streamed-carry-parity")
+                .output("first", family.at(0))
+                .unwrap()
+                .output("last", family.at(members - 1))
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap()
+        };
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let actual = execute(
+            &build(carried),
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            store.test_peak_entries <= 2 * members,
+            "peak staged entries: {}",
+            store.test_peak_entries
+        );
+        let expected = execute(
+            &build(unrolled),
+            &mut backend,
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        for name in ["first", "last"] {
+            assert_eq!(matrix_output(&actual, name), matrix_output(&expected, name));
+        }
+    }
+
+    /// Alias and zero-iteration carries preserve the only staged generation without copying it.
+    #[test]
+    fn sequential_streamed_family_alias_and_zero_iterations() {
+        for steps in [0, 3] {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let ring = ring(&parameters);
+            let initial =
+                parallel(4, |member| Ok(ring.polynomial([member.expression()? + 7]))).unwrap();
+            let carried = mxx_dsl::iterate(steps, initial, |_, state| Ok(state)).unwrap();
+            let graph = DslContext::new("alias-streamed-family")
+                .output("out", carried.at(3))
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let mut store = MemoryArtifactStore::default();
+            let result = execute(
+                &graph,
+                &mut cpu_backend([parameters.clone()]),
+                BTreeMap::new(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                matrix_output(&result, "out").entry(0, 0).to_bytes(),
+                DCRTPoly::from_usize_to_constant(&parameters, 10).to_bytes()
+            );
+            assert!(store.test_peak_entries <= 4);
+        }
+    }
+
+    /// A shared initial family remains readable as an invariant and after the sequential loop.
+    #[test]
+    fn sequential_streamed_family_preserves_shared_initial() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = ring(&parameters);
+        let initial =
+            parallel(4, |member| Ok(ring.polynomial([member.expression()? + 1]))).unwrap();
+        let invariant = initial.clone();
+        let carried = mxx_dsl::iterate(3, initial.clone(), |_, state| {
+            parallel(4, |member| Ok(state.at(&member) + invariant.at(&member)))
+        })
+        .unwrap();
+        let graph = DslContext::new("shared-streamed-family")
+            .output("out", carried.at(3))
+            .unwrap()
+            .output("initial", initial.at(3))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        for (name, expected) in [("out", 16), ("initial", 4)] {
+            assert_eq!(
+                matrix_output(&result, name).entry(0, 0).to_bytes(),
+                DCRTPoly::from_usize_to_constant(&parameters, expected).to_bytes()
+            );
+        }
+        assert!(
+            store.test_peak_entries <= 12,
+            "only the shared initial and two live generations may remain"
+        );
+    }
 
     /// A record of an integer family and an integer crosses stages as per-leaf artifacts.
     #[test]

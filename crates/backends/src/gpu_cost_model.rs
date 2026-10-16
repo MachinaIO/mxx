@@ -646,8 +646,6 @@ impl Model<'_> {
                     self.value(Form::Eval, ty)
                 }
                 ConcreteWireType::IndexedFamily { element, .. } if layout(element).is_some() => {
-                    // `allocate_sequential_carry` rejects matrix-family carries.
-                    self.charge("unsupported(sequential_family_carry)", 1)?;
                     let form = form_for(&ty, Form::Eval);
                     if form == Form::Eval {
                         self.need_eval(id)?;
@@ -671,7 +669,11 @@ impl Model<'_> {
         }
         let (outer_factor, outer_device) = (self.factor, self.device_body);
         let outer_cache = std::mem::take(&mut self.converted);
-        self.device_body = true;
+        self.device_body = !carried
+            .iter()
+            .any(|&id| matches!(&self.values[id].ty,
+                ConcreteWireType::IndexedFamily { element, .. }
+                    if matches!(element.as_ref(), ConcreteWireType::Matrix(_) | ConcreteWireType::SmallMatrix { .. })));
         let iterations = if invariant { 1 } else { count };
         if invariant {
             self.factor = outer_factor

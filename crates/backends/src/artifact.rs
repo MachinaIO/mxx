@@ -1688,6 +1688,9 @@ fn try_lock(_file: &fs::File) -> io::Result<bool> {
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryArtifactStore {
+    /// High-water mark used to assert bounded private staging in executor unit tests.
+    #[cfg(test)]
+    pub(crate) test_peak_entries: usize,
     entries: BTreeMap<
         ArtifactKey,
         (ArtifactType, ArtifactAvailability, Option<String>, ArtifactPayload),
@@ -1805,6 +1808,11 @@ pub enum MemoryArtifactError {
 }
 
 impl MemoryArtifactStore {
+    /// Number of payload entries still held after an executor replay, for cleanup assertions.
+    #[cfg(all(test, feature = "gpu"))]
+    pub(crate) fn test_entry_count(&self) -> usize {
+        self.entries.len()
+    }
     /// A store that keeps GPU exports of matrices in GPU memory instead of
     /// host memory. Sessions, manifests, and every other artifact stay on the
     /// host as in the default store.
@@ -2386,6 +2394,10 @@ impl ArtifactStore for MemoryArtifactStore {
                     layout.map(str::to_owned),
                     payload,
                 ));
+                #[cfg(test)]
+                {
+                    self.test_peak_entries = self.test_peak_entries.max(self.entries.len());
+                }
                 Ok(())
             }
             Entry::Occupied(entry)

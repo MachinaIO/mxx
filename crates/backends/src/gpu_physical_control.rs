@@ -20,8 +20,11 @@
 //!   division) go to a per-device status word, first error wins, and the word is checked only after
 //!   the launch joins.
 //! - **Sequential-loop carries.** A sequential loop may carry matrices, scalars, and integer
-//!   families. An integer carry is sized by a range closed over every iteration, and a Euclidean
-//!   remainder by a positive constant has the exact range `[0, divisor)`.
+//!   families. Matrix-family carries use private, double-buffered artifact generations and
+//!   top-level parallel bodies replay bounded waves. Loop-dependent polynomial constants read
+//!   resident indices on every replay. An integer carry is sized by a range closed over every
+//!   iteration, and a Euclidean remainder by a positive constant has the exact range `[0,
+//!   divisor)`.
 //! - **Scalar kernels.** Hash integer families share the hash-sample primitive and match the CPU
 //!   transcript. Monomial products multiply each evaluation slot by the matching twiddle, with no
 //!   NTT of their own. Integer matrix-vector products use one warp per row (`M v`) or chunked
@@ -72,7 +75,7 @@ use mxx_ir_core::{
     artifact::{ArtifactType, ManifestArtifact, ProductionId},
     concretize_wire_type,
     graph::{FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
-    node::{ConcatAxis, LoopInputMode, MatrixBinaryOp, NodeKind},
+    node::{ConcatAxis, ConstantMatrix, LoopInputMode, MatrixBinaryOp, NodeKind},
     types::{
         CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef,
         WireType,
@@ -152,6 +155,8 @@ pub(super) struct ExternalIoImport {
     pub destination: PhysicalValueId,
     pub upload_owner: ImportDestination,
     pub selector: PhysicalValueId,
+    /// A private carry whose key is resolved at its host load boundary.
+    pub carry: Option<crate::gpu_streamed_carry::StreamedFamily>,
 }
 
 /// A selected artifact read in a host-driven loop whose member the host
@@ -185,6 +190,8 @@ pub(super) struct ExternalIoLoop {
     pub carry_copy_ops: Vec<u32>,
     pub imports: Vec<ExternalIoImport>,
     pub ahead: Vec<AheadImport>,
+    /// Matrix-family carries whose exports must join before the next iteration.
+    pub streamed_carries: Vec<crate::gpu_streamed_carry::StreamedCarry>,
 }
 
 fn allocate_wave_occurrence(
@@ -243,6 +250,12 @@ struct ArtifactZipLane {
     /// A `Gather` lane's resident index family and its Zip offset: the lane
     /// of the wave starting at `w` reads member `indices[w + lane + offset]`.
     gather: Option<(PhysicalValueId, usize)>,
+    /// Broadcast runtime base, added to the wave and lane index.
+    base: Option<PhysicalValueId>,
+    /// Mapped publication of the runtime base, shared by every lane.
+    base_slot: Option<usize>,
+    /// Private sequential carry whose generation changes with its host iteration.
+    carry: Option<crate::gpu_streamed_carry::StreamedFamily>,
     /// The second owner odd waves read into, so each wave's members are read
     /// while the previous wave runs.
     twin: Option<(ImportDestination, Arc<GpuResidentValue>)>,
@@ -706,9 +719,45 @@ pub(super) fn pack_resident_family(
         .map_err(str::to_owned)
 }
 
-/// Lower a non-matrix semantic node using only physical owners and direct
-/// Graph operations. Unsupported semantics return a preparation error; no
-/// legacy capture, host execution, or eager artifact-family load is invoked.
+/// Lower one member read of a private carry into an on-demand, iteration-resolved import.
+fn lower_streamed_member(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    family: crate::gpu_streamed_carry::StreamedFamily,
+    selector: PhysicalValueId,
+    output: WireRef,
+    expected: ConcreteWireType,
+) -> Result<(), String> {
+    let request_operation = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU streamed carry operations")?;
+    let request_slot = crate::gpu_physical_lowering::emit_import_request(ctx, selector)?;
+    let key = crate::gpu_streamed_carry::scratch_key(&family.carry.name);
+    let (destination, graph_value, upload_owner, before_operation) =
+        crate::gpu_physical_lowering::allocate_typed_import_destination(
+            ctx, &expected, &key, None,
+        )?;
+    ctx.external_io_imports.push(ExternalIoImport {
+        before_operation,
+        request_operation,
+        request_slot,
+        key,
+        descriptor: ManifestArtifact {
+            artifact_type: family.carry.element.clone(),
+            availability: family.carry.availability,
+            family_count: Some(family.carry.count as u128),
+            layout: family.carry.layout.clone(),
+        },
+        expected_type: family.carry.element.clone(),
+        staged: true,
+        destination,
+        upload_owner,
+        selector,
+        carry: Some(family),
+    });
+    ctx.wire_ids.insert(output, graph_value);
+    Ok(())
+}
+
+/// Lower semantic control with explicit rejection of whole-family streamed consumers.
 pub(super) fn lower_control_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -721,6 +770,22 @@ pub(super) fn lower_control_node(
         .scope(scope_id)
         .ok_or_else(|| format!("GPU control scope {scope_id:?} is missing"))?;
     let output = WireRef { node: node_id, port: Port(0) };
+    let streamed_argument = scope.arguments(node).is_some_and(|arguments| {
+        arguments.iter().any(|wire| {
+            ctx.wire_ids.get(wire).is_some_and(|id| ctx.streaming.families.contains_key(id))
+        })
+    });
+    if streamed_argument &&
+        !matches!(
+            node.kind(),
+            NodeKind::FamilyGetStatic { .. } |
+                NodeKind::FamilyGetDynamic |
+                NodeKind::ParallelLoop(_) |
+                NodeKind::SequentialLoop(_)
+        )
+    {
+        return Err("GPU streamed carry does not support a whole-family consumer".into());
+    }
     match node.kind() {
         NodeKind::Concat { axis } => lower_concat(ctx, scope, scope_id, node_id, node, env, *axis),
         NodeKind::BlockDiagonal { .. } => {
@@ -1285,6 +1350,12 @@ pub(super) fn lower_control_node(
                 .get(index_wire)
                 .ok_or_else(|| "GPU dynamic family index has no physical value".to_owned())?;
             integer_range(ctx, index)?;
+            if let Some(family) =
+                ctx.wire_ids.get(family_wire).and_then(|id| ctx.streaming.families.get(id)).cloned()
+            {
+                let expected = resolved_node_output_type(scope_id, node_id, node, env)?;
+                return lower_streamed_member(ctx, family, index, output, expected);
+            }
             if !ctx.wire_ids.contains_key(family_wire) {
                 let source = scope
                     .node(family_wire.node)
@@ -1396,6 +1467,8 @@ pub(super) fn lower_control_node(
                             upload_owner,
                             member: None,
                             read_ahead: true,
+                            carry: None,
+                            base: None,
                         },
                         slot,
                         member,
@@ -1438,6 +1511,7 @@ pub(super) fn lower_control_node(
                     destination,
                     upload_owner,
                     selector: index,
+                    carry: None,
                 });
                 ctx.wire_ids.insert(output, graph_value);
                 return Ok(());
@@ -1522,6 +1596,15 @@ pub(super) fn lower_control_node(
                 .ok_or_else(|| "GPU static family selection has no output".to_owned())?;
             let expected = concretize_wire_type(declared, env, scope_id, node_id)
                 .map_err(|error| error.to_string())?;
+            if let Some(family) =
+                ctx.wire_ids.get(family).and_then(|id| ctx.streaming.families.get(id)).cloned()
+            {
+                if index >= family.carry.count {
+                    return Err("GPU streamed carry member is outside its family".into());
+                }
+                let selector = lower_device_int_expr(ctx, &IntExpr::constant(index), env)?;
+                return lower_streamed_member(ctx, family, selector, output, expected);
+            }
             if !ctx.wire_ids.contains_key(family) {
                 let source = scope
                     .node(family.node)
@@ -1578,6 +1661,8 @@ pub(super) fn lower_control_node(
                     upload_owner,
                     member: None,
                     read_ahead: false,
+                    carry: None,
+                    base: None,
                 });
                 ctx.wire_ids.insert(output, graph_value);
                 return Ok(());
@@ -1895,11 +1980,16 @@ pub(super) fn lower_control_node(
         NodeKind::ParallelLoop(loop_node) => {
             // A parallel loop in a device body replays its lanes in that body:
             // none of them is the top level of a host-driven loop body.
-            let host_loops = if ctx.device_body { ctx.host_loops.take() } else { None };
-            let lowered = lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env);
-            if host_loops.is_some() {
-                ctx.host_loops = host_loops;
+            let host_loops = ctx.host_loops.take();
+            let host_body_top = std::mem::replace(&mut ctx.host_body_top, false);
+            let device_body = ctx.device_body;
+            if host_body_top {
+                ctx.device_body = false;
             }
+            let lowered = lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env);
+            ctx.device_body = device_body;
+            ctx.host_body_top = host_body_top;
+            ctx.host_loops = host_loops;
             lowered
         }
         NodeKind::SequentialLoop(loop_node) => {
@@ -2540,6 +2630,8 @@ fn lower_lazy_int_expr_select(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_body_top: false,
+                streaming: &mut *ctx.streaming,
                 host_loops: None,
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
@@ -2609,6 +2701,8 @@ fn lower_lazy_int_expr_select(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_body_top: false,
+                streaming: &mut *ctx.streaming,
                 host_loops: None,
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
@@ -4631,6 +4725,7 @@ fn lower_int_matrix_vector_product(
     Ok(())
 }
 
+/// Bind a DSL integer lift to the shared resident polynomial constructor.
 fn lower_lift_integer_constant(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &GraphScope,
@@ -4652,7 +4747,18 @@ fn lower_lift_integer_constant(
     if ty.rows != 1 || ty.columns != 1 {
         return Err("GPU polynomial lift requires a 1x1 matrix".into());
     }
-    let coefficient = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
+    let coefficient = lift_resident_integer(ctx, integer, &ty)?;
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
+    Ok(())
+}
+
+/// Lift a resident scalar without freezing a replayed loop index at plan time.
+fn lift_resident_integer(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    integer: PhysicalValueId,
+    ty: &ConcreteMatrixType,
+) -> Result<PhysicalValueId, String> {
+    let coefficient = allocate_scratch_matrix(ctx, ty, PhysicalEncoding::FullCoeff)?;
     let status = allocate_integer_status(ctx)?;
     let integer_binding = scalar_binding(ctx, integer)?;
     let output_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
@@ -4685,8 +4791,78 @@ fn lower_lift_integer_constant(
         body: None,
     });
     ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
-    Ok(())
+    Ok(coefficient)
+}
+
+/// Materialize loop-dependent polynomial constants with resident integer kernels.
+/// Other loop-dependent matrix layouts fail rather than silently using iteration zero.
+pub(super) fn lower_loop_matrix_constant(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    value: &ConstantMatrix,
+    env: &ParamEnv,
+) -> Result<Option<PhysicalValueId>, String> {
+    let expressions = match value {
+        ConstantMatrix::Zero | ConstantMatrix::Identity => return Ok(None),
+        ConstantMatrix::Polynomial { coefficients } => coefficients.iter().collect::<Vec<_>>(),
+        ConstantMatrix::UnitRow { index } | ConstantMatrix::UnitColumn { index } => vec![index],
+        ConstantMatrix::Gadget { base, .. } => vec![base],
+        ConstantMatrix::PowerOfBase { base, exponent } => vec![base, exponent],
+        ConstantMatrix::Rotation { exponent } => vec![exponent],
+        ConstantMatrix::AllCoefficients { value } => vec![value],
+    };
+    if !expressions.iter().any(|expression| expression.contains_loop_index()) {
+        return Ok(None);
+    }
+    if ty.rows != 1 || ty.columns != 1 {
+        return Err("GPU loop-dependent matrix constant requires a scalar polynomial".into());
+    }
+    let degree = usize::try_from(ty.ring.ring_dimension())
+        .map_err(|_| "GPU polynomial ring dimension exceeds usize")?;
+    let broadcast = matches!(value, ConstantMatrix::AllCoefficients { .. });
+    if !broadcast && !matches!(value, ConstantMatrix::Polynomial { .. }) {
+        return Err("GPU loop-dependent matrix constant layout is unsupported".into());
+    }
+    if expressions.len() > degree {
+        return Err("GPU loop-dependent polynomial exceeds its ring dimension".into());
+    }
+    let integers = expressions
+        .into_iter()
+        .map(|expression| lower_device_int_expr(ctx, expression, env))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !broadcast && integers.len() == 1 {
+        return lift_resident_integer(ctx, integers[0], ty).map(Some);
+    }
+    let mut minimum = BigInt::from(0);
+    let mut maximum = BigInt::from(0);
+    for integer in &integers {
+        let range = integer_range(ctx, *integer)?;
+        minimum = minimum.min(range.start().clone());
+        maximum = maximum.max(range.end().clone());
+    }
+    let coefficients = allocate_integer_family_value_with_storage(
+        ctx,
+        ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: degree as u128,
+        },
+        minimum..=maximum,
+        false,
+        false,
+        Some(&vec![BigInt::from(0); degree]),
+    )?;
+    for index in 0..if broadcast { degree } else { integers.len() } {
+        emit_integer_operation(
+            ctx,
+            GpuIntegerOperation::Pack,
+            coefficients,
+            integers[if broadcast { 0 } else { index }],
+            None,
+            None,
+            u64::try_from(index).map_err(|_| "GPU coefficient index exceeds u64")?,
+        )?;
+    }
+    resident_polynomial_from_values(ctx, coefficients, ty, false).map(Some)
 }
 
 fn polynomial_source_in_domain(
@@ -5839,6 +6015,7 @@ fn lower_dynamic_matrix_slice(
 /// Convert a resident signed integer family to one canonical CRT polynomial.
 /// The native scatter reduces arbitrary signed values modulo each ordered
 /// prime and reports malformed physical integer encodings through status.
+/// Bind an integer-family polynomial import to the shared resident constructor.
 fn lower_polynomial_from_values(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &GraphScope,
@@ -5854,10 +6031,26 @@ fn lower_polynomial_from_values(
     let [family_wire] = arguments.as_slice() else {
         return Err("GPU polynomial import needs one integer family".into());
     };
-    let mut source = *ctx
+    let source = *ctx
         .wire_ids
         .get(family_wire)
         .ok_or_else(|| "GPU polynomial import family has no physical value".to_owned())?;
+    let ConcreteWireType::Matrix(ty) = resolved_node_output_type(scope_id, node_id, node, env)?
+    else {
+        return Err("GPU polynomial import output is not a matrix".into());
+    };
+    let coefficient = resident_polynomial_from_values(ctx, source, &ty, evaluation)?;
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
+    Ok(())
+}
+
+/// Construct a scalar polynomial from a bounded resident family in canonical order.
+fn resident_polynomial_from_values(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    mut source: PhysicalValueId,
+    ty: &ConcreteMatrixType,
+    evaluation: bool,
+) -> Result<PhysicalValueId, String> {
     // The import kernel reads SignedWords; a canonical family is widened.
     if let [PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)] =
         ctx.values[source.0 as usize].encodings.as_ref()
@@ -5876,10 +6069,6 @@ fn lower_polynomial_from_values(
         .values
         .get(source.0 as usize)
         .ok_or_else(|| "GPU polynomial import family metadata is missing".to_owned())?;
-    let ConcreteWireType::Matrix(ty) = resolved_node_output_type(scope_id, node_id, node, env)?
-    else {
-        return Err("GPU polynomial import output is not a matrix".into());
-    };
     if ty.rows != 1 || ty.columns != 1 || ty.ring.ring_dimension() < 2 {
         return Err("GPU polynomial import requires a scalar negacyclic ring".into());
     }
@@ -5901,7 +6090,7 @@ fn lower_polynomial_from_values(
     // evaluations are stored directly without a transform.
     let encoding =
         if evaluation { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
-    let coefficient = allocate_scratch_matrix(ctx, &ty, encoding)?;
+    let coefficient = allocate_scratch_matrix(ctx, ty, encoding)?;
     let status = allocate_integer_status(ctx)?;
     let source_binding = scalar_binding(ctx, source)?;
     let destination_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
@@ -5934,8 +6123,7 @@ fn lower_polynomial_from_values(
         body: None,
     });
     ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: 1 }, index)]);
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
-    Ok(())
+    Ok(coefficient)
 }
 
 /// Exact CRT tower projection, with no rescaling or host reconstruction.
@@ -6833,6 +7021,10 @@ fn copy_carry_to(
     Ok(vec![operation])
 }
 
+/// Lowers sequential carries, streaming matrix families through host-replayed waves.
+///
+/// Native reset ownership is assigned only after the final replay classification,
+/// because fixed artifact imports need not make a loop host-driven.
 fn lower_sequential_loop(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -6846,8 +7038,18 @@ fn lower_sequential_loop(
     let child_id = graph
         .child_scope_id(scope_id, node_id)
         .ok_or_else(|| "GPU sequential loop has no child scope".to_owned())?;
+    let has_streamed_carries = node
+        .output_types()
+        .iter()
+        .map(|ty| {
+            concretize_wire_type(ty, env, scope_id, node_id).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(crate::gpu_streamed_carry::is_streamed_carry);
     let has_scoped_artifacts = contains_scoped_artifact_input(graph, &child_id)?;
-    if has_scoped_artifacts && ctx.device_body && ctx.host_loops.is_none() {
+    let host_driven = has_scoped_artifacts || has_streamed_carries;
+    if host_driven && ctx.device_body && ctx.host_loops.is_none() {
         // Per-iteration artifact reads are host-driven region boundaries,
         // which only the host's replay of a host-driven loop body can nest.
         return Err("GPU artifact-reading sequential loop cannot run inside a device body".into());
@@ -6855,7 +7057,7 @@ fn lower_sequential_loop(
     // A loop that reads artifacts, directly or in a nested loop, is
     // host-driven: the host replays its body, and so drives the loops in it
     // that read artifacts too.
-    let body_host_loops = has_scoped_artifacts.then(|| {
+    let body_host_loops = host_driven.then(|| {
         let mut loops = ctx.host_loops.clone().unwrap_or_default();
         loops.push((loop_node.index_slot, count));
         loops
@@ -6875,8 +7077,32 @@ fn lower_sequential_loop(
     {
         return Err("GPU sequential loop has unsupported carry arity".into());
     }
+    let mut streamed_inputs = Vec::with_capacity(loop_node.carried_count);
+    for (position, &argument) in arguments.iter().take(loop_node.carried_count).enumerate() {
+        let ty = concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
+            .map_err(|error| error.to_string())?;
+        streamed_inputs.push(crate::gpu_streamed_carry::prepare_carry(
+            ctx,
+            graph,
+            scope_id,
+            node_id,
+            argument,
+            &child_id,
+            position,
+            loop_node.index_slot,
+            &ty,
+        )?);
+    }
     if count == 0 {
         for (position, wire) in arguments.iter().take(loop_node.carried_count).enumerate() {
+            if let Some((id, family)) = &streamed_inputs[position] {
+                let mut family = family.clone();
+                family.iteration = IntExpr::constant(0);
+                let ty = ctx.values[id.0 as usize].ty.clone();
+                let output = crate::gpu_streamed_carry::bind_family(ctx, ty, family)?;
+                ctx.wire_ids.insert(WireRef { node: node_id, port: Port(position as u32) }, output);
+                continue;
+            }
             let source = *ctx
                 .wire_ids
                 .get(wire)
@@ -6913,6 +7139,9 @@ fn lower_sequential_loop(
     // trials are rolled back so only the final lowering remains.
     let mut carry_ranges = (0..loop_node.carried_count)
         .map(|position| {
+            if streamed_inputs[position].is_some() {
+                return Ok(None);
+            }
             let source = *ctx
                 .wire_ids
                 .get(&arguments[position])
@@ -6925,11 +7154,13 @@ fn lower_sequential_loop(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut widenings = 0u64;
+    let body_parallel_lanes_start = ctx.parallel_lanes.len();
     let (
         input_ids,
         outer_dependencies,
         control_ids,
         external_index_owner,
+        control_reset,
         body_operations,
         mut body_imports,
         mut body_ahead,
@@ -6937,6 +7168,7 @@ fn lower_sequential_loop(
         outputs,
         carry_copy_ops,
         nested_loops,
+        body_waves_start,
     ) = loop {
         let mark = (
             ctx.values.len(),
@@ -6953,11 +7185,16 @@ fn lower_sequential_loop(
             *ctx.crt_resource_next,
             ctx.slots.len(),
             ctx.export_templates.len(),
+            ctx.parallel_lanes.len(),
         );
         let resource_keys = ctx.hash_resources.keys().copied().collect::<BTreeSet<_>>();
         let mut input_ids = Vec::with_capacity(arguments.len());
         let mut outer_dependencies = std::collections::BTreeSet::new();
         for (position, wire) in arguments.iter().enumerate() {
+            if let Some(Some((id, _))) = streamed_inputs.get(position) {
+                input_ids.push(*id);
+                continue;
+            }
             if position >= loop_node.carried_count &&
                 matches!(
                     child.node(child.inputs()[position].node).map(NodeHandle::kind),
@@ -7013,7 +7250,6 @@ fn lower_sequential_loop(
                 return Err("GPU sequential loop has no typed index owner".into());
             }
         };
-        ctx.control_resets.push(reset);
         if ctx.device_body {
             // The host resets loop control only before a root region or wave
             // replay. An enclosing device body replays this loop without the
@@ -7072,6 +7308,8 @@ fn lower_sequential_loop(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_body_top: host_driven,
+                streaming: &mut *ctx.streaming,
                 host_loops: body_host_loops.clone(),
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
@@ -7115,6 +7353,9 @@ fn lower_sequential_loop(
             if outputs.iter().any(|output| input_ids[..loop_node.carried_count].contains(output)) {
                 let mut stage_copies = Vec::new();
                 for (position, output) in outputs.iter().copied().enumerate() {
+                    if streamed_inputs[position].is_some() {
+                        continue;
+                    }
                     let target = body_ctx.values[output.0 as usize].ty.clone();
                     let staged = allocate_sequential_carry(&mut body_ctx, output, &target, None)?;
                     stage_copies.extend(copy_carry_to(
@@ -7126,6 +7367,9 @@ fn lower_sequential_loop(
                     copy_sources[position] = staged;
                 }
                 for (position, source) in copy_sources.iter().copied().enumerate() {
+                    if streamed_inputs[position].is_some() {
+                        continue;
+                    }
                     carry_copy_ops.extend(copy_carry_to(
                         &mut body_ctx,
                         source,
@@ -7135,6 +7379,9 @@ fn lower_sequential_loop(
                 }
             } else {
                 for (position, output) in outputs.iter().copied().enumerate() {
+                    if streamed_inputs[position].is_some() {
+                        continue;
+                    }
                     // An external-I/O body keeps its carried-state copy tail,
                     // which the host relaunches around each selected import.
                     if body_ctx.external_io_imports.is_empty() &&
@@ -7170,6 +7417,7 @@ fn lower_sequential_loop(
                 outer_dependencies,
                 control_ids,
                 external_index_owner,
+                reset,
                 body_operations,
                 body_imports,
                 body_ahead,
@@ -7177,6 +7425,7 @@ fn lower_sequential_loop(
                 outputs,
                 carry_copy_ops,
                 mark.10,
+                mark.8,
             );
         }
         let first_new = mark.0;
@@ -7198,11 +7447,29 @@ fn lower_sequential_loop(
         *ctx.crt_resource_next = mark.11;
         ctx.slots.truncate(mark.12);
         ctx.export_templates.truncate(mark.13);
+        ctx.parallel_lanes.truncate(mark.14);
+        ctx.streaming.families.retain(|id, _| (id.0 as usize) < first_new);
+        ctx.streaming.member_overrides.retain(|_, id| (id.0 as usize) < first_new);
         ctx.hash_resources.retain(|id, _| resource_keys.contains(id));
         ctx.integer_status.retain(|_, id| (id.0 as usize) < first_new);
         carry_ranges = widened;
         widenings += 1;
     };
+    if body_operations.is_empty() &&
+        streamed_inputs
+            .iter()
+            .all(|input| input.as_ref().is_some_and(|(_, family)| !family.carry.updated))
+    {
+        for (position, input) in streamed_inputs.iter().enumerate() {
+            let (id, family) = input.as_ref().expect("alias-only streamed carry");
+            let mut family = family.clone();
+            family.iteration = IntExpr::constant(0);
+            let ty = ctx.values[id.0 as usize].ty.clone();
+            let output = crate::gpu_streamed_carry::bind_family(ctx, ty, family)?;
+            ctx.wire_ids.insert(WireRef { node: node_id, port: Port(position as u32) }, output);
+        }
+        return Ok(());
+    }
     if outputs.len() != loop_node.carried_count || body_operations.is_empty() {
         return Err("GPU sequential body has no valid carried computation".into());
     }
@@ -7216,9 +7483,12 @@ fn lower_sequential_loop(
     {
         return Err("GPU scoped artifact has no selected import boundary".into());
     }
-    let external_io = !body_imports.is_empty() || !body_ahead.is_empty() || !nested.is_empty();
+    let external_io = has_streamed_carries ||
+        !body_imports.is_empty() ||
+        !body_ahead.is_empty() ||
+        !nested.is_empty();
     if external_io {
-        if carry_copy_ops.is_empty() {
+        if carry_copy_ops.is_empty() && !has_streamed_carries {
             return Err("GPU external-I/O loop has no selected import or carry copy".into());
         }
         let body_start = u32::try_from(ctx.operations.len())
@@ -7241,7 +7511,39 @@ fn lower_sequential_loop(
         }
         let body_end = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU external-I/O body operations".to_owned())?;
-        for mut import in body_static_imports {
+        for lanes in &mut ctx.parallel_lanes[body_parallel_lanes_start..] {
+            for lane in lanes {
+                lane.start += body_start;
+                lane.end += body_start;
+            }
+        }
+        let first_import = ctx.import_templates.len();
+        let wave_imports = ctx.waves[body_waves_start..]
+            .iter()
+            .flat_map(|wave| {
+                wave.import_template_indices
+                    .iter()
+                    .chain(wave.invocation_imports.values().flatten())
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
+        for wave in &mut ctx.waves[body_waves_start..] {
+            wave.body_start += body_start;
+            wave.body_end += body_start;
+            for index in wave
+                .import_template_indices
+                .iter_mut()
+                .chain(wave.invocation_imports.values_mut().flatten())
+            {
+                *index += first_import;
+            }
+        }
+        for (position, mut import) in body_static_imports.into_iter().enumerate() {
+            if wave_imports.contains(&position) {
+                import.before_operation += body_start;
+                ctx.import_templates.push(import);
+                continue;
+            }
             // A fixed member is read once at loop entry, while its NTT may
             // remain in the repeated body. It never reads the full family.
             import.before_operation = body_start;
@@ -7302,12 +7604,29 @@ fn lower_sequential_loop(
             count,
             index_slot: loop_node.index_slot,
             index_owner: external_index_owner,
-            carried_ids: carried_ids.clone(),
+            carried_ids: carried_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(position, id)| streamed_inputs[position].is_none().then_some(*id))
+                .collect(),
             carry_copy_ops: carry_copy_ops.clone(),
             imports: body_imports,
             ahead: body_ahead,
+            streamed_carries: streamed_inputs
+                .iter()
+                .flatten()
+                .map(|(_, family)| family.carry.clone())
+                .collect(),
         });
         for (position, carried) in carried_ids.into_iter().enumerate() {
+            if let Some((_, family)) = &streamed_inputs[position] {
+                let mut family = family.clone();
+                family.iteration = IntExpr::constant(count);
+                let ty = ctx.values[carried.0 as usize].ty.clone();
+                let output = crate::gpu_streamed_carry::bind_family(ctx, ty, family)?;
+                ctx.wire_ids.insert(WireRef { node: node_id, port: Port(position as u32) }, output);
+                continue;
+            }
             let declared =
                 concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
                     .map_err(|error| error.to_string())?;
@@ -7331,6 +7650,7 @@ fn lower_sequential_loop(
     if !body_imports.is_empty() || !body_ahead.is_empty() {
         return Err("GPU native loop has an uncommitted artifact import".into());
     }
+    ctx.control_resets.push(control_reset);
     let scalar_binding = |bindings: &mut Vec<GpuBindingSource>, id| -> Result<u32, String> {
         let index = u32::try_from(bindings.len())
             .map_err(|_| "too many GPU control bindings".to_owned())?;
@@ -7947,6 +8267,7 @@ fn lower_parallel_loop(
     {
         return Err("GPU parallel loop boundary has the wrong arity".into());
     }
+    let mut carry_exports = Vec::with_capacity(node.output_types().len());
     let mut outputs_by_port = Vec::with_capacity(node.output_types().len());
     let mut names_by_port = Vec::with_capacity(node.output_types().len());
     for (port, declared) in node.output_types().iter().enumerate() {
@@ -7980,7 +8301,10 @@ fn lower_parallel_loop(
         } else {
             Vec::new()
         };
-        outputs_by_port.push((ty, Vec::<Arc<GpuResidentValue>>::with_capacity(count)));
+        let carry_export =
+            crate::gpu_streamed_carry::initial_parallel_export(ctx, graph, scope_id, wire, &ty)?;
+        carry_exports.push(carry_export);
+        outputs_by_port.push((ty, Vec::<Arc<GpuResidentValue>>::new()));
         names_by_port.push(names);
     }
     // Root output ports that no node reads after the loop: at most their
@@ -7993,15 +8317,19 @@ fn lower_parallel_loop(
         .map(|(port, names)| {
             let wire = WireRef { node: node_id, port: Port(port as u32) };
             let root = graph.root_scope();
-            is_root &&
-                !ctx.device_body &&
-                ctx.active_parallel_template.is_none() &&
-                names.iter().all(|name| {
-                    graph.outputs().get(name).is_some_and(|output| output.availability.is_some())
-                }) &&
-                !root.nodes().iter().any(|consumer| {
-                    root.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
-                })
+            carry_exports[port].is_some() ||
+                is_root &&
+                    !ctx.device_body &&
+                    ctx.active_parallel_template.is_none() &&
+                    names.iter().all(|name| {
+                        graph
+                            .outputs()
+                            .get(name)
+                            .is_some_and(|output| output.availability.is_some())
+                    }) &&
+                    !root.nodes().iter().any(|consumer| {
+                        root.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
+                    })
         })
         .collect::<Vec<_>>();
     // Output ports whose only reads sum their members: each wave adds its
@@ -8088,10 +8416,30 @@ fn lower_parallel_loop(
         for (argument, (source, mode)) in source_ids.iter().zip(&loop_node.input_modes).enumerate()
         {
             if let (LoopInputMode::Broadcast, Some(source)) = (mode, source) {
+                if ctx.streaming.families.contains_key(source) {
+                    continue;
+                }
                 let replica =
                     crate::gpu_physical_lowering::replicate_to_device(ctx, *source, device)?;
                 broadcast_replicas.insert((argument, device), replica);
             }
+        }
+    }
+    let runtime_reads = if ctx.device_body {
+        BTreeMap::new()
+    } else {
+        crate::gpu_streamed_carry::runtime_base_reads(child, loop_node)
+    };
+    let mut base_slots = BTreeMap::new();
+    for (base_argument, _) in runtime_reads.values() {
+        let base = source_ids
+            .get(*base_argument)
+            .copied()
+            .flatten()
+            .ok_or("GPU runtime Zip base has no scalar owner")?;
+        if !base_slots.contains_key(&base) {
+            let slot = crate::gpu_physical_lowering::emit_import_request(ctx, base)?;
+            base_slots.insert(base, slot);
         }
     }
     let body_start = u32::try_from(ctx.operations.len())
@@ -8134,7 +8482,9 @@ fn lower_parallel_loop(
         for (argument, ((source, wire), mode)) in
             source_ids.iter().zip(arguments.iter()).zip(&loop_node.input_modes).enumerate()
         {
+            let dynamic = runtime_reads.get(&argument);
             let offset = match mode {
+                LoopInputMode::Broadcast if dynamic.is_some() => 0,
                 LoopInputMode::Broadcast => {
                     // A root artifact family is never loaded whole: the body's
                     // family reads import the members they reach, so this
@@ -8197,28 +8547,54 @@ fn lower_parallel_loop(
             // Only root artifact inputs are imported per lane; a nested loop's
             // Zip source is a family already resident in its template.
             let artifact = match source_node.kind() {
-                NodeKind::Input { artifact, .. } if is_root => artifact.as_ref(),
+                NodeKind::Input { artifact, .. } => artifact.as_ref(),
                 _ => None,
             };
+            let carry = source.and_then(|id| ctx.streaming.families.get(&id)).cloned();
             let index = lane
                 .checked_add(offset)
                 .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
-            if let Some(artifact) = artifact {
-                if source.is_some() {
+            if artifact.is_some() || carry.is_some() {
+                if source.is_some() && carry.is_none() {
                     return Err("GPU artifact family was unexpectedly materialized".into());
                 }
-                let descriptor = ctx
-                    .validated
-                    .root_scope()
-                    .artifact_inputs
-                    .get(wire)
-                    .ok_or_else(|| "GPU Zip artifact lacks a validated descriptor".to_owned())?
-                    .clone();
-                let family_ty =
-                    ctx.validated.root_scope().wire_types.get(wire).ok_or_else(|| {
-                        "GPU Zip artifact lacks a concrete family type".to_owned()
-                    })?;
-                let ConcreteWireType::IndexedFamily { element, count: family_count } = family_ty
+                let family_ty = match source {
+                    Some(id) => ctx.values[id.0 as usize].ty.clone(),
+                    None => ctx
+                        .validated
+                        .scope(scope_id)
+                        .and_then(|scope| scope.wire_types.get(wire))
+                        .cloned()
+                        .ok_or("GPU Zip artifact lacks a concrete family type")?,
+                };
+                let (key, descriptor) = if let Some(family) = &carry {
+                    (
+                        crate::gpu_streamed_carry::scratch_key(&family.carry.name),
+                        ManifestArtifact {
+                            artifact_type: family.carry.element.clone(),
+                            availability: family.carry.availability,
+                            family_count: Some(family.carry.count as u128),
+                            layout: family.carry.layout.clone(),
+                        },
+                    )
+                } else {
+                    let artifact = artifact.expect("artifact Zip source");
+                    let descriptor = ctx
+                        .validated
+                        .scope(scope_id)
+                        .and_then(|scope| scope.artifact_inputs.get(wire))
+                        .cloned()
+                        .ok_or("GPU Zip artifact lacks a validated descriptor")?;
+                    (
+                        ArtifactKey {
+                            production: artifact.production_id.clone(),
+                            name: artifact.artifact_name.clone(),
+                            index: None,
+                        },
+                        descriptor,
+                    )
+                };
+                let ConcreteWireType::IndexedFamily { element, count: family_count } = &family_ty
                 else {
                     return Err("GPU Zip artifact is not an indexed family".into());
                 };
@@ -8241,15 +8617,11 @@ fn lower_parallel_loop(
                 let capacity = selected_import_capacity(
                     ctx,
                     &element_type,
-                    &artifact.production_id,
-                    &artifact.artifact_name,
+                    &key.production,
+                    &key.name,
                     selected_indexes,
                 )?;
-                let key = ArtifactKey {
-                    production: artifact.production_id.clone(),
-                    name: artifact.artifact_name.clone(),
-                    index: gather.is_none().then_some(index),
-                };
+                let key = ArtifactKey { index: gather.is_none().then_some(index), ..key };
                 // A matrix member lives in plan scratch placed for its wave
                 // loop, from the loop's first reads to its last wave.
                 let (destination, graph_value, upload_owner, before_operation) =
@@ -8273,7 +8645,17 @@ fn lower_parallel_loop(
                             capacity,
                         )?,
                     };
-                input_ids.push(graph_value);
+                if let Some((_, reads)) = dynamic {
+                    input_ids.push(source.unwrap_or(UNLOADED_FAMILY));
+                    for read in reads {
+                        ctx.streaming
+                            .member_overrides
+                            .insert((child_id.clone(), *read), graph_value);
+                    }
+                } else {
+                    input_ids.push(graph_value);
+                }
+                let base = dynamic.and_then(|(argument, _)| source_ids[*argument]);
                 // With more than one wave, odd waves read into a second owner
                 // so that each wave's members are read during the previous
                 // wave. A nested template replays per parent occurrence and
@@ -8289,8 +8671,8 @@ fn lower_parallel_loop(
                 };
                 artifact_zip_lanes.push(ArtifactZipLane {
                     argument,
-                    name: artifact.artifact_name.clone(),
-                    production: artifact.production_id.clone(),
+                    name: key.name.clone(),
+                    production: key.production.clone(),
                     descriptor,
                     expected_type,
                     offset,
@@ -8299,6 +8681,9 @@ fn lower_parallel_loop(
                     upload_owner,
                     before_operation,
                     gather,
+                    base,
+                    base_slot: base.and_then(|base| base_slots.get(&base).copied()),
+                    carry,
                     twin,
                 });
             } else {
@@ -8401,26 +8786,42 @@ fn lower_parallel_loop(
             let artifact_type = ArtifactType::from_wire_type(element)
                 .ok_or_else(|| "GPU streamed family member has no artifact type".to_owned())?;
             let source = crate::gpu_physical_lowering::full_eval_value(ctx, id)?;
-            for name in &names_by_port[port] {
-                let availability = graph
-                    .outputs()
-                    .get(name)
-                    .and_then(|output| output.availability)
-                    .ok_or_else(|| "GPU streamed export has no availability".to_owned())?;
+            let scratch = carry_exports[port].as_ref();
+            let export_names = scratch
+                .map(|export| vec![export.family.carry.name.clone()])
+                .unwrap_or_else(|| names_by_port[port].clone());
+            for name in &export_names {
+                let availability = if scratch.is_some() {
+                    mxx_ir_core::artifact::ArtifactAvailability::Cached
+                } else {
+                    graph
+                        .outputs()
+                        .get(name)
+                        .and_then(|output| output.availability)
+                        .ok_or_else(|| "GPU streamed export has no availability".to_owned())?
+                };
                 let (first, first_operation) = (ctx.export_templates.len(), ctx.operations.len());
-                crate::gpu_physical_lowering::emit_artifact_export(
+                let device_exports = ctx.device_artifact_exports;
+                if scratch.is_some() {
+                    ctx.device_artifact_exports = false;
+                }
+                let exported = crate::gpu_physical_lowering::emit_artifact_export(
                     ctx,
                     name,
                     &[(Some(lane), source)],
                     artifact_type.clone(),
                     availability,
                     None,
-                )?;
+                );
+                ctx.device_artifact_exports = device_exports;
+                exported?;
                 // Each lane's export is a site of its own, reused by every
                 // wave: its slot is the site's first, whichever member it
                 // names.
                 for template in &mut ctx.export_templates[first..] {
                     template.streamed = true;
+                    template.scratch = scratch.is_some();
+                    template.member_base = scratch.and_then(|export| export.member_base.clone());
                     template.occurrence = 0;
                 }
                 let publish = ctx
@@ -8718,6 +9119,8 @@ fn lower_parallel_loop(
                 upload_owner,
                 member,
                 read_ahead: lane.twin.is_some(),
+                carry: lane.carry.clone(),
+                base: lane.base_slot.zip(lane.base),
             });
             wave.import_template_indices.push(template_index);
         }
@@ -8768,6 +9171,11 @@ fn lower_parallel_loop(
     }
     for (port, (ty, members)) in outputs_by_port.into_iter().enumerate() {
         // Nothing reads a streamed or summed port as a family.
+        if let Some(export) = &carry_exports[port] {
+            let id = crate::gpu_streamed_carry::bind_family(ctx, ty, export.family.clone())?;
+            ctx.wire_ids.insert(WireRef { node: node_id, port: Port(port as u32) }, id);
+            continue;
+        }
         if streamed_ports[port] || summed_ports[port] {
             continue;
         }
@@ -9062,6 +9470,8 @@ fn lower_inlined_child(
                     upload_owner,
                     member: None,
                     read_ahead: false,
+                    carry: None,
+                    base: None,
                 });
                 ctx.wire_ids.insert(*input, graph_value);
                 continue;
@@ -9119,6 +9529,13 @@ fn lower_inlined_child(
                     ctx.wire_ids.insert(wire, id);
                     continue;
                 }
+            }
+            let output = WireRef { node: child_node_id, port: Port(0) };
+            if let Some(id) =
+                ctx.streaming.member_overrides.get(&(child_scope_id.clone(), output)).copied()
+            {
+                ctx.wire_ids.insert(output, id);
+                continue;
             }
             let first_operation = ctx.operations.len();
             if matches!(child_node.kind(), NodeKind::MatrixBinary(_)) {

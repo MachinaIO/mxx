@@ -111,6 +111,10 @@ pub(crate) struct ExportTemplate {
     /// its lane reuses in every wave (`PhysicalWave::streamed_exports`),
     /// rather than observed from a slot of its own.
     pub streamed: bool,
+    /// Private scratch export, excluded from the public manifest and committed outputs.
+    pub scratch: bool,
+    /// Host loop slot and expression added to each exported member index.
+    pub member_base: Option<(u32, mxx_ir_core::IntExpr)>,
 }
 
 /// A canonical artifact is requested only at its first dependent Graph
@@ -164,6 +168,10 @@ pub(crate) struct ImportTemplate {
     /// A wave import into one of two alternating owners, which the wave group
     /// starts one wave ahead of its consumers.
     pub read_ahead: bool,
+    /// Iteration-resolved private carry source, instead of the fixed artifact key.
+    pub carry: Option<crate::gpu_streamed_carry::StreamedFamily>,
+    /// A scalar selector published before this wave group starts.
+    pub base: Option<(usize, PhysicalValueId)>,
 }
 
 /// The resident owner of every physical value of a lowering, with the values viewing every
@@ -1626,6 +1634,10 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// sequential loop) whose operations replay without the host, so a
     /// parallel loop inside runs every occurrence in one template.
     pub device_body: bool,
+    /// Top-level parallel loops in this host-driven body replay as bounded waves.
+    pub host_body_top: bool,
+    /// Private streamed family identities, export targets, and lane member overrides.
+    pub streaming: &'a mut crate::gpu_streamed_carry::StreamingLowering,
     pub preimage_replays: &'a mut Vec<PreimageReplay>,
     pub trapdoor_public_ids: &'a mut BTreeMap<PhysicalValueId, PhysicalValueId>,
     pub waves: &'a mut Vec<PhysicalWave>,
@@ -2972,6 +2984,7 @@ pub(super) fn encode_static_matrix(
     .map_err(|error| error.to_string())
 }
 
+/// Upload invariant constants once; construct loop-dependent polynomials on device.
 pub(super) fn lower_static_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
@@ -2997,7 +3010,11 @@ pub(super) fn lower_static_matrix_node(
         .get(&wire)
         .and_then(ConcreteWireType::matrix_type)
         .ok_or_else(|| "GPU static matrix has no validated type".to_owned())?;
-    let evaluation = plan_static_matrix(ctx, ty, value, env)?;
+    let evaluation =
+        match crate::gpu_physical_control::lower_loop_matrix_constant(ctx, ty, value, env)? {
+            Some(value) => value,
+            None => plan_static_matrix(ctx, ty, value, env)?,
+        };
     ctx.wire_ids.insert(wire, evaluation);
     Ok(())
 }
@@ -4799,6 +4816,8 @@ fn retry_body_context<'b>(
         active_parallel_template: ctx.active_parallel_template,
         active_parallel_instances: ctx.active_parallel_instances.clone(),
         device_body: true,
+        host_body_top: false,
+        streaming: &mut *ctx.streaming,
         host_loops: None,
         preimage_replays: &mut *ctx.preimage_replays,
         trapdoor_public_ids: &mut *ctx.trapdoor_public_ids,
@@ -7227,6 +7246,8 @@ pub(super) fn emit_artifact_export(
                 availability,
                 export: Arc::clone(export),
                 streamed: false,
+                scratch: false,
+                member_base: None,
             });
         }
     }
@@ -7358,6 +7379,8 @@ pub(crate) fn plan_physical_graph(
                             },
                             member: None,
                             read_ahead: false,
+                            carry: None,
+                            base: None,
                         })
                         .collect(),
                 );
@@ -7439,6 +7462,8 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Bytes { owner: native, length: *length },
                         member: None,
                         read_ahead: false,
+                        carry: None,
+                        base: None,
                     }],
                 );
                 continue;
@@ -7506,6 +7531,8 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Bytes { owner: native, length: capacity },
                         member: None,
                         read_ahead: false,
+                        carry: None,
+                        base: None,
                     }],
                 );
                 continue;
@@ -7541,6 +7568,8 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Bounded { owner: native, ty: ty.clone() },
                         member: None,
                         read_ahead: false,
+                        carry: None,
+                        base: None,
                     }],
                 );
                 continue;
@@ -7587,6 +7616,8 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Signed { owner: native, ty: ty.clone() },
                         member: None,
                         read_ahead: false,
+                        carry: None,
+                        base: None,
                     }],
                 );
                 continue;
@@ -7634,6 +7665,8 @@ pub(crate) fn plan_physical_graph(
                     upload_owner: ImportDestination::Placed { ty },
                     member: None,
                     read_ahead: false,
+                    carry: None,
+                    base: None,
                 }],
             );
             continue;
@@ -7769,6 +7802,7 @@ pub(crate) fn plan_physical_graph(
     let mut waves = Vec::<PhysicalWave>::new();
     let mut import_templates = Vec::<ImportTemplate>::new();
     let mut external_io_loops = Vec::<ExternalIoLoop>::new();
+    let mut streaming = crate::gpu_streamed_carry::StreamingLowering::default();
     let mut external_io_imports = Vec::<ExternalIoImport>::new();
     let mut parallel_lanes = Vec::new();
     let mut node_operations = Vec::new();
@@ -7804,6 +7838,8 @@ pub(crate) fn plan_physical_graph(
                 active_parallel_template: None,
                 active_parallel_instances: Vec::new(),
                 device_body: false,
+                host_body_top: false,
+                streaming: &mut streaming,
                 host_loops: None,
                 preimage_replays: &mut preimage_replays,
                 trapdoor_public_ids: &mut trapdoor_public_ids,
@@ -7842,6 +7878,8 @@ pub(crate) fn plan_physical_graph(
                 upload_owner,
                 member: None,
                 read_ahead: false,
+                carry: None,
+                base: None,
             }],
         );
     }
@@ -8635,6 +8673,12 @@ pub(crate) fn plan_physical_graph(
         &mut external_io_loops,
     );
     let mut site_starts = BTreeMap::<usize, u32>::new();
+    for (slot, _) in import_templates.iter().filter_map(|template| template.base) {
+        let site = IMPORT_REQUEST_SITE_BASE
+            .checked_add(u32::try_from(slot).map_err(|_| "too many GPU runtime base slots")?)
+            .ok_or("GPU runtime base site overflows")?;
+        site_starts.insert(slot, site);
+    }
     for template in &export_templates {
         // A streamed lane's slot starts the same site in every wave.
         if template.occurrence == 0 &&

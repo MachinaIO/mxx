@@ -23,7 +23,7 @@ use mxx_backends::{
     poly::Poly,
     transcript::{DrawSite, RecordedValue},
 };
-use mxx_dsl::BuiltGraph;
+use mxx_dsl::{BuiltGraph, DslContext};
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId},
@@ -294,6 +294,7 @@ pub struct StageGraph {
 }
 
 impl StageGraph {
+    /// Package a frozen graph with its runtime bindings and dependency manifests.
     pub fn new(
         graph: BuiltGraph,
         runtime_inputs: BTreeMap<String, RuntimeValue>,
@@ -301,6 +302,52 @@ impl StageGraph {
     ) -> Self {
         Self { graph, runtime_inputs, manifests }
     }
+}
+
+/// One builder's contribution to a caller-owned graph, before freezing or execution.
+///
+/// Carry `graph` into the next emitter and merge the runtime inputs and manifests of
+/// all contributions. Only freeze once, after the caller adds its own outputs.
+pub struct GraphEmission<D> {
+    /// The caller's context with this contribution's outputs added.
+    pub graph: DslContext,
+    /// Resident inputs needed by this contribution, including potentially pruned inputs.
+    pub runtime_inputs: BTreeMap<String, RuntimeValue>,
+    /// Manifests of the productions this contribution reads.
+    pub manifests: BTreeMap<ProductionId, Manifest>,
+    /// Artifact metadata to attach to the final, shared production.
+    pub descriptor: D,
+}
+
+impl<D> GraphEmission<D> {
+    /// Freeze a complete emission and discard bindings for unreachable graph inputs.
+    pub fn build(self) -> Result<(StageGraph, D), ApiError> {
+        let graph = self.graph.build().map_err(ApiError::scheme)?;
+        let mut runtime = self.runtime_inputs;
+        runtime.retain(|name, _| {
+            graph.graph.root_scope().nodes().iter().any(|node| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { name: input, .. } if input == name)
+            })
+        });
+        Ok((StageGraph::new(graph, runtime, self.manifests), self.descriptor))
+    }
+}
+
+/// A bound Program builder that exposes its normal lowering traversal for composition.
+pub trait ProgramBuild {
+    /// The lowered carrier returned for each declared Program output.
+    type Wire;
+
+    /// Traverse a bound Program without freezing or executing its graph.
+    fn lower(&mut self, program: &ExponentLutProgram) -> Result<Vec<Self::Wire>, ApiError>;
+}
+
+/// Lower a bound Program into graph values that the caller can compose further.
+pub fn lower<T: ProgramBuild>(
+    program: &ExponentLutProgram,
+    build: &mut T,
+) -> Result<Vec<T::Wire>, ApiError> {
+    build.lower(program)
 }
 
 /// Owned outputs of one non-producing stage execution.
@@ -430,7 +477,9 @@ pub struct StageArtifacts<D> {
 }
 
 impl<D> StageArtifacts<D> {
-    fn new(
+    /// Associate a descriptor with a finalized production and its immutable session.
+    /// Several descriptors may refer to different prefixes in the same production.
+    pub fn new(
         production: ProductionId,
         manifest: Manifest,
         descriptor: D,
@@ -564,10 +613,23 @@ pub trait PreprocessBuild<P: Poly> {
         descriptors: (Self::EncryptDescriptor, Self::OnlineEvalDescriptor),
     ) -> Result<(Self::EncryptDescriptor, Self::OnlineEvalDescriptor), ApiError>;
 
+    /// Add this preprocessing to a caller-owned context without freezing it.
+    fn emit(
+        self,
+        graph: DslContext,
+        outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
+    ) -> Result<GraphEmission<(Self::EncryptDescriptor, Self::OnlineEvalDescriptor)>, ApiError>;
+
+    /// Emit into a fresh context and freeze the standalone preprocessing stage.
     fn build_graph(
         self,
         outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
-    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineEvalDescriptor)), ApiError>;
+    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineEvalDescriptor)), ApiError>
+    where
+        Self: Sized,
+    {
+        self.emit(DslContext::new("rns-bgg-preprocess"), outputs)?.build()
+    }
 }
 
 /// Builder contract for the input-only encryption graph.
@@ -653,10 +715,23 @@ pub trait OnlineEvalBuild {
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
+    /// Add evaluation outputs to a caller-owned context without freezing it.
+    fn emit(
+        self,
+        graph: DslContext,
+        outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
+    ) -> Result<GraphEmission<()>, ApiError>;
+
+    /// Emit into a fresh context and freeze the standalone evaluation stage.
     fn build_graph(
         self,
         outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
-    ) -> Result<StageGraph, ApiError>;
+    ) -> Result<StageGraph, ApiError>
+    where
+        Self: Sized,
+    {
+        Ok(self.emit(DslContext::new("rns-bgg-online-eval"), outputs)?.build()?.0)
+    }
 }
 
 /// Builder contract for Program-based noise simulation.

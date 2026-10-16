@@ -33,6 +33,8 @@ impl<'a> RnsPreprocessBuild<'a> {
     /// Create an unbound preprocessing adapter.
     pub fn new(parameters: &'a RnsBggParameters, context: [u8; 32]) -> Self {
         Self {
+            artifact_prefix: None,
+            rhs_values: None,
             parameters,
             context,
             hash_key_commitment: [0; 32],
@@ -51,6 +53,41 @@ impl<'a> RnsPreprocessBuild<'a> {
             inputs_by_shape: false,
             root_inputs: BTreeMap::new(),
         }
+    }
+
+    /// Namespace this instance's inputs and artifacts without changing its sampling seed.
+    /// Configure before binding; choose distinct, nonempty prefixes for Programs in one context.
+    pub fn with_artifact_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.artifact_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Bind Static RHS plaintext expressions from the caller's graph at level zero.
+    /// Families keep their symbolic counts and are read inside graph loops. This adds
+    /// no plaintext inputs and does not execute encryption or online evaluation.
+    pub fn bind_rhs_values(
+        &mut self,
+        program: &ExponentLutProgram,
+        parameters: &mxx_ir_core::ParamEnv,
+        rhs: BTreeMap<RhsId, InputBinding<Mat, Family<Mat>>>,
+        payload: Option<&RnsBggPayloadSecret>,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        if self.evaluator.is_some() {
+            return Err(ApiError::input("preprocessing is already bound"));
+        }
+        if self.parameters.rhs_mode() != RhsMode::Static {
+            return Err(ApiError::input("graph RHS plaintexts require Static mode"));
+        }
+        if rhs.len() != program.rhs_inputs().len() ||
+            rhs.keys().any(|id| !program.rhs_inputs().contains_key(id))
+        {
+            return Err(ApiError::input("RHS values do not exactly match Program inputs"));
+        }
+        self.rhs_values = Some(rhs);
+        self.bind_program_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
+            program, parameters, None, payload, hash_key,
+        )
     }
 
     /// This builder reading every input of `root_inputs` from the root object of its tag on
@@ -181,6 +218,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         if self.decoder_declaration.is_some() {
             return Err(ApiError::input("decoder was already applied"));
         }
+        self.check_child_namespace(&smudge)?;
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
         self.parameters
@@ -304,6 +342,8 @@ impl<'a> RnsPreprocessBuild<'a> {
         if self.decoder_declaration.is_some() || self.refresh.is_some() {
             return Err(ApiError::input("a decoder or refresh was already applied"));
         }
+        self.check_child_namespace(&fresh)?;
+        self.check_child_namespace(&smudge)?;
         let mismatch = || ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch));
         let child_program = |child: &RnsPreprocessBuild<'a>| {
             child.evaluator.as_ref().map(|evaluator| evaluator.program.id())
@@ -401,7 +441,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             let port = |port: usize| {
                 ring.artifact_input(
                     sigma.production().clone(),
-                    format!("public-key/{sigma_wire:?}.{port}"),
+                    sigma.descriptor().artifact_name(&format!("public-key/{sigma_wire:?}.{port}")),
                     (1, columns),
                     availability,
                 )
@@ -473,12 +513,21 @@ impl RnsPreprocessBuild<'_> {
     /// the child's artifact names); `None` for a family bound by shape only.
     /// The stage's own Program data are not exported: online evaluation is
     /// given them, and the binding commits to them.
+    /// Children must bind inputs in the parent's instance namespace before composition.
+    fn check_child_namespace(&self, child: &Self) -> Result<(), ApiError> {
+        if self.artifact_prefix != child.artifact_prefix {
+            return Err(ApiError::input("preprocess child must use its parent's artifact prefix"));
+        }
+        Ok(())
+    }
+
+    /// Data published by composed children, including the enclosing instance namespace.
     fn published_child_data(&self) -> BTreeMap<String, Option<Vec<usize>>> {
         let mut published = BTreeMap::new();
         let mut add = |child: &PublicKeyLowering<'_>, name: &dyn Fn(&str) -> String| {
             for id in child.data.keys() {
                 published.insert(
-                    name(&format!("data/{id:?}")),
+                    instance_name(self.artifact_prefix.as_deref(), &name(&format!("data/{id:?}"))),
                     child.data_values.as_ref().and_then(|data| data.values(*id)).map(<[_]>::to_vec),
                 );
             }
@@ -603,6 +652,11 @@ impl<'a> RnsPreprocessBuild<'a> {
         payload: Option<&RnsBggPayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
+        if self.evaluator.is_some() || self.artifact_prefix.as_deref() == Some("") {
+            return Err(ApiError::input(
+                "preprocessing needs a fresh builder and a nonempty namespace",
+            ));
+        }
         let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
         match (dynamic, payload) {
             (false, Some(_)) | (true, None) => {}
@@ -636,8 +690,10 @@ impl<'a> RnsPreprocessBuild<'a> {
             binding.validate(setup, program).map_err(ApiError::scheme)?;
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let hash_key_input =
-            crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref());
+        let hash_key_input = instance_name(
+            self.artifact_prefix.as_deref(),
+            &crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
+        );
         let sampling_key = match &self.hash_namespace {
             Some(namespace) => crate::rns_bgg::refresh::child_hash_key(hash_key, namespace),
             None => hash_key.to_vec(),
@@ -661,9 +717,14 @@ impl<'a> RnsPreprocessBuild<'a> {
         evaluator.root_hash_key = self.parameters.root_hash_key_input();
         // Every data family is a graph input named under the builder's
         // namespace, with the builder's values unless bound by shape only.
-        let name = |family| crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family);
+        let name = |family| {
+            instance_name(
+                self.artifact_prefix.as_deref(),
+                &crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family),
+            )
+        };
         let data = crate::program::data_inputs(&program, name);
-        if values.is_some() {
+        if (values.is_some() || self.rhs_values.is_some()) && !self.inputs_by_shape {
             self.data.validate(&program).map_err(|error| ApiError::input(error.to_string()))?;
             for family in program.data_families().keys() {
                 let values = self.data.values(*family).expect("validated program data");
@@ -718,7 +779,10 @@ impl<'a> RnsPreprocessBuild<'a> {
                 .bind_wire(*wire, binding)
                 .map_err(|e| ApiError::input(e.to_string()))?;
         }
-        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "rhs");
+        let prefix = instance_name(
+            self.artifact_prefix.as_deref(),
+            &super::plaintext_input_prefix(self.hash_namespace.as_ref(), "rhs"),
+        );
         for (id, declaration) in program.rhs_inputs() {
             if dynamic {
                 // Only references: every key derives from setup matrices, and
@@ -746,26 +810,41 @@ impl<'a> RnsPreprocessBuild<'a> {
                 continue;
             }
             let name = format!("{prefix}/rhs/{id:?}");
-            let plaintext = match values {
-                Some(rhs) => super::plaintext_inputs(
-                    &ring,
-                    &name,
-                    rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?,
-                    &mut self.runtime,
-                ),
-                None => {
-                    let shape = match declaration {
-                        InputBinding::Scalar(()) => InputBinding::Scalar(()),
-                        InputBinding::Family(count) => InputBinding::Family(
-                            count.evaluate(parameters).ok().map(IntExpr::constant).ok_or_else(
-                                || ApiError::input("RHS family count is not concrete"),
-                            )?,
-                        ),
-                    };
-                    super::plaintext_handles(&ring, &name, shape)
+            let plaintext = if let Some(values) = &self.rhs_values {
+                let schema = ring.matrix_type((1, 1));
+                match values.get(id).ok_or_else(|| ApiError::input("missing RHS value"))? {
+                    InputBinding::Scalar(value) if value.matrix_type() == &schema => {
+                        InputBinding::Scalar(value.clone())
+                    }
+                    InputBinding::Family(values)
+                        if values.schema().element == mxx_dsl::MatType(schema) =>
+                    {
+                        InputBinding::Family(super::PlaintextFamily::Values(values.clone()))
+                    }
+                    _ => return Err(ApiError::input("RHS values must be level-zero polynomials")),
                 }
-            }
-            .map_err(ApiError::input)?;
+            } else {
+                match values {
+                    Some(rhs) => super::plaintext_inputs(
+                        &ring,
+                        &name,
+                        rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?,
+                        &mut self.runtime,
+                    ),
+                    None => {
+                        let shape = match declaration {
+                            InputBinding::Scalar(()) => InputBinding::Scalar(()),
+                            InputBinding::Family(count) => InputBinding::Family(
+                                count.evaluate(parameters).ok().map(IntExpr::constant).ok_or_else(
+                                    || ApiError::input("RHS family count is not concrete"),
+                                )?,
+                            ),
+                        };
+                        super::plaintext_handles(&ring, &name, shape)
+                    }
+                }
+                .map_err(ApiError::input)?
+            };
             match (declaration, plaintext) {
                 (InputBinding::Scalar(()), InputBinding::Scalar(plaintext)) => {
                     evaluator.rhs.insert(*id, InputBinding::Scalar(plaintext));
@@ -784,7 +863,7 @@ impl<'a> RnsPreprocessBuild<'a> {
                         .ok()
                         .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
                     let members = plaintexts.count().clone();
-                    if members != IntExpr::constant(expected) {
+                    if members.evaluate(parameters).ok().as_ref() != Some(&expected) {
                         return Err(ApiError::input("RHS family count does not match Program"));
                     }
                     evaluator.rhs.insert(*id, InputBinding::Family(plaintexts));
@@ -881,6 +960,10 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             digest.update(b"hash-namespace");
             digest.update(namespace);
         }
+        if let Some(prefix) = &self.artifact_prefix {
+            digest.update(b"artifact-prefix");
+            digest.update(prefix.as_bytes());
+        }
         // A compiled Program is bound to its output use and, for Dynamic
         // parameters, to its setup and its mapping to the setup coordinates.
         // The default direct decoding of a Static Program keeps its identity.
@@ -919,11 +1002,14 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         Ok((encrypt, online_eval))
     }
 
-    fn build_graph(
+    fn emit(
         self,
+        mut graph: DslContext,
         outputs: Vec<RnsBggPublicKey>,
-    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineEvalDescriptor)), ApiError> {
+    ) -> Result<GraphEmission<(Self::EncryptDescriptor, Self::OnlineEvalDescriptor)>, ApiError>
+    {
         let child_data = self.published_child_data();
+        let name = |role: &str| instance_name(self.artifact_prefix.as_deref(), role);
         let mut evaluator =
             self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
         let carriers = outputs
@@ -941,7 +1027,6 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             .map_err(ApiError::scheme)?;
         let outputs =
             deduplicate_outputs(evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?);
-        let mut graph = DslContext::new("rns-bgg-preprocess");
 
         // Input public keys are sampled from the hash key alone, so no stage
         // stores them: encryption and online evaluation derive them where
@@ -951,7 +1036,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             if evaluator.program.inputs().contains_key(&output.wire) {
                 continue;
             }
-            let name = format!("public-key/{:?}", output.wire);
+            let name = name(&format!("public-key/{:?}", output.wire));
             graph = match preprocess_output_availability(&evaluator.program, output.wire)
                 .map_err(ApiError::scheme)?
             {
@@ -970,8 +1055,8 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             graph = publish_child(
                 graph,
                 child,
-                |role| decoder_smudge_artifact_name(&key, role),
-                |wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
+                |role| name(&decoder_smudge_artifact_name(&key, role)),
+                |wire, port| name(&decoder_smudge_input_key_artifact_name(&key, wire, port)),
             )?;
         }
         if let Some(refresh) = &self.refresh {
@@ -979,26 +1064,28 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             graph = publish_child(
                 graph,
                 &refresh.fresh,
-                |role| crate::rns_bgg::refresh::refresh_fresh_artifact_name(spec, role),
+                |role| name(&crate::rns_bgg::refresh::refresh_fresh_artifact_name(spec, role)),
                 |wire, port| {
-                    crate::rns_bgg::refresh::refresh_fresh_input_key_artifact_name(spec, wire, port)
+                    name(&crate::rns_bgg::refresh::refresh_fresh_input_key_artifact_name(
+                        spec, wire, port,
+                    ))
                 },
             )?;
             let key = refresh.declaration.decoder().artifact_key();
             graph = publish_child(
                 graph,
                 &refresh.smudge,
-                |role| decoder_smudge_artifact_name(&key, role),
-                |wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
+                |role| name(&decoder_smudge_artifact_name(&key, role)),
+                |wire, port| name(&decoder_smudge_input_key_artifact_name(&key, wire, port)),
             )?
             .transferred_output(
-                decoder_artifact_name(&key, "unmask-preimage"),
+                name(&decoder_artifact_name(&key, "unmask-preimage")),
                 refresh.preimage.clone(),
             )
             .map_err(ApiError::scheme)?;
             graph = graph
                 .transferred_output(
-                    crate::rns_bgg::refresh::refresh_artifact_name(spec, "unmask-public"),
+                    name(&crate::rns_bgg::refresh::refresh_artifact_name(spec, "unmask-public")),
                     refresh.public.clone(),
                 )
                 .map_err(ApiError::scheme)?;
@@ -1009,13 +1096,13 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             match prepared {
                 InputBinding::Scalar(value) => {
                     graph = graph
-                        .transferred_output(format!("rhs/{rhs:?}"), value.1.clone())
+                        .transferred_output(name(&format!("rhs/{rhs:?}")), value.1.clone())
                         .map_err(ApiError::scheme)?;
                 }
                 InputBinding::Family(value) => {
                     graph = graph
                         .transferred_output(
-                            format!("rhs/{rhs:?}/family"),
+                            name(&format!("rhs/{rhs:?}/family")),
                             evaluator
                                 .published_rhs_family(rhs, value)?
                                 .field(|matrix| matrix.1)
@@ -1030,24 +1117,29 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         {
             graph = graph
                 .transferred_output(
-                    format!(
+                    name(&format!(
                         "lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}"
-                    ),
+                    )),
                     material.clone(),
                 )
                 .map_err(ApiError::scheme)?;
         }
-        graph = publish_public_actions(graph, &evaluator.public_actions, |role| role)?;
+        graph = publish_public_actions(graph, &evaluator.public_actions, |role| name(&role))?;
         // The unmasking of the decoder: `K` for online evaluation and `B` for
         // encryption. The trapdoor itself stays in the setup production.
         if let Some((key, preimage, public)) = &evaluator.unmask {
             graph = graph
-                .transferred_output(decoder_artifact_name(key, "unmask-preimage"), preimage.clone())
+                .transferred_output(
+                    name(&decoder_artifact_name(key, "unmask-preimage")),
+                    preimage.clone(),
+                )
                 .map_err(ApiError::scheme)?
-                .transferred_output(decoder_artifact_name(key, "unmask-public"), public.clone())
+                .transferred_output(
+                    name(&decoder_artifact_name(key, "unmask-public")),
+                    public.clone(),
+                )
                 .map_err(ApiError::scheme)?;
         }
-        let graph = graph.build().map_err(ApiError::scheme)?;
         let input_levels = evaluator
             .program
             .inputs()
@@ -1064,6 +1156,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             self.parameters.rhs_mode(),
         )
         .map_err(ApiError::scheme)?
+        .with_artifact_prefix(self.artifact_prefix.clone())
         .with_input_levels(input_levels)
         .with_outputs(evaluator.output_use, carriers)
         .with_child_data(child_data);
@@ -1081,18 +1174,422 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         }
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_eval_binding = RnsBggPreprocessOnlineEvalDescriptor::from_binding(binding);
-        let runtime = super::encoding::declared_runtime_inputs(&graph, self.runtime);
         // A refresh reads the key of the caller's encoding of `sigma_0 G` from its production.
         let manifests = self.refresh.map(|refresh| refresh.sigma).into_iter().collect();
-        Ok((StageGraph::new(graph, runtime, manifests), (encrypt_binding, online_eval_binding)))
+        Ok(GraphEmission {
+            graph,
+            runtime_inputs: self.runtime,
+            manifests,
+            descriptor: (encrypt_binding, online_eval_binding),
+        })
+    }
+}
+
+impl ProgramBuild for RnsPreprocessBuild<'_> {
+    type Wire = RnsBggPublicKey;
+
+    fn lower(&mut self, program: &ExponentLutProgram) -> Result<Vec<Self::Wire>, ApiError> {
+        let evaluator =
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("preprocessing is not bound"))?;
+        if evaluator.program.id() != program.id() {
+            return Err(ApiError::input("lowered Program differs from the bound preprocessing"));
+        }
+        lower_program(program, evaluator, &mut self.families, &mut self.environment)
+            .map_err(ApiError::lowering)
+    }
+}
+
+impl RnsPreprocessBuild<'_> {
+    /// Publish this instance into `graph`, leaving it open for further composition.
+    /// Finalize both returned descriptors against the eventual shared production.
+    pub fn emit(
+        self,
+        graph: DslContext,
+        outputs: Vec<RnsBggPublicKey>,
+    ) -> Result<
+        GraphEmission<(RnsBggPreprocessEncryptDescriptor, RnsBggPreprocessOnlineEvalDescriptor)>,
+        ApiError,
+    > {
+        <Self as PreprocessBuild<mxx_backends::poly::dcrt::poly::DCRTPoly>>::emit(
+            self, graph, outputs,
+        )
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::api::StageArtifacts;
 
     use mxx_ir_core::ParamEnv;
+
+    /// A small CPU-only chain; its dimension and CRT prime size are test-overridable.
+    fn emission_parameters() -> RnsBggParameters {
+        let read = |name: &str, default| {
+            std::env::var(format!("MXX_EMISSION_TEST_{name}"))
+                .map_or(default, |value| value.parse().unwrap())
+        };
+        let level = DCRTPolyParams::new(
+            read("DIMENSION", 16) as u32,
+            2,
+            read("PRIME_BITS", 30),
+            4,
+            None,
+            None,
+        );
+        RnsBggParameters::new(vec![level; 2], read("SIGMA", 1) as u64, 1).unwrap()
+    }
+
+    /// Two copies of one Program retain separate hash, plaintext, data and artifact names.
+    #[test]
+    fn test_emission_namespaces_keep_distinct_program_inputs_and_artifacts() {
+        use mxx_backends::poly::dcrt::poly::DCRTPoly;
+        let parameters = emission_parameters();
+        let ring = parameters.ring(0).unwrap();
+        let payload = RnsBggPayloadSecret::from_row(&parameters, ring.identity(1)).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let data = builder.data_family(1usize, Some(2)).unwrap();
+        let output = builder
+            .mul_private(
+                Operand::Scalar(input),
+                Operand::Selected { family: rhs, data, position: IntExpr::constant(0) },
+            )
+            .unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let make = |prefix: &str, choice: usize| {
+            let values = crate::program::ProgramData::new().with(data, vec![choice]);
+            let mut build = RnsPreprocessBuild::new(&parameters, rand::random())
+                .with_artifact_prefix(prefix)
+                .with_data(values);
+            let constant = |value| DCRTPoly::from_u32s(parameters.level(0).unwrap(), &[value]);
+            build
+                .bind_rhs_inputs(
+                    &program,
+                    &ParamEnv::default(),
+                    Some(&BTreeMap::from([(
+                        rhs,
+                        InputBinding::Family(vec![constant(0), constant(1)]),
+                    )])),
+                    Some(&payload),
+                    &rand::random::<[u8; 32]>(),
+                )
+                .unwrap();
+            build
+        };
+        let mut first = make("first", 0);
+        let outputs = crate::api::lower(&program, &mut first).unwrap();
+        let first = first.emit(DslContext::new("two-programs"), outputs).unwrap();
+        let mut second = make("second", 1);
+        let outputs = crate::api::lower(&program, &mut second).unwrap();
+        let second = second.emit(first.graph, outputs).unwrap();
+        let mut runtime = first.runtime_inputs;
+        assert!(second.runtime_inputs.keys().all(|name| !runtime.contains_key(name)));
+        runtime.extend(second.runtime_inputs);
+        let graph = second.graph.build().unwrap();
+        let validated = graph.validate(&ParamEnv::default()).unwrap();
+        for prefix in ["first", "second"] {
+            assert!(graph_declares_input(&graph, &format!("{prefix}/rns-bgg/hash-key")));
+            assert!(graph_declares_input(&graph, &format!("{prefix}/exponent-lut/data.0")));
+            assert!(
+                runtime
+                    .keys()
+                    .any(|name| name.starts_with(&format!("{prefix}/")) && name.contains("/rhs/"))
+            );
+            assert!(
+                validated
+                    .source
+                    .outputs()
+                    .keys()
+                    .any(|name| name.starts_with(&format!("{prefix}/public-key/")))
+            );
+            assert!(
+                validated
+                    .source
+                    .outputs()
+                    .keys()
+                    .any(|name| name.starts_with(&format!("{prefix}/rhs/")))
+            );
+        }
+        assert_eq!(second.descriptor.1.artifact_prefix(), Some("second"));
+    }
+
+    /// Compare the legacy stages with two single graphs, using identical hash seeds and
+    /// secrets. Compare each key to its preprocessing and decode the terminal private product.
+    /// With zero sampling error all preprocessing keys must also agree across graphs;
+    /// otherwise only the public product is independent of fresh RHS sampling errors.
+    #[test]
+    fn test_emission_single_graph_matches_legacy_keys_and_decoding() {
+        use mxx_backends::{
+            MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
+            poly::dcrt::poly::DCRTPoly,
+        };
+        let parameters = emission_parameters();
+        let ring = parameters.ring(0).unwrap();
+        let secret = || {
+            ring.polynomial(
+                (0..parameters.level(0).unwrap().ring_dimension())
+                    .map(|_| IntExpr::constant(i32::from(rand::random::<u8>() % 3) - 1))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let payload = RnsBggPayloadSecret::from_row(&parameters, secret()).unwrap();
+        let mask = crate::rns_bgg::RnsBggMaskSecret::from_row(&parameters, secret()).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let output = builder.mul_public(Operand::Scalar(public), Operand::Scalar(private)).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let data = builder.data_family(1usize, Some(2)).unwrap();
+        let rhs_output = builder
+            .mul_private(
+                Operand::Scalar(private),
+                Operand::Selected { family: rhs, data, position: IntExpr::constant(0) },
+            )
+            .unwrap();
+        let program =
+            builder.finish(vec![Operand::Scalar(output), Operand::Scalar(rhs_output)]).unwrap();
+        let values = crate::program::ProgramData::new().with(data, vec![1]);
+        let context = rand::random();
+        let hash_key: [u8; 32] = rand::random();
+        let bit = u32::from(rand::random::<bool>());
+        let plaintext = ring.polynomial([IntExpr::constant(bit)]);
+        let lhs = BTreeMap::from([
+            (
+                private,
+                InputBinding::Scalar(DCRTPoly::from_u32s(parameters.level(0).unwrap(), &[bit])),
+            ),
+            (public, InputBinding::Scalar(DCRTPoly::from_u32s(parameters.level(0).unwrap(), &[1]))),
+        ]);
+        let mut execution = CpuExecution::new(cpu_backend(parameters.levels().iter().cloned()));
+        let mut store = MemoryArtifactStore::default();
+        let (legacy_encrypt, legacy_online) = crate::api::preprocess(
+            &program,
+            &ParamEnv::default(),
+            &BTreeMap::from([(
+                rhs,
+                InputBinding::Family(vec![
+                    DCRTPoly::from_u32s(parameters.level(0).unwrap(), &[0]),
+                    DCRTPoly::from_u32s(parameters.level(0).unwrap(), &[1]),
+                ]),
+            )]),
+            Some(&payload),
+            &hash_key,
+            RnsPreprocessBuild::new(&parameters, context).with_data(values.clone()),
+            &mut execution,
+            &mut store,
+            |_, outputs| Ok(outputs),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let encrypted = crate::api::encrypt(
+            &program.encryption_inputs(),
+            &ParamEnv::default(),
+            &lhs,
+            Some(&legacy_encrypt),
+            &payload,
+            Some(&mask),
+            &hash_key,
+            RnsEncryptBuild::new(&parameters, context),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let legacy = crate::api::online_eval(
+            &program,
+            &ParamEnv::default(),
+            &legacy_online,
+            &encrypted,
+            &hash_key,
+            RnsOnlineEvalBuild::new(&parameters, context).with_data(values.clone()),
+            &mut execution,
+            &mut store,
+            |_, outputs| Ok(outputs),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let mut preprocessing = RnsPreprocessBuild::new(&parameters, context)
+            .with_artifact_prefix("instance")
+            .with_data(values.clone());
+        preprocessing
+            .bind_rhs_values(
+                &program,
+                &ParamEnv::default(),
+                BTreeMap::from([(
+                    rhs,
+                    InputBinding::Family(
+                        mxx_dsl::parallel(2usize, |index| {
+                            Ok(ring.polynomial([IntExpr::Rem(
+                                Box::new(index.expression()?),
+                                Box::new(IntExpr::constant(2)),
+                            )]))
+                        })
+                        .unwrap(),
+                    ),
+                )]),
+                Some(&payload),
+                &hash_key,
+            )
+            .unwrap();
+        let keys = crate::api::lower(&program, &mut preprocessing).unwrap();
+        let source = preprocessing.evaluator.as_ref().unwrap();
+        let root = crate::rns_bgg::RnsBggRoot::new(parameters.level(0).unwrap().clone(), hash_key);
+        let private_key = source.sample_input_public_key(private).unwrap();
+        let public_key = source.sample_input_public_key(public).unwrap();
+        let error = || parameters.encoding_contract().sample_row(&ring, root.columns()).unwrap();
+        let private_row = root
+            .encode(
+                &private_key.matrix,
+                mask.row(),
+                (payload.row().0.clone() * plaintext.clone(), plaintext),
+                error(),
+            )
+            .unwrap();
+        let public_row =
+            root.encode(&public_key.matrix, mask.row(), mask.row().clone(), error()).unwrap();
+        let graph = DslContext::new("obfuscate-like")
+            .transferred_output("initial-private", private_row)
+            .unwrap()
+            .transferred_output("initial-public", public_row)
+            .unwrap();
+        let (graph, descriptor) = preprocessing.emit(graph, keys).unwrap().build().unwrap();
+        let obfuscation = crate::api::execute_artifacts(
+            graph,
+            &ParamEnv::default(),
+            descriptor,
+            rand::random(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let online = StageArtifacts::new(
+            obfuscation.production().clone(),
+            obfuscation.manifest().clone(),
+            obfuscation.descriptor().1.clone(),
+            obfuscation.session().clone(),
+        );
+        let row = |name: &str| {
+            (0..2)
+                .map(|port| {
+                    ring.artifact_input(
+                        obfuscation.production().clone(),
+                        format!("{name}.{port}"),
+                        (1, root.columns()),
+                        ArtifactAvailability::Transferred,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let private_row = row("initial-private");
+        let public_row = row("initial-public");
+        let mut evaluation = RnsOnlineEvalBuild::new(&parameters, context).with_data(values);
+        evaluation
+            .bind_rows(
+                &program,
+                &ParamEnv::default(),
+                &online,
+                BTreeMap::from([
+                    (
+                        private,
+                        InputBinding::Scalar((private_row[0].clone(), private_row[1].clone())),
+                    ),
+                    (public, InputBinding::Scalar((public_row[0].clone(), public_row[1].clone()))),
+                ]),
+                BTreeMap::from([(public, InputBinding::Scalar(ring.identity(1)))]),
+                &hash_key,
+            )
+            .unwrap();
+        let outputs = crate::api::lower(&program, &mut evaluation).unwrap();
+        let mut emission = evaluation.emit(DslContext::new("evaluate-like"), outputs).unwrap();
+        assert_eq!(emission.manifests.len(), 1, "no encryption production is read");
+        emission
+            .manifests
+            .insert(legacy_online.production().clone(), legacy_online.manifest().clone());
+        for (index, wire) in [output, rhs_output].into_iter().enumerate() {
+            for port in 0..4 {
+                let role = format!("public-key/{wire:?}.{port}");
+                let entry = &legacy_online.manifest().artifacts[&role];
+                let mxx_ir_core::artifact::ArtifactType::Matrix(matrix) = &entry.artifact_type
+                else {
+                    panic!("public key matrix");
+                };
+                for (kind, stage) in [("legacy", &legacy_online), ("emitted", &online)] {
+                    let key = ring.artifact_input(
+                        stage.production().clone(),
+                        stage.descriptor().artifact_name(&role),
+                        (matrix.rows, matrix.columns),
+                        entry.availability,
+                    );
+                    emission.graph =
+                        emission.graph.output(format!("{kind}-key-{index}-{port}"), key).unwrap();
+                }
+            }
+        }
+        let (graph, ()) = emission.build().unwrap();
+        let mut emitted = crate::api::execute_graph(
+            graph,
+            &ParamEnv::default(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        emitted.outputs = emitted
+            .outputs
+            .into_iter()
+            .map(|(name, value)| {
+                (name.strip_prefix("instance/").unwrap_or(&name).to_owned(), value)
+            })
+            .collect();
+        for index in 0..2 {
+            for port in 0..4 {
+                let name = format!("output-{index}.{port}");
+                assert_eq!(
+                    crate::test_support::full(&legacy.outputs[&name]),
+                    crate::test_support::full(
+                        &emitted.outputs[&format!("legacy-key-{index}-{port}")]
+                    )
+                );
+                assert_eq!(
+                    crate::test_support::full(&emitted.outputs[&name]),
+                    crate::test_support::full(
+                        &emitted.outputs[&format!("emitted-key-{index}-{port}")]
+                    )
+                );
+                if index == 0 || parameters.encoding_error_bound() == &BigUint::from(0u8) {
+                    assert_eq!(
+                        crate::test_support::full(&legacy.outputs[&name]),
+                        crate::test_support::full(&emitted.outputs[&name])
+                    );
+                }
+            }
+            for result in [&legacy, &emitted] {
+                if index == 0 {
+                    continue;
+                }
+                let decoded = crate::rns_bgg::decode_output(
+                    &program,
+                    result,
+                    index,
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    RnsOutputUse::default(),
+                    &[0],
+                    &mut execution,
+                    &mut store,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(decoded, vec![BigInt::from(bit)]);
+            }
+        }
+    }
 
     /// Shape-only Static preprocessing preserves a selector count larger than `usize` through
     /// plaintext handles, reference/material families and the actual Program lowerer.
@@ -1141,6 +1638,139 @@ mod test {
         let (evaluator, families, environment) =
             <RnsPreprocessBuild as PreprocessBuild<DCRTPoly>>::lowering_state(&mut child).unwrap();
         lower_program(&program, evaluator, families, environment).unwrap();
+
+        let ring = parameters.ring(0).unwrap();
+        let plaintexts = mxx_dsl::parallel(count.clone(), |_| Ok(ring.identity(1))).unwrap();
+        let mut composed = RnsPreprocessBuild::new(&parameters, rand::random())
+            .with_artifact_prefix("symbolic-rhs");
+        composed
+            .bind_rhs_values(
+                &program,
+                &ParamEnv::default(),
+                BTreeMap::from([(rhs, InputBinding::Family(plaintexts))]),
+                Some(&payload),
+                &rand::random::<[u8; 32]>(),
+            )
+            .unwrap();
+        let outputs = crate::api::lower(&program, &mut composed).unwrap();
+        let emission = composed.emit(DslContext::new("symbolic-rhs"), outputs).unwrap();
+        assert!(!emission.runtime_inputs.keys().any(|name| name.contains("/rhs/")));
+        let (graph, _) = emission.build().unwrap();
+        graph.graph.validate(&ParamEnv::default()).unwrap();
+    }
+
+    /// Graph secrets reject matrices of the wrong width and require no resident binding.
+    #[test]
+    fn test_emission_graph_secrets_validate_schema() {
+        let parameters = emission_parameters();
+        let ring = parameters.ring(0).unwrap();
+        let payload = RnsBggPayloadSecret::from_row(&parameters, ring.identity(1)).unwrap();
+        let mask =
+            crate::rns_bgg::RnsBggMaskSecret::from_row(&parameters, ring.identity(1)).unwrap();
+        assert!(payload.input_name().is_none());
+        assert!(mask.input_name().is_none());
+        assert!(RnsBggPayloadSecret::from_row(&parameters, ring.zero((1, 2))).is_err());
+        assert!(
+            crate::rns_bgg::RnsBggMaskSecret::from_row(&parameters, ring.zero((2, 1))).is_err()
+        );
+    }
+
+    /// Graph input families bind symbolically, and public payload coverage is exact.
+    #[test]
+    fn test_emission_graph_row_families_validate_shape() {
+        use mxx_backends::{
+            MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
+            poly::dcrt::poly::DCRTPoly,
+        };
+        let parameters = emission_parameters();
+        let ring = parameters.ring(0).unwrap();
+        let payload = RnsBggPayloadSecret::from_row(&parameters, ring.identity(1)).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input =
+            builder.input_family(IntExpr::constant(3), AttributeKnowledge::PublicPayload).unwrap();
+        let output = builder.sum(input).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let context = rand::random();
+        let hash_key: [u8; 32] = rand::random();
+        let mut execution = CpuExecution::new(cpu_backend(parameters.levels().iter().cloned()));
+        let mut store = MemoryArtifactStore::default();
+        let (_, preprocessing) = crate::api::preprocess(
+            &program,
+            &ParamEnv::default(),
+            &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            Some(&payload),
+            &hash_key,
+            RnsPreprocessBuild::new(&parameters, context).with_artifact_prefix("family"),
+            &mut execution,
+            &mut store,
+            |_, outputs| Ok(outputs),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let rows = |count| {
+            mxx_dsl::parallel(count, |_| {
+                Ok((
+                    ring.zero((
+                        1,
+                        parameters
+                            .key_component_columns(0, AttributeKnowledge::PublicPayload)
+                            .unwrap(),
+                    )),
+                    ring.zero((
+                        1,
+                        parameters
+                            .key_component_columns(0, AttributeKnowledge::PublicPayload)
+                            .unwrap(),
+                    )),
+                ))
+            })
+            .unwrap()
+        };
+        let plaintexts = mxx_dsl::parallel(3usize, |_| Ok(ring.identity(1))).unwrap();
+        let mut evaluation = RnsOnlineEvalBuild::new(&parameters, context);
+        assert!(
+            evaluation
+                .bind_rows(
+                    &program,
+                    &ParamEnv::default(),
+                    &preprocessing,
+                    BTreeMap::from([(input, InputBinding::Family(rows(3usize)))]),
+                    BTreeMap::new(),
+                    &hash_key
+                )
+                .is_err()
+        );
+        let mut wrong = RnsOnlineEvalBuild::new(&parameters, context);
+        assert!(
+            wrong
+                .bind_rows(
+                    &program,
+                    &ParamEnv::default(),
+                    &preprocessing,
+                    BTreeMap::from([(input, InputBinding::Family(rows(2usize)))]),
+                    BTreeMap::from([(input, InputBinding::Family(plaintexts.clone()))]),
+                    &hash_key
+                )
+                .is_err()
+        );
+        evaluation
+            .bind_rows(
+                &program,
+                &ParamEnv::default(),
+                &preprocessing,
+                BTreeMap::from([(input, InputBinding::Family(rows(3usize)))]),
+                BTreeMap::from([(input, InputBinding::Family(plaintexts))]),
+                &hash_key,
+            )
+            .unwrap();
+        let outputs = crate::api::lower(&program, &mut evaluation).unwrap();
+        let (graph, ()) = evaluation
+            .emit(DslContext::new("family-evaluation"), outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(graph.manifests.len(), 1);
+        graph.graph.validate_with_manifests(&ParamEnv::default(), &graph.manifests).unwrap();
     }
 
     #[test]

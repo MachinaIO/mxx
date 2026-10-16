@@ -69,9 +69,157 @@ fn label_payloads(
 type HashKeyInputs = Vec<(String, Vec<u8>)>;
 
 impl<'a> RnsOnlineEvalBuild<'a> {
+    /// Select this instance's namespace before binding, which checks the preprocess descriptor.
+    pub fn with_artifact_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.artifact_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Bind root-ring rows and public plaintext expressions, without an encryption stage.
+    ///
+    /// `rows` covers exactly the Program inputs; `public_payloads` covers exactly its
+    /// public inputs. Each family retains the Program's symbolic cardinality. Rooted
+    /// chains use the tags supplied to `with_root_inputs` and retarget each row at its
+    /// consuming level. Static RHS material is read from `preprocess`'s namespace.
+    /// Dynamic ciphertext packages still require `bind_artifacts`.
+    pub fn bind_rows(
+        &mut self,
+        program: &ExponentLutProgram,
+        parameters: &ParamEnv,
+        preprocess: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
+        rows: BTreeMap<WireId, InputBinding<RnsBggRow, Family<RnsBggRow>>>,
+        public_payloads: BTreeMap<WireId, InputBinding<Mat, Family<Mat>>>,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        if rows.len() != program.inputs().len() ||
+            rows.keys().any(|wire| !program.inputs().contains_key(wire)) ||
+            public_payloads.len() !=
+                program
+                    .inputs()
+                    .values()
+                    .filter(|input| input.knowledge() == AttributeKnowledge::PublicPayload)
+                    .count() ||
+            public_payloads.keys().any(|wire| {
+                program
+                    .inputs()
+                    .get(wire)
+                    .is_none_or(|input| input.knowledge() != AttributeKnowledge::PublicPayload)
+            })
+        {
+            return Err(ApiError::input(
+                "graph rows or public payloads do not match Program inputs",
+            ));
+        }
+        self.bind_sources(program, parameters, preprocess, None, hash_key)?;
+        self.evaluator.as_mut().expect("bound sources").root_lut_helpers = Some(BTreeMap::new());
+        let evaluator = self.evaluator.as_ref().expect("bound sources");
+        for (wire, input) in program.inputs() {
+            let level = evaluator.workload.level(*wire).map_err(ApiError::scheme)?;
+            let key = InputKeySource::Static {
+                level,
+                knowledge: input.knowledge(),
+                root: self
+                    .root_inputs
+                    .get(wire)
+                    .map(|tag| {
+                        self.parameters
+                            .root_hash_key_input()
+                            .map(|hash_key| (tag.clone(), hash_key))
+                            .ok_or_else(|| ApiError::input("a root input needs a rooted chain"))
+                    })
+                    .transpose()?,
+            };
+            let payload = public_payloads.get(wire);
+            let encoding = |row, payload, index| {
+                graph_input_encoding(
+                    self.parameters,
+                    *wire,
+                    level,
+                    input.knowledge(),
+                    &key,
+                    evaluator.hash_key.clone(),
+                    row,
+                    payload,
+                    index,
+                )
+            };
+            let binding = match (input.shape(), &rows[wire], payload) {
+                (InputBinding::Scalar(()), InputBinding::Scalar(row), payload) => {
+                    let payload = match payload {
+                        Some(InputBinding::Scalar(value)) => Some(value.clone()),
+                        None => None,
+                        _ => return Err(ApiError::input("public payload shape differs from input")),
+                    };
+                    InputBinding::Scalar(
+                        encoding(row.clone(), payload, None).map_err(ApiError::scheme)?,
+                    )
+                }
+                (InputBinding::Family(count), InputBinding::Family(rows), payload) => {
+                    if rows.count() != count || payload.is_some_and(|payload|
+                        !matches!(payload, InputBinding::Family(values) if values.count() == count))
+                    {
+                        return Err(ApiError::input("graph row or public payload family count differs"));
+                    }
+                    let encodings = mxx_dsl::parallel(count.clone(), |index| {
+                        let payload = match payload {
+                            Some(InputBinding::Family(values)) => Some(values.at(index.clone())),
+                            _ => None,
+                        };
+                        encoding(rows.at(index.clone()), payload, Some(index))
+                            .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?;
+                    InputBinding::Family(OnlineEvalWireFamily::Stored(encodings))
+                }
+                _ => return Err(ApiError::input("graph row shape differs from Program input")),
+            };
+            self.environment
+                .bind_wire(*wire, binding)
+                .map_err(|error| ApiError::input(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Bind root-ring LUT helper families by `LutTable::helper_family_key`, after `bind_rows`.
+    /// Each member is retargeted in the graph at the LUT's consuming level.
+    pub fn bind_lut_helper_rows(
+        &mut self,
+        helpers: BTreeMap<String, Family<RnsBggRow>>,
+    ) -> Result<(), ApiError> {
+        let evaluator =
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_rows first"))?;
+        let target = evaluator
+            .root_lut_helpers
+            .as_mut()
+            .ok_or_else(|| ApiError::input("LUT graph helpers require bind_rows"))?;
+        *target = helpers;
+        Ok(())
+    }
+
+    /// Bind the graph-produced hint used when a decoder is applied to graph rows.
+    pub fn bind_decoder_hint(&mut self, hint: Mat) -> Result<(), ApiError> {
+        let evaluator =
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_rows first"))?;
+        if evaluator.root_lut_helpers.is_none() {
+            return Err(ApiError::input("a graph decoder hint requires bind_rows"));
+        }
+        evaluator.decoder_hint = Some(hint);
+        Ok(())
+    }
+
+    /// Emit evaluation into `graph`, leaving freezing and execution to its caller.
+    pub fn emit(
+        self,
+        graph: DslContext,
+        outputs: Vec<RnsBggEncoding>,
+    ) -> Result<GraphEmission<()>, ApiError> {
+        <Self as OnlineEvalBuild>::emit(self, graph, outputs)
+    }
+
     /// Creates an unbound online evaluation builder.
     pub fn new(parameters: &'a RnsBggParameters, context: [u8; 32]) -> Self {
         Self {
+            artifact_prefix: None,
             parameters,
             context,
             hash_key_commitment: [0; 32],
@@ -412,8 +560,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
+        let encryption_prefix = encryption.descriptor().artifact_name(&prefix);
+        let prefix = preprocess.descriptor().artifact_name(&prefix);
         let name = |role: &str| format!("{prefix}/{role}");
+        let ciphertext_name = |role: &str| format!("{encryption_prefix}/{role}");
         let preprocess_binding = preprocess.descriptor().binding();
+        self.artifact_prefix = preprocess.descriptor().artifact_prefix().map(str::to_owned);
         let encryption_binding = encryption.descriptor().binding();
         let expected_hash_key = hash_key_commitment(hash_key);
         for binding in [preprocess_binding, encryption_binding] {
@@ -466,7 +618,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // with its public key, under the child's namespace.
         self.environment = Environment::new();
         let hash_key = self.parameters.ring(0).map_err(ApiError::scheme)?.bytes_input(
-            crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
+            instance_name(
+                self.artifact_prefix.as_deref(),
+                &crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
+            ),
             self.hash_key.len(),
         );
         // A Dynamic child's inputs are encodings of its setup's coordinates
@@ -481,7 +636,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 &hash_key,
                 dynamic.as_ref(),
                 label.as_ref(),
-                |role| name(&role),
+                |role| ciphertext_name(&role),
             )?;
         } else {
             for (wire, input) in prepared.inputs() {
@@ -495,7 +650,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 let port = |port: usize, columns: usize| {
                     ring.artifact_input(
                         encryption_production.clone(),
-                        name(&format!("input-{wire:?}.{port}")),
+                        ciphertext_name(&format!("input-{wire:?}.{port}")),
                         (1, columns),
                         ArtifactAvailability::Transferred,
                     )
@@ -503,7 +658,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 let family_port = |port: usize, count: &IntExpr, columns: usize| {
                     ring.family_artifact_input(
                         encryption_production.clone(),
-                        name(&format!("input-{wire:?}.{port}")),
+                        ciphertext_name(&format!("input-{wire:?}.{port}")),
                         count.clone(),
                         (1, columns),
                         ArtifactAvailability::Transferred,
@@ -558,13 +713,18 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             prelude.as_ref(),
             dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
             &hash_key,
-            |role: String| name(&role),
+            |role: String| {
+                if dynamic.is_some() { ciphertext_name(&role) } else { name(&role) }
+            },
         )? {
             self.environment
                 .bind_rhs(rhs, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
         let mut evaluator = EncodingLowering {
+            encryption_artifact_prefix: Some(encryption_prefix),
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: self.parameters,
             program: Arc::new(prepared.clone()),
             workload,
@@ -679,17 +839,23 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .ok_or(RnsBggError::Binding("the unmask preimage bound is not bound"))?;
         let preimage = ring.preimage_artifact_input(
             evaluator.preprocess.clone(),
-            decoder_artifact_name(&key, "unmask-preimage"),
+            evaluator.preprocess_artifact_name(decoder_artifact_name(&key, "unmask-preimage")),
             (columns, 1),
             BigInt::from(bound),
             ArtifactAvailability::Transferred,
         );
-        let hint = ring.artifact_input(
-            evaluator.encryption.clone(),
-            decoder_artifact_name(&key, "unmask-hint"),
-            (1, columns),
-            ArtifactAvailability::Transferred,
-        );
+        let hint = if let Some(hint) = &evaluator.decoder_hint {
+            hint.clone()
+        } else if evaluator.root_lut_helpers.is_some() {
+            return Err(RnsBggError::Binding("graph row decoding requires a graph hint"));
+        } else {
+            ring.artifact_input(
+                evaluator.encryption.clone(),
+                evaluator.encryption_artifact_name(decoder_artifact_name(&key, "unmask-hint")),
+                (1, columns),
+                ArtifactAvailability::Transferred,
+            )
+        };
         // The halved smudge weights leave `2^-1` in every coefficient (see
         // `crate::decoder::decoding`); removing it centers the smudge.
         let modulus: BigUint = self.parameters.level(level)?.modulus().as_ref().clone();
@@ -933,13 +1099,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let one = (
             ring.artifact_input(
                 encryption.clone(),
-                refresh_artifact_name(spec, "one-encoding.0"),
+                evaluator.encryption_artifact_name(refresh_artifact_name(spec, "one-encoding.0")),
                 (1, columns),
                 ArtifactAvailability::Transferred,
             ),
             ring.artifact_input(
                 encryption.clone(),
-                refresh_artifact_name(spec, "one-encoding.1"),
+                evaluator.encryption_artifact_name(refresh_artifact_name(spec, "one-encoding.1")),
                 (1, columns),
                 ArtifactAvailability::Transferred,
             ),
@@ -947,7 +1113,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let hint_columns = crate::decoder::unmask::UNMASK_ROWS * (columns + 2);
         let hint = ring.artifact_input(
             encryption,
-            refresh_artifact_name(spec, "unmask-hint"),
+            evaluator.encryption_artifact_name(refresh_artifact_name(spec, "unmask-hint")),
             (1, hint_columns),
             ArtifactAvailability::Transferred,
         );
@@ -991,7 +1157,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let encoding = decoded + checked_modulus_convert(smudge_output.row.1, &ring)?;
         let preimage = ring.preimage_artifact_input(
             preprocess,
-            decoder_artifact_name(&decoder.artifact_key(), "unmask-preimage"),
+            evaluator.preprocess_artifact_name(decoder_artifact_name(
+                &decoder.artifact_key(),
+                "unmask-preimage",
+            )),
             (hint_columns, output_columns),
             BigInt::from(bound),
             ArtifactAvailability::Transferred,
@@ -1014,7 +1183,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let hash_keys = [&fresh, &smudge]
             .into_iter()
             .map(|child| {
-                (hash_key_input_name(child.hash_namespace.as_ref()), child.hash_key.clone())
+                (
+                    instance_name(
+                        child.artifact_prefix.as_deref(),
+                        &hash_key_input_name(child.hash_namespace.as_ref()),
+                    ),
+                    child.hash_key.clone(),
+                )
             })
             .collect::<Vec<_>>();
         for child in [&mut fresh, &mut smudge] {
@@ -1038,6 +1213,11 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         ),
         ApiError,
     > {
+        if let Some(evaluator) = self.evaluator.as_mut() {
+            if evaluator.root_lut_helpers.is_some() {
+                evaluator.import_body_lut_material().map_err(ApiError::scheme)?;
+            }
+        }
         Ok((
             self.evaluator
                 .as_mut()
@@ -1045,6 +1225,60 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             &mut self.families,
             &mut self.environment,
         ))
+    }
+}
+
+/// Retarget a caller's root row and derive its key using the preprocessing key schedule.
+#[allow(clippy::too_many_arguments)]
+fn graph_input_encoding(
+    parameters: &RnsBggParameters,
+    wire: WireId,
+    level: usize,
+    knowledge: AttributeKnowledge,
+    key: &InputKeySource,
+    hash_key: Bytes,
+    row: RnsBggRow,
+    payload: Option<Mat>,
+    index: Option<Int>,
+) -> Result<RnsBggEncoding, RnsBggError> {
+    let form = match knowledge {
+        AttributeKnowledge::PublicPayload => crate::rns_bgg::RnsBggForm::Public,
+        AttributeKnowledge::PrivatePayload => crate::rns_bgg::RnsBggForm::State,
+    };
+    let (ring, columns) = match parameters.root() {
+        Some(root) => (root.ring(), root.columns()),
+        None => (parameters.ring(level)?, parameters.key_component_columns(level, knowledge)?),
+    };
+    if row.0.matrix_type() != &ring.matrix_type((1, columns)) ||
+        row.1.matrix_type() != &ring.matrix_type((1, columns))
+    {
+        return Err(RnsBggError::Binding("graph input row has the wrong ring or width"));
+    }
+    let row =
+        if parameters.root().is_some() { parameters.retarget_row(level, form, row)? } else { row };
+    let payload = payload
+        .map(|value| {
+            if value.matrix_type().rows != IntExpr::constant(1) ||
+                value.matrix_type().columns != IntExpr::constant(1)
+            {
+                return Err(RnsBggError::Binding("public graph payload must be a polynomial"));
+            }
+            checked_modulus_convert(value, &parameters.ring(level)?)
+        })
+        .transpose()?;
+    Ok(RnsBggEncoding::new(key.key(parameters, hash_key, wire, index)?, row, payload))
+}
+
+impl ProgramBuild for RnsOnlineEvalBuild<'_> {
+    type Wire = RnsBggEncoding;
+
+    fn lower(&mut self, program: &ExponentLutProgram) -> Result<Vec<Self::Wire>, ApiError> {
+        let (evaluator, families, environment) = self.lowering_state_inner()?;
+        if evaluator.program.id() != program.id() {
+            return Err(ApiError::input("lowered Program differs from the bound evaluation"));
+        }
+        crate::program::lower_program(program, evaluator, families, environment)
+            .map_err(ApiError::lowering)
     }
 }
 
@@ -1080,166 +1314,14 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
         encryption: &StageArtifacts<Self::EncryptDescriptor>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        for declaration in program.inputs().values() {
-            if let InputBinding::Family(count) = declaration.shape() {
-                let count = count.evaluate(parameters).map_err(|_| {
-                    ApiError::input("online evaluation input family count is not concrete")
-                })?;
-                if count <= BigInt::from(0) {
-                    return Err(ApiError::input("online evaluation input family count is empty"));
-                }
-            }
-        }
-        let preprocess_binding = preprocess.descriptor().binding();
-        let encryption_binding = encryption.descriptor().binding();
-        let expected_parameters = self.parameters.parameter_identity();
-        let preprocess_production = preprocess.production().clone();
-        let encryption_production = encryption.production().clone();
-        let expected_hash_key = hash_key_commitment(hash_key);
-        for binding in [preprocess_binding, encryption_binding] {
-            if binding.context() != &self.context ||
-                binding.parameters() != &expected_parameters ||
-                binding.rhs_mode() != self.parameters.rhs_mode() ||
-                binding.hash_key_commitment() != &expected_hash_key
-            {
-                return Err(ApiError::compatibility(
-                    "RNS-BGG artifact binding does not match the online evaluation",
-                ));
-            }
-        }
-        if preprocess_binding.program() != Some(program.id()) {
-            return Err(ApiError::compatibility(
-                "RNS-BGG preprocess binding does not match the online evaluation Program",
-            ));
-        }
-        if !self.inputs_by_shape {
-            self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
-        }
-        let expected_data = (!program.data_families().is_empty()).then(|| self.data.commitment());
-        if preprocess_binding.data() != expected_data.as_ref() {
-            return Err(ApiError::compatibility(
-                "RNS-BGG preprocess binding has other Program data than the online evaluation",
-            ));
-        }
-        // The data are graph inputs whose values this builder was given.
-        let data = crate::program::data_inputs(program, |family| {
-            crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family)
-        });
-        for family in program.data_families().keys().filter(|_| !self.inputs_by_shape) {
-            let values = self.data.values(*family).expect("validated program data");
-            self.runtime.insert(
-                crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), *family),
-                RuntimeValue::integer_values(values.iter().map(|value| (*value).into()).collect()),
-            );
-        }
-        self.families.data = data.clone();
-        if !preprocess_binding.sources().is_empty() {
-            return Err(ApiError::compatibility(
-                "RNS-BGG preprocess root unexpectedly declares sources",
-            ));
-        }
-        // A Static ciphertext is encrypted for one compiled Program; a
-        // Dynamic one for the setup the compiled Program belongs to.
-        let dynamic = match self.parameters.rhs_mode() {
-            RhsMode::Static => {
-                if encryption_binding.program() != Some(program.id()) ||
-                    encryption_binding.sources().len() != 1 ||
-                    !encryption_binding.sources().contains(&preprocess_production)
-                {
-                    return Err(ApiError::compatibility(
-                        "RNS-BGG encryption source is not the preprocess production",
-                    ));
-                }
-                None
-            }
-            RhsMode::Dynamic => {
-                Some(self.validate_dynamic_stages(program, preprocess, encryption)?)
-            }
-        };
-        if preprocess_binding.decoder_commitment() != encryption_binding.decoder_commitment() {
-            return Err(ApiError::compatibility(
-                "RNS-BGG decoder declaration commitment differs between stages",
-            ));
-        }
-        if preprocess_binding.output_use() != self.output_use {
-            return Err(ApiError::compatibility(
-                "RNS-BGG output use differs from the preprocessed Program",
-            ));
-        }
-        self.unmask_preimage_bound = preprocess_binding.unmask_preimage_bound().cloned();
-        self.output_carriers = preprocess_binding.output_carriers().to_vec();
-        let mut manifests = BTreeMap::new();
-        manifests.insert(preprocess_production.clone(), preprocess.manifest().clone());
-        manifests.insert(encryption_production.clone(), encryption.manifest().clone());
-        let prelude = encryption_binding.ciphertext_prelude().map(|(production, manifest)| {
-            manifests.insert(production.clone(), manifest.clone());
-            production.clone()
-        });
-        let workload = Arc::new(
-            RnsBggDerivedWorkload::from_program_with_parameters(self.parameters, program)
-                .map_err(ApiError::scheme)?,
-        );
-        self.hash_key_commitment = expected_hash_key;
-        self.hash_key = hash_key.to_vec();
-        let hash_key = self.parameters.ring(0).map_err(ApiError::scheme)?.bytes_input(
-            crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
-            self.hash_key.len(),
-        );
-        self.bind_encrypted_inputs(
-            program,
-            &workload,
-            &encryption_production,
-            &hash_key,
-            dynamic.as_ref(),
-            None,
-            |role| role,
-        )?;
-        for (rhs, binding) in import_rhs_bindings(
-            self.parameters,
-            program,
-            &workload,
-            &preprocess_production,
-            prelude.as_ref(),
-            dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
-            &hash_key,
-            |role| role,
-        )? {
-            self.environment
-                .bind_rhs(rhs, binding)
-                .map_err(|error| ApiError::input(error.to_string()))?;
-        }
-        let mut evaluator = EncodingLowering {
-            parameters: self.parameters,
-            program: Arc::new(program.clone()),
-            workload,
-            preprocess: preprocess_production,
-            encryption: encryption_production,
-            manifests,
-            decoder_smudge: None,
-            artifact_prefix: None,
-            current_site: None,
-            hash_key,
-            root_hash_key: self.parameters.root_hash_key_input(),
-            rhs_companions: BTreeMap::new(),
-            lut_material: BTreeMap::new(),
-            data,
-            output_use: self.output_use,
-            dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
-                setup,
-                binding,
-                automorphisms: None,
-            }),
-        };
-        if evaluator.dynamic.is_some() {
-            evaluator.import_dynamic_packages().map_err(ApiError::scheme)?;
-        } else {
-            evaluator.import_body_lut_material().map_err(ApiError::scheme)?;
-        }
-        self.evaluator = Some(evaluator);
-        Ok(())
+        self.bind_sources(program, parameters, preprocess, Some(encryption), hash_key)
     }
 
-    fn build_graph(mut self, outputs: Vec<RnsBggEncoding>) -> Result<StageGraph, ApiError> {
+    fn emit(
+        mut self,
+        mut graph: DslContext,
+        outputs: Vec<RnsBggEncoding>,
+    ) -> Result<GraphEmission<()>, ApiError> {
         let decoded = match self.pending_decoder.take() {
             Some((index, declaration, smudge)) => Some((
                 index,
@@ -1278,16 +1360,16 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             ));
         }
         let outputs = evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?;
-        let mut graph = DslContext::new("rns-bgg-online-eval");
+        let name = |role: &str| instance_name(self.artifact_prefix.as_deref(), role);
         let mut hash_keys = vec![(
-            crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
+            name(&crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref())),
             self.hash_key.clone(),
         )];
         if let Some(root) = self.parameters.root() {
             hash_keys.push((root.hash_key_input_name(), root.hash_key().to_vec()));
         }
         if let Some((row, child_keys)) = refreshed {
-            graph = graph.output("refresh", row).map_err(ApiError::scheme)?;
+            graph = graph.output(name("refresh"), row).map_err(ApiError::scheme)?;
             hash_keys.extend(child_keys);
         }
         for output in std::mem::take(&mut self.extra_outputs) {
@@ -1298,19 +1380,232 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             // encoding.
             graph = match &decoded {
                 Some((decoded, plaintext)) if *decoded == index => {
-                    graph.output(format!("output-{index}"), plaintext.clone())
+                    graph.output(name(&format!("output-{index}")), plaintext.clone())
                 }
-                _ => graph.output(format!("output-{index}"), output),
+                _ => graph.output(name(&format!("output-{index}")), output),
             }
             .map_err(ApiError::scheme)?;
         }
-        let graph = graph.build().map_err(ApiError::scheme)?;
-        let mut runtime = super::declared_runtime_inputs(&graph, std::mem::take(&mut self.runtime));
         for (name, key) in hash_keys {
-            if super::graph_declares_input(&graph, &name) {
-                runtime.insert(name, RuntimeValue::Bytes(key.as_slice().into()));
+            self.runtime.insert(name, RuntimeValue::Bytes(key.as_slice().into()));
+        }
+        Ok(GraphEmission {
+            graph,
+            runtime_inputs: self.runtime,
+            manifests: evaluator.manifests.clone(),
+            descriptor: (),
+        })
+    }
+}
+
+impl RnsOnlineEvalBuild<'_> {
+    /// Bind preprocessing and optional ciphertext provenance before selecting row sources.
+    fn bind_sources(
+        &mut self,
+        program: &ExponentLutProgram,
+        parameters: &mxx_ir_core::ParamEnv,
+        preprocess: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
+        encryption: Option<&StageArtifacts<RnsBggEncryptionDescriptor>>,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        if self.evaluator.is_some() {
+            return Err(ApiError::input("online evaluation needs a fresh builder"));
+        }
+        for declaration in program.inputs().values() {
+            if let InputBinding::Family(count) = declaration.shape() {
+                let count = count.evaluate(parameters).map_err(|_| {
+                    ApiError::input("online evaluation input family count is not concrete")
+                })?;
+                if count <= BigInt::from(0) {
+                    return Err(ApiError::input("online evaluation input family count is empty"));
+                }
             }
         }
-        Ok(StageGraph::new(graph, runtime, evaluator.manifests.clone()))
+        let preprocess_binding = preprocess.descriptor().binding();
+        let encryption_binding = encryption.map(|stage| stage.descriptor().binding());
+        let prefix = preprocess.descriptor().artifact_prefix().map(str::to_owned);
+        if self.artifact_prefix.is_some() && self.artifact_prefix != prefix {
+            return Err(ApiError::compatibility(
+                "online artifact prefix differs from preprocessing",
+            ));
+        }
+        self.artifact_prefix = prefix;
+        let expected_parameters = self.parameters.parameter_identity();
+        let preprocess_production = preprocess.production().clone();
+        let encryption_production = encryption
+            .map_or_else(|| preprocess_production.clone(), |stage| stage.production().clone());
+        let expected_hash_key = hash_key_commitment(hash_key);
+        for binding in std::iter::once(preprocess_binding).chain(encryption_binding) {
+            if binding.context() != &self.context ||
+                binding.parameters() != &expected_parameters ||
+                binding.rhs_mode() != self.parameters.rhs_mode() ||
+                binding.hash_key_commitment() != &expected_hash_key
+            {
+                return Err(ApiError::compatibility(
+                    "RNS-BGG artifact binding does not match the online evaluation",
+                ));
+            }
+        }
+        if preprocess_binding.program() != Some(program.id()) {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess binding does not match the online evaluation Program",
+            ));
+        }
+        if !self.inputs_by_shape {
+            self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
+        }
+        let expected_data = (!program.data_families().is_empty()).then(|| self.data.commitment());
+        if preprocess_binding.data() != expected_data.as_ref() {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess binding has other Program data than the online evaluation",
+            ));
+        }
+        // The data are graph inputs whose values this builder was given.
+        let data = crate::program::data_inputs(program, |family| {
+            instance_name(
+                self.artifact_prefix.as_deref(),
+                &crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family),
+            )
+        });
+        for family in program.data_families().keys().filter(|_| !self.inputs_by_shape) {
+            let values = self.data.values(*family).expect("validated program data");
+            self.runtime.insert(
+                instance_name(
+                    self.artifact_prefix.as_deref(),
+                    &crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), *family),
+                ),
+                RuntimeValue::integer_values(values.iter().map(|value| (*value).into()).collect()),
+            );
+        }
+        self.families.data = data.clone();
+        if !preprocess_binding.sources().is_empty() {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess root unexpectedly declares sources",
+            ));
+        }
+        // A Static ciphertext is encrypted for one compiled Program; a
+        // Dynamic one for the setup the compiled Program belongs to.
+        let dynamic = match self.parameters.rhs_mode() {
+            RhsMode::Static => {
+                if let Some(encryption_binding) = encryption_binding {
+                    if encryption_binding.program() != Some(program.id()) ||
+                        encryption_binding.sources().len() != 1 ||
+                        !encryption_binding.sources().contains(&preprocess_production)
+                    {
+                        return Err(ApiError::compatibility(
+                            "RNS-BGG encryption source is not the preprocess production",
+                        ));
+                    }
+                }
+                None
+            }
+            RhsMode::Dynamic => Some(self.validate_dynamic_stages(
+                program,
+                preprocess,
+                encryption.ok_or_else(|| {
+                    ApiError::input("Dynamic evaluation requires ciphertext packages")
+                })?,
+            )?),
+        };
+        if encryption_binding.is_some_and(|binding| {
+            preprocess_binding.decoder_commitment() != binding.decoder_commitment()
+        }) {
+            return Err(ApiError::compatibility(
+                "RNS-BGG decoder declaration commitment differs between stages",
+            ));
+        }
+        if preprocess_binding.output_use() != self.output_use {
+            return Err(ApiError::compatibility(
+                "RNS-BGG output use differs from the preprocessed Program",
+            ));
+        }
+        self.unmask_preimage_bound = preprocess_binding.unmask_preimage_bound().cloned();
+        self.output_carriers = preprocess_binding.output_carriers().to_vec();
+        let mut manifests = BTreeMap::new();
+        manifests.insert(preprocess_production.clone(), preprocess.manifest().clone());
+        if let Some(encryption) = encryption {
+            manifests.insert(encryption_production.clone(), encryption.manifest().clone());
+        }
+        let prelude = encryption_binding.and_then(|binding| binding.ciphertext_prelude()).map(
+            |(production, manifest)| {
+                manifests.insert(production.clone(), manifest.clone());
+                production.clone()
+            },
+        );
+        let workload = Arc::new(
+            RnsBggDerivedWorkload::from_program_with_parameters(self.parameters, program)
+                .map_err(ApiError::scheme)?,
+        );
+        self.hash_key_commitment = expected_hash_key;
+        self.hash_key = hash_key.to_vec();
+        let hash_key = self.parameters.ring(0).map_err(ApiError::scheme)?.bytes_input(
+            instance_name(
+                self.artifact_prefix.as_deref(),
+                &crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
+            ),
+            self.hash_key.len(),
+        );
+        if encryption.is_some() {
+            self.bind_encrypted_inputs(
+                program,
+                &workload,
+                &encryption_production,
+                &hash_key,
+                dynamic.as_ref(),
+                None,
+                |role| encryption.expect("encryption branch").descriptor().artifact_name(&role),
+            )?;
+        }
+        for (rhs, binding) in import_rhs_bindings(
+            self.parameters,
+            program,
+            &workload,
+            &preprocess_production,
+            prelude.as_ref(),
+            dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
+            &hash_key,
+            |role| match (dynamic.as_ref(), encryption) {
+                (Some(_), Some(stage)) => stage.descriptor().artifact_name(&role),
+                _ => instance_name(self.artifact_prefix.as_deref(), &role),
+            },
+        )? {
+            self.environment
+                .bind_rhs(rhs, binding)
+                .map_err(|error| ApiError::input(error.to_string()))?;
+        }
+        let mut evaluator = EncodingLowering {
+            encryption_artifact_prefix: encryption
+                .and_then(|stage| stage.descriptor().artifact_prefix())
+                .map(str::to_owned),
+            root_lut_helpers: encryption.is_none().then(BTreeMap::new),
+            decoder_hint: None,
+            parameters: self.parameters,
+            program: Arc::new(program.clone()),
+            workload,
+            preprocess: preprocess_production,
+            encryption: encryption_production,
+            manifests,
+            decoder_smudge: None,
+            artifact_prefix: self.artifact_prefix.clone(),
+            current_site: None,
+            hash_key,
+            root_hash_key: self.parameters.root_hash_key_input(),
+            rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
+            data,
+            output_use: self.output_use,
+            dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
+                setup,
+                binding,
+                automorphisms: None,
+            }),
+        };
+        if evaluator.dynamic.is_some() {
+            evaluator.import_dynamic_packages().map_err(ApiError::scheme)?;
+        } else if encryption.is_some() {
+            evaluator.import_body_lut_material().map_err(ApiError::scheme)?;
+        }
+        self.evaluator = Some(evaluator);
+        Ok(())
     }
 }

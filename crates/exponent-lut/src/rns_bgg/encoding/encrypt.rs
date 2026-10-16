@@ -7,6 +7,7 @@ fn validate_decoder_smudge_input_key_artifacts(
     parameters: &RnsBggParameters,
     inputs: &crate::program::EncryptionInputs,
     key: &str,
+    prefix: Option<&str>,
 ) -> Result<(), RnsBggError> {
     let manifest = manifests
         .get(production)
@@ -27,7 +28,8 @@ fn validate_decoder_smudge_input_key_artifacts(
             ),
         };
         for port in 0..4 {
-            let name = decoder_smudge_input_key_artifact_name(&key, *wire, port);
+            let name =
+                instance_name(prefix, &decoder_smudge_input_key_artifact_name(&key, *wire, port));
             let artifact = manifest
                 .artifacts
                 .get(&name)
@@ -43,6 +45,11 @@ fn validate_decoder_smudge_input_key_artifacts(
 }
 
 impl<'a> RnsEncryptBuild<'a> {
+    /// Resolve an artifact role inside the bound preprocessing instance.
+    pub(super) fn artifact_name(&self, role: &str) -> String {
+        self.binding.as_ref().map_or_else(|| role.to_owned(), |binding| binding.artifact_name(role))
+    }
+
     /// Creates an unbound encryption builder.
     pub fn new(parameters: &'a RnsBggParameters, context: [u8; 32]) -> Self {
         Self {
@@ -233,7 +240,10 @@ impl<'a> RnsEncryptBuild<'a> {
                 })
                 .map_err(ApiError::scheme)?;
                 graph = graph
-                    .transferred_output(format!("lut-helper/{level}/{key}"), family)
+                    .transferred_output(
+                        self.artifact_name(&format!("lut-helper/{level}/{key}")),
+                        family,
+                    )
                     .map_err(ApiError::scheme)?;
             }
         }
@@ -250,7 +260,7 @@ impl<'a> RnsEncryptBuild<'a> {
             };
             let input_ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
             let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-            let name = format!("input-{wire:?}");
+            let name = self.artifact_name(&format!("input-{wire:?}"));
             let port = |port: usize| super::root_row_input_name(tag, port);
             graph = match declaration.shape() {
                 InputBinding::Scalar(()) => {
@@ -545,6 +555,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     .as_ref()
                     .ok_or(RnsBggError::Binding("decoder smudge child inputs are not bound"))?,
                 &declaration.artifact_key(),
+                binding.artifact_prefix.as_deref(),
             )?;
         }
         // A Dynamic child encrypts under the parent's single secret, in the
@@ -727,13 +738,15 @@ impl<'a> RnsEncryptBuild<'a> {
             refresh_fresh_input_key_artifact_name,
         };
         let spec = *declaration.spec();
+        let prefix = self.binding.as_ref().and_then(|binding| binding.artifact_prefix.clone());
+        let name = |role: &str| instance_name(prefix.as_deref(), role);
         let mut child_graph = |graph: DslContext,
                                child: &RnsEncryptBuild<'a>,
                                program: &crate::program::ExponentLutProgram,
                                name: &dyn Fn(&str) -> String,
                                input_key: &dyn Fn(WireId, usize) -> String|
          -> Result<DslContext, ApiError> {
-            let input = hash_key_input_name(child.hash_namespace.as_ref());
+            let input = name(&hash_key_input_name(child.hash_namespace.as_ref()));
             let child_key = self
                 .parameters
                 .ring(0)
@@ -749,8 +762,8 @@ impl<'a> RnsEncryptBuild<'a> {
             graph,
             fresh,
             declaration.fresh().program(),
-            &|role| refresh_fresh_artifact_name(spec, role),
-            &|wire, port| refresh_fresh_input_key_artifact_name(spec, wire, port),
+            &|role| name(&refresh_fresh_artifact_name(spec, role)),
+            &|wire, port| name(&refresh_fresh_input_key_artifact_name(spec, wire, port)),
         )?;
         let decoder = declaration.decoder();
         let key = decoder.artifact_key();
@@ -758,8 +771,8 @@ impl<'a> RnsEncryptBuild<'a> {
             graph,
             smudge,
             decoder.smudge().program(),
-            &|role| decoder_smudge_artifact_name(&key, role),
-            &|wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
+            &|role| name(&decoder_smudge_artifact_name(&key, role)),
+            &|wire, port| name(&decoder_smudge_input_key_artifact_name(&key, wire, port)),
         )?;
         // The decoding ring is the children's last level, with the CRT basis
         // of the target's level (checked at preprocessing).
@@ -780,9 +793,9 @@ impl<'a> RnsEncryptBuild<'a> {
         let hint =
             self.unmask_hint(refresh_artifact_name(spec, "unmask-public"), parameters, decoding)?;
         graph
-            .transferred_output(refresh_artifact_name(spec, "one-encoding"), one.row)
+            .transferred_output(name(&refresh_artifact_name(spec, "one-encoding")), one.row)
             .map_err(ApiError::scheme)?
-            .transferred_output(refresh_artifact_name(spec, "unmask-hint"), hint)
+            .transferred_output(name(&refresh_artifact_name(spec, "unmask-hint")), hint)
             .map_err(ApiError::scheme)
     }
 
@@ -1198,8 +1211,9 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         let mask =
             self.mask_secret.clone().ok_or_else(|| ApiError::input("mask secret is not bound"))?;
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let hash_key_input =
-            crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref());
+        let hash_key_input = self.artifact_name(&crate::rns_bgg::refresh::hash_key_input_name(
+            self.hash_namespace.as_ref(),
+        ));
         let hash_key = ring.bytes_input(hash_key_input.clone(), self.hash_key.len());
         let mut graph = DslContext::new("rns-bgg-encrypt");
         if let (Some(declaration), Some(child)) =
@@ -1209,8 +1223,10 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             graph = Self::append_child(
                 child,
                 declaration.smudge().program(),
-                |role| decoder_smudge_artifact_name(&key, role),
-                |wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
+                |role| self.artifact_name(&decoder_smudge_artifact_name(&key, role)),
+                |wire, port| {
+                    self.artifact_name(&decoder_smudge_input_key_artifact_name(&key, wire, port))
+                },
                 graph,
                 &hash_key,
             )?;
@@ -1224,7 +1240,10 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             )?;
             graph = graph
                 .transferred_output(
-                    decoder_artifact_name(&declaration.artifact_key(), "unmask-hint"),
+                    self.artifact_name(&decoder_artifact_name(
+                        &declaration.artifact_key(),
+                        "unmask-hint",
+                    )),
                     hint,
                 )
                 .map_err(ApiError::scheme)?;
@@ -1235,7 +1254,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             graph = self.append_refresh(&declaration, &fresh, &smudge, graph, &hash_key, &mask)?;
         }
         if dynamic {
-            graph = self.dynamic_material(graph, &hash_key, |role| role)?;
+            graph = self.dynamic_material(graph, &hash_key, |role| self.artifact_name(&role))?;
         } else {
             for (name, family) in self
                 .lut_helper_families(
@@ -1246,7 +1265,9 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?
             {
-                graph = graph.transferred_output(name, family).map_err(ApiError::scheme)?;
+                graph = graph
+                    .transferred_output(self.artifact_name(&name), family)
+                    .map_err(ApiError::scheme)?;
             }
             // Each input is encoded at its logical level under a public key
             // sampled from the hash key; only the row and, for a public input, the
@@ -1280,7 +1301,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                         self.encode_private(&key, level, &payload, &mask, plaintext)
                     }
                 };
-                let name = format!("input-{wire:?}");
+                let name = self.artifact_name(&format!("input-{wire:?}"));
                 graph = match (value, public) {
                     (InputBinding::Scalar(value), true) => {
                         let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
@@ -1504,6 +1525,63 @@ mod test {
                 alpha,
                 InputBinding::Scalar(monomial(&parameters.levels()[0], alpha_value)),
             )]);
+            let mut graph_rows =
+                RnsOnlineEvalBuild::new(&parameters, context).with_root_inputs(tags.clone());
+            let root_row = |tag: &str| {
+                (
+                    ring.input(root_row_input_name(tag, 0), (1, root.columns())),
+                    ring.input(root_row_input_name(tag, 1), (1, root.columns())),
+                )
+            };
+            graph_rows
+                .bind_rows(
+                    &program,
+                    &ParamEnv::default(),
+                    &online_eval,
+                    BTreeMap::from([
+                        (x, InputBinding::Scalar(root_row("x"))),
+                        (alpha, InputBinding::Scalar(root_row("alpha"))),
+                    ]),
+                    BTreeMap::from([(alpha, InputBinding::Scalar(mono(alpha_value)))]),
+                    &hash_key,
+                )
+                .unwrap();
+            let helpers = program
+                .encryption_inputs()
+                .luts()
+                .iter()
+                .map(|table| {
+                    let key = table.helper_family_key();
+                    let count = table.branch_automorphisms(n as usize).unwrap().len();
+                    let ports = [0, 1].map(|port| {
+                        ring.input_family(
+                            root_helper_input_name(&key, port),
+                            count,
+                            (1, root.columns()),
+                        )
+                    });
+                    let family = mxx_dsl::parallel(count, |index| {
+                        Ok((ports[0].at(index.clone()), ports[1].at(index)))
+                    })
+                    .unwrap();
+                    (key, family)
+                })
+                .collect();
+            graph_rows.bind_lut_helper_rows(helpers).unwrap();
+            let outputs = crate::api::lower(&program, &mut graph_rows).unwrap();
+            let mut emission =
+                graph_rows.emit(DslContext::new("direct-root-evaluation"), outputs).unwrap();
+            emission.runtime_inputs.extend(rows.clone());
+            let (direct, ()) = emission.build().unwrap();
+            assert_eq!(direct.manifests.len(), 1);
+            let direct = crate::api::execute_graph(
+                direct,
+                &ParamEnv::default(),
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
             let encrypted = RnsEncryptBuild::new(&parameters, context)
                 .import(
                     &program.encryption_inputs(),
@@ -1531,6 +1609,13 @@ mod test {
                 |_| Ok(()),
             )
             .unwrap();
+            for (name, value) in &result.outputs {
+                assert_eq!(
+                    crate::test_support::full(value),
+                    crate::test_support::full(&direct.outputs[name]),
+                    "{name}"
+                );
+            }
             let terminal = parameters.levels().last().unwrap();
             let expected = monomial(terminal, alpha_value + table[x_value]);
             let verify = |value: &DCRTPoly, execution: &mut CpuExecution, store: &mut _| {

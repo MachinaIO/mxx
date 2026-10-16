@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    api::{ApiError, PlaintextInputs, PreprocessBuild, StageGraph, apply_decoder},
+    api::{ApiError, GraphEmission, PlaintextInputs, PreprocessBuild, ProgramBuild, apply_decoder},
     decoder::decoding::{Decoder, DecoderError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
@@ -36,6 +36,8 @@ mod sampling;
 
 use self::decoder::sample_unmask_trapdoor;
 pub(super) use self::{lowering::*, sampling::*};
+#[cfg(test)]
+use crate::api::StageGraph;
 #[cfg(test)]
 use mxx_ir_core::node::ConstantMatrix;
 
@@ -116,8 +118,7 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
     /// The Program's integer data inputs ([`crate::program::data_inputs`]).
     pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
-    /// RHS plaintexts, read from graph inputs; a family is read member by
-    /// member.
+    /// RHS plaintext graph expressions or resident inputs; families are read member by member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
     /// Setup-fixed RHS ciphertexts.  These are compact matrices; their signed
     /// decompositions are constructed at the consuming level only.
@@ -158,6 +159,10 @@ pub struct PublicKeyLowering<'a> {
 
 /// Preprocessing stage adapter using the common stage lifecycle.
 pub struct RnsPreprocessBuild<'a> {
+    /// Instance namespace for graph inputs and published artifacts.
+    artifact_prefix: Option<String>,
+    /// RHS expressions supplied by the composing graph, without resident inputs.
+    rhs_values: Option<BTreeMap<RhsId, InputBinding<Mat, Family<Mat>>>>,
     parameters: &'a RnsBggParameters,
     context: [u8; 32],
     hash_key_commitment: [u8; 32],

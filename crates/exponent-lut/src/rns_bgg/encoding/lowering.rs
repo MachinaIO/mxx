@@ -81,6 +81,29 @@ impl OnlineEvalFamilies<'_> {
         }
     }
 
+    /// Read the compact ciphertext and public hash-derived top of one RHS member.
+    fn rhs_member(
+        &self,
+        family: &OnlineEvalRhsFamily,
+        member: Int,
+    ) -> Result<(RnsBggMatrix, RhsRef<Int>), RnsBggError> {
+        let top = match &family.tops {
+            Some(tops) => tops.at(member.clone()),
+            None => super::public_key::rhs_top(
+                self.parameters,
+                family.program,
+                family.hash_key.clone(),
+                family.rhs,
+                family.level,
+                Some(member.clone()),
+            )?,
+        };
+        Ok((
+            (top, family.bottoms.at(member.clone())),
+            RhsRef { id: family.rhs, index: Some(member) },
+        ))
+    }
+
     fn count(family: &OnlineEvalWireFamily) -> IntExpr {
         match family {
             OnlineEvalWireFamily::Stored(family) => family.count().clone(),
@@ -124,26 +147,11 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
         family: &Self::RhsFamily,
         index: &IntExpr,
     ) -> Result<(RnsBggMatrix, RhsRef<Int>), crate::program::ProgramLowerError<RnsBggError>> {
-        let member = Int::evaluate(index.clone());
-        let top = match &family.tops {
-            Some(tops) => tops.at(member.clone()),
-            None => super::public_key::rhs_top(
-                self.parameters,
-                family.program,
-                family.hash_key.clone(),
-                family.rhs,
-                family.level,
-                Some(index.clone()),
-            )
-            .map_err(crate::program::ProgramLowerError::Backend)?,
-        };
-        Ok((
-            (top, family.bottoms.at(member.clone())),
-            RhsRef { id: family.rhs, index: Some(member) },
-        ))
+        self.rhs_member(family, Int::evaluate(index.clone()))
+            .map_err(crate::program::ProgramLowerError::Backend)
     }
 
-    /// A Dynamic RHS family stores both halves of every member, which a runtime index reads.
+    /// Select a Static or Dynamic RHS; its public hash tag uses the same runtime member.
     fn rhs_selected(
         &mut self,
         family: &Self::RhsFamily,
@@ -152,13 +160,7 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
     ) -> Result<(RnsBggMatrix, RhsRef<Int>), crate::program::ProgramLowerError<RnsBggError>> {
         use crate::program::ProgramLowerError;
         let member = self.selected_member(data, position).map_err(ProgramLowerError::Backend)?;
-        let tops = family.tops.as_ref().ok_or(ProgramLowerError::Backend(RnsBggError::Binding(
-            "an RHS member selected at run time needs the Dynamic RHS mode",
-        )))?;
-        Ok((
-            (tops.at(member.clone()), family.bottoms.at(member.clone())),
-            RhsRef { id: family.rhs, index: Some(member) },
-        ))
+        self.rhs_member(family, member).map_err(ProgramLowerError::Backend)
     }
 
     fn parallel(
@@ -326,12 +328,14 @@ pub(super) fn import_rhs_bindings(
 }
 
 impl EncodingLowering<'_> {
+    /// Resolve a public preprocessing artifact in this instance or composed child.
     pub(super) fn preprocess_artifact_name(&self, role: String) -> String {
-        self.encryption_artifact_name(role)
+        instance_name(self.artifact_prefix.as_deref(), &role)
     }
 
+    /// Resolve ciphertext material independently of the compiled Program's namespace.
     pub(super) fn encryption_artifact_name(&self, role: String) -> String {
-        self.artifact_prefix.as_ref().map_or(role.clone(), |prefix| format!("{prefix}/{role}"))
+        instance_name(self.encryption_artifact_prefix.as_deref(), &role)
     }
 
     /// The production of the RHS and LUT-switching ciphertexts: preprocessing
@@ -511,6 +515,24 @@ impl EncodingLowering<'_> {
         table: &LutTable,
         count: usize,
     ) -> Result<(Family<Mat>, Family<Mat>), RnsBggError> {
+        if let Some(helpers) = &self.root_lut_helpers {
+            let rows = helpers
+                .get(&table.helper_family_key())
+                .ok_or(RnsBggError::Binding("missing graph LUT helper rows"))?;
+            if rows.count() != &IntExpr::constant(count) {
+                return Err(RnsBggError::Binding("graph LUT helper count differs from layout"));
+            }
+            let retargeted = mxx_dsl::parallel(count, |index| {
+                self.parameters
+                    .retarget_row(level, RnsBggForm::State, rows.at(index))
+                    .map_err(|_| DslError::Schema)
+            })
+            .map_err(graph)?;
+            return Ok((
+                retargeted.field(|row| row.0).map_err(graph)?,
+                retargeted.field(|row| row.1).map_err(graph)?,
+            ));
+        }
         let ring = self.parameters.ring(level)?;
         let columns = self.parameters.component_columns(level)?;
         let key = table.helper_family_key();
@@ -1355,6 +1377,9 @@ mod test {
                 execution_nonce: [9; 32],
             };
             let mut lowerer = EncodingLowering {
+                encryption_artifact_prefix: None,
+                root_lut_helpers: None,
+                decoder_hint: None,
                 parameters: &parameters,
                 hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
                 root_hash_key: None,
@@ -1426,6 +1451,9 @@ mod test {
         )
         .canonicalize();
         let lowerer = |program: &Arc<ExponentLutProgram>, output| EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1575,6 +1603,9 @@ mod test {
             execution_nonce: [23; 32],
         };
         let mut lowerer = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1649,6 +1680,9 @@ mod test {
         let public_workload =
             Arc::new(RnsBggDerivedWorkload::from_program(&public_program).unwrap());
         let mut public_lowerer = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1728,6 +1762,9 @@ mod test {
             execution_nonce: [43; 32],
         };
         let mut lowerer = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1875,6 +1912,9 @@ mod test {
             )
         };
         let mut lowerer = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -2076,6 +2116,9 @@ mod test {
             execution_nonce: [53; 32],
         };
         let mut lowerer = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,

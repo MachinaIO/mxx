@@ -67,7 +67,7 @@ impl RnsEncryptBuild<'_> {
             .ok_or_else(|| ApiError::input("the unmask trapdoor width overflows"))?;
         let public = ring.artifact_input(
             production.clone(),
-            public_name,
+            self.artifact_name(&public_name),
             (crate::decoder::unmask::UNMASK_ROWS, columns),
             ArtifactAvailability::Transferred,
         );

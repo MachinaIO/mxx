@@ -80,10 +80,11 @@ pub(crate) fn graph_declares_input(graph: &mxx_dsl::BuiltGraph, name: &str) -> b
 pub type RnsBggRow = (Mat, Mat);
 /// A two-by-two polynomial block matrix.
 pub type RnsBggMatrix = ((Mat, Mat), (Mat, Mat));
-/// A two-by-two matrix of signed compact preimages.
 /// Raw signed gadget digits of a right-action matrix in its decomposition ring.
+#[cfg(test)]
 pub(crate) type RnsBggDigits = ((Preimage, Preimage), (Preimage, Preimage));
 /// Bounded digits of a right action, represented in the ring that consumes them.
+#[cfg(test)]
 pub(crate) type RnsBggDecomposition = ((SmallMatrix, SmallMatrix), (SmallMatrix, SmallMatrix));
 fn decoder_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1712,6 +1713,9 @@ impl InputKeySource {
 /// The sole descriptor shared by RNS-BGG stage checkpoints.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RnsBggArtifactBinding {
+    /// Instance namespace within a production shared by several Programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_prefix: Option<String>,
     context: [u8; 32],
     /// The Program of a preprocessing stage, and of a Static encryption; a
     /// Dynamic encryption belongs to its setup only.
@@ -1764,6 +1768,7 @@ impl RnsBggArtifactBinding {
             return Err(RnsBggError::Binding("artifact sources must be canonical and unique"));
         }
         let mut binding = Self {
+            artifact_prefix: None,
             context,
             program,
             parameters,
@@ -1784,6 +1789,17 @@ impl RnsBggArtifactBinding {
             binding = binding.with_source(source)?;
         }
         Ok(binding)
+    }
+
+    /// Set the instance namespace used by every published and imported artifact.
+    pub(crate) fn with_artifact_prefix(mut self, prefix: Option<String>) -> Self {
+        self.artifact_prefix = prefix;
+        self
+    }
+
+    /// Resolve an artifact role within this instance of a shared production.
+    pub(crate) fn artifact_name(&self, role: impl AsRef<str>) -> String {
+        instance_name(self.artifact_prefix.as_deref(), role.as_ref())
     }
 
     /// Records the logical level of each Program input.
@@ -1952,6 +1968,16 @@ macro_rules! rns_bgg_stage_descriptor {
         pub struct $name(RnsBggArtifactBinding);
 
         impl $name {
+            /// Namespace of this Program's artifacts in its containing production.
+            pub fn artifact_prefix(&self) -> Option<&str> {
+                self.0.artifact_prefix.as_deref()
+            }
+
+            /// Resolve a relative artifact role within the containing production.
+            pub fn artifact_name(&self, role: impl AsRef<str>) -> String {
+                self.0.artifact_name(role)
+            }
+
             pub(crate) fn from_binding(binding: RnsBggArtifactBinding) -> Self {
                 Self(binding)
             }
@@ -1970,7 +1996,8 @@ rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineEvalDescriptor);
 rns_bgg_stage_descriptor!(RnsBggEncryptionDescriptor);
 
 impl RnsBggPreprocessEncryptDescriptor {
-    pub(crate) fn with_source(
+    /// Finalize this descriptor against the production containing its namespaced artifacts.
+    pub fn with_source(
         self,
         source: mxx_ir_core::artifact::ProductionId,
     ) -> Result<Self, RnsBggError> {
@@ -1983,6 +2010,14 @@ pub(crate) fn hash_key_commitment(hash_key: &[u8]) -> [u8; 32] {
     digest.update(b"mxx-rns-bgg/hash-key/v1");
     digest.update(hash_key);
     digest.finalize().into()
+}
+
+/// Qualify a graph input or artifact without changing its sampling domain or value.
+pub(crate) fn instance_name(prefix: Option<&str>, role: &str) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}/{role}"),
+        None => role.to_owned(),
+    }
 }
 
 /// One-shot decoder invocation shared by the stage lowerers: the source
@@ -2173,19 +2208,29 @@ fn plaintext_monomial<P: mxx_backends::poly::Poly>(value: &P) -> Result<(BigInt,
 /// never a resident family of full matrices: member `i` is
 /// `coefficients[i] * X^(exponents[i])`.
 #[derive(Clone)]
-pub(crate) struct PlaintextFamily {
-    coefficients: Family<mxx_dsl::Int>,
-    exponents: Family<mxx_dsl::Int>,
+pub(crate) enum PlaintextFamily {
+    /// Compact signed monomials supplied as resident integer inputs.
+    Monomials { coefficients: Family<mxx_dsl::Int>, exponents: Family<mxx_dsl::Int> },
+    /// Arbitrary plaintext expressions supplied by a composing graph.
+    Values(Family<Mat>),
 }
 
 impl PlaintextFamily {
     pub(crate) fn count(&self) -> &IntExpr {
-        self.coefficients.count()
+        match self {
+            Self::Monomials { coefficients, .. } => coefficients.count(),
+            Self::Values(values) => values.count(),
+        }
     }
 
     /// Member `index`, built where it is read in the ring `ring`.
     pub(crate) fn member(&self, ring: &Ring, index: mxx_dsl::Int) -> Mat {
-        signed_monomial(ring, self.coefficients.at(index.clone()), self.exponents.at(index))
+        match self {
+            Self::Monomials { coefficients, exponents } => {
+                signed_monomial(ring, coefficients.at(index.clone()), exponents.at(index))
+            }
+            Self::Values(values) => values.at(index),
+        }
     }
 }
 
@@ -2262,7 +2307,7 @@ pub(crate) fn plaintext_handles(
                 input(exponent_name)?,
             ))
         }
-        InputBinding::Family(count) => InputBinding::Family(PlaintextFamily {
+        InputBinding::Family(count) => InputBinding::Family(PlaintextFamily::Monomials {
             coefficients: context.int_family_input(coefficient_name, count.clone()),
             exponents: context.int_family_input(exponent_name, count),
         }),
@@ -2743,20 +2788,30 @@ pub(crate) fn multiply_rows_by_columns<D: RightAction>(
     first.into_iter().zip(second).collect()
 }
 
-/// An encoding's row and public-key matrix under an action given by its
-/// stacked column decompositions, as one product per column.
+/// A key-only matrix product under stacked column decompositions.
+/// This is shared by preprocessing and evaluation so no row enters a key subexpression.
+pub(crate) fn multiply_public_by_columns<D: RightAction>(
+    matrix: RnsBggMatrix,
+    columns: (D, D),
+) -> RnsBggMatrix {
+    let mut rows = multiply_rows_by_columns(vec![matrix.0, matrix.1], columns).into_iter();
+    (rows.next().expect("two key rows"), rows.next().expect("two key rows"))
+}
+
+/// Apply one action to an encoding's row and key, with the key computed independently.
+/// Only decomposition nodes are shared: the key never depends on an encoded row.
 pub(crate) fn multiply_row_and_public_by_columns<D: RightAction>(
     row: RnsBggRow,
     matrix: RnsBggMatrix,
     columns: (D, D),
 ) -> (RnsBggRow, RnsBggMatrix) {
-    let (top, bottom) = matrix;
-    let mut rows = multiply_rows_by_columns(vec![row, top, bottom], columns).into_iter();
-    let row = rows.next().expect("three rows");
-    let top = rows.next().expect("three rows");
-    (row, (top, rows.next().expect("three rows")))
+    let key = multiply_public_by_columns(matrix, columns.clone());
+    let row = multiply_rows_by_columns(vec![row], columns).pop().expect("one encoding row");
+    (row, key)
 }
 
+/// Entry-wise rebase for the independent decomposition test oracle.
+#[cfg(test)]
 pub(crate) fn centered_rebase_compact(value: RnsBggDigits, ring: &Ring) -> RnsBggDecomposition {
     (
         (value.0.0.centered_rebase(ring), value.0.1.centered_rebase(ring)),
@@ -2846,6 +2901,7 @@ impl RightAction for SmallMatrix {
 /// factor multiplies all rows at once, stacked, so every factor has one use:
 /// the rows' later consumers never keep a factor, which is as large as the
 /// product's column count squared, alive after its products.
+#[cfg(test)]
 pub(crate) fn multiply_rows_action<D: RightAction>(
     rows: Vec<RnsBggRow>,
     rhs: ((D, D), (D, D)),
@@ -2881,6 +2937,7 @@ pub(crate) fn multiply_rows_action<D: RightAction>(
 }
 
 /// `lhs * rhs` for 2x2 matrices of blocks.
+#[cfg(test)]
 pub(crate) fn multiply_public_action<D: RightAction>(
     lhs: RnsBggMatrix,
     rhs: ((D, D), (D, D)),

@@ -196,9 +196,7 @@ impl<'a> PublicKeyLowering<'a> {
         let index = rhs
             .index
             .as_ref()
-            .map(Int::expression)
-            .transpose()
-            .map_err(|_| RnsBggError::Binding("RHS member index is not an index expression"))?
+            .and_then(|index| index.expression().ok())
             .map(|index| index.canonicalize());
         let own_member = match (self.parallel_bodies.as_slice(), &index) {
             ([(count, member, _)], Some(index)) => {
@@ -718,14 +716,7 @@ impl<'a> PublicKeyLowering<'a> {
             ),
             None => return Err(RnsBggError::Binding("RHS plaintext was not bound")),
         };
-        // The member enters the tag as an index expression, as it does where
-        // online evaluation reads the member.
-        let member = rhs
-            .index
-            .as_ref()
-            .map(Int::expression)
-            .transpose()
-            .map_err(|_| RnsBggError::Binding("RHS member index is not an index expression"))?;
+        let member = rhs.index.clone();
         rhs_ciphertext(
             self.parameters,
             level,
@@ -907,10 +898,11 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         } else {
             rhs.matrix.clone()
         };
-        let rhs_decomposition = decompose_matrix(self.parameters, target_level, rhs_matrix)?;
+        let rhs_decomposition =
+            compact_decompose_columns(self.parameters, target_level, target_level, rhs_matrix)?;
         Ok(RnsBggPublicKey::new(
             self.output()?,
-            super::multiply_public_action(lhs_matrix, rhs_decomposition),
+            super::multiply_public_by_columns(lhs_matrix, rhs_decomposition),
         ))
     }
     fn mul_private(
@@ -959,18 +951,21 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             .ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
         let target_ring = self.parameters.ring(decomposition_level)?;
         let compact = checked_modulus_convert_matrix(compact, &target_ring)?;
-        let compact = decompose_matrix(self.parameters, decomposition_level, compact)?;
-        let evaluation_ring = self.parameters.ring(evaluation_level)?;
         // Only the bounded decomposition digits cross back into the
         // evaluation ring; the compact RHS artifact itself remains at its
         // native next-level schema.
-        let action = super::centered_rebase_compact(compact, &evaluation_ring);
+        let action = compact_decompose_columns(
+            self.parameters,
+            evaluation_level,
+            decomposition_level,
+            compact,
+        )?;
         let target_level = self.workload.level(self.output()?)?;
         let target_ring = self.parameters.ring(target_level)?;
         Ok(RnsBggPublicKey::new(
             self.output()?,
             super::mod_down_public(
-                super::multiply_public_action(input.matrix.clone(), action),
+                super::multiply_public_by_columns(input.matrix.clone(), action),
                 &target_ring,
             ),
         ))
@@ -1041,16 +1036,14 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                 let routed = super::map_matrix(input.matrix.clone(), |entry| {
                     entry.ring_automorphism(sigma.clone())
                 });
-                let switching_decomposition = super::centered_rebase_compact(
-                    decompose_matrix(
-                        self.parameters,
-                        next_level,
-                        switching_ciphertexts.at(index.clone()),
-                    )
-                    .map_err(|_| DslError::Schema)?,
-                    &source_ring,
-                );
-                let switched = super::multiply_public_action(routed, switching_decomposition);
+                let switching_decomposition = compact_decompose_columns(
+                    self.parameters,
+                    source_level,
+                    next_level,
+                    switching_ciphertexts.at(index.clone()),
+                )
+                .map_err(|_| DslError::Schema)?;
+                let switched = super::multiply_public_by_columns(routed, switching_decomposition);
                 let switched_public_key = super::mod_down_public(switched, &target_ring);
                 // A_sigma is sampled in its own branch, so one is resident.
                 let data = lut_public_matrix(
@@ -1061,12 +1054,14 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                     Int::from(sigma),
                 )
                 .map_err(|_| DslError::Schema)?;
-                let switched_key_decomposition = super::centered_rebase_compact(
-                    decompose_matrix(self.parameters, next_level, switched_public_key)
-                        .map_err(|_| DslError::Schema)?,
-                    &source_ring,
-                );
-                let branch = public_lut_branch(data, switched_key_decomposition);
+                let switched_key_decomposition = compact_decompose_columns(
+                    self.parameters,
+                    source_level,
+                    next_level,
+                    switched_public_key,
+                )
+                .map_err(|_| DslError::Schema)?;
+                let branch = super::multiply_public_by_columns(data, switched_key_decomposition);
                 Ok(super::add_public_matrices(sum, branch))
             })
             .map_err(graph)?;
@@ -1273,6 +1268,9 @@ mod test {
             execution_nonce: rand::random(),
         };
         let mut online_eval = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters: &parameters,
             program: owned_program,
             workload,

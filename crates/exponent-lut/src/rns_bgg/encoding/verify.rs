@@ -879,6 +879,9 @@ mod test {
             execution_nonce: rand::random(),
         };
         let mut lowerer = EncodingLowering {
+            encryption_artifact_prefix: None,
+            root_lut_helpers: None,
+            decoder_hint: None,
             parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,

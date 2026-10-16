@@ -21,6 +21,48 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
 | `lean/` | Lean proofs of the evaluator's correctness claims. |
 | `tests/` | Integration tests: NAND circuits, the LWR PRF, decoders, public inner products, and the noise refresh. |
 
+## Caller-owned graphs
+
+`api::preprocess` and `api::online_eval` remain convenience execution wrappers. To compose
+several Programs into one execution, bind a builder, call `api::lower(program, &mut builder)`,
+and pass the resulting carriers to `builder.emit(context, outputs)`. Emission neither freezes
+nor executes the caller's `DslContext`. `api::GraphEmission` returns that context, resident
+input bindings, dependency manifests, and descriptors. Merge the bindings and manifests of all
+emissions, add application outputs, and call `GraphEmission::build` only once. It discards
+bindings for inputs that freezing pruned.
+
+Give each Program instance a distinct, nonempty `with_artifact_prefix` **before binding**.
+Preprocessing prefixes its generated hash-key, plaintext and Program-data inputs, public keys,
+RHS ciphertexts, LUT material, and composed child artifacts. Online evaluation infers the
+namespace from its preprocessing descriptor (or checks an explicitly supplied prefix) and
+prefixes its `output-N` names as well. A composed preprocessing child must use the parent's
+instance prefix; its existing hash namespace still distinguishes its inputs from the parent's.
+Application-supplied graph expressions and intentionally shared root/reference inputs remain
+caller-owned: choose their names and bindings consistently. Prefixes do not change hash tags or
+sampling seeds.
+
+For an obfuscate-like graph, `RnsBggPayloadSecret::from_row(parameters, polynomial)` and
+`RnsBggMaskSecret::from_row` construct `(polynomial, 1)` secret rows without a resident-secret
+handoff. `RnsPreprocessBuild::bind_rhs_values` takes Static RHS plaintext `Mat`/`Family<Mat>`
+expressions at level zero, retaining symbolic family counts instead of expanding host vectors.
+It builds Static RHS ciphertexts, not an encryption or online-evaluation stage.
+
+For an evaluate-like graph, `RnsOnlineEvalBuild::bind_rows` takes the Program's input rows and
+public plaintexts as scalar/family graph values, plus its preprocessing artifacts. It reads no
+encryption production. On a rooted chain, supply the same `with_root_inputs` tags as
+preprocessing: rows are at the root modulus and retargeting happens in the graph at each input's
+level. Without a root, supply rows in the input's logical ring and width. LUTs additionally need
+`bind_lut_helper_rows`, keyed by `LutTable::helper_family_key`; a composed decoder can take its
+graph-produced hint with `bind_decoder_hint`. Dynamic ciphertext packages still use
+`bind_artifacts`.
+
+Multiple emitted preprocessings may publish into one production. Retain each returned
+descriptor with its prefix; after finalizing that production, attach descriptors with
+`api::StageArtifacts::new` and the production's manifest/session. Finalize an encryption
+descriptor with `with_source(production)` before attaching it. This does not duplicate or load
+artifact payloads. Namespaced `StageOutputs` retain their prefixed names; extract the selected
+instance's outputs before using the standalone verification/decoding helpers.
+
 ## RHS modes
 
 - **Static.** RHS ciphertexts and LUT switching material are sampled at preprocessing for one

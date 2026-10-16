@@ -8,8 +8,8 @@
 use super::*;
 use crate::{
     api::{
-        ApiError, EncryptBuild, OnlineEvalBuild, PlaintextInputs, StageArtifacts, StageExecution,
-        StageGraph, StageOutputs, apply_decoder,
+        ApiError, EncryptBuild, GraphEmission, OnlineEvalBuild, PlaintextInputs, ProgramBuild,
+        StageArtifacts, StageExecution, StageGraph, StageOutputs, apply_decoder,
     },
     decoder::decoding::{Decoder, DecoderDeclaration, DecoderError},
     program::{
@@ -221,6 +221,16 @@ impl SecretBinding {
 }
 
 impl RnsBggPayloadSecret {
+    /// Augment the graph polynomial `row` with one to form `(row, 1)` at level zero.
+    /// The caller owns its sampling and runtime bindings; this creates no graph input.
+    pub fn from_row(parameters: &RnsBggParameters, row: Mat) -> Result<Self, RnsBggError> {
+        let ring = parameters.ring(0)?;
+        if row.matrix_type() != &ring.matrix_type((1, 1)) {
+            return Err(RnsBggError::Binding("payload secret must be a level-zero polynomial"));
+        }
+        Ok(Self { row: (row, ring.identity(1)), binding: None })
+    }
+
     /// The graph input through which every stage reads this sampled secret,
     /// or `None` for a secret given as a graph expression.
     pub fn input_name(&self) -> Option<&str> {
@@ -258,6 +268,16 @@ impl RnsBggPayloadSecret {
 }
 
 impl RnsBggMaskSecret {
+    /// Augment the graph polynomial `row` with one to form `(row, 1)` at level zero.
+    /// The caller owns its sampling and runtime bindings; this creates no graph input.
+    pub fn from_row(parameters: &RnsBggParameters, row: Mat) -> Result<Self, RnsBggError> {
+        let ring = parameters.ring(0)?;
+        if row.matrix_type() != &ring.matrix_type((1, 1)) {
+            return Err(RnsBggError::Binding("mask secret must be a level-zero polynomial"));
+        }
+        Ok(Self { row: (row, ring.identity(1)), binding: None })
+    }
+
     /// The mask secret `(s_bar, 1)` whose `s_bar` is the sampled `1 x 1` polynomial `value` of
     /// the ring of level zero of `parameters`, read by every stage through a fresh graph input:
     /// a mask a scheme samples itself (Diamond iO 2 samples a binary one).
@@ -508,6 +528,10 @@ fn public_encoding_row(
 /// Online evaluation lowering state.  Its artifact fields are metadata and lazy handles,
 /// never resident matrix payloads.
 pub struct EncodingLowering<'a> {
+    /// Root helper rows supplied by graph composition; `None` reads ciphertext artifacts.
+    pub(crate) root_lut_helpers: Option<BTreeMap<String, Family<RnsBggRow>>>,
+    /// An in-graph decoder hint, instead of an encryption artifact.
+    pub(crate) decoder_hint: Option<Mat>,
     pub(crate) parameters: &'a RnsBggParameters,
     pub(crate) program: Arc<ExponentLutProgram>,
     pub(crate) workload: Arc<RnsBggDerivedWorkload>,
@@ -519,6 +543,8 @@ pub struct EncodingLowering<'a> {
     /// artifacts are published under (see `decoder_smudge_artifact_name` and
     /// `refresh_fresh_artifact_name`).
     pub(crate) artifact_prefix: Option<String>,
+    /// Encryption may have a separate instance namespace, notably for Dynamic setups.
+    pub(crate) encryption_artifact_prefix: Option<String>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
@@ -627,6 +653,8 @@ pub fn root_helper_input_name(key: &str, port: usize) -> String {
 
 /// Online evaluation builder with no backend, secrets, or plaintexts.
 pub struct RnsOnlineEvalBuild<'a> {
+    /// Instance namespace for graph inputs, imported artifacts and output names.
+    artifact_prefix: Option<String>,
     parameters: &'a RnsBggParameters,
     context: [u8; 32],
     hash_key_commitment: [u8; 32],

@@ -2,6 +2,7 @@
 //! derived from them.
 use super::*;
 
+#[cfg(test)]
 pub(super) fn public_lut_branch<D: super::RightAction>(
     public_data: RnsBggMatrix,
     switched_key_decomposition: ((D, D), (D, D)),
@@ -81,13 +82,15 @@ fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::H
 /// no two ciphertexts under one payload secret share a top row: the bottom
 /// rows of two that did would differ by their plaintext difference times the
 /// secret, revealing whether the plaintexts differ.
+/// `member` may be a runtime integer selected from a Program-data family; both
+/// runtime and compile-time members use the same little-endian `u64` tag component.
 pub(crate) fn rhs_top(
     parameters: &RnsBggParameters,
     program: crate::program::ExponentLutProgramId,
     hash_key: Bytes,
     rhs: RhsId,
     level: usize,
-    member: Option<IntExpr>,
+    member: Option<Int>,
 ) -> Result<RnsBggRow, RnsBggError> {
     let next_level = level.checked_add(1).ok_or(RnsBggError::Parameters("RHS level overflow"))?;
     let ring = parameters.ring(next_level)?;
@@ -102,7 +105,7 @@ pub(crate) fn rhs_top(
     crate::rns_bgg::push_digest(&mut tag, program.as_bytes());
     if let Some(member) = member {
         tag.push("member");
-        tag.push(member);
+        tag.push_u64_le(member);
     }
     let component = |index: u64| {
         let mut tag = tag.clone();
@@ -113,6 +116,8 @@ pub(crate) fn rhs_top(
     Ok((component(0), component(1)))
 }
 
+/// Direct entry-wise decomposition used by the independent unit-test oracle.
+#[cfg(test)]
 pub(super) fn decompose_matrix(
     parameters: &RnsBggParameters,
     level: usize,

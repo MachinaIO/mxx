@@ -3,6 +3,7 @@
 import re
 from date_parameters import write_lean, reference_facts, rename_roots
 from pathlib import Path
+from export_format import translate
 
 HERE = Path(__file__).resolve().parent
 # (top scope, key scope) of each attribute position, per step.
@@ -117,7 +118,9 @@ def forall_slots(proofs):
 
 
 def scope_data(scope):
-    source = rename_roots((HERE / 'generated/Stage_preprocess.lean').read_text(), 'pre', reverse=True)
+    source = translate((HERE / 'generated/Stage_preprocess.lean').read_text(),
+                       'Stage_preprocess', reverse=True)
+    source = rename_roots(source, 'pre', reverse=True)
     start = re.search(r'(?:abbrev ' + scope + r'\.body|def ' + scope + r' )', source).start()
     body = re.split(r'\n(?:def|abbrev|set_option)', source[start:], maxsplit=1)[0]
     witnesses = re.findall(r'∃ \((w_\d+_\d+) :', body)

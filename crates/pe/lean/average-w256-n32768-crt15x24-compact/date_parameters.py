@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+from export_format import translate
+
 HERE = Path(__file__).resolve().parent
 REFERENCE = HERE.parent / "average-w128-n65536-crt22x32-compact"
 WIDTH = 256
@@ -190,6 +192,7 @@ def rename_roots(text, stage, reverse=False):
 def reference_facts(stage):
     module = 'Stage_online_eval' if stage == 'online' else 'Stage_preprocess'
     text = (HERE / 'generated' / f'{module}_Facts.lean').read_text()
+    text = translate(text, module, reverse=True)
     text = rename_roots(text, stage, reverse=True)
     root_start = text.index('structure generatedRoot.Facts_0 ')
     head, root = text[:root_start], text[root_start:]
@@ -212,7 +215,7 @@ def write_lean(path, text, stage=None, root=False, protected=None):
     path = Path(path)
     for key, value in (protected or {}).items():
         text = text.replace(key, value)
-    path.write_text(text)
+    path.write_text(translate(text))
 
 
 def write_decode(path, text, protected=None):
@@ -235,7 +238,7 @@ def write_decode(path, text, protected=None):
                   lambda match: 'F.c' + chunks[match[1]] + '.' + match[1], text)
     for key, value in (protected or {}).items():
         text = text.replace(key, value)
-    Path(path).write_text(text)
+    Path(path).write_text(translate(text))
 
 
 def generate_math():
@@ -339,7 +342,7 @@ def write_chain(path, text):
                       lambda match: rename_roots(match[0], stage), text)
     text = re.sub(r'(G\.c\d+\.h)(\d+)(?=_)',
                   lambda match: match[1] + str(pre_wire(int(match[2]))), text)
-    Path(path).write_text(text)
+    Path(path).write_text(translate(text))
 
 
 def generate_certificate():

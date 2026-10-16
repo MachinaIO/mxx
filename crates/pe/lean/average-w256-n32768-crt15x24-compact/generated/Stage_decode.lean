@@ -27,9 +27,9 @@ local notation "mxxMat5" => Mxx.Primitives.ExactMatrix modulus_0 32768 1 60
 local notation "mxxMat6" => Mxx.Primitives.ExactMatrix modulus_0 32768 1 45
 local notation "mxxMat7" => Mxx.Primitives.ExactMatrix modulus_0 32768 60 45
 local notation "mxxMat8" => Mxx.Primitives.ExactMatrix modulus_1 32768 1 295
-local notation "mxxMat9" => Mxx.Primitives.ExactMatrix modulus_1 32768 1 1
-local notation "mxxMat10" => Mxx.Primitives.ExactMatrix modulus_1 32768 1 30
-local notation "mxxMat11" => Mxx.Primitives.ExactMatrix modulus_0 32768 60 1
+local notation "mxxMat9" => Mxx.Primitives.ExactMatrix modulus_0 32768 60 1
+local notation "mxxMat10" => Mxx.Primitives.ExactMatrix modulus_1 32768 1 1
+local notation "mxxMat11" => Mxx.Primitives.ExactMatrix modulus_1 32768 1 30
 
 abbrev sequential_generatedRoot_11.constraints_0 (i_0 : Nat) (w_2_0 : Fin 256 → mxxMat0) (w_3_0 : Int) (w_4_0 : mxxMat0) (w_5_0 : mxxMat1) (w_6_0 : mxxMat1) (w_7_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_3_0 ∧
@@ -158,6 +158,9 @@ def sequential_generatedRoot_37 (backend : MxxRuntime.BackendContext) (hashModel
   ∃ witness : sequential_generatedRoot_37.Witness,
     sequential_generatedRoot_37.body backend hashModel tape path params i_0 inputs outputs witness
 
+abbrev generatedRoot.InputType : Type :=
+  mxxMat1 × ByteArray × mxxMat8 × (Fin 256 → mxxMat0) × (Fin 256 → mxxMat4) × (Fin 45 → mxxMat3) × (Fin 45 → mxxMat3) × (Fin 256 → mxxMat7) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat9 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Witness where
@@ -166,14 +169,14 @@ structure generatedRoot.Witness where
   w_7_0 : mxxMat8
   w_8_0 : mxxMat2
   w_11_0 : mxxMat1
-  w_13_0 : mxxMat9
+  w_13_0 : mxxMat10
   w_14_0 : mxxMat3
-  w_15_0 : mxxMat10
+  w_15_0 : mxxMat11
   w_17_0 : mxxMat3
   w_19_0 : mxxMat8
-  w_20_0 : mxxMat9
+  w_20_0 : mxxMat10
   w_21_0 : mxxMat3
-  w_22_0 : mxxMat10
+  w_22_0 : mxxMat11
   w_24_0 : mxxMat3
   w_28_0 : mxxMat1
   w_34_0 : mxxMat3
@@ -191,7 +194,7 @@ abbrev generatedRoot.constraints_1 (backend : MxxRuntime.BackendContext) (hashMo
   (∀ k : Fin 32768, MxxRuntime.thresholdDecode (2) (32768) (k.val : Int) w_49_0 (w_50_0 k)) ∧
   outputs = w_50_0
 
-abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_1_0 : ByteArray) (w_5_0 : mxxMat8) (w_10_0 : Fin 256 → mxxMat0) (w_27_0 : Fin 256 → mxxMat4) (w_2_0 : mxxMat1) (w_4_0 : mxxMat1) (w_6_0 : mxxMat2) (w_7_0 : mxxMat8) (w_8_0 : mxxMat2) (w_9_0 : mxxMat2) (w_11_0 : mxxMat1) (w_12_0 : mxxMat1) (w_13_0 : mxxMat9) (w_14_0 : mxxMat3) (w_15_0 : mxxMat10) (w_16_0 : mxxMat10) (w_17_0 : mxxMat3) (w_19_0 : mxxMat8) (w_20_0 : mxxMat9) (w_21_0 : mxxMat3) (w_22_0 : mxxMat10) (w_23_0 : mxxMat10) (w_24_0 : mxxMat3) (w_26_0 : mxxMat3) (w_28_0 : mxxMat1) (w_33_0 : mxxMat3) (w_34_0 : mxxMat3) (w_35_0 : mxxMat5) : Prop :=
+abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_1_0 : ByteArray) (w_5_0 : mxxMat8) (w_10_0 : Fin 256 → mxxMat0) (w_27_0 : Fin 256 → mxxMat4) (w_2_0 : mxxMat1) (w_4_0 : mxxMat1) (w_6_0 : mxxMat2) (w_7_0 : mxxMat8) (w_8_0 : mxxMat2) (w_9_0 : mxxMat2) (w_11_0 : mxxMat1) (w_12_0 : mxxMat1) (w_13_0 : mxxMat10) (w_14_0 : mxxMat3) (w_15_0 : mxxMat11) (w_16_0 : mxxMat11) (w_17_0 : mxxMat3) (w_19_0 : mxxMat8) (w_20_0 : mxxMat10) (w_21_0 : mxxMat3) (w_22_0 : mxxMat11) (w_23_0 : mxxMat11) (w_24_0 : mxxMat3) (w_26_0 : mxxMat3) (w_28_0 : mxxMat1) (w_33_0 : mxxMat3) (w_34_0 : mxxMat3) (w_35_0 : mxxMat5) : Prop :=
   MxxRuntime.hashSample (hashModel) ([109, 120, 120, 45, 112, 101]) ([.bytes [51, 52, 101, 99, 56, 49, 55, 48, 55, 98, 100, 100, 54, 99, 102, 98, 102, 99, 99, 52, 50, 51, 99, 55, 99, 98, 54, 97, 53, 51, 51, 100, 52, 57, 98, 102, 98, 101, 99, 56, 98, 57, 100, 97, 57, 101, 98, 98, 56, 48, 97, 52, 54, 57, 52, 51, 53, 53, 52, 48, 99, 101, 50, 48], .bytes [109, 101, 115, 115, 97, 103, 101, 45, 114, 111, 119], .u64Le (1)]) (w_1_0) w_2_0 ∧
   MxxRuntime.modulusSwitchRuns w_5_0 w_6_0 ∧
   MxxRuntime.hashSample (hashModel) ([109, 120, 120, 45, 112, 101]) ([.bytes [51, 52, 101, 99, 56, 49, 55, 48, 55, 98, 100, 100, 54, 99, 102, 98, 102, 99, 99, 52, 50, 51, 99, 55, 99, 98, 54, 97, 53, 51, 51, 100, 52, 57, 98, 102, 98, 101, 99, 56, 98, 57, 100, 97, 57, 101, 98, 98, 56, 48, 97, 52, 54, 57, 52, 51, 53, 53, 52, 48, 99, 101, 50, 48], .bytes [97, 110, 99, 104, 111, 114, 45, 115, 101, 99, 111, 110, 100, 45, 114, 111, 119]]) (w_1_0) w_7_0 ∧
@@ -225,7 +228,7 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   MxxRuntime.concatColumns w_33_0 w_34_0 w_35_0 ∧
   0 ≤ (256)
 
-abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : mxxMat1 × ByteArray × mxxMat8 × (Fin 256 → mxxMat0) × (Fin 256 → mxxMat4) × (Fin 45 → mxxMat3) × (Fin 45 → mxxMat3) × (Fin 256 → mxxMat7) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat11 × Unit) (outputs : Fin 32768 → Int) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (generatedRoot.InputType)) (outputs : Fin 32768 → Int) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -240,7 +243,7 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   let w_40_0 : mxxMat3 := inputs.2.2.2.2.2.2.2.2.2.1
   let w_42_0 : mxxMat3 := inputs.2.2.2.2.2.2.2.2.2.2.1
   let w_43_0 : mxxMat3 := inputs.2.2.2.2.2.2.2.2.2.2.2.1
-  let w_46_0 : mxxMat11 := inputs.2.2.2.2.2.2.2.2.2.2.2.2.1
+  let w_46_0 : mxxMat9 := inputs.2.2.2.2.2.2.2.2.2.2.2.2.1
   let w_2_0 := witness.w_2_0
   let w_3_0 : mxxMat1 := MxxRuntime.matrixSub w_0_0 w_2_0
   let w_4_0 : mxxMat1 := (0 : mxxMat1)
@@ -253,14 +256,14 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   let w_13_0 := witness.w_13_0
   let w_14_0 := witness.w_14_0
   let w_15_0 := witness.w_15_0
-  let w_16_0 : mxxMat10 := MxxRuntime.matrixMulScalarLeft w_13_0 w_15_0
+  let w_16_0 : mxxMat11 := MxxRuntime.matrixMulScalarLeft w_13_0 w_15_0
   let w_17_0 := witness.w_17_0
   let w_18_0 : mxxMat3 := w_17_0
   let w_19_0 := witness.w_19_0
   let w_20_0 := witness.w_20_0
   let w_21_0 := witness.w_21_0
   let w_22_0 := witness.w_22_0
-  let w_23_0 : mxxMat10 := MxxRuntime.matrixMulScalarLeft w_20_0 w_22_0
+  let w_23_0 : mxxMat11 := MxxRuntime.matrixMulScalarLeft w_20_0 w_22_0
   let w_24_0 := witness.w_24_0
   let w_25_0 : mxxMat3 := w_24_0
   let w_26_0 : mxxMat3 := MxxRuntime.matrixSub w_18_0 w_25_0
@@ -282,7 +285,7 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   generatedRoot.constraints_0 backend hashModel tape path params w_1_0 w_5_0 w_10_0 w_27_0 w_2_0 w_4_0 w_6_0 w_7_0 w_8_0 w_9_0 w_11_0 w_12_0 w_13_0 w_14_0 w_15_0 w_16_0 w_17_0 w_19_0 w_20_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_28_0 w_33_0 w_34_0 w_35_0 ∧
     generatedRoot.constraints_1 backend hashModel tape path params w_1_0 w_31_0 w_32_0 w_36_0 w_39_0 w_40_0 w_42_0 w_43_0 w_30_0 w_35_0 w_37_0 w_41_0 w_44_0 w_49_0 w_50_0 outputs
 
-def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : mxxMat1 × ByteArray × mxxMat8 × (Fin 256 → mxxMat0) × (Fin 256 → mxxMat4) × (Fin 45 → mxxMat3) × (Fin 45 → mxxMat3) × (Fin 256 → mxxMat7) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat11 × Unit) (outputs : Fin 32768 → Int) : Prop :=
+def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (generatedRoot.InputType)) (outputs : Fin 32768 → Int) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body backend hashModel tape path params inputs outputs witness
 

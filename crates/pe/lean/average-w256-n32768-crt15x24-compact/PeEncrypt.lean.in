@@ -433,13 +433,7 @@ theorem encrypt_helpers {model : HashModel} {tape : SampleTape} {path : List Nat
       GeneratedClaim.stage_4_params := ⟨(secret, key, hf0, hf1, c, e, Y0, Y1, ()), w⟩
   have F := Stage_encrypt.generatedRoot.facts ctx hbody
   rw [F.c0.hout]
-  constructor <;> funext index
-  · have copied := F.c0.h6_1 index
-    change (_, _, ()) = (hf0 index, hf1 index, ()) at copied
-    exact congrArg Prod.fst copied
-  · have copied := F.c0.h6_1 index
-    change (_, _, ()) = (hf0 index, hf1 index, ()) at copied
-    exact congrArg (Prod.fst ∘ Prod.snd) copied
+  exact ⟨rfl, rfl⟩
 
 set_option maxHeartbeats 32000000 in
 /-- The encryption: the helpers, the compact companions of the switches and of the attribute
@@ -487,12 +481,7 @@ theorem encrypt_explicit {model : HashModel} {tape : SampleTape} {path : List Na
   have hw0 : Stage_encrypt.generatedRoot.w_0_0 ctx = fun _ _ ↦ reducePoly Q N sm := hsecret
   rw [F.c0.hout]
   refine ⟨fun index ↦ ?_, fun i ↦ ?_, fun i ↦ ?_, ?_, fun j ↦ ?_⟩
-  · have copied := F.c0.h6_1 index
-    change (_, _, ()) = (hf0 index, hf1 index, ()) at copied
-    simp only [Prod.mk.injEq] at copied
-    simp only [Stage_encrypt.generatedRoot.outs]
-    rw [copied.1, copied.2.1]
-    exact helpers index
+  · exact helpers index
   · have hi5 := F.c0.h5_1 i
     rw [hw0] at hi5
     exact encrypt_companion i.isLt hs hi5

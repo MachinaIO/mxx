@@ -32,7 +32,7 @@ local notation "mxxMat9" => Mxx.Primitives.ExactMatrix modulus_0 32768 2 1
 local notation "mxxMat10" => Mxx.Primitives.ExactMatrix modulus_0 32768 60 1
 local notation "mxxMat11" => Mxx.Primitives.ExactMatrix modulus_0 32768 30 30
 
-abbrev sequential_sequential_generatedRoot_10_12.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_119.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -58,7 +58,7 @@ abbrev sequential_sequential_generatedRoot_10_12.constraints_0 (i_1 : Nat) (w_1_
   MxxRuntime.sliceMatrix w_10_0 0 1 (Int.ofNat i_1) (1 + (Int.ofNat i_1)) w_11_0 ∧
   outputs = (w_8_0, (w_13_0, ()))
 
-def sequential_sequential_generatedRoot_10_12 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_119 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -75,7 +75,7 @@ def sequential_sequential_generatedRoot_10_12 (backend : MxxRuntime.BackendConte
       ∃ (w_11_0 : mxxMat1),
         let w_12_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_11_0 w_6_0
         let w_13_0 : mxxMat0 := MxxRuntime.matrixAdd w_9_0 w_12_0
-        sequential_sequential_generatedRoot_10_12.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
+        scope_119.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -107,7 +107,7 @@ abbrev sequential_generatedRoot_10.constraints_0 (backend : MxxRuntime.BackendCo
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_8_0 w_9_0 ∧
   MxxRuntime.compactCenteredRebaseRuns 2048 w_9_0 w_10_0 ∧
   0 ≤ (30) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_10_12 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_119 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_12_0 w_13_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_12_1 w_16_0 ∧
   outputs = (w_14_0, (w_17_0, ()))
@@ -140,7 +140,7 @@ def sequential_generatedRoot_10 (backend : MxxRuntime.BackendContext) (hashModel
   ∃ witness : sequential_generatedRoot_10.Witness,
     sequential_generatedRoot_10.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev sequential_sequential_generatedRoot_11_11.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_120.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   (30) ≠ 0 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [114, 104, 115], .u64Le (0), .bytes [109, 101, 109, 98, 101, 114], .u64Le (0), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_1)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.fmod ((Int.ofNat i_0)) (30)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_3_0 ∧
@@ -169,7 +169,7 @@ abbrev sequential_sequential_generatedRoot_11_11.constraints_0 (backend : MxxRun
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, ()))
 
-def sequential_sequential_generatedRoot_11_11 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_120 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -206,7 +206,7 @@ def sequential_sequential_generatedRoot_11_11 (backend : MxxRuntime.BackendConte
                               let w_31_0 : mxxMat1 := MxxRuntime.matrixAdd w_25_0 w_30_0
                               let w_32_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_31_0 w_17_0
                               let w_33_0 : mxxMat0 := MxxRuntime.matrixAdd w_20_0 w_32_0
-                              sequential_sequential_generatedRoot_11_11.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
+                              scope_120.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -222,7 +222,7 @@ structure sequential_generatedRoot_11.Witness where
   w_15_0 : mxxMat0
 
 abbrev sequential_generatedRoot_11.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_4_0 : ByteArray) (w_2_0 : mxxMat1) (w_3_0 : mxxMat0) (w_7_0 : mxxMat8) (w_10_0 : mxxMat8) (w_11_0 : mxxMat0) (w_11_1 : mxxMat0) (w_12_0 : mxxMat0) (w_13_0 : mxxMat0) (w_15_0 : mxxMat0) (w_16_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_11_11 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_120 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_11_0 w_12_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_11_1 w_15_0 ∧
   outputs = (w_13_0, (w_16_0, ()))
@@ -289,7 +289,7 @@ def sequential_generatedRoot_11 (backend : MxxRuntime.BackendContext) (hashModel
   ∃ witness : sequential_generatedRoot_11.Witness,
     sequential_generatedRoot_11.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev sequential_sequential_generatedRoot_14_12.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_121.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -315,7 +315,7 @@ abbrev sequential_sequential_generatedRoot_14_12.constraints_0 (i_1 : Nat) (w_1_
   MxxRuntime.sliceMatrix w_10_0 0 1 (Int.ofNat i_1) (1 + (Int.ofNat i_1)) w_11_0 ∧
   outputs = (w_8_0, (w_13_0, ()))
 
-def sequential_sequential_generatedRoot_14_12 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_121 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -332,7 +332,7 @@ def sequential_sequential_generatedRoot_14_12 (backend : MxxRuntime.BackendConte
       ∃ (w_11_0 : mxxMat1),
         let w_12_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_11_0 w_6_0
         let w_13_0 : mxxMat0 := MxxRuntime.matrixAdd w_9_0 w_12_0
-        sequential_sequential_generatedRoot_14_12.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
+        scope_121.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -364,7 +364,7 @@ abbrev sequential_generatedRoot_14.constraints_0 (backend : MxxRuntime.BackendCo
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_8_0 w_9_0 ∧
   MxxRuntime.compactCenteredRebaseRuns 2048 w_9_0 w_10_0 ∧
   0 ≤ (30) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_14_12 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_121 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_12_0 w_13_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_12_1 w_16_0 ∧
   outputs = (w_14_0, (w_17_0, ()))
@@ -397,7 +397,7 @@ def sequential_generatedRoot_14 (backend : MxxRuntime.BackendContext) (hashModel
   ∃ witness : sequential_generatedRoot_14.Witness,
     sequential_generatedRoot_14.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev sequential_sequential_generatedRoot_15_11.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_122.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   (30) ≠ 0 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [114, 104, 115], .u64Le (0), .bytes [109, 101, 109, 98, 101, 114], .u64Le (1), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_1)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.fmod ((Int.ofNat i_0)) (30)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_3_0 ∧
@@ -426,7 +426,7 @@ abbrev sequential_sequential_generatedRoot_15_11.constraints_0 (backend : MxxRun
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, ()))
 
-def sequential_sequential_generatedRoot_15_11 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_122 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -463,7 +463,7 @@ def sequential_sequential_generatedRoot_15_11 (backend : MxxRuntime.BackendConte
                               let w_31_0 : mxxMat1 := MxxRuntime.matrixAdd w_25_0 w_30_0
                               let w_32_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_31_0 w_17_0
                               let w_33_0 : mxxMat0 := MxxRuntime.matrixAdd w_20_0 w_32_0
-                              sequential_sequential_generatedRoot_15_11.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
+                              scope_122.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -479,7 +479,7 @@ structure sequential_generatedRoot_15.Witness where
   w_15_0 : mxxMat0
 
 abbrev sequential_generatedRoot_15.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_4_0 : ByteArray) (w_2_0 : mxxMat1) (w_3_0 : mxxMat0) (w_7_0 : mxxMat8) (w_10_0 : mxxMat8) (w_11_0 : mxxMat0) (w_11_1 : mxxMat0) (w_12_0 : mxxMat0) (w_13_0 : mxxMat0) (w_15_0 : mxxMat0) (w_16_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_15_11 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_122 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_11_0 w_12_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_11_1 w_15_0 ∧
   outputs = (w_13_0, (w_16_0, ()))
@@ -599,7 +599,7 @@ def sequential_parallel_generatedRoot_30_11 (backend : MxxRuntime.BackendContext
             let w_15_0 : mxxMat0 := MxxRuntime.matrixAdd w_10_0 w_14_0
             sequential_parallel_generatedRoot_30_11.constraints_0 i_0 i_1 w_1_0 w_11_0 w_2_0 w_3_0 w_4_0 w_5_0 w_9_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_30_12_11.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_127.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 30 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(257), (513), (769), (1025), (1281), (1537), (1793), (2049), (2305), (2561), (2817), (3073), (3329), (3585), (3841), (4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -632,7 +632,7 @@ abbrev sequential_sequential_parallel_generatedRoot_30_12_11.constraints_0 (back
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, ()))
 
-def sequential_sequential_parallel_generatedRoot_30_12_11 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_127 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -669,7 +669,7 @@ def sequential_sequential_parallel_generatedRoot_30_12_11 (backend : MxxRuntime.
                               let w_31_0 : mxxMat1 := MxxRuntime.matrixAdd w_25_0 w_30_0
                               let w_32_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_31_0 w_17_0
                               let w_33_0 : mxxMat0 := MxxRuntime.matrixAdd w_20_0 w_32_0
-                              sequential_sequential_parallel_generatedRoot_30_12_11.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
+                              scope_127.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -707,7 +707,7 @@ abbrev sequential_parallel_generatedRoot_30_12.constraints_0 (backend : MxxRunti
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(257), (513), (769), (1025), (1281), (1537), (1793), (2049), (2305), (2561), (2817), (3073), (3329), (3585), (3841), (4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_8_0 w_9_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_9_0 w_10_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_30_12_11 backend hashModel tape (path ++ [11, i]) params i_0 i_1 i (current.1, (current.2.1, (w_2_0, (w_6_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, ())) (w_11_0, (w_11_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_127 backend hashModel tape (path ++ [11, i]) params i_0 i_1 i (current.1, (current.2.1, (w_2_0, (w_6_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, ())) (w_11_0, (w_11_1, ())) ∧
   outputs = (w_11_0, (w_11_1, ()))
 
 abbrev sequential_parallel_generatedRoot_30_12.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_30_12.Witness) : Prop :=
@@ -818,6 +818,9 @@ def sequential_parallel_generatedRoot_30_34 (backend : MxxRuntime.BackendContext
       let w_18_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_17_0
       sequential_parallel_generatedRoot_30_34.constraints_0 i_0 w_2_0 w_5_0 w_6_0 w_15_0 w_16_0 w_18_0 outputs
 
+abbrev parallel_generatedRoot_30.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure parallel_generatedRoot_30.Witness where
@@ -854,7 +857,7 @@ structure parallel_generatedRoot_30.Witness where
   w_36_0 : mxxMat3
   w_38_0 : mxxMat11
 
-abbrev parallel_generatedRoot_30.constraints_3 (backend : MxxRuntime.BackendContext) (w_12_0 : mxxMat0) (w_12_1 : mxxMat0) (w_27_0 : mxxMat3) (w_28_0 : mxxMat3) (w_29_0 : mxxMat3) (w_30_0 : mxxMat3) (w_37_0 : mxxMat3) (w_38_0 : mxxMat11) (w_39_0 : mxxMat3) (w_40_0 : mxxMat3) (w_41_0 : mxxMat3) (w_42_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_30.constraints_3 (backend : MxxRuntime.BackendContext) (w_12_0 : mxxMat0) (w_12_1 : mxxMat0) (w_27_0 : mxxMat3) (w_28_0 : mxxMat3) (w_29_0 : mxxMat3) (w_30_0 : mxxMat3) (w_37_0 : mxxMat3) (w_38_0 : mxxMat11) (w_39_0 : mxxMat3) (w_40_0 : mxxMat3) (w_41_0 : mxxMat3) (w_42_0 : mxxMat3) (outputs : (parallel_generatedRoot_30.OutputType)) : Prop :=
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_37_0 w_38_0 ∧
   outputs = (w_12_0, (w_12_1, (w_27_0, (w_28_0, (w_29_0, (w_30_0, (w_39_0, (w_40_0, (w_41_0, (w_42_0, ()))))))))))
 
@@ -960,7 +963,7 @@ abbrev parallel_generatedRoot_30.constraints_0 (backend : MxxRuntime.BackendCont
   0 < 30 ∧
   30 ≤ 60
 
-abbrev parallel_generatedRoot_30.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_30.Witness) : Prop :=
+abbrev parallel_generatedRoot_30.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_30.OutputType)) (witness : parallel_generatedRoot_30.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : mxxMat0 := inputs.1
@@ -1014,9 +1017,12 @@ abbrev parallel_generatedRoot_30.body (backend : MxxRuntime.BackendContext) (has
     parallel_generatedRoot_30.constraints_2 backend hashModel tape path params i_0 w_33_0 w_13_0 w_16_0 w_19_0 w_22_0 w_25_0 w_26_0 w_26_1 w_27_0 w_28_0 w_29_0 w_30_0 w_32_0 w_34_0 w_36_0 ∧
     parallel_generatedRoot_30.constraints_3 backend w_12_0 w_12_1 w_27_0 w_28_0 w_29_0 w_30_0 w_37_0 w_38_0 w_39_0 w_40_0 w_41_0 w_42_0 outputs
 
-def parallel_generatedRoot_30 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_30 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_30.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_30.Witness,
     parallel_generatedRoot_30.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_31_36.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_31_36.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -1114,7 +1120,7 @@ abbrev sequential_parallel_generatedRoot_31_36.constraints_0 (i_0 : Nat) (i_1 : 
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_31_36 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_31_36 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_31_36.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -1173,7 +1179,10 @@ def sequential_parallel_generatedRoot_31_36 (backend : MxxRuntime.BackendContext
     sequential_parallel_generatedRoot_31_36.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_31_36.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_31_37_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_128.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_128.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -1206,7 +1215,7 @@ abbrev sequential_sequential_parallel_generatedRoot_31_37_41.constraints_0 (back
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_31_37_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_128 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_128.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -1285,7 +1294,10 @@ def sequential_sequential_parallel_generatedRoot_31_37_41 (backend : MxxRuntime.
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_31_37_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_128.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_31_37.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -1349,7 +1361,7 @@ abbrev sequential_parallel_generatedRoot_31_37.constraints_2 (backend : MxxRunti
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_31_37_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_128 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_31_37.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -1420,7 +1432,7 @@ abbrev sequential_parallel_generatedRoot_31_37.constraints_0 (backend : MxxRunti
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_31_37.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_31_37.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_31_37.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_31_37.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_31_37.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -1476,7 +1488,7 @@ abbrev sequential_parallel_generatedRoot_31_37.body (backend : MxxRuntime.Backen
     sequential_parallel_generatedRoot_31_37.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_31_37.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_31_37 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_31_37 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_31_37.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_31_37.Witness,
     sequential_parallel_generatedRoot_31_37.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -1832,6 +1844,9 @@ def sequential_parallel_generatedRoot_31_127 (backend : MxxRuntime.BackendContex
       let w_18_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_17_0
       sequential_parallel_generatedRoot_31_127.constraints_0 i_0 w_2_0 w_5_0 w_6_0 w_15_0 w_16_0 w_18_0 outputs
 
+abbrev parallel_generatedRoot_31.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure parallel_generatedRoot_31.Witness where
@@ -1961,7 +1976,7 @@ structure parallel_generatedRoot_31.Witness where
   w_161_0 : mxxMat3
   w_164_0 : mxxMat3
 
-abbrev parallel_generatedRoot_31.constraints_13 (w_37_0 : mxxMat0) (w_37_1 : mxxMat0) (w_37_2 : mxxMat0) (w_37_3 : mxxMat0) (w_37_4 : mxxMat0) (w_37_5 : mxxMat0) (w_37_6 : mxxMat0) (w_37_7 : mxxMat0) (w_123_1 : mxxMat0) (w_133_0 : mxxMat3) (w_144_0 : mxxMat3) (w_155_0 : mxxMat3) (w_164_0 : mxxMat3) (w_166_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_31.constraints_13 (w_37_0 : mxxMat0) (w_37_1 : mxxMat0) (w_37_2 : mxxMat0) (w_37_3 : mxxMat0) (w_37_4 : mxxMat0) (w_37_5 : mxxMat0) (w_37_6 : mxxMat0) (w_37_7 : mxxMat0) (w_123_1 : mxxMat0) (w_133_0 : mxxMat3) (w_144_0 : mxxMat3) (w_155_0 : mxxMat3) (w_164_0 : mxxMat3) (w_166_0 : mxxMat3) (outputs : (parallel_generatedRoot_31.OutputType)) : Prop :=
   MxxRuntime.sliceMatrix w_123_1 0 1 30 60 w_164_0 ∧
   outputs = (w_37_0, (w_37_1, (w_37_2, (w_37_3, (w_37_4, (w_37_5, (w_37_6, (w_37_7, (w_133_0, (w_144_0, (w_155_0, (w_166_0, ()))))))))))))
 
@@ -2407,7 +2422,7 @@ abbrev parallel_generatedRoot_31.constraints_0 (backend : MxxRuntime.BackendCont
   w_12_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_19_0 w_12_0 w_20_0
 
-abbrev parallel_generatedRoot_31.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_31.Witness) : Prop :=
+abbrev parallel_generatedRoot_31.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_31.OutputType)) (witness : parallel_generatedRoot_31.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : mxxMat0 := inputs.1
@@ -2610,9 +2625,12 @@ abbrev parallel_generatedRoot_31.body (backend : MxxRuntime.BackendContext) (has
     parallel_generatedRoot_31.constraints_12 w_51_1 w_75_1 w_99_1 w_123_1 w_153_0 w_156_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_31.constraints_13 w_37_0 w_37_1 w_37_2 w_37_3 w_37_4 w_37_5 w_37_6 w_37_7 w_123_1 w_133_0 w_144_0 w_155_0 w_164_0 w_166_0 outputs
 
-def parallel_generatedRoot_31 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_31 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_31.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_31.Witness,
     parallel_generatedRoot_31.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_32_41.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_32_41.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -2710,7 +2728,7 @@ abbrev sequential_parallel_generatedRoot_32_41.constraints_0 (i_0 : Nat) (i_1 : 
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_32_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_32_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_32_41.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -2769,7 +2787,10 @@ def sequential_parallel_generatedRoot_32_41 (backend : MxxRuntime.BackendContext
     sequential_parallel_generatedRoot_32_41.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_32_41.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_32_42_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_129.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_129.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -2802,7 +2823,7 @@ abbrev sequential_sequential_parallel_generatedRoot_32_42_41.constraints_0 (back
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_32_42_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_129 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_129.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -2881,7 +2902,10 @@ def sequential_sequential_parallel_generatedRoot_32_42_41 (backend : MxxRuntime.
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_32_42_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_129.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_32_42.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -2945,7 +2969,7 @@ abbrev sequential_parallel_generatedRoot_32_42.constraints_2 (backend : MxxRunti
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_32_42_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_129 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_32_42.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -3016,7 +3040,7 @@ abbrev sequential_parallel_generatedRoot_32_42.constraints_0 (backend : MxxRunti
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_32_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_32_42.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_32_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_32_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_32_42.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -3072,7 +3096,7 @@ abbrev sequential_parallel_generatedRoot_32_42.body (backend : MxxRuntime.Backen
     sequential_parallel_generatedRoot_32_42.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_32_42.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_32_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_32_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_32_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_32_42.Witness,
     sequential_parallel_generatedRoot_32_42.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -3428,6 +3452,9 @@ def sequential_parallel_generatedRoot_32_132 (backend : MxxRuntime.BackendContex
       let w_18_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_17_0
       sequential_parallel_generatedRoot_32_132.constraints_0 i_0 w_2_0 w_5_0 w_6_0 w_15_0 w_16_0 w_18_0 outputs
 
+abbrev parallel_generatedRoot_32.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure parallel_generatedRoot_32.Witness where
@@ -3563,7 +3590,7 @@ structure parallel_generatedRoot_32.Witness where
   w_166_0 : mxxMat3
   w_169_0 : mxxMat3
 
-abbrev parallel_generatedRoot_32.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_32.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : (parallel_generatedRoot_32.OutputType)) : Prop :=
   1 ≤ 1 ∧
   0 ≤ 30 ∧
   30 < 60 ∧
@@ -4027,7 +4054,7 @@ abbrev parallel_generatedRoot_32.constraints_0 (backend : MxxRuntime.BackendCont
   w_2_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_17_0 w_2_0 w_18_0
 
-abbrev parallel_generatedRoot_32.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_32.Witness) : Prop :=
+abbrev parallel_generatedRoot_32.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_32.OutputType)) (witness : parallel_generatedRoot_32.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Fin 15 → mxxMat3 := inputs.1
@@ -4235,9 +4262,12 @@ abbrev parallel_generatedRoot_32.body (backend : MxxRuntime.BackendContext) (has
     parallel_generatedRoot_32.constraints_12 w_56_1 w_80_1 w_104_1 w_128_1 w_150_0 w_152_0 w_155_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_32.constraints_13 w_42_0 w_42_1 w_42_2 w_42_3 w_42_4 w_42_5 w_42_6 w_42_7 w_80_1 w_104_1 w_128_1 w_138_0 w_149_0 w_160_0 w_163_0 w_166_0 w_169_0 w_171_0 outputs
 
-def parallel_generatedRoot_32 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_32 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_32.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_32.Witness,
     parallel_generatedRoot_32.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_33_41.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_33_41.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -4335,7 +4365,7 @@ abbrev sequential_parallel_generatedRoot_33_41.constraints_0 (i_0 : Nat) (i_1 : 
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_33_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_33_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_33_41.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -4394,7 +4424,10 @@ def sequential_parallel_generatedRoot_33_41 (backend : MxxRuntime.BackendContext
     sequential_parallel_generatedRoot_33_41.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_33_41.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_33_42_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_130.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_130.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -4427,7 +4460,7 @@ abbrev sequential_sequential_parallel_generatedRoot_33_42_41.constraints_0 (back
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_33_42_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_130 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_130.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -4506,7 +4539,10 @@ def sequential_sequential_parallel_generatedRoot_33_42_41 (backend : MxxRuntime.
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_33_42_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_130.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_33_42.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -4570,7 +4606,7 @@ abbrev sequential_parallel_generatedRoot_33_42.constraints_2 (backend : MxxRunti
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_33_42_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_130 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_33_42.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -4641,7 +4677,7 @@ abbrev sequential_parallel_generatedRoot_33_42.constraints_0 (backend : MxxRunti
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_33_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_33_42.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_33_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_33_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_33_42.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -4697,7 +4733,7 @@ abbrev sequential_parallel_generatedRoot_33_42.body (backend : MxxRuntime.Backen
     sequential_parallel_generatedRoot_33_42.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_33_42.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_33_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_33_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_33_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_33_42.Witness,
     sequential_parallel_generatedRoot_33_42.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -5053,6 +5089,9 @@ def sequential_parallel_generatedRoot_33_132 (backend : MxxRuntime.BackendContex
       let w_18_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_17_0
       sequential_parallel_generatedRoot_33_132.constraints_0 i_0 w_2_0 w_5_0 w_6_0 w_15_0 w_16_0 w_18_0 outputs
 
+abbrev parallel_generatedRoot_33.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure parallel_generatedRoot_33.Witness where
@@ -5188,7 +5227,7 @@ structure parallel_generatedRoot_33.Witness where
   w_166_0 : mxxMat3
   w_169_0 : mxxMat3
 
-abbrev parallel_generatedRoot_33.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_33.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : (parallel_generatedRoot_33.OutputType)) : Prop :=
   1 ≤ 1 ∧
   0 ≤ 30 ∧
   30 < 60 ∧
@@ -5652,7 +5691,7 @@ abbrev parallel_generatedRoot_33.constraints_0 (backend : MxxRuntime.BackendCont
   w_2_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_17_0 w_2_0 w_18_0
 
-abbrev parallel_generatedRoot_33.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_33.Witness) : Prop :=
+abbrev parallel_generatedRoot_33.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_33.OutputType)) (witness : parallel_generatedRoot_33.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Fin 15 → mxxMat3 := inputs.1
@@ -5860,9 +5899,12 @@ abbrev parallel_generatedRoot_33.body (backend : MxxRuntime.BackendContext) (has
     parallel_generatedRoot_33.constraints_12 w_56_1 w_80_1 w_104_1 w_128_1 w_150_0 w_152_0 w_155_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_33.constraints_13 w_42_0 w_42_1 w_42_2 w_42_3 w_42_4 w_42_5 w_42_6 w_42_7 w_80_1 w_104_1 w_128_1 w_138_0 w_149_0 w_160_0 w_163_0 w_166_0 w_169_0 w_171_0 outputs
 
-def parallel_generatedRoot_33 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_33 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_33.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_33.Witness,
     parallel_generatedRoot_33.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_34_41.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_34_41.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -5960,7 +6002,7 @@ abbrev sequential_parallel_generatedRoot_34_41.constraints_0 (i_0 : Nat) (i_1 : 
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_34_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_34_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_34_41.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -6019,7 +6061,10 @@ def sequential_parallel_generatedRoot_34_41 (backend : MxxRuntime.BackendContext
     sequential_parallel_generatedRoot_34_41.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_34_41.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_34_42_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_131.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_131.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -6052,7 +6097,7 @@ abbrev sequential_sequential_parallel_generatedRoot_34_42_41.constraints_0 (back
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_34_42_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_131 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_131.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -6131,7 +6176,10 @@ def sequential_sequential_parallel_generatedRoot_34_42_41 (backend : MxxRuntime.
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_34_42_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_131.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_34_42.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -6195,7 +6243,7 @@ abbrev sequential_parallel_generatedRoot_34_42.constraints_2 (backend : MxxRunti
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_34_42_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_131 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_34_42.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -6266,7 +6314,7 @@ abbrev sequential_parallel_generatedRoot_34_42.constraints_0 (backend : MxxRunti
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_34_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_34_42.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_34_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_34_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_34_42.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -6322,7 +6370,7 @@ abbrev sequential_parallel_generatedRoot_34_42.body (backend : MxxRuntime.Backen
     sequential_parallel_generatedRoot_34_42.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_34_42.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_34_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_34_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_34_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_34_42.Witness,
     sequential_parallel_generatedRoot_34_42.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -6678,6 +6726,9 @@ def sequential_parallel_generatedRoot_34_132 (backend : MxxRuntime.BackendContex
       let w_18_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_17_0
       sequential_parallel_generatedRoot_34_132.constraints_0 i_0 w_2_0 w_5_0 w_6_0 w_15_0 w_16_0 w_18_0 outputs
 
+abbrev parallel_generatedRoot_34.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure parallel_generatedRoot_34.Witness where
@@ -6813,7 +6864,7 @@ structure parallel_generatedRoot_34.Witness where
   w_166_0 : mxxMat3
   w_169_0 : mxxMat3
 
-abbrev parallel_generatedRoot_34.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_34.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : (parallel_generatedRoot_34.OutputType)) : Prop :=
   1 ≤ 1 ∧
   0 ≤ 30 ∧
   30 < 60 ∧
@@ -7277,7 +7328,7 @@ abbrev parallel_generatedRoot_34.constraints_0 (backend : MxxRuntime.BackendCont
   w_2_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_17_0 w_2_0 w_18_0
 
-abbrev parallel_generatedRoot_34.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_34.Witness) : Prop :=
+abbrev parallel_generatedRoot_34.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_34.OutputType)) (witness : parallel_generatedRoot_34.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Fin 15 → mxxMat3 := inputs.1
@@ -7485,7 +7536,7 @@ abbrev parallel_generatedRoot_34.body (backend : MxxRuntime.BackendContext) (has
     parallel_generatedRoot_34.constraints_12 w_56_1 w_80_1 w_104_1 w_128_1 w_150_0 w_152_0 w_155_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_34.constraints_13 w_42_0 w_42_1 w_42_2 w_42_3 w_42_4 w_42_5 w_42_6 w_42_7 w_80_1 w_104_1 w_128_1 w_138_0 w_149_0 w_160_0 w_163_0 w_166_0 w_169_0 w_171_0 outputs
 
-def parallel_generatedRoot_34 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_34 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_34.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_34.Witness,
     parallel_generatedRoot_34.body backend hashModel tape path params i_0 inputs outputs witness
 
@@ -7715,7 +7766,7 @@ def sequential_generatedRoot_111 (backend : MxxRuntime.BackendContext) (_ : MxxR
           let w_18_0 : mxxMat3 := MxxRuntime.matrixAdd w_15_0 w_17_0
           sequential_generatedRoot_111.constraints_0 w_1_0 w_8_0 w_12_0 w_16_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_13_0 w_14_0 w_17_0 w_18_0 outputs
 
-abbrev sequential_sequential_generatedRoot_135_12.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_123.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -7741,7 +7792,7 @@ abbrev sequential_sequential_generatedRoot_135_12.constraints_0 (i_1 : Nat) (w_1
   MxxRuntime.sliceMatrix w_10_0 0 1 (Int.ofNat i_1) (1 + (Int.ofNat i_1)) w_11_0 ∧
   outputs = (w_8_0, (w_13_0, ()))
 
-def sequential_sequential_generatedRoot_135_12 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_123 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -7758,7 +7809,7 @@ def sequential_sequential_generatedRoot_135_12 (backend : MxxRuntime.BackendCont
       ∃ (w_11_0 : mxxMat1),
         let w_12_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_11_0 w_6_0
         let w_13_0 : mxxMat0 := MxxRuntime.matrixAdd w_9_0 w_12_0
-        sequential_sequential_generatedRoot_135_12.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
+        scope_123.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -7790,7 +7841,7 @@ abbrev sequential_generatedRoot_135.constraints_0 (backend : MxxRuntime.BackendC
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_8_0 w_9_0 ∧
   MxxRuntime.compactCenteredRebaseRuns 2048 w_9_0 w_10_0 ∧
   0 ≤ (30) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_135_12 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_123 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_12_0 w_13_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_12_1 w_16_0 ∧
   outputs = (w_14_0, (w_17_0, ()))
@@ -7823,7 +7874,7 @@ def sequential_generatedRoot_135 (backend : MxxRuntime.BackendContext) (hashMode
   ∃ witness : sequential_generatedRoot_135.Witness,
     sequential_generatedRoot_135.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev sequential_sequential_generatedRoot_136_11.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_124.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   (30) ≠ 0 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [114, 104, 115], .u64Le (0), .bytes [109, 101, 109, 98, 101, 114], .u64Le (0), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_1)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.fmod ((Int.ofNat i_0)) (30)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_3_0 ∧
@@ -7852,7 +7903,7 @@ abbrev sequential_sequential_generatedRoot_136_11.constraints_0 (backend : MxxRu
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, ()))
 
-def sequential_sequential_generatedRoot_136_11 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_124 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -7889,7 +7940,7 @@ def sequential_sequential_generatedRoot_136_11 (backend : MxxRuntime.BackendCont
                               let w_31_0 : mxxMat1 := MxxRuntime.matrixAdd w_25_0 w_30_0
                               let w_32_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_31_0 w_17_0
                               let w_33_0 : mxxMat0 := MxxRuntime.matrixAdd w_20_0 w_32_0
-                              sequential_sequential_generatedRoot_136_11.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
+                              scope_124.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -7905,7 +7956,7 @@ structure sequential_generatedRoot_136.Witness where
   w_15_0 : mxxMat0
 
 abbrev sequential_generatedRoot_136.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_4_0 : ByteArray) (w_2_0 : mxxMat1) (w_3_0 : mxxMat0) (w_7_0 : mxxMat8) (w_10_0 : mxxMat8) (w_11_0 : mxxMat0) (w_11_1 : mxxMat0) (w_12_0 : mxxMat0) (w_13_0 : mxxMat0) (w_15_0 : mxxMat0) (w_16_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_136_11 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_124 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_11_0 w_12_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_11_1 w_15_0 ∧
   outputs = (w_13_0, (w_16_0, ()))
@@ -7972,7 +8023,7 @@ def sequential_generatedRoot_136 (backend : MxxRuntime.BackendContext) (hashMode
   ∃ witness : sequential_generatedRoot_136.Witness,
     sequential_generatedRoot_136.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev sequential_sequential_generatedRoot_139_12.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_125.constraints_0 (i_1 : Nat) (w_1_0 : mxxMat0) (w_10_0 : mxxMat0) (w_2_0 : mxxMat1) (w_3_0 : mxxMat2) (w_4_0 : mxxMat3) (w_8_0 : mxxMat0) (w_11_0 : mxxMat1) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -7998,7 +8049,7 @@ abbrev sequential_sequential_generatedRoot_139_12.constraints_0 (i_1 : Nat) (w_1
   MxxRuntime.sliceMatrix w_10_0 0 1 (Int.ofNat i_1) (1 + (Int.ofNat i_1)) w_11_0 ∧
   outputs = (w_8_0, (w_13_0, ()))
 
-def sequential_sequential_generatedRoot_139_12 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_125 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -8015,7 +8066,7 @@ def sequential_sequential_generatedRoot_139_12 (backend : MxxRuntime.BackendCont
       ∃ (w_11_0 : mxxMat1),
         let w_12_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_11_0 w_6_0
         let w_13_0 : mxxMat0 := MxxRuntime.matrixAdd w_9_0 w_12_0
-        sequential_sequential_generatedRoot_139_12.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
+        scope_125.constraints_0 i_1 w_1_0 w_10_0 w_2_0 w_3_0 w_4_0 w_8_0 w_11_0 w_13_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -8047,7 +8098,7 @@ abbrev sequential_generatedRoot_139.constraints_0 (backend : MxxRuntime.BackendC
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_8_0 w_9_0 ∧
   MxxRuntime.compactCenteredRebaseRuns 2048 w_9_0 w_10_0 ∧
   0 ≤ (30) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_139_12 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_125 backend hashModel tape (path ++ [12, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_10_0, (w_11_0, ()))))) next) (Int.toNat (30)) (w_3_0, (w_3_0, ())) (w_12_0, (w_12_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_12_0 w_13_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_12_1 w_16_0 ∧
   outputs = (w_14_0, (w_17_0, ()))
@@ -8080,7 +8131,7 @@ def sequential_generatedRoot_139 (backend : MxxRuntime.BackendContext) (hashMode
   ∃ witness : sequential_generatedRoot_139.Witness,
     sequential_generatedRoot_139.body backend hashModel tape path params i_0 inputs outputs witness
 
-abbrev sequential_sequential_generatedRoot_140_11.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_126.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   (30) ≠ 0 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [114, 104, 115], .u64Le (0), .bytes [109, 101, 109, 98, 101, 114], .u64Le (1), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_1)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.fmod ((Int.ofNat i_0)) (30)))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_3_0 ∧
@@ -8109,7 +8160,7 @@ abbrev sequential_sequential_generatedRoot_140_11.constraints_0 (backend : MxxRu
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, ()))
 
-def sequential_sequential_generatedRoot_140_11 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_126 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -8146,7 +8197,7 @@ def sequential_sequential_generatedRoot_140_11 (backend : MxxRuntime.BackendCont
                               let w_31_0 : mxxMat1 := MxxRuntime.matrixAdd w_25_0 w_30_0
                               let w_32_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_31_0 w_17_0
                               let w_33_0 : mxxMat0 := MxxRuntime.matrixAdd w_20_0 w_32_0
-                              sequential_sequential_generatedRoot_140_11.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
+                              scope_126.constraints_0 backend hashModel i_0 i_1 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -8162,7 +8213,7 @@ structure sequential_generatedRoot_140.Witness where
   w_15_0 : mxxMat0
 
 abbrev sequential_generatedRoot_140.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_4_0 : ByteArray) (w_2_0 : mxxMat1) (w_3_0 : mxxMat0) (w_7_0 : mxxMat8) (w_10_0 : mxxMat8) (w_11_0 : mxxMat0) (w_11_1 : mxxMat0) (w_12_0 : mxxMat0) (w_13_0 : mxxMat0) (w_15_0 : mxxMat0) (w_16_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_generatedRoot_140_11 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_126 backend hashModel tape (path ++ [11, i]) params i_0 i (current.1, (current.2.1, (w_4_0, (w_7_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_3_0, (w_3_0, ())) (w_11_0, (w_11_1, ())) ∧
   MxxRuntime.tensorRuns w_2_0 w_11_0 w_12_0 ∧
   MxxRuntime.tensorRuns w_2_0 w_11_1 w_15_0 ∧
   outputs = (w_13_0, (w_16_0, ()))
@@ -8282,7 +8333,7 @@ def sequential_parallel_generatedRoot_154_11 (backend : MxxRuntime.BackendContex
             let w_15_0 : mxxMat0 := MxxRuntime.matrixAdd w_10_0 w_14_0
             sequential_parallel_generatedRoot_154_11.constraints_0 i_0 i_1 w_1_0 w_11_0 w_2_0 w_3_0 w_4_0 w_5_0 w_9_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_154_12_11.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_132.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 30 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(257), (513), (769), (1025), (1281), (1537), (1793), (2049), (2305), (2561), (2817), (3073), (3329), (3585), (3841), (4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -8315,7 +8366,7 @@ abbrev sequential_sequential_parallel_generatedRoot_154_12_11.constraints_0 (bac
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, ()))
 
-def sequential_sequential_parallel_generatedRoot_154_12_11 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_132 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -8352,7 +8403,7 @@ def sequential_sequential_parallel_generatedRoot_154_12_11 (backend : MxxRuntime
                               let w_31_0 : mxxMat1 := MxxRuntime.matrixAdd w_25_0 w_30_0
                               let w_32_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_31_0 w_17_0
                               let w_33_0 : mxxMat0 := MxxRuntime.matrixAdd w_20_0 w_32_0
-                              sequential_sequential_parallel_generatedRoot_154_12_11.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
+                              scope_132.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 outputs
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -8390,7 +8441,7 @@ abbrev sequential_parallel_generatedRoot_154_12.constraints_0 (backend : MxxRunt
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(257), (513), (769), (1025), (1281), (1537), (1793), (2049), (2305), (2561), (2817), (3073), (3329), (3585), (3841), (4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_8_0 w_9_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_9_0 w_10_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_154_12_11 backend hashModel tape (path ++ [11, i]) params i_0 i_1 i (current.1, (current.2.1, (w_2_0, (w_6_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, ())) (w_11_0, (w_11_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_132 backend hashModel tape (path ++ [11, i]) params i_0 i_1 i (current.1, (current.2.1, (w_2_0, (w_6_0, (w_10_0, ()))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, ())) (w_11_0, (w_11_1, ())) ∧
   outputs = (w_11_0, (w_11_1, ()))
 
 abbrev sequential_parallel_generatedRoot_154_12.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_154_12.Witness) : Prop :=
@@ -8498,6 +8549,9 @@ def sequential_parallel_generatedRoot_154_34 (backend : MxxRuntime.BackendContex
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
       sequential_parallel_generatedRoot_154_34.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
+abbrev parallel_generatedRoot_154.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure parallel_generatedRoot_154.Witness where
@@ -8534,7 +8588,7 @@ structure parallel_generatedRoot_154.Witness where
   w_36_0 : mxxMat3
   w_38_0 : mxxMat11
 
-abbrev parallel_generatedRoot_154.constraints_3 (backend : MxxRuntime.BackendContext) (w_12_0 : mxxMat0) (w_12_1 : mxxMat0) (w_27_0 : mxxMat3) (w_28_0 : mxxMat3) (w_29_0 : mxxMat3) (w_30_0 : mxxMat3) (w_37_0 : mxxMat3) (w_38_0 : mxxMat11) (w_39_0 : mxxMat3) (w_40_0 : mxxMat3) (w_41_0 : mxxMat3) (w_42_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_154.constraints_3 (backend : MxxRuntime.BackendContext) (w_12_0 : mxxMat0) (w_12_1 : mxxMat0) (w_27_0 : mxxMat3) (w_28_0 : mxxMat3) (w_29_0 : mxxMat3) (w_30_0 : mxxMat3) (w_37_0 : mxxMat3) (w_38_0 : mxxMat11) (w_39_0 : mxxMat3) (w_40_0 : mxxMat3) (w_41_0 : mxxMat3) (w_42_0 : mxxMat3) (outputs : (parallel_generatedRoot_154.OutputType)) : Prop :=
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_37_0 w_38_0 ∧
   outputs = (w_12_0, (w_12_1, (w_27_0, (w_28_0, (w_29_0, (w_30_0, (w_39_0, (w_40_0, (w_41_0, (w_42_0, ()))))))))))
 
@@ -8640,7 +8694,7 @@ abbrev parallel_generatedRoot_154.constraints_0 (backend : MxxRuntime.BackendCon
   0 < 30 ∧
   30 ≤ 60
 
-abbrev parallel_generatedRoot_154.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_154.Witness) : Prop :=
+abbrev parallel_generatedRoot_154.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_154.OutputType)) (witness : parallel_generatedRoot_154.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : mxxMat0 := inputs.1
@@ -8694,9 +8748,12 @@ abbrev parallel_generatedRoot_154.body (backend : MxxRuntime.BackendContext) (ha
     parallel_generatedRoot_154.constraints_2 backend hashModel tape path params i_0 w_33_0 w_13_0 w_16_0 w_19_0 w_22_0 w_25_0 w_26_0 w_26_1 w_27_0 w_28_0 w_29_0 w_30_0 w_32_0 w_34_0 w_36_0 ∧
     parallel_generatedRoot_154.constraints_3 backend w_12_0 w_12_1 w_27_0 w_28_0 w_29_0 w_30_0 w_37_0 w_38_0 w_39_0 w_40_0 w_41_0 w_42_0 outputs
 
-def parallel_generatedRoot_154 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_154 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_154.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_154.Witness,
     parallel_generatedRoot_154.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_155_36.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_155_36.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -8794,7 +8851,7 @@ abbrev sequential_parallel_generatedRoot_155_36.constraints_0 (i_0 : Nat) (i_1 :
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_155_36 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_155_36 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_155_36.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -8853,7 +8910,10 @@ def sequential_parallel_generatedRoot_155_36 (backend : MxxRuntime.BackendContex
     sequential_parallel_generatedRoot_155_36.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_155_36.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_155_37_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_133.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_133.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -8886,7 +8946,7 @@ abbrev sequential_sequential_parallel_generatedRoot_155_37_41.constraints_0 (bac
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_155_37_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_133 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_133.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -8965,7 +9025,10 @@ def sequential_sequential_parallel_generatedRoot_155_37_41 (backend : MxxRuntime
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_155_37_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_133.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_155_37.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -9029,7 +9092,7 @@ abbrev sequential_parallel_generatedRoot_155_37.constraints_2 (backend : MxxRunt
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_155_37_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_133 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_155_37.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -9100,7 +9163,7 @@ abbrev sequential_parallel_generatedRoot_155_37.constraints_0 (backend : MxxRunt
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_155_37.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_155_37.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_155_37.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_155_37.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_155_37.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -9156,7 +9219,7 @@ abbrev sequential_parallel_generatedRoot_155_37.body (backend : MxxRuntime.Backe
     sequential_parallel_generatedRoot_155_37.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_155_37.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_155_37 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_155_37 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_155_37.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_155_37.Witness,
     sequential_parallel_generatedRoot_155_37.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -9383,7 +9446,7 @@ def sequential_parallel_generatedRoot_155_99 (backend : MxxRuntime.BackendContex
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
               sequential_parallel_generatedRoot_155_99.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_155_103.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_86.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -9394,7 +9457,7 @@ abbrev sequential_parallel_generatedRoot_155_103.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(1), (16), (31), (46), (61), (76), (91), (106), (121), (136), (151), (166), (181), (196), (211)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_155_103 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_86 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -9413,9 +9476,9 @@ def sequential_parallel_generatedRoot_155_103 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_155_103.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_86.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_155_123.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_87.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -9444,7 +9507,7 @@ abbrev sequential_parallel_generatedRoot_155_123.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_155_123 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_87 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -9466,9 +9529,9 @@ def sequential_parallel_generatedRoot_155_123 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_155_123.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_87.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_155_127.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_88.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -9479,7 +9542,7 @@ abbrev sequential_parallel_generatedRoot_155_127.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(2), (17), (32), (47), (62), (77), (92), (107), (122), (137), (152), (167), (182), (197), (212)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_155_127 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_88 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -9498,7 +9561,10 @@ def sequential_parallel_generatedRoot_155_127 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_155_127.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_88.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+
+abbrev parallel_generatedRoot_155.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -9629,7 +9695,7 @@ structure parallel_generatedRoot_155.Witness where
   w_161_0 : mxxMat3
   w_164_0 : mxxMat3
 
-abbrev parallel_generatedRoot_155.constraints_13 (w_37_0 : mxxMat0) (w_37_1 : mxxMat0) (w_37_2 : mxxMat0) (w_37_3 : mxxMat0) (w_37_4 : mxxMat0) (w_37_5 : mxxMat0) (w_37_6 : mxxMat0) (w_37_7 : mxxMat0) (w_123_1 : mxxMat0) (w_133_0 : mxxMat3) (w_144_0 : mxxMat3) (w_155_0 : mxxMat3) (w_164_0 : mxxMat3) (w_166_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_155.constraints_13 (w_37_0 : mxxMat0) (w_37_1 : mxxMat0) (w_37_2 : mxxMat0) (w_37_3 : mxxMat0) (w_37_4 : mxxMat0) (w_37_5 : mxxMat0) (w_37_6 : mxxMat0) (w_37_7 : mxxMat0) (w_123_1 : mxxMat0) (w_133_0 : mxxMat3) (w_144_0 : mxxMat3) (w_155_0 : mxxMat3) (w_164_0 : mxxMat3) (w_166_0 : mxxMat3) (outputs : (parallel_generatedRoot_155.OutputType)) : Prop :=
   MxxRuntime.sliceMatrix w_123_1 0 1 30 60 w_164_0 ∧
   outputs = (w_37_0, (w_37_1, (w_37_2, (w_37_3, (w_37_4, (w_37_5, (w_37_6, (w_37_7, (w_133_0, (w_144_0, (w_155_0, (w_166_0, ()))))))))))))
 
@@ -9703,7 +9769,7 @@ abbrev parallel_generatedRoot_155.constraints_11 (w_51_1 : mxxMat0) (w_75_1 : mx
 
 abbrev parallel_generatedRoot_155.constraints_10 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (w_55_0 : Fin 512 → Int) (w_51_0 : mxxMat0) (w_75_0 : mxxMat0) (w_110_0 : mxxMat0) (w_113_0 : mxxMat0) (w_116_0 : mxxMat0) (w_119_0 : mxxMat0) (w_122_0 : mxxMat0) (w_123_0 : mxxMat0) (w_123_1 : mxxMat0) (w_124_0 : mxxMat3) (w_126_0 : mxxMat1) (w_127_0 : mxxMat1) (w_129_0 : mxxMat3) (w_130_0 : mxxMat3) (w_131_0 : mxxMat11) (w_134_0 : mxxMat3) (w_136_0 : mxxMat3) : Prop :=
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_155_123 backend hashModel tape (path ++ [123, i]) params i_0 i (current.1, (current.2.1, (w_113_0, (w_116_0, (w_119_0, (w_122_0, ())))))) next) (Int.toNat (60)) (w_110_0, (w_110_0, ())) (w_123_0, (w_123_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_87 backend hashModel tape (path ++ [123, i]) params i_0 i (current.1, (current.2.1, (w_113_0, (w_116_0, (w_119_0, (w_122_0, ())))))) next) (Int.toNat (60)) (w_110_0, (w_110_0, ())) (w_123_0, (w_123_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -9712,7 +9778,7 @@ abbrev parallel_generatedRoot_155.constraints_10 (backend : MxxRuntime.BackendCo
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_123_0 0 1 0 30 w_124_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_155_127 backend hashModel tape (path ++ [127, i]) params i_0 i (current, (w_55_0, ())) next) (Int.toNat (256)) w_126_0 w_127_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_88 backend hashModel tape (path ++ [127, i]) params i_0 i (current, (w_55_0, ())) next) (Int.toNat (256)) w_126_0 w_127_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_129_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_130_0 w_131_0 ∧
   0 ≤ 0 ∧
@@ -9779,7 +9845,7 @@ abbrev parallel_generatedRoot_155.constraints_8 (backend : MxxRuntime.BackendCon
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_99_0 0 1 0 30 w_100_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_155_103 backend hashModel tape (path ++ [103, i]) params i_0 i (current, (w_55_0, ())) next) (Int.toNat (256)) w_102_0 w_103_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_86 backend hashModel tape (path ++ [103, i]) params i_0 i (current, (w_55_0, ())) next) (Int.toNat (256)) w_102_0 w_103_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_105_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_106_0 w_107_0 ∧
   0 ≤ ((Int.ofNat i_0)) ∧
@@ -10075,7 +10141,7 @@ abbrev parallel_generatedRoot_155.constraints_0 (backend : MxxRuntime.BackendCon
   w_12_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_19_0 w_12_0 w_20_0
 
-abbrev parallel_generatedRoot_155.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_155.Witness) : Prop :=
+abbrev parallel_generatedRoot_155.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_155.OutputType)) (witness : parallel_generatedRoot_155.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : mxxMat0 := inputs.1
@@ -10278,9 +10344,12 @@ abbrev parallel_generatedRoot_155.body (backend : MxxRuntime.BackendContext) (ha
     parallel_generatedRoot_155.constraints_12 w_51_1 w_75_1 w_99_1 w_123_1 w_153_0 w_156_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_155.constraints_13 w_37_0 w_37_1 w_37_2 w_37_3 w_37_4 w_37_5 w_37_6 w_37_7 w_123_1 w_133_0 w_144_0 w_155_0 w_164_0 w_166_0 outputs
 
-def parallel_generatedRoot_155 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_155 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : mxxMat0 × ByteArray × mxxMat0 × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_155.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_155.Witness,
     parallel_generatedRoot_155.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_156_41.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_156_41.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -10378,7 +10447,7 @@ abbrev sequential_parallel_generatedRoot_156_41.constraints_0 (i_0 : Nat) (i_1 :
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_156_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_156_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_156_41.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -10437,7 +10506,10 @@ def sequential_parallel_generatedRoot_156_41 (backend : MxxRuntime.BackendContex
     sequential_parallel_generatedRoot_156_41.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_156_41.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_156_42_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_134.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_134.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -10470,7 +10542,7 @@ abbrev sequential_sequential_parallel_generatedRoot_156_42_41.constraints_0 (bac
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_156_42_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_134 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_134.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -10549,7 +10621,10 @@ def sequential_sequential_parallel_generatedRoot_156_42_41 (backend : MxxRuntime
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_156_42_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_134.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_156_42.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -10613,7 +10688,7 @@ abbrev sequential_parallel_generatedRoot_156_42.constraints_2 (backend : MxxRunt
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_156_42_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_134 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_156_42.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -10684,7 +10759,7 @@ abbrev sequential_parallel_generatedRoot_156_42.constraints_0 (backend : MxxRunt
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_156_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_156_42.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_156_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_156_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_156_42.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -10740,7 +10815,7 @@ abbrev sequential_parallel_generatedRoot_156_42.body (backend : MxxRuntime.Backe
     sequential_parallel_generatedRoot_156_42.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_156_42.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_156_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_156_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_156_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_156_42.Witness,
     sequential_parallel_generatedRoot_156_42.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -10914,7 +10989,7 @@ def sequential_parallel_generatedRoot_156_84 (backend : MxxRuntime.BackendContex
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
       sequential_parallel_generatedRoot_156_84.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_156_104.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_95.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -10943,7 +11018,7 @@ abbrev sequential_parallel_generatedRoot_156_104.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_156_104 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_95 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -10965,9 +11040,9 @@ def sequential_parallel_generatedRoot_156_104 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_156_104.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_95.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_156_108.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_96.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -10978,7 +11053,7 @@ abbrev sequential_parallel_generatedRoot_156_108.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(5), (20), (35), (50), (65), (80), (95), (110), (125), (140), (155), (170), (185), (200), (215)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_156_108 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_96 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -10997,9 +11072,9 @@ def sequential_parallel_generatedRoot_156_108 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_156_108.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_96.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_156_128.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_97.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -11028,7 +11103,7 @@ abbrev sequential_parallel_generatedRoot_156_128.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_156_128 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_97 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -11050,9 +11125,9 @@ def sequential_parallel_generatedRoot_156_128 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_156_128.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_97.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_156_132.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_98.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -11063,7 +11138,7 @@ abbrev sequential_parallel_generatedRoot_156_132.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(6), (21), (36), (51), (66), (81), (96), (111), (126), (141), (156), (171), (186), (201), (216)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_156_132 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_98 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -11082,7 +11157,10 @@ def sequential_parallel_generatedRoot_156_132 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_156_132.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_98.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+
+abbrev parallel_generatedRoot_156.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -11219,7 +11297,7 @@ structure parallel_generatedRoot_156.Witness where
   w_166_0 : mxxMat3
   w_169_0 : mxxMat3
 
-abbrev parallel_generatedRoot_156.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_156.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : (parallel_generatedRoot_156.OutputType)) : Prop :=
   1 ≤ 1 ∧
   0 ≤ 30 ∧
   30 < 60 ∧
@@ -11329,7 +11407,7 @@ abbrev parallel_generatedRoot_156.constraints_10 (backend : MxxRuntime.BackendCo
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [104, 101, 108, 112, 101, 114, 45, 107, 101, 121], .u64Le ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(6), (21), (36), (51), (66), (81), (96), (111), (126), (141), (156), (171), (186), (201), (216)])) [(4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441)])), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (w_7_0) w_126_0 ∧
   MxxRuntime.concatColumns w_125_0 w_126_0 w_127_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_156_128 backend hashModel tape (path ++ [128, i]) params i_0 i (current.1, (current.2.1, (w_118_0, (w_121_0, (w_124_0, (w_127_0, ())))))) next) (Int.toNat (60)) (w_115_0, (w_115_0, ())) (w_128_0, (w_128_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_97 backend hashModel tape (path ++ [128, i]) params i_0 i (current.1, (current.2.1, (w_118_0, (w_121_0, (w_124_0, (w_127_0, ())))))) next) (Int.toNat (60)) (w_115_0, (w_115_0, ())) (w_128_0, (w_128_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -11338,7 +11416,7 @@ abbrev parallel_generatedRoot_156.constraints_10 (backend : MxxRuntime.BackendCo
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_128_0 0 1 0 30 w_129_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_156_132 backend hashModel tape (path ++ [132, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_131_0 w_132_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_98 backend hashModel tape (path ++ [132, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_131_0 w_132_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_134_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_135_0 w_136_0 ∧
   0 ≤ 0
@@ -11396,7 +11474,7 @@ abbrev parallel_generatedRoot_156.constraints_8 (backend : MxxRuntime.BackendCon
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [104, 101, 108, 112, 101, 114, 45, 107, 101, 121], .u64Le ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(5), (20), (35), (50), (65), (80), (95), (110), (125), (140), (155), (170), (185), (200), (215)])) [(4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441)])), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (w_7_0) w_102_0 ∧
   MxxRuntime.concatColumns w_101_0 w_102_0 w_103_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_156_104 backend hashModel tape (path ++ [104, i]) params i_0 i (current.1, (current.2.1, (w_94_0, (w_97_0, (w_100_0, (w_103_0, ())))))) next) (Int.toNat (60)) (w_91_0, (w_91_0, ())) (w_104_0, (w_104_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_95 backend hashModel tape (path ++ [104, i]) params i_0 i (current.1, (current.2.1, (w_94_0, (w_97_0, (w_100_0, (w_103_0, ())))))) next) (Int.toNat (60)) (w_91_0, (w_91_0, ())) (w_104_0, (w_104_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -11405,7 +11483,7 @@ abbrev parallel_generatedRoot_156.constraints_8 (backend : MxxRuntime.BackendCon
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_104_0 0 1 0 30 w_105_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_156_108 backend hashModel tape (path ++ [108, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_107_0 w_108_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_96 backend hashModel tape (path ++ [108, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_107_0 w_108_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_110_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_111_0 w_112_0 ∧
   0 ≤ ((Int.ofNat i_0)) ∧
@@ -11683,7 +11761,7 @@ abbrev parallel_generatedRoot_156.constraints_0 (backend : MxxRuntime.BackendCon
   w_2_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_17_0 w_2_0 w_18_0
 
-abbrev parallel_generatedRoot_156.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_156.Witness) : Prop :=
+abbrev parallel_generatedRoot_156.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_156.OutputType)) (witness : parallel_generatedRoot_156.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Fin 15 → mxxMat3 := inputs.1
@@ -11891,9 +11969,12 @@ abbrev parallel_generatedRoot_156.body (backend : MxxRuntime.BackendContext) (ha
     parallel_generatedRoot_156.constraints_12 w_56_1 w_80_1 w_104_1 w_128_1 w_150_0 w_152_0 w_155_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_156.constraints_13 w_42_0 w_42_1 w_42_2 w_42_3 w_42_4 w_42_5 w_42_6 w_42_7 w_80_1 w_104_1 w_128_1 w_138_0 w_149_0 w_160_0 w_163_0 w_166_0 w_169_0 w_171_0 outputs
 
-def parallel_generatedRoot_156 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_156 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_156.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_156.Witness,
     parallel_generatedRoot_156.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_157_41.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_157_41.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -11991,7 +12072,7 @@ abbrev sequential_parallel_generatedRoot_157_41.constraints_0 (i_0 : Nat) (i_1 :
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_157_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_157_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_157_41.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -12050,7 +12131,10 @@ def sequential_parallel_generatedRoot_157_41 (backend : MxxRuntime.BackendContex
     sequential_parallel_generatedRoot_157_41.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_157_41.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_157_42_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_135.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_135.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -12083,7 +12167,7 @@ abbrev sequential_sequential_parallel_generatedRoot_157_42_41.constraints_0 (bac
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_157_42_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_135 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_135.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -12162,7 +12246,10 @@ def sequential_sequential_parallel_generatedRoot_157_42_41 (backend : MxxRuntime
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_157_42_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_135.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_157_42.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -12226,7 +12313,7 @@ abbrev sequential_parallel_generatedRoot_157_42.constraints_2 (backend : MxxRunt
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_157_42_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_135 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_157_42.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -12297,7 +12384,7 @@ abbrev sequential_parallel_generatedRoot_157_42.constraints_0 (backend : MxxRunt
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_157_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_157_42.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_157_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_157_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_157_42.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -12353,7 +12440,7 @@ abbrev sequential_parallel_generatedRoot_157_42.body (backend : MxxRuntime.Backe
     sequential_parallel_generatedRoot_157_42.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_157_42.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_157_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_157_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_157_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_157_42.Witness,
     sequential_parallel_generatedRoot_157_42.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -12527,7 +12614,7 @@ def sequential_parallel_generatedRoot_157_84 (backend : MxxRuntime.BackendContex
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
       sequential_parallel_generatedRoot_157_84.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_157_104.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_105.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -12556,7 +12643,7 @@ abbrev sequential_parallel_generatedRoot_157_104.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_157_104 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_105 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -12578,9 +12665,9 @@ def sequential_parallel_generatedRoot_157_104 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_157_104.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_105.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_157_108.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_106.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -12591,7 +12678,7 @@ abbrev sequential_parallel_generatedRoot_157_108.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(9), (24), (39), (54), (69), (84), (99), (114), (129), (144), (159), (174), (189), (204), (219)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_157_108 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_106 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -12610,9 +12697,9 @@ def sequential_parallel_generatedRoot_157_108 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_157_108.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_106.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_157_128.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_107.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -12641,7 +12728,7 @@ abbrev sequential_parallel_generatedRoot_157_128.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_157_128 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_107 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -12663,9 +12750,9 @@ def sequential_parallel_generatedRoot_157_128 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_157_128.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_107.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_157_132.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_108.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -12676,7 +12763,7 @@ abbrev sequential_parallel_generatedRoot_157_132.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(10), (25), (40), (55), (70), (85), (100), (115), (130), (145), (160), (175), (190), (205), (220)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_157_132 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_108 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -12695,7 +12782,10 @@ def sequential_parallel_generatedRoot_157_132 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_157_132.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_108.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+
+abbrev parallel_generatedRoot_157.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -12832,7 +12922,7 @@ structure parallel_generatedRoot_157.Witness where
   w_166_0 : mxxMat3
   w_169_0 : mxxMat3
 
-abbrev parallel_generatedRoot_157.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_157.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : (parallel_generatedRoot_157.OutputType)) : Prop :=
   1 ≤ 1 ∧
   0 ≤ 30 ∧
   30 < 60 ∧
@@ -12942,7 +13032,7 @@ abbrev parallel_generatedRoot_157.constraints_10 (backend : MxxRuntime.BackendCo
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [104, 101, 108, 112, 101, 114, 45, 107, 101, 121], .u64Le ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(10), (25), (40), (55), (70), (85), (100), (115), (130), (145), (160), (175), (190), (205), (220)])) [(4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441)])), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (w_7_0) w_126_0 ∧
   MxxRuntime.concatColumns w_125_0 w_126_0 w_127_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_157_128 backend hashModel tape (path ++ [128, i]) params i_0 i (current.1, (current.2.1, (w_118_0, (w_121_0, (w_124_0, (w_127_0, ())))))) next) (Int.toNat (60)) (w_115_0, (w_115_0, ())) (w_128_0, (w_128_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_107 backend hashModel tape (path ++ [128, i]) params i_0 i (current.1, (current.2.1, (w_118_0, (w_121_0, (w_124_0, (w_127_0, ())))))) next) (Int.toNat (60)) (w_115_0, (w_115_0, ())) (w_128_0, (w_128_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -12951,7 +13041,7 @@ abbrev parallel_generatedRoot_157.constraints_10 (backend : MxxRuntime.BackendCo
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_128_0 0 1 0 30 w_129_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_157_132 backend hashModel tape (path ++ [132, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_131_0 w_132_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_108 backend hashModel tape (path ++ [132, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_131_0 w_132_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_134_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_135_0 w_136_0 ∧
   0 ≤ 0
@@ -13009,7 +13099,7 @@ abbrev parallel_generatedRoot_157.constraints_8 (backend : MxxRuntime.BackendCon
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [104, 101, 108, 112, 101, 114, 45, 107, 101, 121], .u64Le ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(9), (24), (39), (54), (69), (84), (99), (114), (129), (144), (159), (174), (189), (204), (219)])) [(4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441)])), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (w_7_0) w_102_0 ∧
   MxxRuntime.concatColumns w_101_0 w_102_0 w_103_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_157_104 backend hashModel tape (path ++ [104, i]) params i_0 i (current.1, (current.2.1, (w_94_0, (w_97_0, (w_100_0, (w_103_0, ())))))) next) (Int.toNat (60)) (w_91_0, (w_91_0, ())) (w_104_0, (w_104_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_105 backend hashModel tape (path ++ [104, i]) params i_0 i (current.1, (current.2.1, (w_94_0, (w_97_0, (w_100_0, (w_103_0, ())))))) next) (Int.toNat (60)) (w_91_0, (w_91_0, ())) (w_104_0, (w_104_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -13018,7 +13108,7 @@ abbrev parallel_generatedRoot_157.constraints_8 (backend : MxxRuntime.BackendCon
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_104_0 0 1 0 30 w_105_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_157_108 backend hashModel tape (path ++ [108, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_107_0 w_108_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_106 backend hashModel tape (path ++ [108, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_107_0 w_108_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_110_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_111_0 w_112_0 ∧
   0 ≤ ((Int.ofNat i_0)) ∧
@@ -13296,7 +13386,7 @@ abbrev parallel_generatedRoot_157.constraints_0 (backend : MxxRuntime.BackendCon
   w_2_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_17_0 w_2_0 w_18_0
 
-abbrev parallel_generatedRoot_157.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_157.Witness) : Prop :=
+abbrev parallel_generatedRoot_157.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_157.OutputType)) (witness : parallel_generatedRoot_157.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Fin 15 → mxxMat3 := inputs.1
@@ -13504,9 +13594,12 @@ abbrev parallel_generatedRoot_157.body (backend : MxxRuntime.BackendContext) (ha
     parallel_generatedRoot_157.constraints_12 w_56_1 w_80_1 w_104_1 w_128_1 w_150_0 w_152_0 w_155_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_157.constraints_13 w_42_0 w_42_1 w_42_2 w_42_3 w_42_4 w_42_5 w_42_6 w_42_7 w_80_1 w_104_1 w_128_1 w_138_0 w_149_0 w_160_0 w_163_0 w_166_0 w_169_0 w_171_0 outputs
 
-def parallel_generatedRoot_157 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_157 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_157.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_157.Witness,
     parallel_generatedRoot_157.body backend hashModel tape path params i_0 inputs outputs witness
+
+abbrev sequential_parallel_generatedRoot_158_41.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 abbrev sequential_parallel_generatedRoot_158_41.constraints_2 (i_0 : Nat) (i_1 : Nat) (w_35_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_9_0 : mxxMat0) (w_15_0 : mxxMat0) (w_21_0 : mxxMat0) (w_27_0 : mxxMat0) (w_33_0 : mxxMat0) (w_36_0 : mxxMat1) (w_37_0 : mxxMat1) (w_39_0 : mxxMat0) (w_42_0 : mxxMat1) (w_43_0 : mxxMat1) (w_45_0 : mxxMat0) (w_48_0 : mxxMat1) (w_49_0 : mxxMat1) (w_51_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   (1 + (Int.ofNat i_1)) ≤ 60 ∧
@@ -13604,7 +13697,7 @@ abbrev sequential_parallel_generatedRoot_158_41.constraints_0 (i_0 : Nat) (i_1 :
   0 < 1 ∧
   1 ≤ 1
 
-def sequential_parallel_generatedRoot_158_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat4 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_158_41 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_158_41.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -13663,7 +13756,10 @@ def sequential_parallel_generatedRoot_158_41 (backend : MxxRuntime.BackendContex
     sequential_parallel_generatedRoot_158_41.constraints_1 i_0 i_1 w_17_0 w_23_0 w_29_0 w_18_0 w_19_0 w_24_0 w_25_0 w_30_0 w_31_0 ∧
     sequential_parallel_generatedRoot_158_41.constraints_2 i_0 i_1 w_35_0 w_41_0 w_47_0 w_9_0 w_15_0 w_21_0 w_27_0 w_33_0 w_36_0 w_37_0 w_39_0 w_42_0 w_43_0 w_45_0 w_48_0 w_49_0 w_51_0 outputs
 
-abbrev sequential_sequential_parallel_generatedRoot_158_42_41.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_136.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit
+
+abbrev scope_136.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (w_1_0 : ByteArray) (w_2_0 : mxxMat5) (w_3_0 : mxxMat3) (w_4_0 : mxxMat6) (w_5_0 : mxxMat6) (w_6_0 : mxxMat3) (w_9_0 : mxxMat5) (w_10_0 : mxxMat6) (w_11_0 : mxxMat6) (w_12_0 : mxxMat3) (w_16_0 : mxxMat7) (w_17_0 : mxxMat0) (w_19_0 : mxxMat0) (w_21_0 : mxxMat5) (w_22_0 : mxxMat6) (w_23_0 : mxxMat6) (w_24_0 : mxxMat3) (w_26_0 : mxxMat5) (w_27_0 : mxxMat6) (w_28_0 : mxxMat6) (w_29_0 : mxxMat3) (w_33_0 : mxxMat0) (w_41_0 : mxxMat0) (w_47_0 : mxxMat0) (w_55_0 : mxxMat0) (w_61_0 : mxxMat0) (w_69_0 : mxxMat0) (w_75_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ ((Int.ofNat i_0)) ∧
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [99, 111, 109, 112, 97, 110, 105, 111, 110, 45, 107, 101, 121], .bytes [97, 117, 116, 111, 109, 111, 114, 112, 104, 105, 115, 109], .u64Le ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])), .bytes [99, 111, 108, 117, 109, 110], .u64Le ((Int.ofNat i_2)), .bytes [100, 105, 103, 105, 116, 45, 114, 111, 119], .u64Le ((30 + (Int.ofNat i_1))), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_2_0 ∧
@@ -13696,7 +13792,7 @@ abbrev sequential_sequential_parallel_generatedRoot_158_42_41.constraints_0 (bac
   MxxRuntime.modulusSwitchRuns w_28_0 w_29_0 ∧
   outputs = (w_19_0, (w_33_0, (w_41_0, (w_47_0, (w_55_0, (w_61_0, (w_69_0, (w_75_0, ()))))))))
 
-def sequential_sequential_parallel_generatedRoot_158_42_41 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × mxxMat8 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_136 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (i_2 : Nat) (inputs : (scope_136.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -13775,7 +13871,10 @@ def sequential_sequential_parallel_generatedRoot_158_42_41 (backend : MxxRuntime
                               let w_73_0 : mxxMat1 := MxxRuntime.matrixAdd w_71_0 w_72_0
                               let w_74_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_73_0 w_17_0
                               let w_75_0 : mxxMat0 := MxxRuntime.matrixAdd w_70_0 w_74_0
-                              sequential_sequential_parallel_generatedRoot_158_42_41.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+                              scope_136.constraints_0 backend hashModel i_0 i_1 i_2 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_11_0 w_12_0 w_16_0 w_17_0 w_19_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_29_0 w_33_0 w_41_0 w_47_0 w_55_0 w_61_0 w_69_0 w_75_0 outputs
+
+abbrev sequential_parallel_generatedRoot_158_42.InputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -13839,7 +13938,7 @@ abbrev sequential_parallel_generatedRoot_158_42.constraints_2 (backend : MxxRunt
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_38_0 w_39_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_39_0 w_40_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => sequential_sequential_parallel_generatedRoot_158_42_41 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) => scope_136 backend hashModel tape (path ++ [41, i]) params i_0 i_1 i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (current.2.2.2.2.2.1, (current.2.2.2.2.2.2.1, (current.2.2.2.2.2.2.2.1, (w_8_0, (w_12_0, (w_16_0, (w_20_0, (w_24_0, (w_28_0, (w_32_0, (w_36_0, (w_40_0, ()))))))))))))))))) next) (Int.toNat (60)) (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, (w_5_0, (w_6_0, (w_7_0, ())))))))) (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ())))))))) ∧
   outputs = (w_41_0, (w_41_1, (w_41_2, (w_41_3, (w_41_4, (w_41_5, (w_41_6, (w_41_7, ()))))))))
 
 abbrev sequential_parallel_generatedRoot_158_42.constraints_1 (backend : MxxRuntime.BackendContext) (i_0 : Nat) (i_1 : Nat) (w_21_0 : mxxMat0) (w_25_0 : mxxMat0) (w_29_0 : mxxMat0) (w_19_0 : mxxMat1) (w_20_0 : mxxMat8) (w_22_0 : mxxMat1) (w_23_0 : mxxMat1) (w_24_0 : mxxMat8) (w_26_0 : mxxMat1) (w_27_0 : mxxMat1) (w_28_0 : mxxMat8) (w_30_0 : mxxMat1) : Prop :=
@@ -13910,7 +14009,7 @@ abbrev sequential_parallel_generatedRoot_158_42.constraints_0 (backend : MxxRunt
   ((Int.ofNat i_0)) < 15 ∧
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((Int.ofNat i_0)) [(4097), (8193), (12289), (16385), (20481), (24577), (28673), (32769), (36865), (40961), (45057), (49153), (53249), (57345), (61441)])) w_18_0 w_19_0
 
-abbrev sequential_parallel_generatedRoot_158_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_158_42.Witness) : Prop :=
+abbrev sequential_parallel_generatedRoot_158_42.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_158_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (witness : sequential_parallel_generatedRoot_158_42.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -13966,7 +14065,7 @@ abbrev sequential_parallel_generatedRoot_158_42.body (backend : MxxRuntime.Backe
     sequential_parallel_generatedRoot_158_42.constraints_1 backend i_0 i_1 w_21_0 w_25_0 w_29_0 w_19_0 w_20_0 w_22_0 w_23_0 w_24_0 w_26_0 w_27_0 w_28_0 w_30_0 ∧
     sequential_parallel_generatedRoot_158_42.constraints_2 backend hashModel tape path params i_0 i_1 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_33_0 w_37_0 w_12_0 w_16_0 w_20_0 w_24_0 w_28_0 w_30_0 w_31_0 w_32_0 w_34_0 w_35_0 w_36_0 w_38_0 w_39_0 w_40_0 w_41_0 w_41_1 w_41_2 w_41_3 w_41_4 w_41_5 w_41_6 w_41_7 outputs
 
-def sequential_parallel_generatedRoot_158_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × ByteArray × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
+def sequential_parallel_generatedRoot_158_42 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : (sequential_parallel_generatedRoot_158_42.InputType)) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   ∃ witness : sequential_parallel_generatedRoot_158_42.Witness,
     sequential_parallel_generatedRoot_158_42.body backend hashModel tape path params i_0 i_1 inputs outputs witness
 
@@ -14140,7 +14239,7 @@ def sequential_parallel_generatedRoot_158_84 (backend : MxxRuntime.BackendContex
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
       sequential_parallel_generatedRoot_158_84.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_158_104.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_115.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -14169,7 +14268,7 @@ abbrev sequential_parallel_generatedRoot_158_104.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_158_104 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_115 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -14191,9 +14290,9 @@ def sequential_parallel_generatedRoot_158_104 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_158_104.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_115.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_158_108.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_116.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -14204,7 +14303,7 @@ abbrev sequential_parallel_generatedRoot_158_108.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(13), (28), (43), (58), (73), (88), (103), (118), (133), (148), (163), (178), (193), (208), (223)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_158_108 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_116 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -14223,9 +14322,9 @@ def sequential_parallel_generatedRoot_158_108 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_158_108.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_116.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
 
-abbrev sequential_parallel_generatedRoot_158_128.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+abbrev scope_117.constraints_0 (backend : MxxRuntime.BackendContext) (i_1 : Nat) (w_2_0 : mxxMat0) (w_4_0 : mxxMat0) (w_3_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat9) (w_7_0 : mxxMat10) (w_8_0 : mxxMat10) (w_10_0 : mxxMat7) (w_11_0 : mxxMat0) (w_13_0 : mxxMat0) (w_18_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -14254,7 +14353,7 @@ abbrev sequential_parallel_generatedRoot_158_128.constraints_0 (backend : MxxRun
   MxxRuntime.sliceMatrix w_10_0 0 1 (59 + (-1 * (Int.ofNat i_1))) (119 + (-1 * (Int.ofNat i_1))) w_11_0 ∧
   outputs = (w_13_0, (w_18_0, ()))
 
-def sequential_parallel_generatedRoot_158_128 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
+def scope_117 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (_ : Nat) (i_1 : Nat) (inputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
@@ -14276,9 +14375,9 @@ def sequential_parallel_generatedRoot_158_128 (backend : MxxRuntime.BackendConte
               let w_16_0 : mxxMat1 := MxxRuntime.matrixMul w_15_0 w_8_0
               let w_17_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_16_0 w_11_0
               let w_18_0 : mxxMat0 := MxxRuntime.matrixAdd w_14_0 w_17_0
-              sequential_parallel_generatedRoot_158_128.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
+              scope_117.constraints_0 backend i_1 w_2_0 w_4_0 w_3_0 w_5_0 w_6_0 w_7_0 w_8_0 w_10_0 w_11_0 w_13_0 w_18_0 outputs
 
-abbrev sequential_parallel_generatedRoot_158_132.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
+abbrev scope_118.constraints_0 (i_0 : Nat) (w_1_0 : Fin 512 → Int) (w_4_0 : Int) (w_5_0 : Int) (w_12_0 : mxxMat1) (w_13_0 : mxxMat1) (w_15_0 : mxxMat1) (outputs : mxxMat1) : Prop :=
   0 ≤ w_4_0 ∧
   w_4_0 < 512 ∧
   MxxRuntime.familyGetDynamic w_1_0 w_4_0 w_5_0 ∧
@@ -14289,7 +14388,7 @@ abbrev sequential_parallel_generatedRoot_158_132.constraints_0 (i_0 : Nat) (w_1_
   MxxRuntime.ringAutomorphismRuns ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(14), (29), (44), (59), (74), (89), (104), (119), (134), (149), (164), (179), (194), (209), (224)])) [(4353), (4609), (4865), (5121), (5377), (5633), (5889), (6145), (6401), (6657), (6913), (7169), (7425), (7681), (7937), (8449), (8705), (8961), (9217), (9473), (9729), (9985), (10241), (10497), (10753), (11009), (11265), (11521), (11777), (12033), (12545), (12801), (13057), (13313), (13569), (13825), (14081), (14337), (14593), (14849), (15105), (15361), (15617), (15873), (16129), (16641), (16897), (17153), (17409), (17665), (17921), (18177), (18433), (18689), (18945), (19201), (19457), (19713), (19969), (20225), (20737), (20993), (21249), (21505), (21761), (22017), (22273), (22529), (22785), (23041), (23297), (23553), (23809), (24065), (24321), (24833), (25089), (25345), (25601), (25857), (26113), (26369), (26625), (26881), (27137), (27393), (27649), (27905), (28161), (28417), (28929), (29185), (29441), (29697), (29953), (30209), (30465), (30721), (30977), (31233), (31489), (31745), (32001), (32257), (32513), (33025), (33281), (33537), (33793), (34049), (34305), (34561), (34817), (35073), (35329), (35585), (35841), (36097), (36353), (36609), (37121), (37377), (37633), (37889), (38145), (38401), (38657), (38913), (39169), (39425), (39681), (39937), (40193), (40449), (40705), (41217), (41473), (41729), (41985), (42241), (42497), (42753), (43009), (43265), (43521), (43777), (44033), (44289), (44545), (44801), (45313), (45569), (45825), (46081), (46337), (46593), (46849), (47105), (47361), (47617), (47873), (48129), (48385), (48641), (48897), (49409), (49665), (49921), (50177), (50433), (50689), (50945), (51201), (51457), (51713), (51969), (52225), (52481), (52737), (52993), (53505), (53761), (54017), (54273), (54529), (54785), (55041), (55297), (55553), (55809), (56065), (56321), (56577), (56833), (57089), (57601), (57857), (58113), (58369), (58625), (58881), (59137), (59393), (59649), (59905), (60161), (60417), (60673), (60929), (61185), (61697), (61953), (62209), (62465), (62721), (62977), (63233), (63489), (63745), (64001), (64257), (64513), (64769), (65025), (65281)])) w_12_0 w_13_0 ∧
   outputs = w_15_0
 
-def sequential_parallel_generatedRoot_158_132 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
+def scope_118 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (i_0 : Nat) (i_1 : Nat) (inputs : mxxMat1 × (Fin 512 → Int) × Unit) (outputs : mxxMat1) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -14308,7 +14407,10 @@ def sequential_parallel_generatedRoot_158_132 (backend : MxxRuntime.BackendConte
     ∃ (w_13_0 : mxxMat1),
       let w_14_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_6_0 w_13_0
       let w_15_0 : mxxMat1 := MxxRuntime.matrixAdd w_0_0 w_14_0
-      sequential_parallel_generatedRoot_158_132.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+      scope_118.constraints_0 i_0 w_1_0 w_4_0 w_5_0 w_12_0 w_13_0 w_15_0 outputs
+
+abbrev parallel_generatedRoot_158.OutputType : Type :=
+  mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -14445,7 +14547,7 @@ structure parallel_generatedRoot_158.Witness where
   w_166_0 : mxxMat3
   w_169_0 : mxxMat3
 
-abbrev parallel_generatedRoot_158.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev parallel_generatedRoot_158.constraints_13 (w_42_0 : mxxMat0) (w_42_1 : mxxMat0) (w_42_2 : mxxMat0) (w_42_3 : mxxMat0) (w_42_4 : mxxMat0) (w_42_5 : mxxMat0) (w_42_6 : mxxMat0) (w_42_7 : mxxMat0) (w_80_1 : mxxMat0) (w_104_1 : mxxMat0) (w_128_1 : mxxMat0) (w_138_0 : mxxMat3) (w_149_0 : mxxMat3) (w_160_0 : mxxMat3) (w_163_0 : mxxMat3) (w_166_0 : mxxMat3) (w_169_0 : mxxMat3) (w_171_0 : mxxMat3) (outputs : (parallel_generatedRoot_158.OutputType)) : Prop :=
   1 ≤ 1 ∧
   0 ≤ 30 ∧
   30 < 60 ∧
@@ -14555,7 +14657,7 @@ abbrev parallel_generatedRoot_158.constraints_10 (backend : MxxRuntime.BackendCo
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [104, 101, 108, 112, 101, 114, 45, 107, 101, 121], .u64Le ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(14), (29), (44), (59), (74), (89), (104), (119), (134), (149), (164), (179), (194), (209), (224)])) [(4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441)])), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (w_7_0) w_126_0 ∧
   MxxRuntime.concatColumns w_125_0 w_126_0 w_127_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_158_128 backend hashModel tape (path ++ [128, i]) params i_0 i (current.1, (current.2.1, (w_118_0, (w_121_0, (w_124_0, (w_127_0, ())))))) next) (Int.toNat (60)) (w_115_0, (w_115_0, ())) (w_128_0, (w_128_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_117 backend hashModel tape (path ++ [128, i]) params i_0 i (current.1, (current.2.1, (w_118_0, (w_121_0, (w_124_0, (w_127_0, ())))))) next) (Int.toNat (60)) (w_115_0, (w_115_0, ())) (w_128_0, (w_128_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -14564,7 +14666,7 @@ abbrev parallel_generatedRoot_158.constraints_10 (backend : MxxRuntime.BackendCo
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_128_0 0 1 0 30 w_129_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_158_132 backend hashModel tape (path ++ [132, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_131_0 w_132_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_118 backend hashModel tape (path ++ [132, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_131_0 w_132_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_134_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_135_0 w_136_0 ∧
   0 ≤ 0
@@ -14622,7 +14724,7 @@ abbrev parallel_generatedRoot_158.constraints_8 (backend : MxxRuntime.BackendCon
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [104, 101, 108, 112, 101, 114, 45, 107, 101, 121], .u64Le ((MxxIR.selectInt ((MxxIR.selectInt ((Int.ofNat i_0)) [(13), (28), (43), (58), (73), (88), (103), (118), (133), (148), (163), (178), (193), (208), (223)])) [(4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (4097), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (8193), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (12289), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (16385), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (20481), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (24577), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (28673), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (32769), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (36865), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (40961), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (45057), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (49153), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (53249), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (57345), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441), (61441)])), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (3)]) (w_7_0) w_102_0 ∧
   MxxRuntime.concatColumns w_101_0 w_102_0 w_103_0 ∧
   0 ≤ (60) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => sequential_parallel_generatedRoot_158_104 backend hashModel tape (path ++ [104, i]) params i_0 i (current.1, (current.2.1, (w_94_0, (w_97_0, (w_100_0, (w_103_0, ())))))) next) (Int.toNat (60)) (w_91_0, (w_91_0, ())) (w_104_0, (w_104_1, ())) ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0 × mxxMat0 × Unit) => scope_115 backend hashModel tape (path ++ [104, i]) params i_0 i (current.1, (current.2.1, (w_94_0, (w_97_0, (w_100_0, (w_103_0, ())))))) next) (Int.toNat (60)) (w_91_0, (w_91_0, ())) (w_104_0, (w_104_1, ())) ∧
   0 ≤ 0 ∧
   0 < 1 ∧
   1 ≤ 1 ∧
@@ -14631,7 +14733,7 @@ abbrev parallel_generatedRoot_158.constraints_8 (backend : MxxRuntime.BackendCon
   30 ≤ 60 ∧
   MxxRuntime.sliceMatrix w_104_0 0 1 0 30 w_105_0 ∧
   0 ≤ (256) ∧
-  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_parallel_generatedRoot_158_108 backend hashModel tape (path ++ [108, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_107_0 w_108_0 ∧
+  MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => scope_116 backend hashModel tape (path ++ [108, i]) params i_0 i (current, (w_60_0, ())) next) (Int.toNat (256)) w_107_0 w_108_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_110_0 ∧
   MxxRuntime.gadgetDecomposeRuns backend 4096 30 w_111_0 w_112_0 ∧
   0 ≤ ((Int.ofNat i_0)) ∧
@@ -14909,7 +15011,7 @@ abbrev parallel_generatedRoot_158.constraints_0 (backend : MxxRuntime.BackendCon
   w_2_0 < 15 ∧
   MxxRuntime.familyGetDynamic w_17_0 w_2_0 w_18_0
 
-abbrev parallel_generatedRoot_158.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : parallel_generatedRoot_158.Witness) : Prop :=
+abbrev parallel_generatedRoot_158.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_158.OutputType)) (witness : parallel_generatedRoot_158.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Fin 15 → mxxMat3 := inputs.1
@@ -15117,7 +15219,7 @@ abbrev parallel_generatedRoot_158.body (backend : MxxRuntime.BackendContext) (ha
     parallel_generatedRoot_158.constraints_12 w_56_1 w_80_1 w_104_1 w_128_1 w_150_0 w_152_0 w_155_0 w_158_0 w_161_0 ∧
     parallel_generatedRoot_158.constraints_13 w_42_0 w_42_1 w_42_2 w_42_3 w_42_4 w_42_5 w_42_6 w_42_7 w_80_1 w_104_1 w_128_1 w_138_0 w_149_0 w_160_0 w_163_0 w_166_0 w_169_0 w_171_0 outputs
 
-def parallel_generatedRoot_158 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def parallel_generatedRoot_158 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (i_0 : Nat) (inputs : (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × ByteArray × (Fin 15 → mxxMat3) × (Fin 15 → mxxMat3) × (Fin 512 → Int) × Unit) (outputs : (parallel_generatedRoot_158.OutputType)) : Prop :=
   ∃ witness : parallel_generatedRoot_158.Witness,
     parallel_generatedRoot_158.body backend hashModel tape path params i_0 inputs outputs witness
 
@@ -15343,6 +15445,9 @@ def sequential_generatedRoot_235 (backend : MxxRuntime.BackendContext) (_ : MxxR
         ∃ (w_17_0 : mxxMat3),
           let w_18_0 : mxxMat3 := MxxRuntime.matrixAdd w_15_0 w_17_0
           sequential_generatedRoot_235.constraints_0 w_1_0 w_8_0 w_12_0 w_16_0 w_4_0 w_5_0 w_6_0 w_9_0 w_10_0 w_13_0 w_14_0 w_17_0 w_18_0 outputs
+
+abbrev generatedRoot.OutputType : Type :=
+  mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -15644,7 +15749,7 @@ structure generatedRoot.Witness where
   w_235_2 : mxxMat3
   w_235_3 : mxxMat3
 
-abbrev generatedRoot.constraints_9 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_17_0 : mxxMat3) (w_20_0 : mxxMat3) (w_23_0 : mxxMat3) (w_26_0 : mxxMat3) (w_30_0 : Fin 15 → mxxMat0) (w_30_1 : Fin 15 → mxxMat0) (w_31_0 : Fin 15 → mxxMat0) (w_31_1 : Fin 15 → mxxMat0) (w_31_2 : Fin 15 → mxxMat0) (w_31_3 : Fin 15 → mxxMat0) (w_31_4 : Fin 15 → mxxMat0) (w_31_5 : Fin 15 → mxxMat0) (w_31_6 : Fin 15 → mxxMat0) (w_31_7 : Fin 15 → mxxMat0) (w_32_0 : Fin 15 → mxxMat0) (w_32_1 : Fin 15 → mxxMat0) (w_32_2 : Fin 15 → mxxMat0) (w_32_3 : Fin 15 → mxxMat0) (w_32_4 : Fin 15 → mxxMat0) (w_32_5 : Fin 15 → mxxMat0) (w_32_6 : Fin 15 → mxxMat0) (w_32_7 : Fin 15 → mxxMat0) (w_33_0 : Fin 15 → mxxMat0) (w_33_1 : Fin 15 → mxxMat0) (w_33_2 : Fin 15 → mxxMat0) (w_33_3 : Fin 15 → mxxMat0) (w_33_4 : Fin 15 → mxxMat0) (w_33_5 : Fin 15 → mxxMat0) (w_33_6 : Fin 15 → mxxMat0) (w_33_7 : Fin 15 → mxxMat0) (w_34_0 : Fin 15 → mxxMat0) (w_34_1 : Fin 15 → mxxMat0) (w_34_2 : Fin 15 → mxxMat0) (w_34_3 : Fin 15 → mxxMat0) (w_34_4 : Fin 15 → mxxMat0) (w_34_5 : Fin 15 → mxxMat0) (w_34_6 : Fin 15 → mxxMat0) (w_34_7 : Fin 15 → mxxMat0) (w_112_0 : mxxMat3) (w_118_0 : mxxMat3) (w_124_0 : mxxMat3) (w_130_0 : mxxMat3) (w_142_0 : mxxMat3) (w_145_0 : mxxMat3) (w_148_0 : mxxMat3) (w_151_0 : mxxMat3) (w_154_0 : Fin 15 → mxxMat0) (w_154_1 : Fin 15 → mxxMat0) (w_155_0 : Fin 15 → mxxMat0) (w_155_1 : Fin 15 → mxxMat0) (w_155_2 : Fin 15 → mxxMat0) (w_155_3 : Fin 15 → mxxMat0) (w_155_4 : Fin 15 → mxxMat0) (w_155_5 : Fin 15 → mxxMat0) (w_155_6 : Fin 15 → mxxMat0) (w_155_7 : Fin 15 → mxxMat0) (w_156_0 : Fin 15 → mxxMat0) (w_156_1 : Fin 15 → mxxMat0) (w_156_2 : Fin 15 → mxxMat0) (w_156_3 : Fin 15 → mxxMat0) (w_156_4 : Fin 15 → mxxMat0) (w_156_5 : Fin 15 → mxxMat0) (w_156_6 : Fin 15 → mxxMat0) (w_156_7 : Fin 15 → mxxMat0) (w_157_0 : Fin 15 → mxxMat0) (w_157_1 : Fin 15 → mxxMat0) (w_157_2 : Fin 15 → mxxMat0) (w_157_3 : Fin 15 → mxxMat0) (w_157_4 : Fin 15 → mxxMat0) (w_157_5 : Fin 15 → mxxMat0) (w_157_6 : Fin 15 → mxxMat0) (w_157_7 : Fin 15 → mxxMat0) (w_157_8 : Fin 15 → mxxMat3) (w_157_9 : Fin 15 → mxxMat3) (w_157_10 : Fin 15 → mxxMat3) (w_157_11 : Fin 15 → mxxMat3) (w_158_0 : Fin 15 → mxxMat0) (w_158_1 : Fin 15 → mxxMat0) (w_158_2 : Fin 15 → mxxMat0) (w_158_3 : Fin 15 → mxxMat0) (w_158_4 : Fin 15 → mxxMat0) (w_158_5 : Fin 15 → mxxMat0) (w_158_6 : Fin 15 → mxxMat0) (w_158_7 : Fin 15 → mxxMat0) (w_158_8 : Fin 15 → mxxMat3) (w_158_9 : Fin 15 → mxxMat3) (w_158_10 : Fin 15 → mxxMat3) (w_158_11 : Fin 15 → mxxMat3) (w_211_0 : mxxMat3) (w_214_0 : mxxMat3) (w_217_0 : mxxMat3) (w_218_0 : mxxMat3) (w_219_0 : mxxMat3) (w_220_0 : mxxMat3) (w_221_0 : mxxMat3) (w_221_1 : mxxMat3) (w_221_2 : mxxMat3) (w_221_3 : mxxMat3) (w_223_0 : mxxMat3) (w_224_0 : mxxMat3) (w_225_0 : mxxMat3) (w_226_0 : mxxMat3) (w_227_0 : mxxMat3) (w_228_0 : mxxMat3) (w_229_0 : mxxMat3) (w_230_0 : mxxMat3) (w_231_0 : mxxMat3) (w_232_0 : mxxMat3) (w_233_0 : mxxMat3) (w_234_0 : mxxMat3) (w_235_0 : mxxMat3) (w_235_1 : mxxMat3) (w_235_2 : mxxMat3) (w_235_3 : mxxMat3) (w_236_0 : mxxMat3) (w_242_0 : mxxMat3) (w_248_0 : mxxMat3) (w_254_0 : mxxMat3) (outputs : mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+abbrev generatedRoot.constraints_9 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_17_0 : mxxMat3) (w_20_0 : mxxMat3) (w_23_0 : mxxMat3) (w_26_0 : mxxMat3) (w_30_0 : Fin 15 → mxxMat0) (w_30_1 : Fin 15 → mxxMat0) (w_31_0 : Fin 15 → mxxMat0) (w_31_1 : Fin 15 → mxxMat0) (w_31_2 : Fin 15 → mxxMat0) (w_31_3 : Fin 15 → mxxMat0) (w_31_4 : Fin 15 → mxxMat0) (w_31_5 : Fin 15 → mxxMat0) (w_31_6 : Fin 15 → mxxMat0) (w_31_7 : Fin 15 → mxxMat0) (w_32_0 : Fin 15 → mxxMat0) (w_32_1 : Fin 15 → mxxMat0) (w_32_2 : Fin 15 → mxxMat0) (w_32_3 : Fin 15 → mxxMat0) (w_32_4 : Fin 15 → mxxMat0) (w_32_5 : Fin 15 → mxxMat0) (w_32_6 : Fin 15 → mxxMat0) (w_32_7 : Fin 15 → mxxMat0) (w_33_0 : Fin 15 → mxxMat0) (w_33_1 : Fin 15 → mxxMat0) (w_33_2 : Fin 15 → mxxMat0) (w_33_3 : Fin 15 → mxxMat0) (w_33_4 : Fin 15 → mxxMat0) (w_33_5 : Fin 15 → mxxMat0) (w_33_6 : Fin 15 → mxxMat0) (w_33_7 : Fin 15 → mxxMat0) (w_34_0 : Fin 15 → mxxMat0) (w_34_1 : Fin 15 → mxxMat0) (w_34_2 : Fin 15 → mxxMat0) (w_34_3 : Fin 15 → mxxMat0) (w_34_4 : Fin 15 → mxxMat0) (w_34_5 : Fin 15 → mxxMat0) (w_34_6 : Fin 15 → mxxMat0) (w_34_7 : Fin 15 → mxxMat0) (w_112_0 : mxxMat3) (w_118_0 : mxxMat3) (w_124_0 : mxxMat3) (w_130_0 : mxxMat3) (w_142_0 : mxxMat3) (w_145_0 : mxxMat3) (w_148_0 : mxxMat3) (w_151_0 : mxxMat3) (w_154_0 : Fin 15 → mxxMat0) (w_154_1 : Fin 15 → mxxMat0) (w_155_0 : Fin 15 → mxxMat0) (w_155_1 : Fin 15 → mxxMat0) (w_155_2 : Fin 15 → mxxMat0) (w_155_3 : Fin 15 → mxxMat0) (w_155_4 : Fin 15 → mxxMat0) (w_155_5 : Fin 15 → mxxMat0) (w_155_6 : Fin 15 → mxxMat0) (w_155_7 : Fin 15 → mxxMat0) (w_156_0 : Fin 15 → mxxMat0) (w_156_1 : Fin 15 → mxxMat0) (w_156_2 : Fin 15 → mxxMat0) (w_156_3 : Fin 15 → mxxMat0) (w_156_4 : Fin 15 → mxxMat0) (w_156_5 : Fin 15 → mxxMat0) (w_156_6 : Fin 15 → mxxMat0) (w_156_7 : Fin 15 → mxxMat0) (w_157_0 : Fin 15 → mxxMat0) (w_157_1 : Fin 15 → mxxMat0) (w_157_2 : Fin 15 → mxxMat0) (w_157_3 : Fin 15 → mxxMat0) (w_157_4 : Fin 15 → mxxMat0) (w_157_5 : Fin 15 → mxxMat0) (w_157_6 : Fin 15 → mxxMat0) (w_157_7 : Fin 15 → mxxMat0) (w_157_8 : Fin 15 → mxxMat3) (w_157_9 : Fin 15 → mxxMat3) (w_157_10 : Fin 15 → mxxMat3) (w_157_11 : Fin 15 → mxxMat3) (w_158_0 : Fin 15 → mxxMat0) (w_158_1 : Fin 15 → mxxMat0) (w_158_2 : Fin 15 → mxxMat0) (w_158_3 : Fin 15 → mxxMat0) (w_158_4 : Fin 15 → mxxMat0) (w_158_5 : Fin 15 → mxxMat0) (w_158_6 : Fin 15 → mxxMat0) (w_158_7 : Fin 15 → mxxMat0) (w_158_8 : Fin 15 → mxxMat3) (w_158_9 : Fin 15 → mxxMat3) (w_158_10 : Fin 15 → mxxMat3) (w_158_11 : Fin 15 → mxxMat3) (w_211_0 : mxxMat3) (w_214_0 : mxxMat3) (w_217_0 : mxxMat3) (w_218_0 : mxxMat3) (w_219_0 : mxxMat3) (w_220_0 : mxxMat3) (w_221_0 : mxxMat3) (w_221_1 : mxxMat3) (w_221_2 : mxxMat3) (w_221_3 : mxxMat3) (w_223_0 : mxxMat3) (w_224_0 : mxxMat3) (w_225_0 : mxxMat3) (w_226_0 : mxxMat3) (w_227_0 : mxxMat3) (w_228_0 : mxxMat3) (w_229_0 : mxxMat3) (w_230_0 : mxxMat3) (w_231_0 : mxxMat3) (w_232_0 : mxxMat3) (w_233_0 : mxxMat3) (w_234_0 : mxxMat3) (w_235_0 : mxxMat3) (w_235_1 : mxxMat3) (w_235_2 : mxxMat3) (w_235_3 : mxxMat3) (w_236_0 : mxxMat3) (w_242_0 : mxxMat3) (w_248_0 : mxxMat3) (w_254_0 : mxxMat3) (outputs : (generatedRoot.OutputType)) : Prop :=
   MxxRuntime.familyGetStatic w_157_11 (0) w_218_0 ∧
   MxxRuntime.familyGetStatic w_157_11 (1) w_219_0 ∧
   0 ≤ (13) ∧
@@ -15967,7 +16072,7 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   w_1_0 < 2 ∧
   2 = 2
 
-abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 2 → Int) × ByteArray × (Fin 512 → Int) × Unit) (outputs : mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 2 → Int) × ByteArray × (Fin 512 → Int) × Unit) (outputs : (generatedRoot.OutputType)) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : Fin 2 → Int := inputs.1
@@ -16380,7 +16485,7 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
     generatedRoot.constraints_8 backend hashModel tape path params w_154_6 w_154_7 w_154_8 w_154_9 w_155_8 w_155_9 w_155_10 w_155_11 w_156_8 w_156_9 w_156_10 w_156_11 w_157_8 w_157_9 w_157_10 w_169_0 w_172_0 w_173_0 w_174_0 w_175_0 w_176_0 w_177_0 w_178_0 w_179_0 w_179_1 w_179_2 w_179_3 w_181_0 w_182_0 w_183_0 w_184_0 w_185_0 w_186_0 w_187_0 w_188_0 w_189_0 w_190_0 w_191_0 w_192_0 w_193_0 w_193_1 w_193_2 w_193_3 w_195_0 w_196_0 w_197_0 w_198_0 w_199_0 w_200_0 w_201_0 w_202_0 w_203_0 w_204_0 w_205_0 w_206_0 w_207_0 w_207_1 w_207_2 w_207_3 w_209_0 w_210_0 w_212_0 w_213_0 w_215_0 w_216_0 ∧
     generatedRoot.constraints_9 backend hashModel tape path params w_17_0 w_20_0 w_23_0 w_26_0 w_30_0 w_30_1 w_31_0 w_31_1 w_31_2 w_31_3 w_31_4 w_31_5 w_31_6 w_31_7 w_32_0 w_32_1 w_32_2 w_32_3 w_32_4 w_32_5 w_32_6 w_32_7 w_33_0 w_33_1 w_33_2 w_33_3 w_33_4 w_33_5 w_33_6 w_33_7 w_34_0 w_34_1 w_34_2 w_34_3 w_34_4 w_34_5 w_34_6 w_34_7 w_112_0 w_118_0 w_124_0 w_130_0 w_142_0 w_145_0 w_148_0 w_151_0 w_154_0 w_154_1 w_155_0 w_155_1 w_155_2 w_155_3 w_155_4 w_155_5 w_155_6 w_155_7 w_156_0 w_156_1 w_156_2 w_156_3 w_156_4 w_156_5 w_156_6 w_156_7 w_157_0 w_157_1 w_157_2 w_157_3 w_157_4 w_157_5 w_157_6 w_157_7 w_157_8 w_157_9 w_157_10 w_157_11 w_158_0 w_158_1 w_158_2 w_158_3 w_158_4 w_158_5 w_158_6 w_158_7 w_158_8 w_158_9 w_158_10 w_158_11 w_211_0 w_214_0 w_217_0 w_218_0 w_219_0 w_220_0 w_221_0 w_221_1 w_221_2 w_221_3 w_223_0 w_224_0 w_225_0 w_226_0 w_227_0 w_228_0 w_229_0 w_230_0 w_231_0 w_232_0 w_233_0 w_234_0 w_235_0 w_235_1 w_235_2 w_235_3 w_236_0 w_242_0 w_248_0 w_254_0 outputs
 
-def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 2 → Int) × ByteArray × (Fin 512 → Int) × Unit) (outputs : mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × (Fin 15 → mxxMat0) × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit) : Prop :=
+def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (Fin 2 → Int) × ByteArray × (Fin 512 → Int) × Unit) (outputs : (generatedRoot.OutputType)) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body backend hashModel tape path params inputs outputs witness
 

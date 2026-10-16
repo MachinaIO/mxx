@@ -18,7 +18,7 @@ set_option maxHeartbeats 8000000 in
 theorem keyInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray}
     {U : Fin 2 → ExactMatrix Q N 30 1} {a j : Nat} (ha : a < 30) (_hj : j < 60) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_sequential_generatedRoot_11_11 Backend.backend model tape path
+    (h : Stage_preprocess.scope_120 Backend.backend model tape path
       params a j (s.1, s.2.1, key, U 0, U 1, ()) t) :
     t.1 = s.1 + (expand (rhsCompKey model key 0 j (30 + a) 0 0) * U 0 +
         expand (rhsCompKey model key 0 j (30 + a) 0 1) * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
@@ -49,7 +49,7 @@ theorem keyInner {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 30) (a : Fin 30) {final : KeyRows}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyRows) ↦
-      Stage_preprocess.sequential_sequential_generatedRoot_11_11 Backend.backend model tape
+      Stage_preprocess.scope_120 Backend.backend model tape
         (path ++ [11, i]) params a i
         (current.1, (current.2.1, (key, (keyDigits A ⟨30 + a, by omega⟩ 0,
           (keyDigits A ⟨30 + a, by omega⟩ 1, ()))))) next) (Int.toNat 60) (0, (0, ())) final)
@@ -58,7 +58,7 @@ theorem keyInner {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hcount : Int.toNat 60 = 60 := rfl
   rw [hcount] at h
   have hk := fun (proj : KeyRows → ExactMatrix Q N 1 60) (r : Fin 2)
-      (hp : ∀ i s t (hi : i < 60), Stage_preprocess.sequential_sequential_generatedRoot_11_11 Backend.backend
+      (hp : ∀ i s t (hi : i < 60), Stage_preprocess.scope_120 Backend.backend
         model tape (path ++ [11, i]) params a i (s.1, (s.2.1, (key, (keyDigits A ⟨30 + a, by omega⟩ 0,
           (keyDigits A ⟨30 + a, by omega⟩ 1, ()))))) t →
         ∀ w, proj t 0 w = proj s 0 w + keyCompanionSum model key 0 A r ⟨i, hi⟩ a *
@@ -165,7 +165,7 @@ set_option maxHeartbeats 8000000 in
 theorem topInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {i0 : Nat} {A0 A1 : ExactMatrix Q N 1 60} {D : ExactMatrix Q N 30 60}
     {i : Nat} (hi : i < 30) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_sequential_generatedRoot_10_12 Backend.backend model tape path
+    (h : Stage_preprocess.scope_119 Backend.backend model tape path
       params i0 i (s.1, s.2.1, A0, D, A1, ()) t) (w : Fin 60) :
     t.1 0 w = s.1 0 w + A0 0 ⟨i, by omega⟩ * D ⟨i, hi⟩ w ∧
       t.2.1 0 w = s.2.1 0 w + A1 0 ⟨i, by omega⟩ * D ⟨i, hi⟩ w := by
@@ -221,7 +221,7 @@ theorem topStep {model : HashModel} {tape : SampleTape} {path : List Nat}
   rw [hcount] at hin
   set D := rowDigits (joinRow ![rhsTop model key 0 0, rhsTop model key 0 1]) with hD
   have hacc := fun (proj : KeyRows → ExactMatrix Q N 1 60) (X : ExactMatrix Q N 1 60)
-      (hp : ∀ j (x y : KeyRows) (hj : j < 30), Stage_preprocess.sequential_sequential_generatedRoot_10_12
+      (hp : ∀ j (x y : KeyRows) (hj : j < 30), Stage_preprocess.scope_119
         Backend.backend model tape (path ++ [12, j]) params 0 j (x.1, (x.2.1, (A0, (D, (A1, ()))))) y →
         proj y 0 w = proj x 0 w + X 0 ⟨j, by omega⟩ * D ⟨j, hj⟩ w) ↦
     IterRuns.accumulate (fun x : KeyRows ↦ proj x 0 w)

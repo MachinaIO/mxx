@@ -106,8 +106,8 @@ theorem keygen_anchors {model : HashModel} {tape : SampleTape} {path : List Nat}
   · exact absurd (kind.symm.trans imported.1) (by decide)
 
 theorem family_sum {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_keygen.Params} {family : Fin 256 → ExactMatrix Q N 256 1}
-    {first second final : ExactMatrix Q N 256 1}
+    {params : Stage_keygen.Params} {family : Fin 256 → ExactMatrix Q N 1 256}
+    {first second final : ExactMatrix Q N 1 256}
     (first_get : familyGetStatic family 0 first) (second_get : familyGetStatic family 1 second)
     (loop : MxxIR.IterRuns (fun index current next ↦
       Stage_keygen.sequential_generatedRoot_18 Backend.backend model tape (path ++ [18, index])
@@ -129,7 +129,6 @@ theorem family_sum {model : HashModel} {tape : SampleTape} {path : List Nat}
   rw [sum]
   rw [Fin.sum_univ_succ (f := family)]
   rw [Fin.sum_univ_succ (f := fun index : Fin 255 ↦ family index.succ)]
-  simp only [Fin.succ_mk, Fin.val_zero, Nat.zero_add]
   abel
 
 set_option maxHeartbeats 16000000 in
@@ -137,7 +136,7 @@ theorem keygen_helper_sum {model : HashModel} {tape : SampleTape} {path : List N
     {ctx : Stage_keygen.generatedRoot.Ctx Backend.backend model tape path GeneratedClaim.stage_7_params}
     {outputs : KeygenOutputs} (facts : Stage_keygen.generatedRoot.Facts ctx outputs)
     (target : Fin 256) :
-    Stage_keygen.generatedRoot.w_18_0 ctx target 0 =
+    Stage_keygen.generatedRoot.w_18_0 ctx 0 target =
       (∑ lane : Fin 45, helperTerm model (Stage_keygen.generatedRoot.w_2_0 ctx)
         (packedHelpers (Stage_keygen.generatedRoot.w_10_0 ctx)) target lane) 0 0 := by
   have gadget := gadgetMatrixRuns_unique facts.c0.h11_0 g0_runs
@@ -208,9 +207,9 @@ theorem keygen_targets {model : HashModel} {tape : SampleTape} {path : List Nat}
   have target_eq := routing_slotInv bound target_run
   rw [output, target_eq]
   congr 1
-  have selected_eq : selected 0 0 = Stage_keygen.generatedRoot.w_18_0 ctx ⟨row, bound⟩ 0 :=
-    slice_run.2.2.2.2.2.2.2.2 0 0 (by simpa using bound) (by norm_num)
-  have helpers_eq : Stage_keygen.generatedRoot.w_18_0 ctx ⟨row, bound⟩ 0 =
+  have selected_eq : selected 0 0 = Stage_keygen.generatedRoot.w_18_0 ctx 0 ⟨row, bound⟩ :=
+    slice_run.2.2.2.2.2.2.2.2 0 0 (by norm_num) (by simpa using bound)
+  have helpers_eq : Stage_keygen.generatedRoot.w_18_0 ctx 0 ⟨row, bound⟩ =
       (∑ lane : Fin 45, helperTerm model key (packedHelpers helpers) ⟨row, bound⟩ lane) 0 0 :=
     keygen_helper_sum facts ⟨row, bound⟩
   funext entry column
@@ -219,10 +218,10 @@ theorem keygen_targets {model : HashModel} {tape : SampleTape} {path : List Nat}
     (MxxIR.selectInt (Int.ofNat row) deltaList)) (Stage_keygen.generatedRoot.w_9_0 ctx))
     (matrixAdd selected (Stage_keygen.generatedRoot.w_26_2 ctx ⟨row, bound⟩))) 0 0 = _
   rw [deltaList_eq row bound, y, residual_eq]
-  simp only [matrixSub, matrixAdd, matrixMul, matrixMulScalarLeft, matrixMulScalarRight,
+  simp only [matrixSub, matrixAdd, matrixMul, matrixMulScalarLeft,
     liftInteger, Matrix.add_apply, Matrix.sub_apply, Matrix.one_apply_eq, one_mul,
     route_eq, ← compact_eq, ← identity_eq, selected_eq, helpers_eq, slotResidual]
   by_cases equal : row = 0 <;> simp only [equal, if_true, if_false, Int.cast_one, Int.cast_zero,
-    one_mul, zero_mul, Matrix.sub_apply, Matrix.add_apply, Matrix.zero_apply] <;> abel
+    one_mul, zero_mul, Matrix.sub_apply, Matrix.zero_apply] <;> abel
 
 end PeProof

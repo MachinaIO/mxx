@@ -295,8 +295,6 @@ set_option genSizeOf false in
 structure generatedRoot.Witness where
   w_5_0 : Fin 54000 → mxxMat3
   w_5_1 : Fin 54000 → mxxMat3
-  w_6_0 : Fin 45 → mxxMat4
-  w_6_1 : Fin 45 → mxxMat4
   w_7_0 : mxxMat4
   w_9_0 : mxxMat4
   w_12_0 : mxxMat4
@@ -312,7 +310,6 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   (54000) = 54000 ∧
   (∀ i : Fin 54000, parallel_generatedRoot_5 backend hashModel tape (path ++ [5, i.val]) params i (w_0_0, (w_1_0, (w_2_0, (w_3_0, (w_4_0, ()))))) ((w_5_0 i), ((w_5_1 i), ()))) ∧
   (45) = 45 ∧
-  (∀ i : Fin 45, parallel_generatedRoot_6 backend hashModel tape (path ++ [6, i.val]) params i ((w_3_0 i), ((w_4_0 i), ())) ((w_6_0 i), ((w_6_1 i), ()))) ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [105, 110, 112, 117, 116, 45, 107, 101, 121], .u64Le (0), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (0)]) (w_1_0) w_7_0 ∧
   MxxRuntime.hashSample (hashModel) ([114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]) ([.bytes [55, 51, 50, 48, 54, 98, 48, 49, 52, 57, 53, 52, 99, 53, 53, 100, 101, 48, 99, 53, 52, 55, 54, 57, 100, 102, 98, 56, 50, 52, 51, 53, 98, 52, 101, 54, 100, 98, 100, 55, 49, 50, 53, 102, 54, 50, 53, 53, 50, 52, 50, 56, 53, 52, 49, 102, 102, 51, 50, 57, 48, 49, 51, 52], .bytes [105, 110, 112, 117, 116, 45, 107, 101, 121], .u64Le (0), .bytes [99, 111, 109, 112, 111, 110, 101, 110, 116], .u64Le (2)]) (w_1_0) w_9_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_12_0 ∧
@@ -339,8 +336,8 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   let w_2_0 : mxxMat1 := (1 : mxxMat1)
   let w_5_0 := witness.w_5_0
   let w_5_1 := witness.w_5_1
-  let w_6_0 := witness.w_6_0
-  let w_6_1 := witness.w_6_1
+  let w_6_0 : Fin 45 → mxxMat4 := w_3_0
+  let w_6_1 : Fin 45 → mxxMat4 := w_4_0
   let w_7_0 := witness.w_7_0
   let w_8_0 : mxxMat4 := MxxRuntime.matrixMulScalarLeft w_0_0 w_7_0
   let w_9_0 := witness.w_9_0

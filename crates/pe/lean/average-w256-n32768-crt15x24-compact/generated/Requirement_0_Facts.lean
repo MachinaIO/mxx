@@ -18,94 +18,98 @@ structure generatedRoot.Ctx (tape : MxxRuntime.SampleTape) (path : List Nat) (pa
   inputs : (Fin 2 → Int) × (Fin 512 → Int) × (Fin 2 → Int) × Unit
   witness : generatedRoot.Witness
 
-def generatedRoot.w_1_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Fin 2 → Int :=
+section
+variable {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params}
+local notation "generatedRootCtx" => (generatedRoot.Ctx tape path params)
+
+def generatedRoot.w_1_0  (ctx : generatedRootCtx) : Fin 2 → Int :=
   ctx.inputs.1
 
-def generatedRoot.w_5_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Fin 512 → Int :=
+def generatedRoot.w_5_0  (ctx : generatedRootCtx) : Fin 512 → Int :=
   ctx.inputs.2.1
 
-def generatedRoot.w_20_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Fin 2 → Int :=
+def generatedRoot.w_20_0  (ctx : generatedRootCtx) : Fin 2 → Int :=
   ctx.inputs.2.2.1
 
-def generatedRoot.w_0_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_0_0  (ctx : generatedRootCtx) : Bool :=
   true
 
-def generatedRoot.w_2_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_2_0  (ctx : generatedRootCtx) : Bool :=
   ctx.witness.w_2_0
 
-def generatedRoot.w_3_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_3_0  (ctx : generatedRootCtx) : Int :=
   if (generatedRoot.w_2_0 ctx) then 1 else 0
 
-def generatedRoot.w_4_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_4_0  (ctx : generatedRootCtx) : Bool :=
   true
 
-def generatedRoot.w_6_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_6_0  (ctx : generatedRootCtx) : Bool :=
   ctx.witness.w_6_0
 
-def generatedRoot.w_7_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_7_0  (ctx : generatedRootCtx) : Int :=
   if (generatedRoot.w_6_0 ctx) then 1 else 0
 
-def generatedRoot.w_8_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_8_0  (ctx : generatedRootCtx) : Int :=
   ((generatedRoot.w_3_0 ctx) + (generatedRoot.w_7_0 ctx))
 
-def generatedRoot.w_9_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_9_0  (ctx : generatedRootCtx) : Int :=
   2
 
-def generatedRoot.w_10_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_10_0  (ctx : generatedRootCtx) : Bool :=
   decide ((generatedRoot.w_8_0 ctx) = (generatedRoot.w_9_0 ctx))
 
-def generatedRoot.w_11_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_11_0  (ctx : generatedRootCtx) : Int :=
   if (generatedRoot.w_10_0 ctx) then 1 else 0
 
-def generatedRoot.w_12_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_12_0  (ctx : generatedRootCtx) : Bool :=
   true
 
-def generatedRoot.w_13_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_13_0  (ctx : generatedRootCtx) : Bool :=
   ctx.witness.w_13_0
 
-def generatedRoot.w_14_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_14_0  (ctx : generatedRootCtx) : Int :=
   if (generatedRoot.w_13_0 ctx) then 1 else 0
 
-def generatedRoot.w_15_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_15_0  (ctx : generatedRootCtx) : Int :=
   ((generatedRoot.w_11_0 ctx) + (generatedRoot.w_14_0 ctx))
 
-def generatedRoot.w_16_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_16_0  (ctx : generatedRootCtx) : Int :=
   2
 
-def generatedRoot.w_17_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_17_0  (ctx : generatedRootCtx) : Bool :=
   decide ((generatedRoot.w_15_0 ctx) = (generatedRoot.w_16_0 ctx))
 
-def generatedRoot.w_18_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_18_0  (ctx : generatedRootCtx) : Int :=
   if (generatedRoot.w_17_0 ctx) then 1 else 0
 
-def generatedRoot.w_19_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_19_0  (ctx : generatedRootCtx) : Int :=
   0
 
-def generatedRoot.w_21_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_21_0  (ctx : generatedRootCtx) : Int :=
   ctx.witness.w_21_0
 
-def generatedRoot.w_22_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_22_0  (ctx : generatedRootCtx) : Int :=
   0
 
-def generatedRoot.w_23_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_23_0  (ctx : generatedRootCtx) : Bool :=
   decide ((generatedRoot.w_21_0 ctx) = (generatedRoot.w_22_0 ctx))
 
-def generatedRoot.w_24_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_24_0  (ctx : generatedRootCtx) : Int :=
   if (generatedRoot.w_23_0 ctx) then 1 else 0
 
-def generatedRoot.w_25_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_25_0  (ctx : generatedRootCtx) : Int :=
   ((generatedRoot.w_18_0 ctx) + (generatedRoot.w_24_0 ctx))
 
-def generatedRoot.w_26_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Int :=
+def generatedRoot.w_26_0  (ctx : generatedRootCtx) : Int :=
   2
 
-def generatedRoot.w_27_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.w_27_0  (ctx : generatedRootCtx) : Bool :=
   decide ((generatedRoot.w_25_0 ctx) = (generatedRoot.w_26_0 ctx))
 
-def generatedRoot.outs {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : Bool :=
+def generatedRoot.outs  (ctx : generatedRootCtx) : Bool :=
   (generatedRoot.w_27_0 ctx)
 
-structure generatedRoot.Facts_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) (outputs : Bool) : Prop where
+structure generatedRoot.Facts_0  (ctx : generatedRootCtx) (outputs : Bool) : Prop where
   t0 : 0 ≤ (2)
   h2_0 : MxxIR.IterRuns (fun (i : Nat) (current next : Bool) => sequential_generatedRoot_2 tape (path ++ [2, i]) params i (current, ((generatedRoot.w_1_0 ctx), ())) next) (Int.toNat (2)) (generatedRoot.w_0_0 ctx) (generatedRoot.w_2_0 ctx)
   t2 : 0 ≤ (256)
@@ -116,20 +120,22 @@ structure generatedRoot.Facts_0 {tape : MxxRuntime.SampleTape} {path : List Nat}
   h21_0 : MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_21 tape (path ++ [21, i]) params i (current, ((generatedRoot.w_5_0 ctx), ((generatedRoot.w_1_0 ctx), ((generatedRoot.w_20_0 ctx), ())))) next) (Int.toNat (2)) (generatedRoot.w_19_0 ctx) (generatedRoot.w_21_0 ctx)
   hout : outputs = generatedRoot.outs ctx
 
-theorem generatedRoot.facts_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} {ctx : generatedRoot.Ctx tape path params} {outputs : Bool}
+theorem generatedRoot.facts_0  {ctx : generatedRootCtx} {outputs : Bool}
     (h : generatedRoot.constraints_0 tape path params (generatedRoot.w_1_0 ctx) (generatedRoot.w_5_0 ctx) (generatedRoot.w_20_0 ctx) (generatedRoot.w_0_0 ctx) (generatedRoot.w_2_0 ctx) (generatedRoot.w_4_0 ctx) (generatedRoot.w_6_0 ctx) (generatedRoot.w_12_0 ctx) (generatedRoot.w_13_0 ctx) (generatedRoot.w_19_0 ctx) (generatedRoot.w_21_0 ctx) (generatedRoot.w_27_0 ctx) outputs) :
     generatedRoot.Facts_0 ctx outputs :=
   ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2⟩
 
-structure generatedRoot.Facts {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) (outputs : Bool) : Prop where
+structure generatedRoot.Facts  (ctx : generatedRootCtx) (outputs : Bool) : Prop where
   c0 : generatedRoot.Facts_0 ctx outputs
 
-theorem generatedRoot.facts {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) {outputs : Bool}
+theorem generatedRoot.facts  (ctx : generatedRootCtx) {outputs : Bool}
     (h : generatedRoot.body tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
   have t0 := h
   have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
   ⟨r0⟩
+
+end
 
 end Requirement_0
 

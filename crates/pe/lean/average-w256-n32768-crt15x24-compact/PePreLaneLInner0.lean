@@ -30,7 +30,7 @@ theorem row_zero (slot : Fin 4) (r : Fin 2) :
 theorem innerStep {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray} {m a j : Nat} (hm : m < 15)
     {U : Fin 4 → Fin 2 → ExactMatrix Q N 30 1} {s t : Rows}
-    (h : Stage_preprocess.sequential_sequential_parallel_generatedRoot_31_37_41
+    (h : Stage_preprocess.scope_128
       Backend.backend model tape path params m a j (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, s.2.2.2.2.2.2.1, s.2.2.2.2.2.2.2.1, key, U 0 0, U 0 1, U 1 0, U 1 1, U 2 0, U 2 1, U 3 0, U 3 1, ()) t) :
     ∀ slot r, row t slot r = row s slot r +
       (expand (lutCompKey model key (kSw (15 + m)) (j : Int) ((30 + a : Nat) : Int) r 0) * U slot 0 +

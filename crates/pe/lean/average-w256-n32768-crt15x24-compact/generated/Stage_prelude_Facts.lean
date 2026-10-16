@@ -24,91 +24,95 @@ structure generatedRoot.Ctx (backend : MxxRuntime.BackendContext) (hashModel : M
   inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat1 × (Fin 32768 → Int) × Unit
   witness : generatedRoot.Witness
 
-def generatedRoot.w_0_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+section
+variable {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params}
+local notation "generatedRootCtx" => (generatedRoot.Ctx backend hashModel tape path params)
+
+def generatedRoot.w_0_0  (ctx : generatedRootCtx) : mxxMat0 :=
   ctx.inputs.1
 
-def generatedRoot.w_1_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : ByteArray :=
+def generatedRoot.w_1_0  (ctx : generatedRootCtx) : ByteArray :=
   ctx.inputs.2.1
 
-def generatedRoot.w_5_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : Fin 2 → Int :=
+def generatedRoot.w_5_0  (ctx : generatedRootCtx) : Fin 2 → Int :=
   ctx.inputs.2.2.1
 
-def generatedRoot.w_8_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat1 :=
+def generatedRoot.w_8_0  (ctx : generatedRootCtx) : mxxMat1 :=
   ctx.inputs.2.2.2.1
 
-def generatedRoot.w_21_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : Fin 32768 → Int :=
+def generatedRoot.w_21_0  (ctx : generatedRootCtx) : Fin 32768 → Int :=
   ctx.inputs.2.2.2.2.1
 
-def generatedRoot.w_2_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_2_0  (ctx : generatedRootCtx) : mxxMat0 :=
   (1 : mxxMat0)
 
-def generatedRoot.w_3_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat2 :=
+def generatedRoot.w_3_0  (ctx : generatedRootCtx) : mxxMat2 :=
   ctx.witness.w_3_0
 
-def generatedRoot.w_4_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : Fin 45 → mxxMat2 :=
+def generatedRoot.w_4_0  (ctx : generatedRootCtx) : Fin 45 → mxxMat2 :=
   ctx.witness.w_4_0
 
-def generatedRoot.w_4_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : Fin 45 → mxxMat2 :=
+def generatedRoot.w_4_1  (ctx : generatedRootCtx) : Fin 45 → mxxMat2 :=
   ctx.witness.w_4_1
 
-def generatedRoot.w_6_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : Fin 2 → mxxMat2 :=
+def generatedRoot.w_6_0  (ctx : generatedRootCtx) : Fin 2 → mxxMat2 :=
   ctx.witness.w_6_0
 
-def generatedRoot.w_6_1 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : Fin 2 → mxxMat2 :=
+def generatedRoot.w_6_1  (ctx : generatedRootCtx) : Fin 2 → mxxMat2 :=
   ctx.witness.w_6_1
 
-def generatedRoot.w_7_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat3 :=
+def generatedRoot.w_7_0  (ctx : generatedRootCtx) : mxxMat3 :=
   ctx.witness.w_7_0
 
-def generatedRoot.w_9_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat1 :=
+def generatedRoot.w_9_0  (ctx : generatedRootCtx) : mxxMat1 :=
   MxxRuntime.matrixMulScalarLeft (generatedRoot.w_7_0 ctx) (generatedRoot.w_8_0 ctx)
 
-def generatedRoot.w_10_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat1 :=
+def generatedRoot.w_10_0  (ctx : generatedRootCtx) : mxxMat1 :=
   ctx.witness.w_10_0
 
-def generatedRoot.w_11_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat1 :=
+def generatedRoot.w_11_0  (ctx : generatedRootCtx) : mxxMat1 :=
   MxxRuntime.matrixAdd (generatedRoot.w_9_0 ctx) (generatedRoot.w_10_0 ctx)
 
-def generatedRoot.w_12_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat1 :=
+def generatedRoot.w_12_0  (ctx : generatedRootCtx) : mxxMat1 :=
   ctx.witness.w_12_0
 
-def generatedRoot.w_13_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat1 :=
+def generatedRoot.w_13_0  (ctx : generatedRootCtx) : mxxMat1 :=
   MxxRuntime.matrixAdd (generatedRoot.w_11_0 ctx) (generatedRoot.w_12_0 ctx)
 
-def generatedRoot.w_14_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_14_0  (ctx : generatedRootCtx) : mxxMat0 :=
   ctx.witness.w_14_0
 
-def generatedRoot.w_15_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_15_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixMulScalarLeft (generatedRoot.w_0_0 ctx) (generatedRoot.w_14_0 ctx)
 
-def generatedRoot.w_16_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_16_0  (ctx : generatedRootCtx) : mxxMat0 :=
   ctx.witness.w_16_0
 
-def generatedRoot.w_17_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_17_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixAdd (generatedRoot.w_15_0 ctx) (generatedRoot.w_16_0 ctx)
 
-def generatedRoot.w_18_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_18_0  (ctx : generatedRootCtx) : mxxMat0 :=
   ctx.witness.w_18_0
 
-def generatedRoot.w_19_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_19_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixAdd (generatedRoot.w_17_0 ctx) (generatedRoot.w_18_0 ctx)
 
-def generatedRoot.w_20_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_20_0  (ctx : generatedRootCtx) : mxxMat0 :=
   (MxxRuntime.matrixPolynomial [(mxxNat0)] : mxxMat0)
 
-def generatedRoot.w_22_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_22_0  (ctx : generatedRootCtx) : mxxMat0 :=
   ctx.witness.w_22_0
 
-def generatedRoot.w_23_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_23_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixMulScalarLeft (generatedRoot.w_20_0 ctx) (generatedRoot.w_22_0 ctx)
 
-def generatedRoot.w_24_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : mxxMat0 :=
+def generatedRoot.w_24_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixAdd (generatedRoot.w_19_0 ctx) (generatedRoot.w_23_0 ctx)
 
-def generatedRoot.outs {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit :=
+def generatedRoot.outs  (ctx : generatedRootCtx) : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit :=
   ((generatedRoot.w_4_0 ctx), ((generatedRoot.w_4_1 ctx), ((generatedRoot.w_6_0 ctx), ((generatedRoot.w_6_1 ctx), ((generatedRoot.w_13_0 ctx), ((generatedRoot.w_24_0 ctx), ()))))))
 
-structure generatedRoot.Facts_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) (outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit) : Prop where
+structure generatedRoot.Facts_0  (ctx : generatedRootCtx) (outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit) : Prop where
   h3_0 : MxxRuntime.gadgetMatrixRuns backend 4096 30 (generatedRoot.w_3_0 ctx)
   t1 : (45) = 45
   h4_1 : (∀ i : Fin 45, parallel_generatedRoot_4 backend hashModel tape (path ++ [4, i.val]) params i ((generatedRoot.w_0_0 ctx), ((generatedRoot.w_1_0 ctx), ((generatedRoot.w_2_0 ctx), ((generatedRoot.w_3_0 ctx), ())))) (((generatedRoot.w_4_0 ctx) i), (((generatedRoot.w_4_1 ctx) i), ())))
@@ -123,20 +127,22 @@ structure generatedRoot.Facts_0 {backend : MxxRuntime.BackendContext} {hashModel
   h22_0 : MxxRuntime.polynomialFromValues false (generatedRoot.w_21_0 ctx) (generatedRoot.w_22_0 ctx)
   hout : outputs = generatedRoot.outs ctx
 
-theorem generatedRoot.facts_0 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} {ctx : generatedRoot.Ctx backend hashModel tape path params} {outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit}
+theorem generatedRoot.facts_0  {ctx : generatedRootCtx} {outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit}
     (h : generatedRoot.constraints_0 backend hashModel tape path params (generatedRoot.w_0_0 ctx) (generatedRoot.w_1_0 ctx) (generatedRoot.w_5_0 ctx) (generatedRoot.w_21_0 ctx) (generatedRoot.w_2_0 ctx) (generatedRoot.w_3_0 ctx) (generatedRoot.w_4_0 ctx) (generatedRoot.w_4_1 ctx) (generatedRoot.w_6_0 ctx) (generatedRoot.w_6_1 ctx) (generatedRoot.w_7_0 ctx) (generatedRoot.w_10_0 ctx) (generatedRoot.w_12_0 ctx) (generatedRoot.w_13_0 ctx) (generatedRoot.w_14_0 ctx) (generatedRoot.w_16_0 ctx) (generatedRoot.w_18_0 ctx) (generatedRoot.w_22_0 ctx) (generatedRoot.w_24_0 ctx) outputs) :
     generatedRoot.Facts_0 ctx outputs :=
   ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2⟩
 
-structure generatedRoot.Facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) (outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit) : Prop where
+structure generatedRoot.Facts  (ctx : generatedRootCtx) (outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit) : Prop where
   c0 : generatedRoot.Facts_0 ctx outputs
 
-theorem generatedRoot.facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) {outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit}
+theorem generatedRoot.facts  (ctx : generatedRootCtx) {outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit}
     (h : generatedRoot.body backend hashModel tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
   have t0 := h
   have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
   ⟨r0⟩
+
+end
 
 end Stage_prelude
 

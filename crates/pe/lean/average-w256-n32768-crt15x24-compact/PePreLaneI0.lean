@@ -54,7 +54,7 @@ set_option maxHeartbeats 8000000 in
 theorem keyInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray}
     {U : Fin 2 → ExactMatrix Q N 30 1} {b a j : Nat} (hb : b < 30) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_sequential_parallel_generatedRoot_30_12_11 Backend.backend model tape
+    (h : Stage_preprocess.scope_127 Backend.backend model tape
       path params b a j (s.1, s.2.1, key, U 0, U 1, ()) t) :
     t.1 = s.1 + (expand (lutCompKey model key (kSw b) ((j : Nat) : Int) ((30 + a : Nat) : Int) 0 0) * U 0 +
         expand (lutCompKey model key (kSw b) ((j : Nat) : Int) ((30 + a : Nat) : Int) 0 1) * U 1) 0 0 •
@@ -89,7 +89,7 @@ theorem keyInner {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 30) {b a : Nat} (hb : b < 30) (ha : a < 30) {init final : KeyRows}
     (h : MxxIR.IterRuns (fun (j : Nat) (current next : KeyRows) ↦
-      Stage_preprocess.sequential_sequential_parallel_generatedRoot_30_12_11 Backend.backend model tape
+      Stage_preprocess.scope_127 Backend.backend model tape
         (path ++ [11, j]) params b a j
         (current.1, (current.2.1, (key,
           (keyDigits (routedKey (kSw b) (kSw_odd ⟨b, hb⟩) A) ⟨30 + a, by omega⟩ 0,

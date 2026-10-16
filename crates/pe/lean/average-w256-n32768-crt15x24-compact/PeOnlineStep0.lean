@@ -76,7 +76,7 @@ theorem mulInner0_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {a j : Nat} (ha : a < 30) (hj : j < 60) {s t : MulBlock}
     (hs : s.2.1 = expand (zc0 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)) ∧
       s.2.2.1 = expand (zc1 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)))
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_31_26 Backend.backend model tape path
+    (h : Stage_online_eval.scope_76 Backend.backend model tape path
       params a j (s.1, s.2.1, s.2.2.1, U 0, U 1, zc0, ((x : Nat) : Int), zc1, ()) t) :
     t.1 = s.1 + (expand (zc0 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)) * U 0 +
         expand (zc1 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)) * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
@@ -109,7 +109,7 @@ theorem mulInner0 {model : HashModel} {tape : SampleTape} {path : List Nat}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 30) {zc0 zc1 : Fin 3600 → ExactMatrix PQ N 1 1}
     (x : Fin 2) (a : Fin 30) {final : MulBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_31_26 Backend.backend model tape
+      Stage_online_eval.scope_76 Backend.backend model tape
         (path ++ [26, i]) params a i
         (current.1, (current.2.1, (current.2.2.1, (keyDigits A ⟨30 + a, by omega⟩ 0,
           (keyDigits A ⟨30 + a, by omega⟩ 1, (zc0, (((x : Nat) : Int), (zc1, ())))))))) next)
@@ -125,7 +125,7 @@ theorem mulInner0 {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hInv0 : Inv 0 (0, (expand (zc0 (mulIndex x a 0)), (expand (zc1 (mulIndex x a 0)), ()))) :=
     ⟨congrArg z0 (by simp [mulIndex]), congrArg z1 (by simp [mulIndex])⟩
   have hstep : ∀ i (s t : MulBlock) (hi : i < 60), Inv i s →
-      Stage_online_eval.sequential_sequential_generatedRoot_31_26 Backend.backend model tape
+      Stage_online_eval.scope_76 Backend.backend model tape
         (path ++ [26, i]) params a i
         (s.1, (s.2.1, (s.2.2.1, (keyDigits A ⟨30 + a, by omega⟩ 0, (keyDigits A ⟨30 + a, by omega⟩ 1,
           (zc0, (((x : Nat) : Int), (zc1, ())))))))) t →
@@ -368,7 +368,7 @@ theorem lutInner56_step {model : HashModel} {tape : SampleTape} {path : List Nat
     {b a j : Nat} (hb : b < 30) (ha : a < 30) (hj : j < 60) {s t : MulBlock}
     (hs : s.2.1 = expand (zc0 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)) ∧
       s.2.2.1 = expand (zc1 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)))
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+    (h : Stage_online_eval.scope_78 Backend.backend model tape
       path params b a j (s.1, (s.2.1, (s.2.2.1, (U 0, (U 1, (zc0, (zc1, ()))))))) t) :
     t.1 = s.1 + (expand (zc0 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)) * U 0 +
         expand (zc1 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)) * U 1) 0 0 •
@@ -403,7 +403,7 @@ theorem lutInner56 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 30)
     {zc0 zc1 : Fin 54000 → ExactMatrix PQ N 1 1} {b a : Nat} (hb : b < 30) (ha : a < 30) {start : ExactMatrix Q N 1 60} {final : MulBlock}
     (h : MxxIR.IterRuns (fun (j : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+      Stage_online_eval.scope_78 Backend.backend model tape
         (path ++ [21, j]) params b a j
         (current.1, (current.2.1, (current.2.2.1,
           (keyDigits (routedKey (kSw b) (kSw_odd ⟨b, hb⟩) A) ⟨30 + a, by omega⟩ 0,
@@ -423,7 +423,7 @@ theorem lutInner56 {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hInv0 : Inv 0 (start, (expand (zc0 (lutIndex bb aa 0)), (expand (zc1 (lutIndex bb aa 0)), ()))) :=
     ⟨congrArg z0 (by simp [lutIndex]), congrArg z1 (by simp [lutIndex])⟩
   have hstep : ∀ j (s t : MulBlock) (hj : j < 60), Inv j s →
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+      Stage_online_eval.scope_78 Backend.backend model tape
         (path ++ [21, j]) params b a j
         (s.1, (s.2.1, (s.2.2.1,
           (keyDigits (routedKey (kSw b) (kSw_odd bb) A) ⟨30 + a, by omega⟩ 0,
@@ -861,7 +861,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol0_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_43_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_80 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -882,7 +882,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol0_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_43_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_81 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -903,7 +903,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef0 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_43_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_82 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 0 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -1099,7 +1099,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol1_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_50_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_83 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1120,7 +1120,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol1_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_50_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_84 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1141,7 +1141,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef1 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_50_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_85 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 1 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -1337,7 +1337,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol2_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_55_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_86 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1358,7 +1358,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol2_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_55_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_87 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1379,7 +1379,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef2 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_55_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_88 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 2 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -1575,7 +1575,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol3_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_60_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_89 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1596,7 +1596,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol3_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_60_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_90 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1617,7 +1617,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef3 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_60_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_91 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 3 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -1893,9 +1893,9 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
     {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 15)
     {U : Fin 4 → Fin 2 → ExactMatrix Q N 30 1}
     {zc0 zc1 : Fin 54000 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_39_48 Backend.backend
+    (h : Stage_online_eval.scope_79 Backend.backend
       model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+    Stage_online_eval.scope_78 Backend.backend model tape
       targetPath params (15 + member) a j
       ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
         U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
@@ -1909,7 +1909,7 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
   rw [xout]
   fin_cases slot <;>
     refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
-    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21.constraints_0]
+    dsimp only [Stage_online_eval.scope_78.constraints_0]
   all_goals simp only [switchMembers_eq (15 + member) hbranch]
   all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
     h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
@@ -1941,15 +1941,15 @@ theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path target
   let digits : Fin 4 → Fin 2 → ExactMatrix Q N 30 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_73_39.w_47_0 ctx]]
   have hin := F.c3.h48_5
   change MxxIR.IterRuns (fun j current next ↦
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_39_48 Backend.backend model tape
+    Stage_online_eval.scope_79 Backend.backend model tape
       (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
   have projected := iterProject (State := SharedBlock) (Target := MulBlock)
     (body := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_73_39_48 Backend.backend model tape
+      Stage_online_eval.scope_79 Backend.backend model tape
         (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
     (fun current ↦ blockProjection current slot)
     (targetBody := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+      Stage_online_eval.scope_78 Backend.backend model tape
         (targetPath ++ [21, j]) params (15 + member) a j
         (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
     (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
@@ -2470,7 +2470,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol4_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_50_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_93 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -2491,7 +2491,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol4_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_50_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_94 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -2512,7 +2512,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef4 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_50_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_95 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 4 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -2708,7 +2708,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol5_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_55_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_96 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -2729,7 +2729,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol5_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_55_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_97 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -2750,7 +2750,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef5 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_55_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_98 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 5 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -2946,7 +2946,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol6_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_60_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_99 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -2967,7 +2967,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol6_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_60_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_100 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -2988,7 +2988,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef6 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_60_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_101 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 6 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -3184,7 +3184,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol7_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_65_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_102 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -3205,7 +3205,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol7_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_65_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_103 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -3226,7 +3226,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef7 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_65_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_104 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 7 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -3502,9 +3502,9 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
     {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 15)
     {U : Fin 4 → Fin 2 → ExactMatrix Q N 30 1}
     {zc0 zc1 : Fin 54000 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_46_48 Backend.backend
+    (h : Stage_online_eval.scope_92 Backend.backend
       model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+    Stage_online_eval.scope_78 Backend.backend model tape
       targetPath params (15 + member) a j
       ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
         U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
@@ -3518,7 +3518,7 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
   rw [xout]
   fin_cases slot <;>
     refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
-    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21.constraints_0]
+    dsimp only [Stage_online_eval.scope_78.constraints_0]
   all_goals simp only [switchMembers_eq (15 + member) hbranch]
   all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
     h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
@@ -3550,15 +3550,15 @@ theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path target
   let digits : Fin 4 → Fin 2 → ExactMatrix Q N 30 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_90_46.w_47_0 ctx]]
   have hin := F.c3.h48_5
   change MxxIR.IterRuns (fun j current next ↦
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_46_48 Backend.backend model tape
+    Stage_online_eval.scope_92 Backend.backend model tape
       (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
   have projected := iterProject (State := SharedBlock) (Target := MulBlock)
     (body := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_90_46_48 Backend.backend model tape
+      Stage_online_eval.scope_92 Backend.backend model tape
         (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
     (fun current ↦ blockProjection current slot)
     (targetBody := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+      Stage_online_eval.scope_78 Backend.backend model tape
         (targetPath ++ [21, j]) params (15 + member) a j
         (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
     (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
@@ -4115,7 +4115,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol8_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_50_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_106 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4136,7 +4136,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol8_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_50_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_107 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4157,7 +4157,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef8 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_50_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_108 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 8 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -4353,7 +4353,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol9_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_55_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_109 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4374,7 +4374,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol9_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_55_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_110 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4395,7 +4395,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef9 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_55_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_111 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 9 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -4591,7 +4591,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol10_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_60_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_112 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4612,7 +4612,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol10_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_60_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_113 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4633,7 +4633,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef10 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_60_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_114 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 10 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -4829,7 +4829,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol11_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_65_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_115 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4850,7 +4850,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol11_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_65_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_116 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -4871,7 +4871,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef11 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_65_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_117 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 11 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -5147,9 +5147,9 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
     {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 15)
     {U : Fin 4 → Fin 2 → ExactMatrix Q N 30 1}
     {zc0 zc1 : Fin 54000 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_46_48 Backend.backend
+    (h : Stage_online_eval.scope_105 Backend.backend
       model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+    Stage_online_eval.scope_78 Backend.backend model tape
       targetPath params (15 + member) a j
       ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
         U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
@@ -5163,7 +5163,7 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
   rw [xout]
   fin_cases slot <;>
     refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
-    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21.constraints_0]
+    dsimp only [Stage_online_eval.scope_78.constraints_0]
   all_goals simp only [switchMembers_eq (15 + member) hbranch]
   all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
     h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
@@ -5195,15 +5195,15 @@ theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path target
   let digits : Fin 4 → Fin 2 → ExactMatrix Q N 30 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_107_46.w_47_0 ctx]]
   have hin := F.c3.h48_5
   change MxxIR.IterRuns (fun j current next ↦
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_46_48 Backend.backend model tape
+    Stage_online_eval.scope_105 Backend.backend model tape
       (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
   have projected := iterProject (State := SharedBlock) (Target := MulBlock)
     (body := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_107_46_48 Backend.backend model tape
+      Stage_online_eval.scope_105 Backend.backend model tape
         (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
     (fun current ↦ blockProjection current slot)
     (targetBody := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+      Stage_online_eval.scope_78 Backend.backend model tape
         (targetPath ++ [21, j]) params (15 + member) a j
         (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
     (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
@@ -5760,7 +5760,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol12_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_50_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_119 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -5781,7 +5781,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol12_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_50_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_120 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -5802,7 +5802,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef12 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_50_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_121 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 12 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -5998,7 +5998,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol13_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_55_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_122 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -6019,7 +6019,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol13_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_55_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_123 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -6040,7 +6040,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef13 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_55_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_124 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 13 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -6236,7 +6236,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol14_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_60_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_125 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -6257,7 +6257,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol14_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_60_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_126 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -6278,7 +6278,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef14 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_60_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_127 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 14 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -6474,7 +6474,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol15_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_65_16 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_128 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -6495,7 +6495,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCol15_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 60} {i : Nat} (hi : i < 60)
     {s t : ExactMatrix Q N 1 60}
-    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_65_42 Backend.backend model tape path params i0 tick i
+    (hb : Stage_online_eval.scope_129 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 60) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -6516,7 +6516,7 @@ set_option maxHeartbeats 4000000 in
 theorem slotCoef15 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 15)
     (hi : i < 256) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_65_51 Backend.backend model tape path
+    (h : Stage_online_eval.scope_130 Backend.backend model tape path
       params b tick i (s, (tables, ())) t) :
     t = s + coefTerm tables 0 (kSlot 15 b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w6, w16, -, -, x6, -, -, -, -, x16, xout⟩ := h
@@ -6792,9 +6792,9 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
     {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 15)
     {U : Fin 4 → Fin 2 → ExactMatrix Q N 30 1}
     {zc0 zc1 : Fin 54000 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
-    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_46_48 Backend.backend
+    (h : Stage_online_eval.scope_118 Backend.backend
       model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+    Stage_online_eval.scope_78 Backend.backend model tape
       targetPath params (15 + member) a j
       ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
         U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
@@ -6808,7 +6808,7 @@ theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path target
   rw [xout]
   fin_cases slot <;>
     refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
-    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21.constraints_0]
+    dsimp only [Stage_online_eval.scope_78.constraints_0]
   all_goals simp only [switchMembers_eq (15 + member) hbranch]
   all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
     h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
@@ -6840,15 +6840,15 @@ theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path target
   let digits : Fin 4 → Fin 2 → ExactMatrix Q N 30 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_124_46.w_47_0 ctx]]
   have hin := F.c3.h48_5
   change MxxIR.IterRuns (fun j current next ↦
-    Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_46_48 Backend.backend model tape
+    Stage_online_eval.scope_118 Backend.backend model tape
       (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
   have projected := iterProject (State := SharedBlock) (Target := MulBlock)
     (body := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_124_46_48 Backend.backend model tape
+      Stage_online_eval.scope_118 Backend.backend model tape
         (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
     (fun current ↦ blockProjection current slot)
     (targetBody := fun j current next ↦
-      Stage_online_eval.sequential_sequential_parallel_generatedRoot_56_54_21 Backend.backend model tape
+      Stage_online_eval.scope_78 Backend.backend model tape
         (targetPath ++ [21, j]) params (15 + member) a j
         (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
     (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)

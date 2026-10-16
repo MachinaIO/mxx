@@ -311,7 +311,7 @@ theorem switch_2 (hm : m < 15) :
 
 theorem coefStep_2 {i : Nat} (hm : m < 15) (hi : i < 256)
     {tables : Fin 512 → Int} {s t : ExactMatrix Q N 1 1}
-    (h : Stage_preprocess.sequential_parallel_generatedRoot_156_108
+    (h : Stage_preprocess.scope_96
       Backend.backend model tape path params m i (s, tables, ()) t) :
     t = s + coefTermC tables 256 (kLeaf2 (5 + 15 * m)) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w_5_0, w_13_0, hbody⟩ := h
@@ -426,7 +426,7 @@ theorem switch_3 (hm : m < 15) :
 
 theorem coefStep_3 {i : Nat} (hm : m < 15) (hi : i < 256)
     {tables : Fin 512 → Int} {s t : ExactMatrix Q N 1 1}
-    (h : Stage_preprocess.sequential_parallel_generatedRoot_156_132
+    (h : Stage_preprocess.scope_98
       Backend.backend model tape path params m i (s, tables, ()) t) :
     t = s + coefTermC tables 256 (kLeaf2 (6 + 15 * m)) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w_5_0, w_13_0, hbody⟩ := h

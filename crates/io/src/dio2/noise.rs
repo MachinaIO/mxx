@@ -8,9 +8,9 @@
 //! decode exactly.
 //!
 //! Production labels are DSL families rather than scalar Program outputs. Noise-only Programs
-//! retain the original scalar balanced trees: the family lowerer preserves their ascending
-//! leaves, two-leaf minimum, multiplication order and odd-node carries exactly. Representative
-//! mode therefore continues to use the same maximal-leaf envelope and full event counts.
+//! retain scalar product chains: the family lowerer ([`super::labels`]) has their ascending
+//! leaves, two-leaf minimum and right-deep multiplication order exactly. Representative mode
+//! therefore uses the same maximal-leaf envelope and full event counts.
 //!
 //! Part `(t, j)` of a refreshing step decodes, for every prime `q` of `Q_0`, at the decoding level
 //! `L` (modulus `Q = Q_0`, `m` digits, `Q_q = Q / q`),
@@ -41,8 +41,9 @@
 //! every decoded coefficient of an evaluation.
 
 use super::{
-    Dio2Error, Dio2Parameters, StreamingFunction, anchor_columns, preimage_bound,
-    refresh::{carrier, smudge_weights},
+    Dio2Error, Dio2Parameters, StreamingFunction, anchor_columns,
+    compose::{carrier, smudge_weights},
+    preimage_bound,
     step::{ChainKeys, ChainProgram, NoiseTargets, StepPlan, Target},
 };
 use mxx_backends::poly::PolyParams;

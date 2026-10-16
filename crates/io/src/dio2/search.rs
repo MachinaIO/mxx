@@ -10,8 +10,8 @@
 //! recommended 100-bit Sparse-LWR row of `crates/exponent-lut/tests/lwr_prf_parameters.csv`
 //! (`nu = 1024`, `h = 31`, `Q = 256`, `P = 32`).
 //! Only the noise search uses representative label targets; all sampler sizes and joint event
-//! counts remain those of the full plan. Production/claim label trees use symbolic DSL families
-//! with the same leaf ordering and balanced-tree noise as the scalar search model.
+//! counts remain those of the full plan. Production/claim label chains use symbolic DSL families
+//! with the same leaf ordering and product order as the scalar search model.
 //!
 //! Settings (`MXX_IO_DIO2_SEARCH_*`): `LOG_N` (list, default `16,17`), `CRT_BITS` (list, default
 //! `60,55,50`), `BASE_BITS` (list of gadget bases, default `CRT_BITS / 2`), `MIN_PRIMES`,

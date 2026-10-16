@@ -1500,7 +1500,13 @@ impl<S: SessionStore> Executor<'_, S> {
         if *validated_count != count as u128 {
             return Err(ExecutionError::MissingMetadata(wire_id));
         }
-        let Some(artifact_type) = ArtifactType::from_wire_type(element) else {
+        // A family of families stays resident: artifacts store matrix-like members only.
+        let Some(artifact_type) = ArtifactType::from_wire_type(element).filter(|artifact_type| {
+            !matches!(
+                artifact_type,
+                ArtifactType::IndexedFamily { .. } | ArtifactType::DependentFamily(_)
+            )
+        }) else {
             return Ok(None);
         };
         let encoded = mxx_ir_core::encoding::canonical_json(&wire_id)

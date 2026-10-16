@@ -776,6 +776,7 @@ impl<'a> PublicKeyLowering<'a> {
             tag.push(sigma.clone());
             tag.push("branch");
             tag.push(index.expression()?);
+            self.parameters.push_hash_domain(&mut tag);
             lut_switching_ciphertext(
                 self.parameters,
                 level,
@@ -1277,6 +1278,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             program: owned_program,
             workload,

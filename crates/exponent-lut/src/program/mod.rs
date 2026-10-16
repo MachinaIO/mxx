@@ -912,6 +912,28 @@ pub(crate) fn data_inputs(
         .collect()
 }
 
+/// Check graph-valued data (`values`, for example selected members of a larger runtime
+/// family) against `program`'s declarations: exactly its data families, each with its declared
+/// count. Entry bounds are the producer's contract; graph values have no host entries to check.
+pub(crate) fn validate_data_values(
+    program: &ExponentLutProgram,
+    values: &BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>,
+) -> Result<(), ProgramValidationError> {
+    let matches = values.len() == program.data.len() &&
+        program.data.iter().all(|(family, declaration)| {
+            values.get(family).is_some_and(|value| {
+                value.count().clone().canonicalize() == IntExpr::constant(declaration.count)
+            })
+        });
+    if matches {
+        Ok(())
+    } else {
+        Err(ProgramValidationError::InvalidStructure(
+            "graph data do not match the declared families".into(),
+        ))
+    }
+}
+
 /// Input-only projection used by the encryption stage.  It intentionally
 /// excludes body, RHS declarations, and the program identity.
 #[derive(Clone, Debug, Eq, PartialEq)]

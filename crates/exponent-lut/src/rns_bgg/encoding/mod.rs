@@ -532,6 +532,9 @@ pub struct EncodingLowering<'a> {
     pub(crate) root_lut_helpers: Option<BTreeMap<String, Family<RnsBggRow>>>,
     /// An in-graph decoder hint, instead of an encryption artifact.
     pub(crate) decoder_hint: Option<Mat>,
+    /// The member of every Static preprocessing artifact read, and the member count (see
+    /// [`RnsOnlineEvalBuild::with_material_member`]).
+    pub(crate) material_member: Option<(Int, IntExpr)>,
     pub(crate) parameters: &'a RnsBggParameters,
     pub(crate) program: Arc<ExponentLutProgram>,
     pub(crate) workload: Arc<RnsBggDerivedWorkload>,
@@ -682,6 +685,11 @@ pub struct RnsOnlineEvalBuild<'a> {
     dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
     /// The values of the Program's integer data, which must be the preprocessed data.
     data: crate::program::ProgramData,
+    /// The Program's integer data as graph values (see `RnsOnlineEvalBuild::bind_data_values`).
+    graph_data: Option<BTreeMap<crate::program::DataId, Family<Int>>>,
+    /// The member of every Static preprocessing artifact this evaluation reads, and the number
+    /// of members (see `RnsOnlineEvalBuild::with_material_member`).
+    material_member: Option<(Int, IntExpr)>,
     /// For a refresh child: the namespace its hash key is derived under.
     hash_namespace: Option<[u8; 32]>,
     /// The applied refresh part: its target output index, declaration, and fresh-noise and

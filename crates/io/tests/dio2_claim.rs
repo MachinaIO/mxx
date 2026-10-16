@@ -1,9 +1,9 @@
 //! The correctness claim of a Diamond iO 2 evaluation, exported to Lean
 //! (`mxx_io::dio2::claim`).
 //!
-//! The obfuscation and the evaluation run on an execution that builds and validates every stage
-//! graph but executes only the payload secret's sampling ([`GraphOnly`]), so the export needs no
-//! GPU: the claim is about the recorded graphs, which do not depend on the values. The parameters
+//! The obfuscation and the evaluation (one graph each) run on an execution that builds and
+//! validates both graphs but executes neither ([`GraphOnly`]), so the export needs no GPU: the
+//! claim is about the recorded graphs, which do not depend on the values. The parameters
 //! and the function are those of the GPU round trip (`tests/gpu_round_trip.rs`); the evaluator's
 //! chunks are `MXX_IO_DIO2_CLAIM_X` (one bit per step, default `0,1`), and the claim has the
 //! failure probability `2^-MXX_IO_DIO2_CLAIM_FAILURE_EXPONENT` (default 40) under the
@@ -73,11 +73,10 @@ fn toy() -> (Dio2Parameters, StreamingFunction) {
     (parameters, function)
 }
 
-/// An execution that runs only the payload secret's sampling, on the CPU. Every other graph is
-/// validated by its caller and not executed: a producing stage returns the production its
-/// execution would have (which depends only on the validated graph and the nonce), and an
-/// evaluated stage returns the integer `0` for each of its outputs, so the stages after it can
-/// build their graphs.
+/// An execution that validates graphs without executing them: a producing graph (the
+/// obfuscation) returns the production its execution would have (which depends only on the
+/// validated graph and the nonce), and an evaluated graph returns the integer `0` for each of
+/// its outputs.
 struct GraphOnly(CpuExecution);
 
 impl StageExecution<MemoryArtifactStore> for GraphOnly {
@@ -97,13 +96,10 @@ impl StageExecution<MemoryArtifactStore> for GraphOnly {
     fn evaluate(
         &mut self,
         validated: ValidatedGraph,
-        inputs: BTreeMap<String, RuntimeValue>,
-        store: &mut MemoryArtifactStore,
-        execution_nonce: [u8; 32],
+        _: BTreeMap<String, RuntimeValue>,
+        _: &mut MemoryArtifactStore,
+        _: [u8; 32],
     ) -> Result<StageOutputs, ApiError> {
-        if validated.source.name() == "rns-bgg-secret" {
-            return self.0.evaluate(validated, inputs, store, execution_nonce);
-        }
         Ok(StageOutputs {
             outputs: validated
                 .source
@@ -150,7 +146,7 @@ fn test_dio2_claim_export() {
         )
         .unwrap();
     dio2.evaluate(&obfuscation, &x).unwrap();
-    let protocol = dio2.protocol(&obfuscation, &x, failure).unwrap();
+    let protocol = dio2.protocol(&obfuscation, failure).unwrap();
     for requirement in &protocol.bundle.requirements {
         mxx_ir_core::validate(requirement.graph(), &protocol.bindings)
             .expect("claim requirement validates");

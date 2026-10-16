@@ -305,7 +305,7 @@ pub struct RnsOutputCarrier {
 }
 
 /// Validated modulus-chain and encoding-noise parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RnsBggParameters {
     levels: Vec<DCRTPolyParams>,
     drops: Vec<BigUint>,
@@ -314,6 +314,23 @@ pub struct RnsBggParameters {
     operations_per_drop: usize,
     rhs_mode: RhsMode,
     root: Option<std::sync::Arc<RnsBggRoot>>,
+    /// Components appended to the tag of every public matrix a Program's preprocessing and
+    /// evaluation hash on this chain (see [`Self::with_hash_domain`]).
+    hash_domain: Vec<mxx_dsl::Int>,
+}
+
+impl std::fmt::Debug for RnsBggParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RnsBggParameters")
+            .field("levels", &self.levels)
+            .field("drops", &self.drops)
+            .field("encoding_error_sigma", &self.encoding_error_sigma)
+            .field("operations_per_drop", &self.operations_per_drop)
+            .field("rhs_mode", &self.rhs_mode)
+            .field("root", &self.root)
+            .field("hash_domain", &self.hash_domain.len())
+            .finish()
+    }
 }
 
 /// The root of a Static chain whose input keys and LUT helper keys, and so the rows of its
@@ -339,15 +356,72 @@ pub struct RnsBggParameters {
 /// every chain and every Program reading the same root object derives the key of the same
 /// root row. Diamond iO 2 (`mxx-io`) roots every chain of a step at the modulus of its refreshed
 /// rows.
-#[derive(Clone, Debug)]
+///
+/// A graph that reads the root objects of several instances under one root hash key (Diamond
+/// iO 2 reads every step's objects in one loop) separates them by a hash domain
+/// ([`Self::with_domain`]), whose components follow every root tag. An input whose root key is
+/// a public function of other root keys is declared with [`Self::with_derived_input`].
+#[derive(Clone)]
 pub struct RnsBggRoot {
     parameters: DCRTPolyParams,
     hash_key: [u8; 32],
+    domain: Vec<mxx_dsl::Int>,
+    derived: BTreeMap<String, DerivedRootKey>,
+}
+
+/// The root key of a derived root input: a function of this root, the root hash key handle and
+/// the input member.
+pub type DerivedRootKey = std::sync::Arc<
+    dyn Fn(&RnsBggRoot, Bytes, Option<mxx_dsl::Int>) -> Result<RnsBggMatrix, RnsBggError>
+        + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for RnsBggRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RnsBggRoot")
+            .field("parameters", &self.parameters)
+            .field("hash_key", &self.hash_key)
+            .field("domain", &self.domain.len())
+            .field("derived", &self.derived.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl RnsBggRoot {
     pub fn new(parameters: DCRTPolyParams, hash_key: [u8; 32]) -> Self {
-        Self { parameters, hash_key }
+        Self { parameters, hash_key, domain: Vec::new(), derived: BTreeMap::new() }
+    }
+
+    /// This root with the hash domain `domain`: every root key is hashed under its tag followed
+    /// by `domain` (`u64` components, static for loop indices and runtime otherwise, see
+    /// [`mxx_dsl::HashTag::push_u64_le`]), so one root hash key serves several instances.
+    pub fn with_domain(mut self, domain: Vec<mxx_dsl::Int>) -> Self {
+        self.domain = domain;
+        self
+    }
+
+    /// This root reading input root objects tagged `tag` under the key `key` computes instead
+    /// of a hashed one: a public function of other root keys (for example a public monomial
+    /// times a hashed key). Every reader of the root, preprocessing and evaluation alike, then
+    /// derives the same key subexpression.
+    pub fn with_derived_input(mut self, tag: impl Into<String>, key: DerivedRootKey) -> Self {
+        self.derived.insert(tag.into(), key);
+        self
+    }
+
+    /// The root key of input root object `tag` (member `member` of a family): the derived key
+    /// of [`Self::with_derived_input`], or the key hashed under [`Self::input_tag`].
+    pub fn input_key(
+        &self,
+        hash_key: Bytes,
+        tag: &str,
+        member: Option<mxx_dsl::Int>,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        match self.derived.get(tag) {
+            Some(derived) => derived(self, hash_key, member),
+            None => Ok(self.key(hash_key, Self::input_tag(tag, member))),
+        }
     }
 
     /// The parameters of the root modulus `Q_0`.
@@ -390,7 +464,15 @@ impl RnsBggRoot {
     /// The root key of the root object tagged `tag`: four `1 x m_0` blocks hashed at `Q_0` under
     /// the root hash key `hash_key` ([`Self::hash_key_input`]).
     pub fn key(&self, hash_key: Bytes, tag: impl Into<mxx_dsl::HashTag>) -> RnsBggMatrix {
-        public_key::matrix_from_hash(&self.ring(), hash_key, tag, self.columns())
+        public_key::matrix_from_hash(&self.ring(), hash_key, self.domain_tag(tag), self.columns())
+    }
+
+    /// `tag` followed by this root's hash domain ([`Self::with_domain`]): the tag of any other
+    /// public matrix a caller hashes per instance under the root hash key.
+    pub fn domain_tag(&self, tag: impl Into<mxx_dsl::HashTag>) -> mxx_dsl::HashTag {
+        let mut tag = tag.into();
+        push_domain(&mut tag, &self.domain);
+        tag
     }
 
     /// The root row `c_j = s_bar K_(0j) + K_(1j) - T_j G_(Q_0) + e_j` of the target
@@ -527,7 +609,25 @@ impl RnsBggParameters {
             operations_per_drop,
             rhs_mode: RhsMode::Static,
             root: None,
+            hash_domain: Vec::new(),
         })
+    }
+
+    /// These parameters with the hash domain `domain`: the tag of every public matrix that a
+    /// Program's preprocessing and online evaluation sample from their stage hash key (input
+    /// keys, LUT keys, RHS and LUT-switching tops) ends with `domain`
+    /// ([`mxx_dsl::HashTag::push_u64_le`] components). One graph that lowers a Program for many
+    /// instances in a loop (one hash key, one Program) passes the instance indices here, so
+    /// every instance samples its own matrices: loop indices hash statically, runtime integers
+    /// as hash arguments of the same bytes. The parameter identity does not depend on it.
+    pub fn with_hash_domain(mut self, domain: Vec<mxx_dsl::Int>) -> Self {
+        self.hash_domain = domain;
+        self
+    }
+
+    /// Append the hash domain ([`Self::with_hash_domain`]) to `tag`.
+    pub(crate) fn push_hash_domain(&self, tag: &mut mxx_dsl::HashTag) {
+        push_domain(tag, &self.hash_domain);
     }
 
     /// RHS timing mode shared by preprocessing, encryption, online
@@ -1684,11 +1784,10 @@ impl InputKeySource {
                 };
                 Ok(RnsBggPublicKey::new(
                     wire,
-                    parameters.root_key(
-                        root_hash_key.clone(),
-                        RnsBggRoot::input_tag(tag, member),
+                    parameters.retarget_matrix(
                         *level,
                         form,
+                        parameters.rooted()?.input_key(root_hash_key.clone(), tag, member)?,
                     )?,
                 ))
             }
@@ -2421,6 +2520,18 @@ pub(crate) fn ciphertext_matrix(
         target.1 - prefix * top.1.clone() + error.1,
     );
     Ok((top, bottom))
+}
+
+/// Append a hash domain to `tag`: the marker `domain` and every component as a `u64`, so tags
+/// of distinct domains differ and an empty domain leaves `tag` unchanged.
+pub(crate) fn push_domain(tag: &mut mxx_dsl::HashTag, domain: &[mxx_dsl::Int]) {
+    if domain.is_empty() {
+        return;
+    }
+    tag.push("domain");
+    for component in domain {
+        tag.push_u64_le(component.clone());
+    }
 }
 
 /// Push a 32-byte digest to `tag` as one decimal integer component.

@@ -216,7 +216,8 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
 /// is the gadget ciphertext of its setup coordinate's package: the setup's
 /// public top row over the bottom row the encryption's prelude production
 /// exports. A family RHS is one family per row port. `name` maps a role to
-/// its artifact name.
+/// its artifact name; `member` selects one instance of every Static artifact (see
+/// [`material_matrix`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn import_rhs_bindings(
     parameters: &RnsBggParameters,
@@ -226,6 +227,7 @@ pub(super) fn import_rhs_bindings(
     prelude: Option<&ProductionId>,
     dynamic: Option<(&RnsBggDynamicSetup, &RnsBggDynamicBinding)>,
     hash_key: &Bytes,
+    member: Option<&(Int, IntExpr)>,
     name: impl Fn(String) -> String,
 ) -> Result<Vec<(RhsId, InputBinding<(RnsBggMatrix, RhsRef<Int>), OnlineEvalRhsFamily>)>, ApiError>
 {
@@ -279,11 +281,12 @@ pub(super) fn import_rhs_bindings(
         let binding = match shape {
             InputBinding::Scalar(()) => {
                 let port = |port: usize| {
-                    ring.artifact_input(
-                        preprocess.clone(),
+                    material_matrix(
+                        &ring,
+                        preprocess,
                         name(format!("rhs/{rhs:?}.{port}")),
                         (1, columns),
-                        ArtifactAvailability::Transferred,
+                        member,
                     )
                 };
                 let top = super::public_key::rhs_top(
@@ -298,15 +301,20 @@ pub(super) fn import_rhs_bindings(
                 InputBinding::Scalar(((top, (port(0), port(1))), RhsRef { id: *rhs, index: None }))
             }
             InputBinding::Family(count) => {
-                let families = [0, 1].map(|port| {
-                    ring.family_artifact_input(
-                        preprocess.clone(),
-                        name(format!("rhs/{rhs:?}/family.{port}")),
-                        count.clone(),
-                        (1, columns),
-                        ArtifactAvailability::Transferred,
-                    )
-                });
+                let families = [0, 1]
+                    .map(|port| {
+                        material_family(
+                            &ring,
+                            preprocess,
+                            name(format!("rhs/{rhs:?}/family.{port}")),
+                            count.clone(),
+                            (1, columns),
+                            member,
+                        )
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ApiError::scheme)?;
                 let element: RnsBggRow =
                     (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
                 let fields =
@@ -325,6 +333,63 @@ pub(super) fn import_rhs_bindings(
         bindings.push((*rhs, binding));
     }
     Ok(bindings)
+}
+
+/// A transferred Static preprocessing matrix artifact `name` of `production`, or, with
+/// `member = (m, members)`, member `m` of the family of `members` instances it is published
+/// as (see `RnsOnlineEvalBuild::with_material_member`).
+fn material_matrix(
+    ring: &mxx_dsl::Ring,
+    production: &ProductionId,
+    name: String,
+    shape: (usize, usize),
+    member: Option<&(Int, IntExpr)>,
+) -> Mat {
+    match member {
+        None => {
+            ring.artifact_input(production.clone(), name, shape, ArtifactAvailability::Transferred)
+        }
+        Some((member, members)) => ring
+            .family_artifact_input(
+                production.clone(),
+                name,
+                members.clone(),
+                shape,
+                ArtifactAvailability::Transferred,
+            )
+            .at(member.clone()),
+    }
+}
+
+/// A transferred Static preprocessing family artifact `name` of `count` matrices, or, with
+/// `member = (m, members)`, the `count` matrices of instance `m` in the family of the
+/// `members count` matrices of every instance side by side.
+fn material_family(
+    ring: &mxx_dsl::Ring,
+    production: &ProductionId,
+    name: String,
+    count: IntExpr,
+    shape: (usize, usize),
+    member: Option<&(Int, IntExpr)>,
+) -> Result<Family<Mat>, DslError> {
+    let Some((member, members)) = member else {
+        return Ok(ring.family_artifact_input(
+            production.clone(),
+            name,
+            count,
+            shape,
+            ArtifactAvailability::Transferred,
+        ));
+    };
+    let instances = ring.family_artifact_input(
+        production.clone(),
+        name,
+        IntExpr::Mul(Box::new(members.clone()), Box::new(count.clone())).canonicalize(),
+        shape,
+        ArtifactAvailability::Transferred,
+    );
+    let first = member.clone().mul(Int::evaluate(count.clone()));
+    mxx_dsl::parallel(count, |index| Ok(instances.at(first.clone().add(index))))
 }
 
 impl EncodingLowering<'_> {
@@ -663,8 +728,9 @@ impl EncodingLowering<'_> {
             table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         let families = (0..4)
             .map(|port| {
-                decomposition_ring.family_artifact_input(
-                    self.ciphertext_production().clone(),
+                material_family(
+                    &decomposition_ring,
+                    self.ciphertext_production(),
                     self.preprocess_artifact_name(lut_switching_role(
                         evaluation_level,
                         lut_id,
@@ -673,10 +739,11 @@ impl EncodingLowering<'_> {
                     )),
                     count.clone(),
                     (1, target_columns),
-                    ArtifactAvailability::Transferred,
+                    self.material_member.as_ref(),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(graph)?;
         Ok((families, sigma_indices))
     }
 
@@ -1380,6 +1447,7 @@ mod test {
                 encryption_artifact_prefix: None,
                 root_lut_helpers: None,
                 decoder_hint: None,
+                material_member: None,
                 parameters: &parameters,
                 hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
                 root_hash_key: None,
@@ -1454,6 +1522,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1495,6 +1564,7 @@ mod test {
             None,
             None,
             &hash_key,
+            None,
             |role| role,
         )
         .unwrap();
@@ -1542,6 +1612,7 @@ mod test {
             None,
             None,
             &hash_key,
+            None,
             |role| role,
         )
         .unwrap();
@@ -1606,6 +1677,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1683,6 +1755,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1765,6 +1838,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -1915,6 +1989,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,
@@ -2119,6 +2194,7 @@ mod test {
             encryption_artifact_prefix: None,
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: &parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
             root_hash_key: None,

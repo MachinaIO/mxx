@@ -558,6 +558,31 @@ impl ScopeSealer {
                 }
             }
         }
+        if !self.nodes.contains_key(&identity) &&
+            matches!(value.node.kind(), NodeKind::Input { .. })
+        {
+            // A named graph input declared while a body was being built belongs to the graph,
+            // not to the body: it moves to the enclosing scope (and on to the root as each
+            // enclosing body is sealed) and the body reads it like any outer value. Body
+            // arguments are explicit inputs, which are known nodes already.
+            let parent = self.scope.0.as_ref().map_or(SelfRoot::ID, |scope| scope.parent.clone());
+            let hoisted = NodeHandle::new_in_scope(
+                parent,
+                value.node.kind().clone(),
+                Vec::new(),
+                value.node.output_types().to_vec(),
+                value.node.source_location().cloned(),
+                None,
+            );
+            let input = self.capture(
+                &hoisted
+                    .output(value.port.0)
+                    .ok_or(FreezeError::InvalidPort { port: value.port.0 })?,
+                LoopInputMode::Broadcast,
+            )?;
+            self.nodes.insert(identity, input.node.clone());
+            return Ok(input);
+        }
         let node = if let Some(node) = self.nodes.get(&identity) {
             node.clone()
         } else {

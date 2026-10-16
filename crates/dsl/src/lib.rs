@@ -50,7 +50,7 @@ pub use control::{iterate, parallel, select};
 pub use family::Family;
 pub use subgraph::Subgraph;
 use value::argument_name;
-pub use value::{GraphValue, GraphValueSchema};
+pub use value::{GraphValue, GraphValueSchema, Leaf, LeafType};
 
 use num_bigint::BigUint;
 use std::{
@@ -2345,6 +2345,16 @@ impl DslContext {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
+    }
+
+    /// The named outputs of this context, by leaf name, with their artifact availability
+    /// (`None` for a plain output), without freezing: a caller moves another builder's
+    /// published values into its own graph, for example out of a loop body.
+    pub fn into_outputs(self) -> Vec<(String, Leaf, Option<ArtifactAvailability>)> {
+        self.outputs
+            .into_iter()
+            .map(|(name, output)| (name, Leaf::new(output.value), output.availability))
+            .collect()
     }
 
     pub fn build(self) -> Result<BuiltGraph, DslError> {

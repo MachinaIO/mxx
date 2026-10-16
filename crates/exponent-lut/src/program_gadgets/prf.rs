@@ -625,19 +625,43 @@ impl SparseLwrPrf {
     }
 
     /// The private selector plaintexts and the coordinate tables (Program data) of the
-    /// generated `keys`, one key per member: with one member (on the PRF's
-    /// layout), bit `j` of bucket `b`'s family is 1 exactly when the key
-    /// selects slot `j` of bucket `b`, and there are no tables; with several
-    /// (whose layouts must make up the PRF's key shape), bit `o W + j` of
-    /// bucket `b`'s family is 1 exactly when member `o`'s key selects slot
-    /// `j`, and entry `o W + j` of bucket `b`'s table is the coordinate of that
-    /// cell (the zero member `nu` for a dummy, padding or missing cell).
+    /// generated `keys`, one key per member: the plaintext of selector bit `b` is the constant
+    /// polynomial `b` (see [`Self::key_values`]).
     #[allow(clippy::type_complexity)]
     pub fn key_inputs<P: Poly>(
         &self,
         parameters: &P::Params,
         keys: &[PbcGeneratedKeyLayout],
     ) -> Result<(PlaintextInputs<RhsId, P>, ProgramData), PrfError> {
+        let (selectors, tables) = self.key_values(keys)?;
+        // The two constant plaintexts are built once; every key's row is filled in parallel.
+        let (one, zero) = (P::const_one(parameters), P::const_zero(parameters));
+        let plaintexts = self
+            .selectors
+            .iter()
+            .zip(selectors)
+            .map(|(families, bits)| {
+                let bits = bits
+                    .par_iter()
+                    .map(|selected| if *selected { one.clone() } else { zero.clone() })
+                    .collect();
+                (families[0], InputBinding::Family(bits))
+            })
+            .collect();
+        Ok((plaintexts, tables))
+    }
+
+    /// The selector bits of every bucket and the coordinate tables (Program data) of the
+    /// generated `keys`, one key per member: with one member (on the PRF's layout), bit `j` of
+    /// bucket `b`'s family is 1 exactly when the key selects slot `j` of bucket `b`, and there
+    /// are no tables; with several (whose layouts must make up the PRF's key shape), bit
+    /// `o W + j` of bucket `b`'s family is 1 exactly when member `o`'s key selects slot `j`, and
+    /// entry `o W + j` of bucket `b`'s table is the coordinate of that cell (the zero member
+    /// `nu` for a dummy, padding or missing cell).
+    pub fn key_values(
+        &self,
+        keys: &[PbcGeneratedKeyLayout],
+    ) -> Result<(Vec<Vec<bool>>, ProgramData), PrfError> {
         let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
         let (width, tables) = match (&self.keys, layouts.as_slice()) {
             (PrfKeys::Layout(layout), [key]) if key.layout_id == layout.layout_id => {
@@ -658,25 +682,17 @@ impl SparseLwrPrf {
                 .validate(&key.public_layout)
                 .map_err(|_| PrfError::KeyShapeMismatch)?;
         }
-        // The two constant plaintexts are built once; every key's row is filled in parallel.
-        let (one, zero) = (P::const_one(parameters), P::const_zero(parameters));
-        let plaintexts = self
-            .selectors
-            .iter()
-            .enumerate()
-            .map(|(bucket, families)| {
-                let bits = keys
-                    .par_iter()
+        let selectors = (0..self.selectors.len())
+            .map(|bucket| {
+                keys.par_iter()
                     .flat_map_iter(|key| {
                         let selected = key.private_schedule().selected_slot(bucket);
                         (0..width).map(move |slot| slot == selected)
                     })
-                    .map(|selected| if selected { one.clone() } else { zero.clone() })
-                    .collect();
-                (families[0], InputBinding::Family(bits))
+                    .collect()
             })
             .collect();
-        Ok((plaintexts, tables))
+        Ok((selectors, tables))
     }
 
     /// Check the Program `data` bound to this PRF's Program against its

@@ -229,6 +229,26 @@ pub(crate) fn chunk_value(bits: &[bool]) -> usize {
     bits.iter().enumerate().map(|(bit, set)| usize::from(*set) << bit).sum()
 }
 
+/// The exponent of a chunk bit as a graph function of the bit index and the bit value.
+pub type BitExponent = Arc<dyn Fn(Int, Int) -> Result<Int, DslError> + Send + Sync>;
+
+/// The exponent `set 2^bit stride` of bit `bit < bits` with value `set`, from graph integers:
+/// one loop over the bit positions selects the power of two, so the graph does not grow with
+/// `bits`.
+fn additive_exponent(bits: usize, stride: usize) -> BitExponent {
+    Arc::new(move |bit, set| {
+        let (_, power) = mxx_dsl::iterate(
+            bits,
+            (Int::constant(1), Int::constant(0)),
+            |index, (power, selected)| {
+                let selected = selected.add(index.equal(bit.clone()).to_int().mul(power.clone()));
+                Ok((power.mul(2usize), selected))
+            },
+        )?;
+        Ok(set.mul(power).mul(stride))
+    })
+}
+
 /// A streaming function with one body and bounded per-step integer data.
 #[derive(Clone)]
 pub struct StreamingFunction {
@@ -241,9 +261,10 @@ pub struct StreamingFunction {
     /// The layout of `mono(z) = X^(z * stride)`.
     pub state_layout: ExpLayout,
     /// Graph-valued exponent of evaluator bit `bit` with value `set`.
-    pub x_monomial: Arc<dyn Fn(Int, Int) -> Result<Int, DslError> + Send + Sync>,
-    /// Exponent of an obfuscator bit, whose value is fixed by obfuscation.
-    pub y_monomial: Arc<dyn Fn(usize, bool) -> usize + Send + Sync>,
+    pub x_monomial: BitExponent,
+    /// Graph-valued exponent of obfuscator bit `bit` with value `set`: the obfuscator encodes
+    /// `mono(y_monomial(b, y_b))` as the RHS plaintext of the bit.
+    pub y_monomial: BitExponent,
     /// The common body of every step.
     pub body: StepProgram,
     /// The common data shape and one row per step.
@@ -266,19 +287,8 @@ impl StreamingFunction {
             eval_chunk_bits,
             obf_chunk_bits,
             state_layout,
-            x_monomial: Arc::new(move |bit, set| {
-                let (_, power) = mxx_dsl::iterate(
-                    eval_chunk_bits,
-                    (Int::constant(1), Int::constant(0)),
-                    |index, (power, selected)| {
-                        let selected =
-                            selected.add(index.equal(bit.clone()).to_int().mul(power.clone()));
-                        Ok((power.mul(2usize), selected))
-                    },
-                )?;
-                Ok(set.mul(power).mul(stride))
-            }),
-            y_monomial: Arc::new(move |bit, set| usize::from(set) * (1usize << bit) * stride),
+            x_monomial: additive_exponent(eval_chunk_bits, stride),
+            y_monomial: additive_exponent(obf_chunk_bits, stride),
             body: StepProgram::table(state_bits, eval_chunk_bits, obf_chunk_bits, state_layout),
             data: StepData::new(state_layout.width(), 1 << state_bits, Vec::new())
                 .expect("a nonempty exponent layout and state range"),

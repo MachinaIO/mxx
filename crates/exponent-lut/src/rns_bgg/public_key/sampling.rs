@@ -57,6 +57,7 @@ pub(in crate::rns_bgg) fn lut_public_matrix(
     let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/lut-a".to_vec());
     tag.push(mxx_ir_core::IntExpr::constant(level));
     tag.push(sigma);
+    parameters.push_hash_domain(&mut tag);
     Ok(matrix_from_hash(&ring, key, tag, columns))
 }
 
@@ -107,6 +108,7 @@ pub(crate) fn rhs_top(
         tag.push("member");
         tag.push_u64_le(member);
     }
+    parameters.push_hash_domain(&mut tag);
     let component = |index: u64| {
         let mut tag = tag.clone();
         tag.push("component");
@@ -244,10 +246,9 @@ pub(crate) fn sampled_key(
 ) -> Result<RnsBggPublicKey, RnsBggError> {
     let ring = parameters.ring(level)?;
     let columns = parameters.key_component_columns(level, knowledge)?;
-    Ok(RnsBggPublicKey::new(
-        wire,
-        matrix_from_hash(&ring, hash_key, input_hash_tag(wire, level, member), columns),
-    ))
+    let mut tag = input_hash_tag(wire, level, member);
+    parameters.push_hash_domain(&mut tag);
+    Ok(RnsBggPublicKey::new(wire, matrix_from_hash(&ring, hash_key, tag, columns)))
 }
 
 #[cfg(test)]

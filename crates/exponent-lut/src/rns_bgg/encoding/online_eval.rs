@@ -207,6 +207,54 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         Ok(())
     }
 
+    /// Bind the Program's integer data families to graph values, before the rows, as their
+    /// preprocessing did (`RnsPreprocessBuild::bind_data_values`). They replace
+    /// [`Self::with_data`] and its resident inputs.
+    pub fn bind_data_values(
+        &mut self,
+        program: &ExponentLutProgram,
+        data: BTreeMap<crate::program::DataId, Family<Int>>,
+    ) -> Result<(), ApiError> {
+        if self.evaluator.is_some() {
+            return Err(ApiError::input("bind graph data before the rows"));
+        }
+        crate::program::validate_data_values(program, &data)
+            .map_err(|error| ApiError::input(error.to_string()))?;
+        self.graph_data = Some(data);
+        Ok(())
+    }
+
+    /// Read member `member` of every Static preprocessing artifact, before the rows. A graph
+    /// that preprocesses one Program for `members` instances (in a parallel loop, under a hash
+    /// domain per instance, see `RnsBggParameters::with_hash_domain`) publishes each artifact
+    /// role as one family of the instances' values: a matrix role as `members` matrices, a
+    /// family role of `count` matrices as the `members count` matrices of the instances side
+    /// by side. `member` may be a runtime integer.
+    pub fn with_material_member(mut self, member: Int, members: impl Into<IntExpr>) -> Self {
+        self.material_member = Some((member, members.into()));
+        self
+    }
+
+    /// The resident inputs of this evaluation: its hash keys and given data. A composing
+    /// caller that lowers the Program without [`Self::emit`] binds them in its graph.
+    pub fn runtime_inputs(&self) -> BTreeMap<String, RuntimeValue> {
+        let mut runtime = self.runtime.clone();
+        runtime.insert(
+            instance_name(
+                self.artifact_prefix.as_deref(),
+                &crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
+            ),
+            RuntimeValue::Bytes(self.hash_key.as_slice().into()),
+        );
+        if let Some(root) = self.parameters.root() {
+            runtime.insert(
+                root.hash_key_input_name(),
+                RuntimeValue::Bytes(root.hash_key().as_slice().into()),
+            );
+        }
+        runtime
+    }
+
     /// Emit evaluation into `graph`, leaving freezing and execution to its caller.
     pub fn emit(
         self,
@@ -233,6 +281,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             output_carriers: Vec::new(),
             dynamic: None,
             data: crate::program::ProgramData::new(),
+            graph_data: None,
+            material_member: None,
             hash_namespace: None,
             pending_refresh: None,
             inputs_by_shape: false,
@@ -713,6 +763,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             prelude.as_ref(),
             dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
             &hash_key,
+            None,
             |role: String| {
                 if dynamic.is_some() { ciphertext_name(&role) } else { name(&role) }
             },
@@ -725,6 +776,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             encryption_artifact_prefix: Some(encryption_prefix),
             root_lut_helpers: None,
             decoder_hint: None,
+            material_member: None,
             parameters: self.parameters,
             program: Arc::new(prepared.clone()),
             workload,
@@ -1451,23 +1503,30 @@ impl RnsOnlineEvalBuild<'_> {
                 "RNS-BGG preprocess binding does not match the online evaluation Program",
             ));
         }
-        if !self.inputs_by_shape {
+        let graph_data = self.graph_data.is_some();
+        if !self.inputs_by_shape && !graph_data {
             self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
         }
-        let expected_data = (!program.data_families().is_empty()).then(|| self.data.commitment());
+        let expected_data =
+            (!program.data_families().is_empty() && !graph_data).then(|| self.data.commitment());
         if preprocess_binding.data() != expected_data.as_ref() {
             return Err(ApiError::compatibility(
                 "RNS-BGG preprocess binding has other Program data than the online evaluation",
             ));
         }
-        // The data are graph inputs whose values this builder was given.
-        let data = crate::program::data_inputs(program, |family| {
-            instance_name(
-                self.artifact_prefix.as_deref(),
-                &crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family),
-            )
-        });
-        for family in program.data_families().keys().filter(|_| !self.inputs_by_shape) {
+        // The data are graph values, or graph inputs whose values this builder was given.
+        let data = match &self.graph_data {
+            Some(data) => data.clone(),
+            None => crate::program::data_inputs(program, |family| {
+                instance_name(
+                    self.artifact_prefix.as_deref(),
+                    &crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family),
+                )
+            }),
+        };
+        for family in
+            program.data_families().keys().filter(|_| !self.inputs_by_shape && !graph_data)
+        {
             let values = self.data.values(*family).expect("validated program data");
             self.runtime.insert(
                 instance_name(
@@ -1564,6 +1623,7 @@ impl RnsOnlineEvalBuild<'_> {
             prelude.as_ref(),
             dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
             &hash_key,
+            self.material_member.as_ref(),
             |role| match (dynamic.as_ref(), encryption) {
                 (Some(_), Some(stage)) => stage.descriptor().artifact_name(&role),
                 _ => instance_name(self.artifact_prefix.as_deref(), &role),
@@ -1579,6 +1639,7 @@ impl RnsOnlineEvalBuild<'_> {
                 .map(str::to_owned),
             root_lut_helpers: encryption.is_none().then(BTreeMap::new),
             decoder_hint: None,
+            material_member: self.material_member.clone(),
             parameters: self.parameters,
             program: Arc::new(program.clone()),
             workload,

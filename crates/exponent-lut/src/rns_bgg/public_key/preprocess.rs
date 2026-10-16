@@ -48,6 +48,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             output_use: RnsOutputUse::default(),
             dynamic: None,
             data: crate::program::ProgramData::new(),
+            graph_data: None,
             hash_namespace: None,
             refresh: None,
             inputs_by_shape: false,
@@ -110,6 +111,25 @@ impl<'a> RnsPreprocessBuild<'a> {
     pub fn with_data(mut self, data: crate::program::ProgramData) -> Self {
         self.data = data;
         self
+    }
+
+    /// Bind the Program's integer data families to graph values of the composing graph (for
+    /// example a member's row selected from a larger family by a loop index), before the RHS
+    /// binding. They replace [`Self::with_data`]: preprocessing declares no data input and
+    /// commits to no concrete entries, so an online evaluation binds its data the same way.
+    /// `data` must cover exactly the declared families with their declared counts.
+    pub fn bind_data_values(
+        &mut self,
+        program: &ExponentLutProgram,
+        data: BTreeMap<crate::program::DataId, Family<Int>>,
+    ) -> Result<(), ApiError> {
+        if self.evaluator.is_some() {
+            return Err(ApiError::input("bind graph data before the RHS"));
+        }
+        crate::program::validate_data_values(program, &data)
+            .map_err(|error| ApiError::input(error.to_string()))?;
+        self.graph_data = Some(data);
+        Ok(())
     }
 
     /// This builder for compiling a Program against the Dynamic `setup`,
@@ -723,8 +743,16 @@ impl<'a> RnsPreprocessBuild<'a> {
                 &crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family),
             )
         };
-        let data = crate::program::data_inputs(&program, name);
-        if (values.is_some() || self.rhs_values.is_some()) && !self.inputs_by_shape {
+        let graph_data = self.graph_data.is_some();
+        let data = match &self.graph_data {
+            Some(data) => {
+                crate::program::validate_data_values(&program, data)
+                    .map_err(|error| ApiError::input(error.to_string()))?;
+                data.clone()
+            }
+            None => crate::program::data_inputs(&program, name),
+        };
+        if (values.is_some() || self.rhs_values.is_some()) && !self.inputs_by_shape && !graph_data {
             self.data.validate(&program).map_err(|error| ApiError::input(error.to_string()))?;
             for family in program.data_families().keys() {
                 let values = self.data.values(*family).expect("validated program data");
@@ -974,7 +1002,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             digest.update(setup.identity());
             digest.update(serde_json::to_vec(binding).expect("setup mapping encoding"));
         }
-        if !evaluator.program.data_families().is_empty() {
+        if !evaluator.program.data_families().is_empty() && self.graph_data.is_none() {
             digest.update(self.data.commitment());
         }
         if let Some(refresh) = &self.refresh {
@@ -1160,7 +1188,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         .with_input_levels(input_levels)
         .with_outputs(evaluator.output_use, carriers)
         .with_child_data(child_data);
-        if !evaluator.program.data_families().is_empty() {
+        if !evaluator.program.data_families().is_empty() && self.graph_data.is_none() {
             binding = binding.with_data(self.data.commitment());
         }
         if let Some((setup, mapping)) = &evaluator.dynamic {
@@ -1587,6 +1615,238 @@ mod test {
                 )
                 .unwrap();
                 assert_eq!(decoded, vec![BigInt::from(bit)]);
+            }
+        }
+    }
+
+    /// One graph preprocesses a Program for two instances in a parallel loop, each with its
+    /// own graph-valued data (selecting another RHS member) and its own hash domain, and
+    /// publishes every artifact role as one family of both instances; an evaluation of a
+    /// runtime-selected instance binds the same graph data and reads that instance's material.
+    /// The decoded output is the instance's selected RHS times the input bit.
+    #[test]
+    fn test_graph_data_and_hash_domain_select_one_instance_of_a_loop() {
+        use mxx_backends::{
+            MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
+        };
+        use mxx_dsl::{Leaf, Mat};
+        let base = emission_parameters();
+        let ring = base.ring(0).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let data = builder.data_family(1usize, Some(2)).unwrap();
+        let output = builder
+            .mul_private(
+                Operand::Scalar(private),
+                Operand::Selected { family: rhs, data, position: IntExpr::constant(0) },
+            )
+            .unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let context: [u8; 32] = rand::random();
+        let hash_key: [u8; 32] = rand::random();
+        let bit = u32::from(rand::random::<bool>());
+        let secret = |ring: &mxx_dsl::Ring| ring.uniform_interval((1, 1), -1, 1);
+        let (payload_row, mask_row) = (secret(&ring), secret(&ring));
+        // Instance `m` selects RHS member `m`, whose plaintext is `m + 1`.
+        let selections = mxx_dsl::int_family_input("selections", 2usize);
+        let (mut descriptor, mut names) = (None, Vec::new());
+        let mut runtime = BTreeMap::new();
+        let instances = mxx_dsl::parallel(2usize, |member| {
+            let parameters = base.clone().with_hash_domain(vec![member.clone()]);
+            let payload = RnsBggPayloadSecret::from_row(&parameters, payload_row.clone()).unwrap();
+            let mask =
+                crate::rns_bgg::RnsBggMaskSecret::from_row(&parameters, mask_row.clone()).unwrap();
+            let mut preprocessing =
+                RnsPreprocessBuild::new(&parameters, context).with_artifact_prefix("instances");
+            preprocessing
+                .bind_data_values(
+                    &program,
+                    BTreeMap::from([(
+                        data,
+                        mxx_dsl::parallel(1usize, |_| Ok(selections.at(member.clone())))?,
+                    )]),
+                )
+                .unwrap();
+            let plaintexts = mxx_dsl::parallel(2usize, |index| {
+                Ok(ring.polynomial([IntExpr::Add(
+                    Box::new(index.expression()?),
+                    Box::new(IntExpr::constant(1)),
+                )]))
+            })?;
+            preprocessing
+                .bind_rhs_values(
+                    &program,
+                    &ParamEnv::default(),
+                    BTreeMap::from([(rhs, InputBinding::Family(plaintexts))]),
+                    Some(&payload),
+                    &hash_key,
+                )
+                .unwrap();
+            let keys = crate::api::lower(&program, &mut preprocessing).unwrap();
+            let key =
+                preprocessing.evaluator.as_ref().unwrap().sample_input_public_key(private).unwrap();
+            let root =
+                crate::rns_bgg::RnsBggRoot::new(parameters.level(0).unwrap().clone(), hash_key);
+            let plaintext = ring.polynomial([IntExpr::constant(bit)]);
+            let row = root
+                .encode(
+                    &key.matrix,
+                    mask.row(),
+                    (payload.row().0.clone() * plaintext.clone(), plaintext),
+                    (ring.zero((1, root.columns())), ring.zero((1, root.columns()))),
+                )
+                .unwrap();
+            let emission = preprocessing.emit(DslContext::new("instance"), keys).unwrap();
+            descriptor = Some(emission.descriptor.1);
+            runtime.extend(emission.runtime_inputs);
+            let mut leaves = emission
+                .graph
+                .into_outputs()
+                .into_iter()
+                .filter(|(name, _, _)| {
+                    name.starts_with("instances/rhs/") || name.starts_with("instances/public-key/")
+                })
+                .map(|(name, leaf, _)| (name, leaf))
+                .collect::<Vec<_>>();
+            leaves.push(("row.0".to_owned(), Leaf::of(row.0).unwrap()));
+            leaves.push(("row.1".to_owned(), Leaf::of(row.1).unwrap()));
+            let values: Vec<Leaf>;
+            (names, values) = leaves.into_iter().unzip();
+            Ok(values)
+        })
+        .unwrap();
+        let mut graph = DslContext::new("instances");
+        for (position, name) in names.iter().enumerate() {
+            let family = instances.field(|leaves| leaves[position].clone()).unwrap();
+            let count = match family.at(0).wire_type() {
+                mxx_ir_core::types::WireType::IndexedFamily { count, .. } => Some(count.clone()),
+                _ => None,
+            };
+            let published = match count {
+                None => Leaf::of(family).unwrap(),
+                Some(count) => Leaf::of(
+                    mxx_dsl::parallel(IntExpr::constant(2) * count.clone(), |index| {
+                        let per = Int::evaluate(count.clone());
+                        Ok(family.at(index.clone().div(per.clone())).at(index.rem(per)).unwrap())
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            };
+            graph = graph.transferred_output(name, published).unwrap();
+        }
+        runtime.insert(
+            "selections".to_owned(),
+            RuntimeValue::integer_values(vec![0.into(), 1.into()]),
+        );
+        let graph = graph.build().unwrap();
+        let mut execution = CpuExecution::new(cpu_backend(base.levels().iter().cloned()));
+        let mut store = MemoryArtifactStore::default();
+        let production = crate::api::execute_artifacts(
+            StageGraph::new(graph, runtime, BTreeMap::new()),
+            &ParamEnv::default(),
+            (),
+            rand::random(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let preprocessed = StageArtifacts::new(
+            production.production().clone(),
+            production.manifest().clone(),
+            descriptor.unwrap(),
+            production.session().clone(),
+        );
+        let instance = rand::random::<bool>() as usize;
+        let context_graph = DslContext::new("evaluate-instance");
+        let member = context_graph.input::<Int>("instance", mxx_dsl::IntType).unwrap();
+        let parameters = base.clone().with_hash_domain(vec![member.clone()]);
+        let selected = |name: &str| -> Mat {
+            ring.family_artifact_input(
+                production.production().clone(),
+                name,
+                2usize,
+                (1, base.component_columns(0).unwrap()),
+                ArtifactAvailability::Transferred,
+            )
+            .at(member.clone())
+        };
+        let mut evaluation = RnsOnlineEvalBuild::new(&parameters, context)
+            .with_material_member(member.clone(), 2usize);
+        evaluation
+            .bind_data_values(
+                &program,
+                BTreeMap::from([(
+                    data,
+                    mxx_dsl::parallel(1usize, |_| {
+                        Ok(mxx_dsl::int_family_input("selections", 2usize).at(member.clone()))
+                    })
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        evaluation
+            .bind_rows(
+                &program,
+                &ParamEnv::default(),
+                &preprocessed,
+                BTreeMap::from([(
+                    private,
+                    InputBinding::Scalar((selected("row.0"), selected("row.1"))),
+                )]),
+                BTreeMap::new(),
+                &hash_key,
+            )
+            .unwrap();
+        let outputs = crate::api::lower(&program, &mut evaluation).unwrap();
+        let mut emission = evaluation.emit(context_graph, outputs).unwrap();
+        // The instance's published output key and the other instance's.
+        for port in 0..4 {
+            let role = format!("instances/public-key/{output:?}.{port}");
+            let entry = &production.manifest().artifacts[&role];
+            assert_eq!(entry.family_count, Some(2), "one key per instance");
+            let mxx_ir_core::artifact::ArtifactType::Matrix(matrix) = &entry.artifact_type else {
+                panic!("public key matrices")
+            };
+            let keys = ring.family_artifact_input(
+                production.production().clone(),
+                role,
+                2usize,
+                (matrix.rows, matrix.columns),
+                entry.availability,
+            );
+            emission.graph = emission
+                .graph
+                .output(format!("published-{port}"), keys.at(member.clone()))
+                .unwrap()
+                .output(format!("other-{port}"), keys.at(Int::constant(1).sub(member.clone())))
+                .unwrap();
+        }
+        let (mut graph, ()) = emission.build().unwrap();
+        graph.runtime_inputs.insert("instance".to_owned(), RuntimeValue::Int(instance.into()));
+        graph.runtime_inputs.insert(
+            "selections".to_owned(),
+            RuntimeValue::integer_values(vec![0.into(), 1.into()]),
+        );
+        graph.manifests.insert(production.production().clone(), production.manifest().clone());
+        let result = crate::api::execute_graph(
+            graph,
+            &ParamEnv::default(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let full = |name: &str| crate::test_support::full(&result.outputs[name]);
+        for port in 0..4 {
+            let evaluated = full(&format!("instances/output-0.{port}"));
+            assert_eq!(evaluated, full(&format!("published-{port}")));
+            if port >= 2 {
+                // The bottom key rows of the two instances' private products differ by their
+                // RHS ciphertexts, which differ in plaintext and hash domain.
+                assert_ne!(evaluated, full(&format!("other-{port}")));
             }
         }
     }

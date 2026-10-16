@@ -183,6 +183,9 @@ pub struct RnsPreprocessBuild<'a> {
     dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
     /// The values of the Program's integer data.
     data: crate::program::ProgramData,
+    /// The Program's integer data as graph values (see `RnsPreprocessBuild::bind_data_values`),
+    /// replacing [`Self::data`] and its resident inputs.
+    graph_data: Option<BTreeMap<crate::program::DataId, Family<Int>>>,
     /// For a refresh child: the namespace its hash key is derived under (see
     /// `rns_bgg::refresh::child_hash_key`).
     hash_namespace: Option<[u8; 32]>,

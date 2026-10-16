@@ -398,9 +398,13 @@ For every `r < v` and `c ≤ m_v`:
 
 `LBL'[r, c] := ∏_{k : D_x[k, c] = 1} LBL[r, 1 + k]`
 
-This is a balanced public-by-public product tree (`public_ip`,
-`crates/exponent-lut/src/program_gadgets/public_ip.rs`), with an explicit selection `D_x[:, c]`
-instead of a hash-sampled one, and with `ONEPUB` as the empty product. Its target is
+This is a right-deep chain of public-by-public products `l_0 (l_1 (⋯ l_{p−1}))` of the
+selected leaves in ascending order, with an explicit selection `D_x[:, c]` and `ONEPUB` as the
+padding of a column with fewer than two leaves. `MulPub(P, Q)` scales the error of its left
+operand by the gadget action `A` and adds the error of its right one (`E = A E_P + E_Q` for a
+monomial `P`), so the chain's error is `A (p − 1) e + e`, linear in the leaf count (a balanced
+tree has `(A + 1)^{log2 p} e`). The chain is one loop over the `m_v` leaf slots, so the graph has
+the same size for every label width (decision of the single-graph redesign). Its target is
 `mono(A_{i+1}[r, c]) s_i`, because `A_{i+1}[r, c] = Σ_k A_i[r, 1 + k] D_x[k, c] mod Q`.
 
 The production builder represents this forest as a DSL family, not one scalar Program output
@@ -409,12 +413,11 @@ transition seed, packing each column's ascending selected indices in binary fiel
 bit extraction reads a leaf without allocating a graph node per table entry. The runtime uses
 the original SHA-256 expansion and the Lean relation specifies its concrete 64-round algorithm,
 not an additional random-oracle or witness assumption. Within
-each label member, successive parallel levels multiply adjacent pairs and select the unchanged
-left member when the right member is absent. Zero/one-leaf columns alone are padded with
-ONEPUB to two leaves, as in the scalar noise model. Thus no contributing leaf gains an action,
-and both the multiplication depth and term-by-term noise are unchanged. The family has
-logarithmically many graph levels; the graph/export stores only a seed and dimensions rather than
-`O(m_v^2 log m_v)` literal bits. Runtime selector storage still has that original size.
+each label member, one sequential loop over the leaf slots (from the innermost) multiplies each
+selected leaf onto the product of the later ones, and the index of a slot is decoded by one loop
+over its bits. Zero/one-leaf columns alone are padded with ONEPUB to two leaves, as in the
+scalar noise model, which multiplies in the same order. The graph/export stores only a seed and
+dimensions rather than `O(m_v^2 log m_v)` literal bits. Runtime selector storage still has that original size.
 Refresh parts, initial/zero rows,
 and claim predicates use family ranges rather than scalar label enumerations. Noise-only
 Programs retain scalar trees (or their existing maximal-leaf representative).
@@ -453,15 +456,14 @@ there is no digit-sized literal table. Both the loop body and operation count ar
 of `d`.
 Re-targeting to `k` repeated targets uses one `BlockDiagonal` operation (`I_k ⊗ target`),
 and the centering row is one all-coefficients constant of the full width. Neither creates
-concat intermediates proportional to the gadget columns. Prime bodies remain unrolled.
+concat intermediates proportional to the gadget columns.
 Noise-representative Programs still store one digit and apply every weight to its bound;
 they do not replace the full production member counts or the full noise event budget.
 The noise model restores the packed sum node's logical per-digit reduction multiplicity,
 preserving the pre-packing scalar-digit event budget and its tail multiplier.
 The label selector is a fixed-seed SHA-256 recipe, not a quadratic literal. Label-height and
-family-member multiplicities stay in loop counts. Binary index decoding and the balanced
-public-product schedule retain logarithmic dependence on the label width; fixed PBC bucket
-schedules and the prime bodies remain explicit. The Lean exporter shares large types and
+family-member multiplicities stay in loop counts. Index decoding and the product chain are loops; fixed PBC bucket schedules remain explicit,
+and the prime bodies are loops over a symbolic prime index. The Lean exporter shares large types and
 environment binders and partitions remaining fixed circuit declarations into modules of at
 most 3,000,000 bytes, with unchanged public namespaces and import entry points.
 
@@ -555,28 +557,51 @@ This contract applies only to the rows of `S_0` and to `b_0`. The Static preproc
 ciphertexts keep their Gaussian contract (`encoding_contract`): the RHS ciphertexts and the LUT
 switching ciphertexts under `t`.
 
-**Per `(i, x, q)` preprocessing** of the chain-`q` evaluation of §6. This is the proposal's
+**Per `(i, x)` preprocessing** of the evaluation of §6 (one chain, §15). This is the proposal's
 `noise_refresh_preprocess` together with the program preprocessing:
 
 - **Public keys.** Every public key of the Static evaluation is derived from the input keys
   `A'_{i,o}` and the helper keys `Γ(P'_{i,k})`. These replace the hash-sampled input and helper
-  keys.
-- **Static RHS ciphertexts under `t`** on chain `q`, for:
+  keys. The keys of the evaluator bits are `X^{x_monomial(b, x_b)} A'_{i,pub}` (§6.1).
+- **Static RHS ciphertexts under `t`** for:
   - `Enc_i(y_i)` (the proposal's `RHS(y_i)`);
-  - the selectors of `k^σ_x` (the proposal's `RHS(new_secret_prf_key)`; per `x` and `q`, not
-    per `i`, when the chain levels coincide);
-  - the selectors of `k^cbd_{x,o,j}` and `k^sm_{x,q,o,j}`;
+  - the selectors of `k^σ_x` (the proposal's `RHS(new_secret_prf_key)`), `k^cbd_{x,o,j}` and
+    `k^sm_{x,q,o,j}`;
   - the sampler offsets.
 - The switching ciphertexts `B_k` of the `Aut_k` steps (§4.4), under `t`, for `k ∈ 𝒦`.
 - The LUT switching ciphertexts of every LUT.
-- **Per part `(o, j)`:** the decoder key `K = K_u − K_v + K_f Z + K^sm` and its preimage `K_pre`
-  under `(B_i, T_i)` (§4.7).
+- **Per part `(o, j)` and prime `q`:** the decoder key `K = K_u − K_v + K_f Z + K^sm` and its
+  preimage `K_pre` under `(B_i, T_i)` (§4.7).
 
-The obfuscation is `hk`, `A_0`, `S_0`, `{B_i}`, and the per-`(i, x, q)` preprocessing. The RHS
-ciphertexts that do not depend on `i` are stored once.
+The obfuscation is `S_0`, `{B_i}`, and the per-`(i, x)` preprocessing; `hk`, `A_0`, the step
+rows of the function and the PRF coordinate tables are public inputs it shares with the
+evaluator.
+
+**One graph.** The obfuscator is one DSL graph, executed once into one artifact production
+(`crates/io/src/dio2/obfuscate.rs`):
+
+1. Sample `t̄` (ternary), `s̄_0` (binary) and, in one parallel loop over the steps, the anchors
+   `(B_i, T_i)`; encrypt `S_0` and `b_0`. These are the only encryptions: no other row or
+   ciphertext of the obfuscation reads `s_0`.
+2. For each Program kind (a refreshing step, the last step) one parallel loop over its
+   instances (every refreshing step and chunk `(i, x)`, every chunk of the last step) lowers the
+   Static preprocessing of the uniform step Program once: its RHS plaintexts (`Enc_i(y_i)`, the
+   chunk's selectors, the offsets) and integer data (the step's row, the chunk's coordinate
+   tables) are graph values selected by the loop index, and its hashed public matrices carry the
+   instance's hash domain `(i, x)` (root keys: `i`).
+3. The instance's decoded keys come from the key-only refresh composition on the lowered public
+   keys — the same composition the evaluator runs on rows, with the same key helpers — not from
+   an online evaluation; neither the payload `t` nor the mask enters them. The preimages of
+   every part and prime are one parallel loop.
+4. Every per-instance artifact role is published as one family of the instances' values, so the
+   evaluator reads instance `(i, x_i)` by its runtime index.
 
 **Evaluator.** For `0 ≤ i < i_f`: run §6 with `x_i` to get `S_{i+1}`. At `i_f`, run §6.1–§6.2
-with `x_{i_f}` and decode the outputs (§8).
+with `x_{i_f}` and decode the outputs (§8). This is one DSL graph
+(`crates/io/src/dio2/evaluate.rs`): a sequential loop over the refreshing steps carries `S_i`
+and the clear labels `A_i`, its body lowers the step Program once on the rows of `S_i` (graph
+values) and reads the material of instance `(i, x_i)`; the last step's Program and output
+decoder follow the loop.
 
 ## 8. Outputs
 
@@ -807,10 +832,10 @@ The extensions of §10 are implemented as follows:
 
 | §10 | Implementation |
 | --- | --- |
-| 1, 2, 3, 4 | The refresh of row targets is composed in `crates/io/src/dio2/refresh.rs` from the exposed refresh pieces (`RnsBggParameters::refresh_actions`, `refresh_combination`, `residue_term`), the unmask of `crates/exponent-lut/src/decoder/unmask.rs`, and the anchor's preimages under one trapdoor per step. |
-| 4, 5 | Rooted chains (`RnsBggRoot`, `RnsBggParameters::with_root`, `crates/exponent-lut/src/rns_bgg/mod.rs`): input keys and LUT helper keys are `Gamma` of root keys hashed at `Q_0`, and an imported encryption (`RnsEncryptBuild::import`) publishes `Gamma` of given root rows in place of encodings. |
+| 1, 2, 3, 4 | The refresh of row targets is composed in `crates/io/src/dio2/compose.rs` from the exposed refresh pieces (`RnsBggParameters::refresh_actions`, `refresh_combination`, `residue_term`, each with a symbolic prime index), the unmask of `crates/exponent-lut/src/decoder/unmask.rs`, and the anchor's preimages under one trapdoor per step. The composition is generic over its carrier (`crates/io/src/dio2/carrier.rs`): keys alone for the obfuscator, rows and keys for the evaluator, with the same key helpers (`retarget_key`, `mul_public_key`). |
+| 4, 5 | Rooted chains (`RnsBggRoot`, `RnsBggParameters::with_root`, `crates/exponent-lut/src/rns_bgg/mod.rs`): input keys and LUT helper keys are `Gamma` of root keys hashed at `Q_0` under the root's hash domain (the step); the evaluator-bit keys are derived root inputs (`RnsBggRoot::with_derived_input`). Online evaluation takes the root rows as graph values (`RnsOnlineEvalBuild::bind_rows`, `bind_lut_helper_rows`), the integer data as graph values (`bind_data_values`), and reads one instance of the preprocessing (`with_material_member`); the Program's sampled public matrices carry the instance's hash domain (`RnsBggParameters::with_hash_domain`). |
 | 6 | The automorphism table `LutTable::automorphism` (`crates/exponent-lut/src/program/mod.rs`): a one-branch Static LUT with coefficient `1`, which also reads a raw coefficient wire. |
-| 7 | The label products are balanced DSL families described in `crates/io/src/dio2/step.rs` and lowered with `mul_public_rows` in `crates/io/src/dio2/refresh.rs`; noise-only Programs retain scalar trees. |
+| 7 | The label products are right-deep chains (`crates/io/src/dio2/labels.rs`) lowered with the carrier's public product; noise-only Programs retain scalar chains of the same order. |
 | 9 | `RnsBggParameters::retarget_encoding` and `RnsBggParameters::mul_public_rows` (`crates/exponent-lut/src/rns_bgg/rows.rs`). |
 
 Choices the implementation makes within the specification:
@@ -819,11 +844,12 @@ Choices the implementation makes within the specification:
   and the σ sampler with its automorphisms, are PRFs inside the step Program (no child chains).
   Their inputs read the root objects of `S_i` under the same root tags as the step's inputs. Each
   refresh part has its own CBD sampler, and each part and prime its own smudge PRF (their own
-  keys, §4.5). The refresh is composed into the step's online evaluation (`api::online_eval`'s
-  compose hook), so rows and keys of every part and prime come from one evaluation.
-- **Decoded keys.** The obfuscator obtains every part's decoded key by running the same composed
-  evaluation on zero rows (keys do not depend on rows), then samples the preimages under the
-  step's anchor. Hence keys and rows can never diverge.
+  keys, §4.5). The refresh is composed on the step Program's lowered outputs inside the
+  evaluation graph, so rows and keys of every part and prime come from one lowering.
+- **Decoded keys.** The obfuscator obtains every part's decoded key from the key-only
+  composition of the lowered public keys of its preprocessing (§7), then samples the preimages
+  under the step's anchor. The evaluator's row composition builds the same key subexpressions,
+  so keys and rows cannot diverge.
 - **Smudge weights.** The step Program packs the weight-one rows for all smudge digits `r`
   into one output; a sequential digit loop reads each corresponding slice.
   Both refresh and output decoders re-target each digit row and its key to the BigInt scalar
@@ -837,7 +863,7 @@ Choices the implementation makes within the specification:
   checks `fits` and `hides`. The production parameter search explicitly selects noise-only
   representative targets: every non-label target, and a maximal-leaf label product per chunk.
   The public-product rule `E_out = A E_left + ||mu_left||_1 E_right`, with `A >= 1` and monomial
-  `||mu_left||_1 = 1`, makes the balanced label product's noise monotone in its (at least two)
+  `||mu_left||_1 = 1`, makes the label product chain's noise monotone in its (at least two)
   leaves. Thus its maximum decoder error is unchanged. This does not replace any real label
   output: obfuscation, evaluation, and exported claim graphs still use the full plan.
   `StepPlan::full_target_count`, full sampler member counts, and `decoded_coefficients` retain
@@ -849,6 +875,15 @@ Choices the implementation makes within the specification:
   member operations and placed-row events that scale with the exact digit count; shared
   bindings and the audit's fixed-width inner PRF reductions remain unchanged. This
   avoids `members * bucket_width` overflow in large PRF shapes without shrinking any bound.
+- **Graph size.** Neither graph grows with the ring dimension, the number of primes, the label
+  width, the smudge digits, the stream length or the number of chunks: every such count is a
+  loop or family count (`graphs_do_not_grow_with_the_parameters` in
+  `crates/io/src/dio2/scheme.rs`). The automorphisms `𝒦` are still one Program LUT per
+  automorphism, and the PBC buckets and the user's step body (for example the bit loops of
+  `StepProgram::table`) are Program structure.
+- **Claim.** `crates/io/src/dio2/claim.rs` connects the obfuscation and evaluation graphs into a
+  protocol (`mxx_ir_core::protocol::ProtocolDecl`) with the ideal functionality and a one-hot
+  requirement on the selectors, exported by `mxx_ir_core::lean::protocol::export`.
 - **Execution.** `Dio2<E, S>` runs on any stage executor and store. The end-to-end test
   (`crates/io/tests/gpu_round_trip.rs`) runs on the GPU runtime.
 

@@ -398,4 +398,44 @@ mod tests {
         let built = DslContext::new("empty").output("result", output).unwrap().build().unwrap();
         assert_eq!(multiplications(&built), 0);
     }
+
+    /// A named input declared inside nested loop bodies is a root input of the graph, read by
+    /// the bodies like any outer value.
+    #[test]
+    fn inputs_declared_in_bodies_are_graph_inputs() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let family = parallel(3, |i| {
+            iterate(2, ring.zero((1, 1)), |_, sum| {
+                Ok(sum + ring.input("declared-in-body", (1, 1)).multiply_monomial(i.clone()))
+            })
+        })
+        .unwrap();
+        let built = DslContext::new("body-inputs").output("out", family).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let root_inputs = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::Input { name, .. } if name == "declared-in-body"))
+            .count();
+        assert_eq!(root_inputs, 1);
+    }
+
+    /// Leaves move the outputs of a context through a loop and back into a graph.
+    #[test]
+    fn context_outputs_move_as_leaves() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let family = parallel(2, |i| {
+            let outputs = DslContext::new("inner")
+                .output("value", ring.identity(1).multiply_monomial(i))?
+                .into_outputs();
+            Ok(outputs.into_iter().map(|(_, leaf, _)| leaf).collect::<Vec<_>>())
+        })
+        .unwrap();
+        let leaf = Leaf::of(family.field(|leaves| leaves[0].clone()).unwrap()).unwrap();
+        assert!(matches!(leaf.wire_type(), WireType::IndexedFamily { .. }));
+        assert!(leaf.at(Int::constant(1)).is_some());
+        DslContext::new("leaves").output("out", leaf).unwrap().build().unwrap();
+    }
 }

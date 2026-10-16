@@ -22,7 +22,7 @@
 #[cfg(test)]
 mod tests {
     use crate::dio2::{
-        Dio2Error, Dio2Parameters, StepProgram, StreamingFunction,
+        Dio2Error, Dio2Parameters, StreamingFunction,
         noise::{average_model, simulate_noise_targets},
         step::{ChainKeys, ChainProgram, NoiseTargets, StepPlan},
     };
@@ -80,9 +80,9 @@ mod tests {
     fn function() -> StreamingFunction {
         let function =
             StreamingFunction::additive(1, 1, 1, ExpLayout { stride_log2: 1, width_log2: 2 });
-        [vec![1, 0, 1, 0], vec![0, 1, 1, 0]].into_iter().fold(function.clone(), |acc, table| {
-            acc.with_step(StepProgram::table(&function, table))
-        })
+        [vec![1, 0, 1, 0], vec![0, 1, 1, 0]]
+            .into_iter()
+            .fold(function.clone(), |acc, table| acc.with_step_row(table).unwrap())
     }
 
     /// The highest gadget level of a refreshing step's outputs (the level after a private
@@ -96,8 +96,7 @@ mod tests {
             smudge: shape("smudge", plan.noise_smudge_members(false)),
         };
         let start = std::time::Instant::now();
-        let program =
-            ChainProgram::refreshing(parameters, function, &plan, 0, &[true], &keys).unwrap();
+        let program = ChainProgram::refreshing(parameters, function, &plan, &keys).unwrap();
         eprintln!("  program built in {:?}", start.elapsed());
         let workload = RnsBggDerivedWorkload::from_program(&program.program).unwrap();
         eprintln!("  workload derived in {:?}", start.elapsed());

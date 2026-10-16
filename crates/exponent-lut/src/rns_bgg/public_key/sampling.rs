@@ -186,10 +186,12 @@ pub(in crate::rns_bgg) fn rhs_ciphertext(
 /// `(sigma(t_bar), 1) C_sigma = Delta_(level+1) a_sigma t H_(level+1) + e`.
 /// The operations keep the order the exported correctness claims of the
 /// Static preprocessing graph state.
+/// Data-backed tables read their values from the bound integer families `data`.
 pub(in crate::rns_bgg) fn lut_switching_ciphertext(
     parameters: &RnsBggParameters,
     level: usize,
     table: &LutTable,
+    data: &BTreeMap<crate::program::DataId, Family<Int>>,
     payload: &RnsBggRow,
     sigma: IntExpr,
     top: impl FnOnce() -> Result<RnsBggRow, RnsBggError>,
@@ -201,9 +203,7 @@ pub(in crate::rns_bgg) fn lut_switching_ciphertext(
         table.input_layout(),
         table.output_representation(),
         sigma.clone(),
-        table.values().ok_or(RnsBggError::Binding(
-            "preprocessing needs the LUT values, which are withheld",
-        ))?,
+        crate::rns_bgg::dynamic::lut_entries(table, data)?,
     )?;
     // C_sigma is sampled in the next ring and constrained by the payload
     // secret. Its signed switching decomposition has each compact digit
@@ -255,6 +255,207 @@ mod test {
     use super::*;
 
     use mxx_ir_core::ParamEnv;
+
+    /// One graph preprocesses two data-selected tables in parallel. Every switching block
+    /// agrees with constant-table preprocessing, with identical tops and zero fresh error.
+    #[test]
+    fn static_preprocess_reads_data_lut_values() {
+        use crate::{
+            api::{StageGraph, execute_graph},
+            program::{DataId, LutOutputRepresentation},
+            test_support::full,
+        };
+        use mxx_backends::{
+            MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
+        };
+        use rand::Rng;
+        let bits = std::env::var("MXX_STATIC_DATA_LUT_CRT_BITS")
+            .map_or(17, |value| value.parse().unwrap());
+        let level = DCRTPolyParams::new(16, 2, bits, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone(); 2], 0, 1).unwrap();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        let first = vec![rand::rng().random_range(0..2), rand::rng().random_range(0..2)];
+        let tables = [first.clone(), first.iter().map(|value| 1 - value).collect()];
+        let representation = LutOutputRepresentation::Exponent(layout);
+        let table = LutTable::from_data(2, layout, 2, DataId(0), 0, representation).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let payload = (ring.identity(1), ring.identity(1));
+        let columns = parameters.lut_output_columns(1, representation).unwrap();
+        let top = || Ok((ring.zero((1, columns)), ring.zero((1, columns))));
+        let constants = tables
+            .iter()
+            .map(|values| {
+                let table = LutTable::unary(2, layout, 2, values.clone(), representation).unwrap();
+                lut_switching_ciphertext(
+                    &parameters,
+                    0,
+                    &table,
+                    &BTreeMap::new(),
+                    &payload,
+                    IntExpr::constant(1),
+                    top,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let graph = DslContext::new("static-data-lut-tables");
+        let values = graph.int_family_input("tables", 4usize);
+        let actual = mxx_dsl::parallel(2usize, |member| {
+            let row = mxx_dsl::parallel(2usize, |entry| {
+                Ok(values.at(member.clone().mul(2usize).add(entry)))
+            })?;
+            let data = BTreeMap::from([(DataId(0), row)]);
+            lut_switching_ciphertext(
+                &parameters,
+                0,
+                &table,
+                &data,
+                &payload,
+                IntExpr::constant(1),
+                top,
+            )
+            .map_err(|_| DslError::Schema)
+        })
+        .unwrap();
+        let expected =
+            mxx_dsl::parallel(2usize, |member| mxx_dsl::select(member, constants.clone())).unwrap();
+        let graph = graph
+            .output("actual", actual)
+            .unwrap()
+            .output("expected", expected)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut execution = CpuExecution::new(cpu_backend([level]));
+        let result = execute_graph(
+            StageGraph::new(
+                graph,
+                BTreeMap::from([(
+                    "tables".to_owned(),
+                    RuntimeValue::integer_values(
+                        tables.into_iter().flatten().map(BigInt::from).collect(),
+                    ),
+                )]),
+                BTreeMap::new(),
+            ),
+            &ParamEnv::default(),
+            &mut execution,
+            &mut MemoryArtifactStore::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        for port in 0..4 {
+            let RuntimeValue::IndexedFamily { values: actual, .. } =
+                &result.outputs[&format!("actual.{port}")]
+            else {
+                panic!("matrix family")
+            };
+            let RuntimeValue::IndexedFamily { values: expected, .. } =
+                &result.outputs[&format!("expected.{port}")]
+            else {
+                panic!("matrix family")
+            };
+            assert_eq!(actual.len(), 2);
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                assert_eq!(full(actual), full(expected));
+            }
+        }
+    }
+
+    /// Static preprocessing and online evaluation read two different rows of one Program's
+    /// data, and both match the trusted plaintext monomial verification primitive.
+    #[test]
+    fn static_data_lut_round_trip() {
+        use crate::{
+            program::{
+                AttributeKnowledge, ExponentLutProgramBuilder, InputBinding,
+                LutOutputRepresentation, Operand, ProgramData,
+            },
+            rns_bgg::{RnsOutputUse, decode_output, verify_output},
+        };
+        use mxx_backends::{
+            MemoryArtifactStore,
+            authority::CpuExecution,
+            backend::poly::cpu_backend,
+            poly::{Poly, dcrt::poly::DCRTPoly},
+        };
+        use rand::Rng;
+        let bits = std::env::var("MXX_STATIC_DATA_LUT_CRT_BITS")
+            .map_or(17, |value| value.parse().unwrap());
+        let level = DCRTPolyParams::new(16, 2, bits, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone(); 2], 0, 1).unwrap();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let data = builder.data_family(2, Some(2)).unwrap();
+        let lut = builder
+            .register_lut(
+                LutTable::from_data(
+                    2,
+                    layout,
+                    2,
+                    data,
+                    0,
+                    LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let entry = rand::rng().random_range(0..2);
+        let lhs = BTreeMap::from([(
+            input,
+            InputBinding::Scalar(DCRTPoly::const_rotate_poly(&level, entry)),
+        )]);
+        let mut execution = CpuExecution::new(cpu_backend([level.clone()]));
+        let mut store = MemoryArtifactStore::default();
+        for values in [vec![0, 1], vec![1, 0]] {
+            let bound = ProgramData::new().with(data, values.clone());
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
+                &parameters,
+                &program,
+                &bound,
+                true,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |_| (),
+            );
+            let expected = DCRTPoly::const_rotate_poly(&level, values[entry]);
+            verify_output(
+                &program,
+                &result,
+                0,
+                &expected,
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                &mut execution,
+                &mut store,
+            )
+            .unwrap();
+            let decoded = decode_output(
+                &program,
+                &result,
+                0,
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                &[0, 1],
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let clear = (0..2)
+                .map(|position| BigInt::from(usize::from(position == values[entry])))
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, clear);
+        }
+    }
 
     #[test]
     fn rhs_payload_ciphertext_has_zero_noise_private_product_residual() {

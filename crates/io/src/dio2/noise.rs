@@ -162,7 +162,8 @@ impl StepNoise<'_> {
         step: usize,
         x: &[bool],
     ) -> Result<Vec<RnsBggRefreshNoise>, Dio2Error> {
-        let plan = self.plan;
+        let chunk_plan = self.plan.noise_for_chunk(self.parameters, x);
+        let plan = &chunk_plan;
         let last = step + 1 == function.stream_length();
         let shape = |role: &str, members| {
             self.parameters
@@ -176,14 +177,14 @@ impl StepNoise<'_> {
                 cbd: None,
                 smudge: shape("smudge", plan.noise_smudge_members(true))?,
             };
-            ChainProgram::last(self.parameters, function, plan, step, x, &keys)?
+            ChainProgram::last(self.parameters, function, plan, &keys)?
         } else {
             let keys = ChainKeys {
                 sigma: Some(shape("sigma", plan.ring_dimension)?),
                 cbd: Some(shape("cbd", plan.cbd_members())?),
                 smudge: shape("smudge", plan.noise_smudge_members(false))?,
             };
-            ChainProgram::refreshing(self.parameters, function, plan, step, x, &keys)?
+            ChainProgram::refreshing(self.parameters, function, plan, &keys)?
         };
         let outputs = self.lower(&program)?;
         let workload = RnsBggDerivedWorkload::from_program(&program.program)?;
@@ -606,10 +607,12 @@ mod tests {
                             cbd: (!last).then(|| shape("cbd", plan.cbd_members())),
                             smudge: shape("smudge", plan.noise_smudge_members(last)),
                         };
+                        let chunk_plan = plan.noise_for_chunk(&parameters, &x);
+                        let plan = &chunk_plan;
                         let program = if last {
-                            ChainProgram::last(&parameters, &function, plan, step, &x, &keys)
+                            ChainProgram::last(&parameters, &function, plan, &keys)
                         } else {
-                            ChainProgram::refreshing(&parameters, &function, plan, step, &x, &keys)
+                            ChainProgram::refreshing(&parameters, &function, plan, &keys)
                         }
                         .unwrap();
                         let simulation = StepNoise {

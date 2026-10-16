@@ -164,13 +164,16 @@ pub struct PrfSelectorFamily {
 /// key-set commitment is the digest of the members' layout ids, and the
 /// table digest is the digest of the tables they induce. A declaration that
 /// commits the shape binds its hash namespaces to the key set, and a stage
-/// checks the tables it binds against the table digest.
+/// checks the tables it binds against the table digest. [`Self::with_data_tables`] explicitly
+/// replaces concrete-key commitments with data binding for a uniform multi-key-set Program.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PrfKeyShape {
     parameters: PbcParameters,
     members: usize,
     key_set: [u8; 32],
     tables: [u8; 32],
+    /// Coordinate tables and selectors are data, not commitments to one concrete key set.
+    data_tables: bool,
 }
 
 impl PrfKeyShape {
@@ -199,6 +202,7 @@ impl PrfKeyShape {
             members: layouts.len(),
             key_set: key_set.finalize().into(),
             tables: tables_digest(tables.iter().map(Vec::as_slice)),
+            data_tables: false,
             parameters,
         })
     }
@@ -223,7 +227,25 @@ impl PrfKeyShape {
         if members < 2 || parameters.bucket_width_limit.is_none() {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
-        Ok(Self { parameters, members, key_set, tables })
+        Ok(Self { parameters, members, key_set, tables, data_tables: false })
+    }
+
+    /// Keep the declared parameters, cardinality and hash domain while binding concrete
+    /// coordinate tables and selectors as data. Different key sets may share this Program;
+    /// generated layouts must still match the declared parameters and member count.
+    pub fn with_data_tables(mut self) -> Self {
+        self.data_tables = true;
+        self
+    }
+
+    /// Whether generated layouts match this declaration, including commitments when present.
+    fn accepts(&self, layouts: &[PbcPublicLayout]) -> bool {
+        let Ok(actual) = Self::new(layouts) else { return false };
+        if self.data_tables {
+            actual.parameters == self.parameters && actual.members == self.members
+        } else {
+            actual == *self
+        }
     }
 
     pub const fn parameters(&self) -> &PbcParameters {
@@ -621,7 +643,7 @@ impl SparseLwrPrf {
             (PrfKeys::Layout(layout), [key]) if key.layout_id == layout.layout_id => {
                 (layout.bucket_width, ProgramData::new())
             }
-            (PrfKeys::Shape(shape), _) if PrfKeyShape::new(&layouts).as_ref() == Ok(shape) => (
+            (PrfKeys::Shape(shape), _) if shape.accepts(&layouts) => (
                 shape.width(),
                 self.tables
                     .iter()
@@ -659,7 +681,8 @@ impl SparseLwrPrf {
 
     /// Check the Program `data` bound to this PRF's Program against its
     /// keys: no coordinate table for one member; for several, one per bucket
-    /// whose digest is the key shape's table digest.
+    /// whose digest is the key shape's table digest. Data-table declarations instead check
+    /// the common dimensions and coordinate bounds without committing to a concrete key set.
     pub fn check_tables(&self, data: &ProgramData) -> Result<(), PrfError> {
         let matches = match &self.keys {
             PrfKeys::Layout(_) => true,
@@ -668,7 +691,16 @@ impl SparseLwrPrf {
                 .iter()
                 .map(|id| data.values(*id))
                 .collect::<Option<Vec<_>>>()
-                .is_some_and(|ordered| tables_digest(ordered.into_iter()) == shape.tables),
+                .is_some_and(|ordered| {
+                    if shape.data_tables {
+                        ordered.iter().all(|table| {
+                            table.len() as u128 == shape.members as u128 * shape.width() as u128 &&
+                                table.iter().all(|value| *value <= self.profile.lwr_dimension)
+                        })
+                    } else {
+                        tables_digest(ordered.into_iter()) == shape.tables
+                    }
+                }),
         };
         if matches { Ok(()) } else { Err(PrfError::KeyShapeMismatch) }
     }
@@ -1022,6 +1054,57 @@ mod tests {
         assert!(PrfKeyShape::committed(unlimited_parameters, 2, [0; 32], [0; 32]).is_err());
         assert!(build(wider, PrfKeys::Shape(shape.clone())).is_err());
         assert!(build(toy_profile(), PrfKeys::Shape(shape)).is_ok());
+    }
+
+    /// A uniform declaration binds different valid key sets as data, while enforcing shape,
+    /// table lengths and coordinate ranges rather than the original concrete-key digest.
+    #[test]
+    fn declared_prf_accepts_multiple_key_sets_as_data() {
+        use rand::Rng;
+        let seed = rand::rng().random_range(0..80);
+        let first = [toy_key(&[0, 3, 5, 9], seed), toy_key(&[1, 2, 6, 7], seed + 80)];
+        let second = [toy_key(&[0, 2, 4, 8], seed + 1), toy_key(&[1, 3, 5, 7], seed + 81)];
+        let layouts = first.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+        let shape = PrfKeyShape::committed(
+            layouts[0].parameters.clone(),
+            2,
+            rand::random(),
+            rand::random(),
+        )
+        .unwrap()
+        .with_data_tables();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let prf = SparseLwrPrf::build(
+            &mut builder,
+            toy_profile(),
+            PrfKeys::Shape(shape),
+            LutOutputRepresentation::Coefficient,
+        )
+        .unwrap();
+        let PrfOutput::Family(output) = prf.output() else { panic!("two-member family") };
+        let program = builder
+            .finish(vec![Operand::Member { family: output, index: IntExpr::constant(0) }])
+            .unwrap();
+        let parameters =
+            mxx_backends::poly::dcrt::params::DCRTPolyParams::new(32, 1, 17, 4, None, None);
+        for keys in [&first[..], &second[..]] {
+            let (_, data) = prf
+                .key_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&parameters, keys)
+                .unwrap();
+            data.validate(&program).unwrap();
+            prf.check_tables(&data).unwrap();
+            let id = prf.tables()[0];
+            let wrong_width = data.clone().with(id, vec![0]);
+            assert_eq!(prf.check_tables(&wrong_width), Err(PrfError::KeyShapeMismatch));
+            let invalid_coordinate = data
+                .clone()
+                .with(id, vec![prf.profile.lwr_dimension + 1; data.values(id).unwrap().len()]);
+            assert_eq!(prf.check_tables(&invalid_coordinate), Err(PrfError::KeyShapeMismatch));
+        }
+        assert!(
+            prf.key_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&parameters, &first[..1])
+                .is_err()
+        );
     }
 
     #[test]

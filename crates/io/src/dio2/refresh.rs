@@ -629,7 +629,7 @@ impl StepCompose<'_> {
                         let term = guard(
                             residue_term(
                                 &self.parameters.primes,
-                                q,
+                                prime,
                                 self.parameters.ring_dimension,
                                 residue,
                             )

@@ -81,7 +81,6 @@ pub type RnsBggRow = (Mat, Mat);
 /// A two-by-two polynomial block matrix.
 pub type RnsBggMatrix = ((Mat, Mat), (Mat, Mat));
 /// Raw signed gadget digits of a right-action matrix in its decomposition ring.
-#[cfg(test)]
 pub(crate) type RnsBggDigits = ((Preimage, Preimage), (Preimage, Preimage));
 /// Bounded digits of a right action, represented in the ring that consumes them.
 #[cfg(test)]

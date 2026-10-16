@@ -757,7 +757,7 @@ impl RuntimeValue {
         let ConcreteWireType::IndexedFamily { element, count } = &ty else {
             return Err("GPU signed family requires an indexed-family wire type".into());
         };
-        if *count == 0 || *count != owner.count() {
+        if *count == 0 || *count != owner.count() as u128 {
             return Err("GPU signed family count differs from its owner".into());
         }
         let encoding = match (element.as_ref(), owner.encoding()) {
@@ -893,7 +893,7 @@ impl RuntimeValue {
                 Self::IndexedFamily { element_type, values },
                 ConcreteWireType::IndexedFamily { element, count },
             ) => {
-                values.len() == *count &&
+                values.len() as u128 == *count &&
                     element_type == element.as_ref() &&
                     values.iter().all(|value| value.matches_wire_type(element))
             }

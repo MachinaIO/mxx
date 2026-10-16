@@ -340,7 +340,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 }));
             }
         };
-        if members.len() != count {
+        if members.len() as u128 != count {
             return Err(ExecutionError::ValueKind(wire));
         }
         RuntimeValue::indexed_family(element.as_ref().clone(), members)
@@ -1119,6 +1119,15 @@ impl<S: SessionStore> Executor<'_, S> {
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::BlockDiagonal { count } => {
+                let input = self.matrix(values, node.args[0])?;
+                let inputs = vec![input.as_ref(); *count];
+                let output = self
+                    .backend
+                    .concat(&inputs, mxx_ir_core::node::ConcatAxis::Diagonal)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::Tensor => {
                 let left = self.matrix(values, node.args[0])?;
                 let right = self.matrix(values, node.args[1])?;
@@ -1193,6 +1202,16 @@ impl<S: SessionStore> Executor<'_, S> {
                     })?;
                     self.put(values, node.id, 0, RuntimeValue::matrix(value));
                 }
+            }
+            NodeKind::Sha256BitColumns { seed, rows, columns, index_bits } => {
+                let (packed, counts) = mxx_ir_core::hash_columns::sha256_bit_columns(
+                    seed,
+                    *rows,
+                    *columns,
+                    *index_bits,
+                );
+                self.put(values, node.id, 0, RuntimeValue::integer_values(packed));
+                self.put(values, node.id, 1, RuntimeValue::integer_values(counts));
             }
             NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
                 let (key, tag) =
@@ -2087,7 +2106,8 @@ impl<S: SessionStore> Executor<'_, S> {
         match values.get(&wire).ok_or(ExecutionError::MissingWire(wire))? {
             RuntimeValue::LazyArtifactFamily { descriptor, .. } |
             RuntimeValue::StagedArtifactFamily { descriptor, .. } => {
-                descriptor.family_count.ok_or(ExecutionError::ValueKind(wire))
+                usize::try_from(descriptor.family_count.ok_or(ExecutionError::ValueKind(wire))?)
+                    .map_err(|_| ExecutionError::ValueKind(wire))
             }
             RuntimeValue::IndexedFamily { values, .. } => Ok(values.len()),
             _ => Err(ExecutionError::ValueKind(wire)),
@@ -2121,7 +2141,7 @@ impl<S: SessionStore> Executor<'_, S> {
     ) -> Result<RuntimeValue, ExecutionError> {
         match values.get(&wire).ok_or(ExecutionError::MissingWire(wire))? {
             RuntimeValue::LazyArtifactFamily { production, name, descriptor }
-                if descriptor.family_count.is_some_and(|count| index < count) =>
+                if descriptor.family_count.is_some_and(|count| (index as u128) < count) =>
             {
                 Ok(RuntimeValue::LazyArtifact {
                     production: production.clone(),
@@ -2131,7 +2151,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 })
             }
             RuntimeValue::StagedArtifactFamily { production, name, descriptor }
-                if descriptor.family_count.is_some_and(|count| index < count) =>
+                if descriptor.family_count.is_some_and(|count| (index as u128) < count) =>
             {
                 Ok(RuntimeValue::StagedArtifact {
                     production: production.clone(),
@@ -2933,6 +2953,48 @@ mod tests {
 
     #[test]
 
+    fn test_block_diagonal_matches_concat_and_identity_tensor() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::ConcatAxis;
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = ring(&parameters);
+        let input = ring.uniform_residue((2, 3));
+        let mut context = DslContext::new("block-diagonal-semantics");
+        for count in [1, 3, 5] {
+            context = context
+                .output(format!("block-{count}"), input.clone().block_diagonal(count))
+                .unwrap()
+                .output(
+                    format!("concat-{count}"),
+                    Mat::concat(ConcatAxis::Diagonal, vec![input.clone(); count]),
+                )
+                .unwrap()
+                .output(format!("tensor-{count}"), ring.identity(count).tensor(input.clone()))
+                .unwrap();
+        }
+        let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        for count in [1, 3, 5] {
+            assert_eq!(
+                matrix_output(&result, &format!("block-{count}")),
+                matrix_output(&result, &format!("concat-{count}"))
+            );
+            assert_eq!(
+                matrix_output(&result, &format!("block-{count}")),
+                matrix_output(&result, &format!("tensor-{count}"))
+            );
+        }
+    }
+
+    #[test]
     fn shared_tensor_row_sum_group_executes_tensor_once_and_matches_trace() {
         use mxx_dsl::Mat;
         use mxx_ir_core::node::{ConcatAxis, IndexRange};

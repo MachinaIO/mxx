@@ -141,10 +141,12 @@ pub enum PrfOutput {
 }
 
 /// One selector RHS family: `members` bits, at most `max_nonzero` of them one.
+/// The symbolic bit count is the 128-bit product of the key count and row width; it need not
+/// fit in an addressable runtime vector. Indices and loop arithmetic lower to `IntExpr`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrfSelectorFamily {
     pub rhs: RhsId,
-    pub members: usize,
+    pub members: u128,
     /// The number of one bits in the family, or in each row with
     /// `row_length`.
     pub max_nonzero: usize,
@@ -335,7 +337,9 @@ impl PrfKeys {
 ///   ([`Self::key_inputs`]). The graph does not grow with the members, and the noise model lowers
 ///   each body once: the row contract ([`PrfSelectorFamily::row_length`]) keeps every row sum's
 ///   payload support at one. A last root `parallel` applies the readout LUT; the output is the
-///   member family.
+///   member family. The symbolic cell count is computed in 128 bits before conversion to the
+///   arbitrary-precision `IntExpr`, so declaring `M W` cells does not require a `usize` index or
+///   allocation. Executing with concrete keys still requires addressable tables and selectors.
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrf {
     profile: SparseLwrPrfProfile,
@@ -435,20 +439,21 @@ impl SparseLwrPrf {
             }
             PrfKeys::Shape(shape) => {
                 let (members, width) = (shape.members, shape.width());
+                let cells_count = members as u128 * width as u128;
                 // One selector family per bucket, member `o`'s row of `width` bits
                 // at `o width ..`: each row is one-hot (the key's slot in that
                 // bucket), the row contract of [`PrfSelectorFamily::row_length`].
                 let selectors = (0..shape.bucket_count())
                     .map(|_| {
-                        builder.rhs_family(IntExpr::constant(members * width)).map(|rhs| vec![rhs])
+                        builder.rhs_family(IntExpr::constant(cells_count)).map(|rhs| vec![rhs])
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 // One table per bucket: the coordinate of every cell, a member
                 // of the input vector.
                 let tables = (0..shape.bucket_count())
-                    .map(|_| builder.data_family(members * width, Some(zero_member + 1)))
+                    .map(|_| builder.data_family(cells_count, Some(zero_member + 1)))
                     .collect::<Result<Vec<_>, _>>()?;
-                let cells_range = FamilyRange::full(IntExpr::constant(members * width))?;
+                let cells_range = FamilyRange::full(IntExpr::constant(cells_count))?;
                 let members_range = FamilyRange::full(IntExpr::constant(members))?;
                 let row_range = FamilyRange::full(IntExpr::constant(width))?;
                 // The state of every member, `None` before the first bucket (the
@@ -583,13 +588,13 @@ impl SparseLwrPrf {
             .map(|(bucket, families)| match &self.keys {
                 PrfKeys::Layout(layout) => PrfSelectorFamily {
                     rhs: families[0],
-                    members: layout.cells[bucket].len(),
+                    members: layout.cells[bucket].len() as u128,
                     max_nonzero: 1,
                     row_length: None,
                 },
                 PrfKeys::Shape(shape) => PrfSelectorFamily {
                     rhs: families[0],
-                    members: shape.members * shape.width(),
+                    members: shape.members as u128 * shape.width() as u128,
                     max_nonzero: 1,
                     row_length: Some(shape.width()),
                 },
@@ -861,7 +866,7 @@ mod tests {
         let a = (0..10_u64).map(|coordinate| (7 * coordinate + 3) % q).collect::<Vec<_>>();
         let mut accumulator = 0;
         for (bucket, family) in families.iter().enumerate() {
-            assert_eq!(family.members, key.public_layout.cells[bucket].len());
+            assert_eq!(family.members, key.public_layout.cells[bucket].len() as u128);
             assert_eq!(family.max_nonzero, 1);
             assert_eq!(workload.rhs_level(family.rhs).unwrap(), bucket);
             let bits = bits(&parameters, &plaintexts, family.rhs);
@@ -888,6 +893,36 @@ mod tests {
         );
     }
 
+    /// A full-width key count declares exact selector/data counts without a flattened `usize`
+    /// or any per-key allocation. Both the first and the last output member are in bounds.
+    #[test]
+    fn oversized_prf_families_are_symbolic() {
+        let parameters =
+            PbcParameters { bucket_width_limit: Some(8), ..PbcParameters::paper_evaluation(10, 4) };
+        let keys = PrfKeyShape::committed(parameters, usize::MAX, [0; 32], [1; 32]).unwrap();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let prf = SparseLwrPrf::build(
+            &mut builder,
+            toy_profile(),
+            PrfKeys::Shape(keys),
+            LutOutputRepresentation::Coefficient,
+        )
+        .unwrap();
+        let PrfOutput::Family(output) = prf.output() else { panic!("member output") };
+        let program = builder
+            .finish(vec![
+                Operand::Member { family: output, index: IntExpr::constant(0) },
+                Operand::Member { family: output, index: IntExpr::constant(usize::MAX - 1) },
+            ])
+            .unwrap();
+        let cells = usize::MAX as u128 * 8;
+        assert!(program.data_families().values().all(|table| table.count() == cells));
+        assert!(prf.selector_families().iter().all(|family| {
+            family.members == cells && family.row_length == Some(8) && family.max_nonzero == 1
+        }));
+        assert_eq!(prf.members(), usize::MAX);
+    }
+
     /// Several members: one member-indexed selector family per bucket,
     /// holding the slot bit of every member's key in a row of the width
     /// limit, and one coordinate table per bucket holding every cell's
@@ -908,9 +943,9 @@ mod tests {
             program
                 .data_families()
                 .values()
-                .all(|table| table.count() == 2 * width && table.bound() == Some(11))
+                .all(|table| table.count() == 2 * width as u128 && table.bound() == Some(11))
         );
-        assert!(families.iter().all(|family| family.members == 2 * width &&
+        assert!(families.iter().all(|family| family.members == 2 * width as u128 &&
             family.max_nonzero == 1 &&
             family.row_length == Some(width)));
         let parameters =

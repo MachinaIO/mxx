@@ -7,6 +7,21 @@ description = "Indistinguishability obfuscation constructions for mxx"
 
 [features]
 default = []
-gpu = []
+gpu = ["mxx-exponent-lut/gpu", "mxx-backends/gpu"]
 
 [dependencies]
+mxx-exponent-lut.workspace = true
+mxx-dsl.workspace = true
+mxx-ir-core.workspace = true
+mxx-backends.workspace = true
+bigdecimal.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+rayon.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tracing-subscriber.workspace = true

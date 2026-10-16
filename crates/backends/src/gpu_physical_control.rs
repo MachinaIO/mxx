@@ -1,5 +1,8 @@
 //! Direct GPU Graph lowering for structural control scopes.
 //!
+//! Symbolic family cardinalities are checked for host addressability at physical allocation
+//! and iteration boundaries. Graph-only validation does not allocate their members.
+//!
 //! A loop without external I/O uses a native conditional body. A loop that
 //! selects an artifact member needs an explicit I/O boundary between bounded
 //! Graph replays. Values that change with a device loop index remain physical
@@ -397,6 +400,12 @@ pub(super) fn allocate_loop_control(
     ))
 }
 
+/// Checks a symbolic cardinality before constructing concrete GPU storage or member indices.
+pub(super) fn host_family_count(count: u128) -> Result<usize, String> {
+    usize::try_from(count)
+        .map_err(|_| format!("GPU family cardinality {count} exceeds host addressability"))
+}
+
 /// Resolve the maximum iteration count against the actual enclosing bindings.
 /// No sample input value or validator's index-zero child environment is used.
 pub(super) fn finite_loop_count(
@@ -466,7 +475,29 @@ pub(super) fn wave_family_member(
     source: &GpuResidentValue,
     index: usize,
 ) -> Result<Arc<GpuResidentValue>, String> {
-    let (selected, bindings) = wave_member_layout(source.physical(), index)?;
+    wave_selected_member(source, static_family_physical(source.physical(), index)?)
+}
+
+/// The members `indices` of a resident family rebased as in [`wave_family_member`], selected in
+/// one pass over the family's parts (a loop over every member of a family stored as one part per
+/// member would otherwise scan every part for every member).
+pub(super) fn wave_family_members(
+    source: &GpuResidentValue,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<Arc<GpuResidentValue>>, String> {
+    static_family_physicals(source.physical(), indices)?
+        .into_iter()
+        .map(|selected| wave_selected_member(source, selected))
+        .collect()
+}
+
+/// Rebase the member `selected` of `source` (a static selection of it) as in
+/// [`wave_family_member`].
+fn wave_selected_member(
+    source: &GpuResidentValue,
+    selected: PhysicalValue,
+) -> Result<Arc<GpuResidentValue>, String> {
+    let (selected, bindings) = wave_member_layout(selected)?;
     let mut storage = BTreeMap::new();
     for (old_slot, slot, offset) in bindings {
         let mut bound = source
@@ -496,10 +527,8 @@ pub(super) fn wave_family_member(
 }
 
 fn wave_member_layout(
-    family: &PhysicalValue,
-    index: usize,
+    mut selected: PhysicalValue,
 ) -> Result<(PhysicalValue, Vec<(StorageRef, StorageRef, u64)>), String> {
-    let mut selected = static_family_physical(family, index)?;
     let mut bindings = Vec::with_capacity(selected.parts.len());
     for (part_index, part) in selected.parts.iter_mut().enumerate() {
         let slot = StorageRef::Input(
@@ -560,7 +589,7 @@ pub(super) fn pack_resident_family(
     let ConcreteWireType::IndexedFamily { element, count } = &expected else {
         return Err("GPU packed input is not an indexed family".into());
     };
-    if *count != members.len() {
+    if *count != members.len() as u128 {
         return Err("GPU packed family needs every declared resident member".into());
     }
     if *count == 0 {
@@ -698,6 +727,9 @@ pub(super) fn lower_control_node(
     let output = WireRef { node: node_id, port: Port(0) };
     match node.kind() {
         NodeKind::Concat { axis } => lower_concat(ctx, scope, scope_id, node_id, node, env, *axis),
+        NodeKind::BlockDiagonal { .. } => {
+            lower_concat(ctx, scope, scope_id, node_id, node, env, ConcatAxis::Diagonal)
+        }
         NodeKind::ModulusReduce { .. } => {
             lower_modulus_reduce(ctx, scope, scope_id, node_id, node, env)
         }
@@ -1128,8 +1160,10 @@ pub(super) fn lower_control_node(
                     members.push(Arc::clone(owner));
                     member_producers.push(all_predecessors(ctx.producer, id));
                 }
-                let family_type =
-                    ConcreteWireType::IndexedFamily { element: Box::new(selected_type), count };
+                let family_type = ConcreteWireType::IndexedFamily {
+                    element: Box::new(selected_type),
+                    count: count as u128,
+                };
                 let family_owner = pack_resident_family(family_type, &members, ctx.device)?;
                 let family = value_id(ctx.values.len())?;
                 ctx.values.push(family_owner.physical().as_ref().clone());
@@ -1284,6 +1318,7 @@ pub(super) fn lower_control_node(
                 if descriptor.family_count != Some(count) || element.as_ref() != &expected {
                     return Err("GPU dynamic artifact member differs from its family".into());
                 }
+                let count = host_family_count(count)?;
                 let expected_type = ArtifactType::from_wire_type(&expected)
                     .ok_or("GPU dynamic artifact member has no artifact type")?;
                 let capacity = selected_import_capacity(
@@ -1421,12 +1456,26 @@ pub(super) fn lower_control_node(
             };
             if matches!(element.as_ref(), ConcreteWireType::Matrix(_)) {
                 return lower_dynamic_matrix_member(
-                    ctx, scope_id, node_id, node, env, family, index, *count,
+                    ctx,
+                    scope_id,
+                    node_id,
+                    node,
+                    env,
+                    family,
+                    index,
+                    host_family_count(*count)?,
                 );
             }
             if matches!(element.as_ref(), ConcreteWireType::Trapdoor { .. }) {
                 return lower_dynamic_trapdoor_member(
-                    ctx, scope_id, node_id, node, env, family, index, *count,
+                    ctx,
+                    scope_id,
+                    node_id,
+                    node,
+                    env,
+                    family,
+                    index,
+                    host_family_count(*count)?,
                 );
             }
             if !matches!(element.as_ref(), ConcreteWireType::Int) || physical.parts.len() != 1 {
@@ -1505,7 +1554,7 @@ pub(super) fn lower_control_node(
                     return Err("GPU static artifact source is not an indexed family".into());
                 };
                 if descriptor.family_count != Some(count) ||
-                    index >= count ||
+                    index as u128 >= count ||
                     element.as_ref() != &expected
                 {
                     return Err(
@@ -1590,7 +1639,7 @@ pub(super) fn lower_control_node(
             else {
                 return Err("GPU family pack output is not a family".into());
             };
-            if *expected_count != count {
+            if *expected_count != count as u128 {
                 return Err("GPU family pack count differs from its declared type".into());
             }
             if element.as_ref() == &ConcreteWireType::Int {
@@ -1780,8 +1829,10 @@ pub(super) fn lower_control_node(
                     let writers = ctx.producer.get(&public).cloned().unwrap_or_default();
                     public_producers.extend(writers.iter().copied());
                 }
-                let public_family_type =
-                    ConcreteWireType::IndexedFamily { element: Box::new(public_type), count };
+                let public_family_type = ConcreteWireType::IndexedFamily {
+                    element: Box::new(public_type),
+                    count: count as u128,
+                };
                 let public_owner =
                     pack_resident_family(public_family_type, &public_members, ctx.device)?;
                 let public_family = value_id(ctx.values.len())?;
@@ -1812,6 +1863,28 @@ pub(super) fn lower_control_node(
                 ctx, graph, scope_id, node_id, node, env, &child_id, &child_env, None, None, true,
                 None,
             )?;
+            Ok(())
+        }
+        NodeKind::Sha256BitColumns { seed, rows, columns, index_bits } => {
+            let (packed, counts) =
+                mxx_ir_core::hash_columns::sha256_bit_columns(seed, *rows, *columns, *index_bits);
+            for (port, constants) in [packed, counts].iter().enumerate() {
+                let ty = ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count: *columns as u128,
+                };
+                let maximum =
+                    constants.iter().max().cloned().ok_or("empty SHA-256 column family")?;
+                let id = allocate_integer_family_value_with_storage(
+                    ctx,
+                    ty,
+                    BigInt::from(0)..=maximum,
+                    false,
+                    false,
+                    Some(constants),
+                )?;
+                ctx.wire_ids.insert(WireRef { node: node_id, port: Port(port as u32) }, id);
+            }
             Ok(())
         }
         NodeKind::HashIntFamily { .. } => {
@@ -1965,7 +2038,11 @@ fn lane_type<'c>(
 ) -> &'c ConcreteWireType {
     let ty = &ctx.values[id.0 as usize].ty;
     match ty {
-        ConcreteWireType::IndexedFamily { element, count } if ctx.lanes == Some(*count) => element,
+        ConcreteWireType::IndexedFamily { element, count }
+            if ctx.lanes.map(|lanes| lanes as u128) == Some(*count) =>
+        {
+            element
+        }
         _ => ty,
     }
 }
@@ -2316,7 +2393,7 @@ fn lower_device_int_expr_mode(
                 ctx,
                 ConcreteWireType::IndexedFamily {
                     element: Box::new(ConcreteWireType::Int),
-                    count: basis.len(),
+                    count: basis.len() as u128,
                 },
                 range.clone(),
             )?;
@@ -2660,7 +2737,7 @@ fn allocate_integer_table(
     let physical = PhysicalValue {
         ty: ConcreteWireType::IndexedFamily {
             element: Box::new(ConcreteWireType::Int),
-            count: values.len(),
+            count: values.len() as u128,
         },
         encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedWords(
             words,
@@ -2776,10 +2853,7 @@ fn allocate_integer_value_with_storage(
         origin.insert(0, 0);
         extent.insert(0, lanes);
         byte_strides.insert(0, byte_strides[0]);
-        ConcreteWireType::IndexedFamily {
-            element: Box::new(ty),
-            count: usize::try_from(lanes).map_err(|_| "GPU lane count exceeds usize")?,
-        }
+        ConcreteWireType::IndexedFamily { element: Box::new(ty), count: u128::from(lanes) }
     } else {
         ty
     };
@@ -2856,7 +2930,7 @@ fn allocate_integer_family_value_with_storage(
     if canonical && (range.start().is_negative() || range.end().bits() > 64) {
         return Err("GPU canonical integer family range is outside u64".into());
     }
-    let count = *count;
+    let count = host_family_count(*count)?;
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
     let words = usize::try_from(range.start().bits().max(range.end().bits()).div_ceil(64))
         .map_err(|_| "GPU family integer width exceeds usize".to_owned())?
@@ -2952,7 +3026,7 @@ fn lower_dynamic_matrix_member(
     else {
         return Err("GPU dynamic matrix source is not an indexed family".into());
     };
-    if count == 0 || *source_count != count || element.as_ref() != &expected {
+    if count == 0 || *source_count != count as u128 || element.as_ref() != &expected {
         return Err("GPU dynamic matrix family differs from its output type".into());
     }
     let [encoding @ (PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval)] =
@@ -2963,8 +3037,10 @@ fn lower_dynamic_matrix_member(
     let encoding = encoding.clone();
     let source = Arc::clone(source);
     let mut candidates = Vec::with_capacity(count);
-    for member_index in 0..count {
-        let selected = static_family_member(&source, member_index)?;
+    let members = static_family_physicals(source.physical(), 0..count)?;
+    for (member_index, member) in members.into_iter().enumerate() {
+        let selected =
+            source.with_physical_view(Arc::new(member)).map(Arc::new).map_err(str::to_owned)?;
         if selected.wire_type() != &expected ||
             selected.physical().encodings.as_ref() != [encoding.clone()]
         {
@@ -3159,8 +3235,9 @@ fn lower_subgraph_kernel(
                         "subgraph kernel {name} operand {position} needs evaluation-domain members"
                     ));
                 }
-                let mut members = Vec::with_capacity(*count);
-                for member_index in 0..*count {
+                let count = host_family_count(*count)?;
+                let mut members = Vec::with_capacity(count);
+                for member_index in 0..count {
                     let selected = static_family_member(&source, member_index)?;
                     let member = value_id(ctx.values.len())?;
                     ctx.values.push(selected.physical().as_ref().clone());
@@ -3341,7 +3418,7 @@ fn lower_dynamic_trapdoor_member(
     else {
         return Err("GPU dynamic trapdoor source is not a family".into());
     };
-    if count == 0 || *source_count != count || element.as_ref() != &expected {
+    if count == 0 || *source_count != count as u128 || element.as_ref() != &expected {
         return Err("GPU dynamic trapdoor family differs from its declared type".into());
     }
     let public_gadget =
@@ -4698,7 +4775,7 @@ fn lower_polynomial_values(
     let ConcreteWireType::IndexedFamily { element, count } = &expected else {
         return Err("GPU polynomial values output is not a family".into());
     };
-    if element.as_ref() != &ConcreteWireType::Int || *count != ty.ring.ring_dimension() as usize {
+    if element.as_ref() != &ConcreteWireType::Int || *count != ty.ring.ring_dimension() as u128 {
         return Err("GPU polynomial values output has the wrong cardinality".into());
     }
     let bound = ty.ring.modulus() - BigInt::from(1u8);
@@ -4832,7 +4909,7 @@ fn lower_pack_polynomial_coefficients(
     if element.as_ref() != &ConcreteWireType::Bool || *count == 0 {
         return Err("GPU polynomial pack needs a nonempty Boolean family".into());
     }
-    let count = *count;
+    let count = host_family_count(*count)?;
     let ConcreteWireType::Matrix(ty) = resolved_node_output_type(scope_id, node_id, node, env)?
     else {
         return Err("GPU polynomial pack output is not a matrix".into());
@@ -4844,7 +4921,10 @@ fn lower_pack_polynomial_coefficients(
     integer_range(ctx, width)?;
     let packed_bits = allocate_integer_family_value(
         ctx,
-        ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
+        ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: count as u128,
+        },
         BigInt::from(0u8)..=BigInt::from(1u8),
     )?;
     let family_owner =
@@ -4965,7 +5045,7 @@ fn lower_threshold_decode(
             .map_err(|error| error.to_string())?
         {
             ConcreteWireType::IndexedFamily { element: actual, count } if *actual == element => {
-                count
+                host_family_count(count)?
             }
             _ => return Err("GPU threshold family has the wrong output type".into()),
         }
@@ -5003,7 +5083,10 @@ fn lower_threshold_decode(
     let output_range = BigInt::from(0u8)..=t_magnitude.max(BigInt::from(1u8));
     let decoded = allocate_integer_family_value(
         ctx,
-        ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
+        ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: count as u128,
+        },
         output_range,
     )?;
     let status = allocate_integer_status(ctx)?;
@@ -5910,7 +5993,7 @@ fn lower_polynomial_from_values(
         return Err("GPU polynomial import input is not an integer family".into());
     };
     if element.as_ref() != &ConcreteWireType::Int ||
-        *count != ty.ring.ring_dimension() as usize ||
+        *count != ty.ring.ring_dimension() as u128 ||
         physical.parts.len() != 1 ||
         !matches!(
             physical.encodings.as_ref(),
@@ -6087,6 +6170,15 @@ fn lower_concat(
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU concat arguments are outside their scope".to_owned())?;
+    let arguments = match node.kind() {
+        NodeKind::BlockDiagonal { count } if arguments.len() == 1 && *count > 0 => {
+            vec![arguments[0]; *count]
+        }
+        NodeKind::BlockDiagonal { .. } => {
+            return Err("GPU block diagonal requires one input and a positive count".into())
+        }
+        _ => arguments,
+    };
     if arguments.is_empty() || node.output_types().len() != 1 {
         return Err("GPU concat requires inputs and one output".into());
     }
@@ -6211,8 +6303,13 @@ fn lower_concat(
     if let Some(index) = zero {
         written.push((ColumnRange { start: 0, end: output_ty.columns }, index));
     }
+    // The reads of every wire of the scope, counted once for all pieces.
+    let mut readers = BTreeMap::<WireRef, usize>::new();
+    for argument in scope.nodes().iter().filter_map(|node| scope.arguments(node)).flatten() {
+        *readers.entry(argument).or_default() += 1;
+    }
     for (wire, source, rows, columns) in inputs {
-        let writers = concat_piece_writers(ctx, scope, scope_id, &arguments, wire, source);
+        let writers = concat_piece_writers(ctx, scope_id, (&arguments, &readers), wire, source);
         let owner = Arc::clone(
             ctx.owners
                 .get(&output_id)
@@ -6350,12 +6447,12 @@ fn lower_concat(
 /// piece can be written straight into its output window: elementwise or
 /// product operations of this scope that write only views of the piece's own
 /// unshared scratch allocations, which nothing but this concat reads.
-/// Returns every value viewing the piece's allocations with the writers.
+/// Returns every value viewing the piece's allocations with the writers. `readers` counts the
+/// reads of every wire of the scope.
 fn concat_piece_writers(
     ctx: &PhysicalLoweringContext<'_>,
-    scope: &GraphScope,
     scope_id: &FrozenGraphScopeId,
-    concat_arguments: &[WireRef],
+    (concat_arguments, readers): (&[WireRef], &BTreeMap<WireRef, usize>),
     wire: WireRef,
     source: PhysicalValueId,
 ) -> Option<(Vec<PhysicalValueId>, Vec<(ColumnRange, u32)>)> {
@@ -6367,14 +6464,7 @@ fn concat_piece_writers(
     {
         return None;
     }
-    let readers = scope
-        .nodes()
-        .iter()
-        .filter_map(|node| scope.arguments(node))
-        .flatten()
-        .filter(|argument| *argument == wire)
-        .count();
-    if readers != 1 {
+    if readers.get(&wire) != Some(&1) {
         return None;
     }
     let value = ctx.values.get(source.0 as usize)?;
@@ -6384,19 +6474,15 @@ fn concat_piece_writers(
     if storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_))) {
         return None;
     }
-    let allocations = storages
+    let own = storages
         .iter()
         .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
         .collect::<Vec<_>>();
-    let aliases = ctx
-        .owners
+    let aliases = own
         .iter()
-        .filter(|(_, other)| {
-            other
-                .storages()
-                .any(|(_, bound)| allocations.contains(&Arc::as_ptr(&bound.owner).cast::<()>()))
-        })
-        .map(|(id, _)| *id)
+        .flat_map(|allocation| ctx.owners.viewing(*allocation))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     // Every aliasing value is a view within the piece with its strides; a
     // piece that is itself a view into a larger value (one row of a product)
@@ -7207,7 +7293,7 @@ fn lower_sequential_loop(
         }
         let first_new = mark.0;
         ctx.values.truncate(first_new);
-        ctx.owners.retain(|id, _| (id.0 as usize) < first_new);
+        ctx.owners.retain(|id| (id.0 as usize) < first_new);
         ctx.producer.retain(|id, _| (id.0 as usize) < first_new);
         ctx.family_member_producers.retain(|(id, _), _| (id.0 as usize) < first_new);
         ctx.trapdoor_public_ids.retain(|id, _| (id.0 as usize) < first_new);
@@ -7538,8 +7624,10 @@ fn lower_vectorized_parallel_loop(
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU loop indices".to_owned())?,
     );
-    let lane_family =
-        |element| ConcreteWireType::IndexedFamily { element: Box::new(element), count };
+    let lane_family = |element| ConcreteWireType::IndexedFamily {
+        element: Box::new(element),
+        count: count as u128,
+    };
     let index_physical = PhysicalValue {
         ty: lane_family(ConcreteWireType::Int),
         encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)]),
@@ -7594,7 +7682,7 @@ fn lower_vectorized_parallel_loop(
         let [part] = family.parts.as_ref() else {
             return Err("GPU vectorized Zip source needs one contiguous part".into());
         };
-        if offset.checked_add(count).is_none_or(|end| end > *members) ||
+        if offset.checked_add(count).is_none_or(|end| end as u128 > *members) ||
             part.view.origin.iter().any(|&origin| origin != 0)
         {
             return Err("GPU vectorized Zip source does not cover every lane".into());
@@ -7646,7 +7734,7 @@ fn lower_vectorized_parallel_loop(
             .into_iter()
             .map(|id| {
                 if matches!(&ctx.values[id.0 as usize].ty,
-                    ConcreteWireType::IndexedFamily { count: members, .. } if *members == count)
+                    ConcreteWireType::IndexedFamily { count: members, .. } if *members == count as u128)
                 {
                     return Ok(id);
                 }
@@ -7958,7 +8046,7 @@ fn lower_parallel_loop(
             return Err("GPU parallel loop output is not an indexed family".into());
         };
         // Members are full or bounded compact matrices; only summed ports (below) need full ones.
-        if *declared_count != count ||
+        if *declared_count != count as u128 ||
             !matches!(
                 element.as_ref(),
                 ConcreteWireType::Matrix(_) | ConcreteWireType::SmallMatrix { .. }
@@ -8227,12 +8315,12 @@ fn lower_parallel_loop(
                 let expected_type = ArtifactType::from_wire_type(element)
                     .ok_or("GPU Zip artifact member has no artifact type")?;
                 if descriptor.family_count != Some(*family_count) ||
-                    (gather.is_none() && index >= *family_count)
+                    (gather.is_none() && index as u128 >= *family_count)
                 {
                     return Err("GPU Zip artifact member is outside its validated family".into());
                 }
                 let selected_indexes = if gather.is_some() {
-                    (0..*family_count).collect::<Vec<_>>()
+                    (0..host_family_count(*family_count)?).collect::<Vec<_>>()
                 } else {
                     (0..count)
                         .step_by(width)
@@ -8554,6 +8642,24 @@ fn lower_parallel_loop(
     if ctx.device_body && !body_imports.is_empty() {
         return Err("GPU device body artifact import needs an on-demand region boundary".into());
     }
+    // Every member a Zip lane selects over the waves, `offset..offset + count` of its source.
+    let zip_members = if ctx.device_body {
+        Vec::new()
+    } else {
+        zip_lanes
+            .iter()
+            .map(|(offset, _, _, source_id)| {
+                let source = ctx
+                    .owners
+                    .get(source_id)
+                    .ok_or_else(|| "GPU Zip root family owner is missing".to_owned())?;
+                let end = offset
+                    .checked_add(count)
+                    .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+                wave_family_members(source, *offset..end)
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
     for wave_start in (0..count).step_by(width).filter(|_| !ctx.device_body) {
         let active_lanes = (count - wave_start).min(width);
         let mut wave = PhysicalWave {
@@ -8583,17 +8689,15 @@ fn lower_parallel_loop(
                     .map_err(|_| "GPU parallel device index exceeds u64".to_owned())?,
             ));
         }
-        for (offset, lane, id, source_id) in &zip_lanes {
-            let source = ctx
-                .owners
-                .get(source_id)
-                .ok_or_else(|| "GPU Zip root family owner is missing".to_owned())?;
-            let member_index = wave_start
+        for ((offset, lane, id, source_id), members) in zip_lanes.iter().zip(&zip_members) {
+            let position = wave_start
                 .checked_add(*lane)
                 .map(|index| index.min(count - 1))
-                .and_then(|index| index.checked_add(*offset))
                 .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
-            let selected = wave_family_member(source, member_index)?;
+            let member_index = position
+                .checked_add(*offset)
+                .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+            let selected = Arc::clone(&members[position]);
             if selected.physical().as_ref() != &ctx.values[id.0 as usize] {
                 return Err("GPU Zip member layout changes between waves".into());
             }
@@ -8645,7 +8749,11 @@ fn lower_parallel_loop(
                         .checked_add(lane.lane)
                         .and_then(|index| index.checked_add(lane.offset))
                         .ok_or_else(|| "GPU artifact Zip index overflows".to_owned())?;
-                    if lane.descriptor.family_count.is_none_or(|count| member_index >= count) {
+                    if lane
+                        .descriptor
+                        .family_count
+                        .is_none_or(|count| member_index as u128 >= count)
+                    {
                         return Err("GPU artifact Zip member is outside its validated family".into());
                     }
                     (Some(member_index), None)
@@ -8777,8 +8885,14 @@ fn bind_template_aliases(
     if replaced.is_empty() {
         return Ok(());
     }
-    for index in template_values {
-        let id = value_id(index)?;
+    // Only a template value viewing a replaced allocation can be rebound: the owners' view index
+    // gives them without scanning the template.
+    let candidates = replaced
+        .keys()
+        .flat_map(|allocation| ctx.owners.viewing(*allocation))
+        .filter(|id| template_values.contains(&(id.0 as usize)))
+        .collect::<BTreeSet<_>>();
+    for id in candidates {
         if wave.owner_bindings.contains_key(&id) {
             continue;
         }
@@ -9241,15 +9355,29 @@ fn lower_inlined_child(
 }
 
 fn static_family_physical(physical: &PhysicalValue, index: usize) -> Result<PhysicalValue, String> {
+    static_family_physicals(physical, index..index + 1)?
+        .pop()
+        .ok_or_else(|| "GPU static family index is out of range".to_owned())
+}
+
+/// The members `indices` of a resident family, as views of its parts. One pass over the parts
+/// selects every member, so selecting all the members of a family of `m` members split into `p`
+/// parts costs `O(p + m)` rather than `O(p m)`.
+fn static_family_physicals(
+    physical: &PhysicalValue,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<PhysicalValue>, String> {
     let ConcreteWireType::IndexedFamily { element, count } = &physical.ty else {
         return Err("GPU static family selection requires a resident family".into());
     };
-    if index >= *count {
+    if indices.end as u128 > *count {
         return Err("GPU static family index is out of range".into());
     }
-    let index = u64::try_from(index)
+    let first = u64::try_from(indices.start)
         .map_err(|_| "GPU static family index exceeds physical coordinates".to_owned())?;
-    let mut parts = Vec::new();
+    let last = u64::try_from(indices.end)
+        .map_err(|_| "GPU static family index exceeds physical coordinates".to_owned())?;
+    let mut members = vec![Vec::new(); indices.len()];
     for part in physical.parts.iter() {
         let start = *part
             .view
@@ -9264,37 +9392,42 @@ fn static_family_physical(physical: &PhysicalValue, index: usize) -> Result<Phys
         let end = start
             .checked_add(extent)
             .ok_or_else(|| "GPU family view range overflows".to_owned())?;
-        if index < start || index >= end {
-            continue;
-        }
         let stride = *part
             .view
             .byte_strides
             .first()
             .ok_or_else(|| "GPU family part has no family stride".to_owned())?;
-        let displacement = (index - start)
-            .checked_mul(stride)
-            .ok_or_else(|| "GPU family member offset overflows".to_owned())?;
-        let mut selected = part.clone();
-        selected.view.byte_offset = selected
-            .view
-            .byte_offset
-            .checked_add(displacement)
-            .ok_or_else(|| "GPU family member address overflows".to_owned())?;
-        selected.view.origin = selected.view.origin[1..].to_vec().into_boxed_slice();
-        selected.view.extent = selected.view.extent[1..].to_vec().into_boxed_slice();
-        selected.view.byte_strides = selected.view.byte_strides[1..].to_vec().into_boxed_slice();
-        parts.push(selected);
+        for index in start.max(first)..end.min(last) {
+            let displacement = (index - start)
+                .checked_mul(stride)
+                .ok_or_else(|| "GPU family member offset overflows".to_owned())?;
+            let mut selected = part.clone();
+            selected.view.byte_offset = selected
+                .view
+                .byte_offset
+                .checked_add(displacement)
+                .ok_or_else(|| "GPU family member address overflows".to_owned())?;
+            selected.view.origin = selected.view.origin[1..].to_vec().into_boxed_slice();
+            selected.view.extent = selected.view.extent[1..].to_vec().into_boxed_slice();
+            selected.view.byte_strides =
+                selected.view.byte_strides[1..].to_vec().into_boxed_slice();
+            members[(index - first) as usize].push(selected);
+        }
     }
-    if parts.is_empty() {
-        return Err("GPU family member has no resident physical part".into());
-    }
-    Ok(PhysicalValue {
-        ty: element.as_ref().clone(),
-        encodings: physical.encodings.clone(),
-        parts: parts.into_boxed_slice(),
-        integer_ranges: physical.integer_ranges.clone(),
-    })
+    members
+        .into_iter()
+        .map(|parts| {
+            if parts.is_empty() {
+                return Err("GPU family member has no resident physical part".to_owned());
+            }
+            Ok(PhysicalValue {
+                ty: element.as_ref().clone(),
+                encodings: physical.encodings.clone(),
+                parts: parts.into_boxed_slice(),
+                integer_ranges: physical.integer_ranges.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Resolve a child scope's bindings without mutating the enclosing scope.
@@ -9704,8 +9837,10 @@ mod tests {
         assert_eq!(selected.parts[0].view.byte_offset, 16);
         assert_eq!(selected.parts[0].view.extent.as_ref(), &[1, 1]);
         assert!(static_family_physical(&family, 3).is_err());
-        let (first_wave, first_bindings) = wave_member_layout(&family, 0).unwrap();
-        let (last_wave, last_bindings) = wave_member_layout(&family, 2).unwrap();
+        let (first_wave, first_bindings) =
+            wave_member_layout(static_family_physical(&family, 0).unwrap()).unwrap();
+        let (last_wave, last_bindings) =
+            wave_member_layout(static_family_physical(&family, 2).unwrap()).unwrap();
         assert_eq!(first_wave, last_wave);
         assert_eq!(first_bindings[0].2, 0);
         assert_eq!(last_bindings[0].2, 16);

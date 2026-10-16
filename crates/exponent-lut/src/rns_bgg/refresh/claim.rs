@@ -173,10 +173,15 @@ impl RefreshRun {
             lower: lower.into(),
             upper: upper.into(),
         };
-        let family_range = |count: usize, lower: i64, upper: i64| InputValueContract::Family {
-            count: IntExpr::constant(count),
-            element: Box::new(range(lower, upper)),
-        };
+        fn family_range(count: impl Into<IntExpr>, lower: i64, upper: i64) -> InputValueContract {
+            InputValueContract::Family {
+                count: count.into(),
+                element: Box::new(InputValueContract::IntegerRange {
+                    lower: lower.into(),
+                    upper: upper.into(),
+                }),
+            }
+        }
         let requirement_input = |input: &str| ProtocolInputDestination::Requirement {
             requirement: 0,
             input: input.into(),
@@ -295,11 +300,10 @@ impl RefreshRun {
         let mut state_exponent = Vec::new();
         let mut label_coefficient = Vec::new();
         let mut label_exponent = Vec::new();
-        let mut selectors =
-            BTreeMap::<String, (usize, usize, Vec<ProtocolInputDestination>)>::new();
-        let mut tables = BTreeMap::<String, (usize, Vec<ProtocolInputDestination>)>::new();
+        let mut selectors = BTreeMap::<String, (u128, usize, Vec<ProtocolInputDestination>)>::new();
+        let mut tables = BTreeMap::<String, (u128, Vec<ProtocolInputDestination>)>::new();
         let mut offset_coefficient = Vec::new();
-        let mut zero_exponents = BTreeMap::<usize, Vec<ProtocolInputDestination>>::new();
+        let mut zero_exponents = BTreeMap::<u128, Vec<ProtocolInputDestination>>::new();
         let mismatch = || ApiError::input("the parts' PRF children differ in shape");
         for &(chain, component) in &parts {
             // The chain's sigma Program is read once, with the chain's first part.
@@ -323,7 +327,10 @@ impl RefreshRun {
                     to_stage(&preprocess, &format!("{prefix}/rhs/{rhs:?}.{field}"))
                 };
                 for (bucket, family) in child.prf.selector_families().iter().enumerate() {
-                    let row_length = family.row_length.unwrap_or(family.members);
+                    let row_length = family
+                        .row_length
+                        .or_else(|| usize::try_from(family.members).ok())
+                        .ok_or_else(mismatch)?;
                     let entry = selectors
                         .entry(format!("{}_selector_{bucket}", child.selectors))
                         .or_insert_with(|| (family.members, row_length, Vec::new()));
@@ -402,11 +409,9 @@ impl RefreshRun {
 
         // The requirement.
         let dsl = |error: mxx_dsl::DslError| ApiError::scheme(error);
-        let family = |count: usize| FamilyType {
-            element: IntType,
-            count: IntExpr::constant(count),
-            member_slot: None,
-        };
+        fn family(count: impl Into<IntExpr>) -> FamilyType<IntType> {
+            FamilyType { element: IntType, count: count.into(), member_slot: None }
+        }
         let requirement = DslContext::new("refresh-top-inputs");
         let a = requirement.input::<Family<Int>>("a", family(members)).map_err(dsl)?;
         let a_coefficient =
@@ -492,7 +497,7 @@ impl RefreshRun {
                     let count = count
                         .evaluate(&ParamEnv::default())
                         .ok()
-                        .and_then(|count| count.to_usize())
+                        .and_then(|count| count.to_u128())
                         .ok_or_else(|| ApiError::input("a part family has no constant count"))?;
                     let input = requirement
                         .input::<Family<Family<Int>>>(
@@ -526,7 +531,7 @@ impl RefreshRun {
                     if let Some(row_length) = selector {
                         valid = mxx_dsl::iterate(parts_count, valid, |k, valid| {
                             let member = input.at(k);
-                            mxx_dsl::iterate(count / row_length, valid, |row, valid| {
+                            mxx_dsl::iterate(count / row_length as u128, valid, |row, valid| {
                                 let total = mxx_dsl::iterate(
                                     row_length,
                                     Int::constant(0),

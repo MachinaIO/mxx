@@ -825,8 +825,11 @@ mod tests {
         // In Lean the member's modulus is a table at `i / 2`, the instance's a table at `i`: the
         // root casts the member to the instance's modulus.
         let lean = crate::lean::export(&validated, &crate::lean::ExportOptions::default()).unwrap();
+        // The member index's bound is the hoisted lemma
+        // `index_quotient_<prefix>_<divisor>_<target>`.
         assert!(lean.source.contains(
-            "(Mxx.Primitives.castModulus (w_0_0 ⟨i.val / 2, by omega⟩) (by revert i; decide +kernel))"
+            "(Mxx.Primitives.castModulus (w_0_0 ⟨i.val / 2, index_quotient_4_2_2 i⟩) \
+             (by revert i; decide +kernel))"
         ));
         // The groups' first instances give the members' types.
         let mixed = [17, 97, 97, 17].map(|prime| instance("sigma", prime, 1));

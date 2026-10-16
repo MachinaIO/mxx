@@ -23,6 +23,14 @@
 //! ([`LeanArtifact::facts_source`], see `facts.rs`): every record scope's wires as top-level
 //! constants and its conjuncts as named fields with a theorem extracting them from the relation, so
 //! proofs read atoms by name instead of destructuring the relation in one large context.
+//! Record bodies with more than 512 bindings use the same context-indexed wire definitions
+//! directly in the relation module. This bounds the local let telescope without changing the
+//! relational meaning or the facts API; their facts module imports rather than duplicates them.
+//! Lifted definitions are explicitly noncomputable: these logical values need no executable code,
+//! and compiling each projection of a large witness record would repeat expensive monomorphization.
+//! Large independent bodies balance their fragment conjunctions, so facts extraction uses
+//! logarithmic-depth projections rather than a large telescope of intermediate proof bindings.
+//! Prefix-family indexing shares closed, kernel-checked numeric inequalities per pair of lengths.
 //!
 //! By default a sampler relation admits any value within the sampler's support, so a claim holds
 //! for every execution. With [`ExportOptions::sampling_tape`], each sampled coefficient is instead
@@ -37,13 +45,14 @@ pub mod claim;
 mod facts;
 #[cfg(test)]
 mod fixtures;
+mod modules;
 pub mod protocol;
 
 use crate::{
     expr::{IntExpr, RealExpr},
     graph::{FrozenGraphScopeId, Graph, GraphScope},
     node::{ConstantMatrix, IntBinaryOp, IntCompareOp, MatrixBinaryOp, NodeKind},
-    types::{NodeId, WireRef},
+    types::{ConcreteWireType, NodeId, WireRef, WireType},
     validate::ValidatedGraph,
 };
 use sha2::{Digest, Sha256};
@@ -929,6 +938,8 @@ struct Emitter<'a> {
     /// instead of repeating its literal. The boundary types of the claim keep the literals
     /// (`abbreviate_moduli` is off), since the claim compares them across modules.
     moduli: RefCell<Vec<String>>,
+    index_bounds: RefCell<BTreeSet<(u128, u128)>>,
+    index_transforms: RefCell<BTreeMap<String, String>>,
     abbreviate_moduli: Cell<bool>,
     source_map: SourceMap,
     scopes: BTreeMap<FrozenGraphScopeId, String>,
@@ -962,7 +973,25 @@ struct Emitter<'a> {
 impl<'a> Emitter<'a> {
     fn new(validated: &'a ValidatedGraph, options: &'a ExportOptions) -> Self {
         let graph = &validated.source;
-        let scopes = graph.scopes().keys().map(|id| (id.clone(), scope_name(id))).collect();
+        let scopes = graph
+            .scopes()
+            .keys()
+            .enumerate()
+            .map(|(index, id)| {
+                let name = scope_name(id);
+                let name = if name.len() > 40 &&
+                    matches!(
+                        id,
+                        FrozenGraphScopeId::ParallelBody { .. } |
+                            FrozenGraphScopeId::SequentialBody { .. }
+                    ) {
+                    format!("scope_{index}")
+                } else {
+                    name
+                };
+                (id.clone(), name)
+            })
+            .collect();
         let mut params = graph.parameters().iter().map(|p| p.name.clone()).collect::<BTreeSet<_>>();
         for scope in graph.scopes().values() {
             for node in scope.nodes() {
@@ -986,6 +1015,8 @@ impl<'a> Emitter<'a> {
             selection_tables: Rc::default(),
             modulus_tables: Rc::default(),
             moduli: RefCell::default(),
+            index_bounds: RefCell::default(),
+            index_transforms: RefCell::default(),
             abbreviate_moduli: Cell::new(options.facts),
             instance_tables: graph.root_scope().nodes().iter().any(|node| {
                 matches!(node.kind(), NodeKind::ParallelLoop(_)) &&
@@ -1075,6 +1106,14 @@ impl<'a> Emitter<'a> {
             tables.push_str(&format!(
                 "/-- The modulus of a matrix type. -/\nabbrev modulus_{index} : Nat := {modulus}\n\n"
             ));
+        }
+        for (count, target) in self.index_bounds.borrow().iter() {
+            tables.push_str(&format!(
+                "theorem index_le_{count}_{target} : {count} ≤ {target} := by decide\n\n"
+            ));
+        }
+        for theorem in self.index_transforms.borrow().values() {
+            tables.push_str(theorem);
         }
         self.abbreviate_moduli.set(false);
         self.source.insert_str(tables_at, &tables);
@@ -1320,7 +1359,8 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        self.current_record = matches!(scope_id, FrozenGraphScopeId::Root) ||
+        self.current_record = self.validated.scopes[scope_id].wire_types.len() > 512 ||
+            matches!(scope_id, FrozenGraphScopeId::Root) ||
             scope.nodes().iter().any(|node| {
                 matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_))
             });
@@ -1400,8 +1440,42 @@ impl<'a> Emitter<'a> {
         let input_types = inputs.iter().map(|wire| wire_type(self, wire)).collect::<Vec<_>>();
         let output_types =
             scope.outputs().iter().map(|wire| wire_type(self, wire)).collect::<Vec<_>>();
-        let input_ty = tuple_type(&input_types);
-        let output_ty = tuple_type(&output_types);
+        let mut input_ty = tuple_type(&input_types);
+        let mut output_ty = tuple_type(&output_types);
+        let scope_name = self.scopes[scope_id].clone();
+        let slots = scope_loop_slots(self.graph, scope_id);
+        for (suffix, ty) in [("InputType", &mut input_ty), ("OutputType", &mut output_ty)] {
+            if ty.len() > 512 {
+                let identifiers = ty
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .collect::<BTreeSet<_>>();
+                let type_slots = slots
+                    .iter()
+                    .filter(|slot| identifiers.contains(format!("i_{slot}").as_str()))
+                    .copied()
+                    .collect::<Vec<_>>();
+                let loop_type_binders =
+                    type_slots.iter().map(|slot| format!(" (i_{slot} : Nat)")).collect::<String>();
+                let loop_type_arguments =
+                    type_slots.iter().map(|slot| format!(" i_{slot}")).collect::<String>();
+                env.referenced_loop_names
+                    .borrow_mut()
+                    .extend(type_slots.iter().map(|slot| format!("i_{slot}")));
+                let params_binder =
+                    if identifiers.contains("params") { " (params : Params)" } else { "" };
+                let params_argument = if identifiers.contains("params") { " params" } else { "" };
+                let backend_binder = if ty.contains("backend") {
+                    " (backend : MxxRuntime.BackendContext)"
+                } else {
+                    ""
+                };
+                let backend_argument = if ty.contains("backend") { " backend" } else { "" };
+                self.source.push_str(&format!("abbrev {scope_name}.{suffix}{backend_binder}{params_binder}{loop_type_binders} : Type :=\n  {ty}\n\n"));
+                *ty = format!(
+                    "({scope_name}.{suffix}{backend_argument}{params_argument}{loop_type_arguments})"
+                );
+            }
+        }
         self.current_wire_types = validated
             .wire_types
             .keys()
@@ -1477,9 +1551,15 @@ impl<'a> Emitter<'a> {
         let output =
             tuple_expr(&scope.outputs().iter().map(|wire| wire_name(*wire)).collect::<Vec<_>>());
         let conclusion = format!("outputs = {}", output);
+        let lifted = self.current_record &&
+            self.source[declaration_start..]
+                .lines()
+                .filter(|line| line.trim_start().starts_with("let "))
+                .count() >
+                512;
         // Keep both the existential telescope and each conjunction fragment small
-        // during elaboration. Reducible suffix calls preserve the exact right-associated
-        // And proposition and original witness order by definitional equality.
+        // during elaboration. Reducible suffix calls retain witness order in the
+        // non-independent encoding.
         let mut constraint_call = conclusion.clone();
         let mut constraint_definition = String::new();
         // Include the output equation in the final fragment even for a closed pure scope.
@@ -1488,6 +1568,10 @@ impl<'a> Emitter<'a> {
         // Independent fragments (with facts): each fragment holds its own relations (the last
         // also the output equation) and the scope is their conjunction.
         let independent = self.options.facts;
+        let mut scope_value_positions = BTreeMap::<&str, Vec<usize>>::new();
+        for (position, (name, _)) in self.current_scope_values.iter().enumerate() {
+            scope_value_positions.entry(name.as_str()).or_default().push(position);
+        }
         for part in (0..fragment_count).rev() {
             let start = (part * 32).min(relations.len());
             let end = ((part + 1) * 32).min(relations.len());
@@ -1503,16 +1587,21 @@ impl<'a> Emitter<'a> {
                 (_, None) => relations[start..end].join(" ∧ "),
                 (false, Some(tail)) => format!("{} ∧ {tail}", relations[start..end].join(" ∧ ")),
             };
-            let (definition, call) = self.scope_constraints(scope_id, &body, &output_ty, part);
+            let (definition, call) =
+                self.scope_constraints(scope_id, &body, &output_ty, part, &scope_value_positions);
             fragment_calls[part] = call.clone();
             constraint_definition.push_str(&definition);
             constraint_call = call;
         }
         if independent {
-            constraint_call = fragment_calls.join(
-                " ∧
+            constraint_call = if lifted {
+                facts::balanced_conjunction(&fragment_calls)
+            } else {
+                fragment_calls.join(
+                    " ∧
     ",
-            );
+                )
+            };
         }
         self.source.push_str(&format!("{}{constraint_call}\n\n", "  ".repeat(self.indent)));
         let loop_binders =
@@ -1557,17 +1646,133 @@ impl<'a> Emitter<'a> {
             String::new()
         };
         if self.current_record {
-            let name = &self.scopes[scope_id];
+            let name = self.scopes[scope_id].clone();
+            let loop_names = scope_loop_slots(self.graph, scope_id)
+                .into_iter()
+                .map(|slot| format!("i_{slot}"))
+                .collect::<Vec<_>>();
+            let mut fact_env = Vec::new();
+            if self.requires_backend {
+                fact_env.push(("backend".to_owned(), "MxxRuntime.BackendContext".to_owned()));
+            }
+            if self.requires_hash_model {
+                fact_env.push(("hashModel".to_owned(), "MxxRuntime.HashModel".to_owned()));
+            }
+            if self.requires_tape {
+                fact_env.push(("tape".to_owned(), "MxxRuntime.SampleTape".to_owned()));
+                fact_env.push(("path".to_owned(), "List Nat".to_owned()));
+            }
+            fact_env.push(("params".to_owned(), "Params".to_owned()));
+            fact_env.extend(loop_names.iter().map(|index| (index.clone(), "Nat".to_owned())));
+            let wires = self
+                .current_scope_values
+                .iter()
+                .map(|(wire, ty)| {
+                    (wire.clone(), ty.clone(), self.current_value_expressions[wire].clone())
+                })
+                .collect();
+            let fragments = fragment_calls
+                .into_iter()
+                .enumerate()
+                .map(|(part, call)| {
+                    let start = (part * 32).min(relations.len());
+                    let end = ((part + 1) * 32).min(relations.len());
+                    (call, relations[start..end].to_vec())
+                })
+                .collect();
+            let scope_facts = facts::RecordScope {
+                name: &name,
+                env: fact_env,
+                input_type: &input_ty,
+                output_type: &output_ty,
+                wires,
+                fragments,
+                independent,
+                balanced: independent && lifted,
+                output_tuple: output.clone(),
+                loops: std::mem::take(&mut self.current_loops),
+            };
             let body_header =
                 final_header.replacen(&format!("def {name} "), &format!("abbrev {name}.body "), 1);
             let witness_name =
                 if self.current_witnesses.is_empty() { "_witness" } else { "witness" };
-            let body_header = format!(
+            let mut body_header = format!(
                 "{}({witness_name} : {name}.Witness) : Prop :=\n",
                 body_header.strip_suffix(": Prop :=\n").expect("scope header")
             );
-            self.source
-                .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
+            let bindings = if lifted {
+                body_header = body_header
+                    .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)")
+                    .replace(
+                        "(_ : MxxRuntime.SampleTape) (_ : List Nat)",
+                        "(tape : MxxRuntime.SampleTape) (path : List Nat)",
+                    );
+                if !loop_binders.is_empty() {
+                    let named_binders = loop_names
+                        .iter()
+                        .map(|name| format!(" ({name} : Nat)"))
+                        .collect::<String>();
+                    body_header = body_header.replacen(&loop_binders, &named_binders, 1);
+                }
+                let mut bindings =
+                    facts::render(&scope_facts, &self.record_scopes, facts::Declarations::Bindings);
+                let wire_names = self
+                    .current_scope_values
+                    .iter()
+                    .map(|(wire, _)| wire.as_str())
+                    .collect::<BTreeSet<_>>();
+                let constants = |text: &str| {
+                    facts::substitute(text, |token| {
+                        if token == "inputs" || token == "witness" {
+                            Some(format!("ctx.{token}"))
+                        } else if wire_names.contains(token) {
+                            Some(format!("({name}.{token} ctx)"))
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let env_names = scope_facts
+                    .env
+                    .iter()
+                    .map(|(binder, _)| binder.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let env_binders = scope_facts
+                    .env
+                    .iter()
+                    .map(|(binder, ty)| format!("{{{binder} : {ty}}}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !self.current_anonymous_lets.is_empty() {
+                    bindings.push_str(
+                        "noncomputable section\nset_option linter.unusedVariables false\n\n",
+                    );
+                }
+                for wire in &self.current_anonymous_lets {
+                    bindings.push_str(&format!(
+                        "noncomputable def {name}.unused_{wire} {env_binders} (ctx : {name}.Ctx {env_names}) : {} :=\n  {}\n\n",
+                        constants(&self.current_wire_types[wire]),
+                        constants(&self.current_value_expressions[wire])
+                    ));
+                }
+                if !self.current_anonymous_lets.is_empty() {
+                    bindings.push_str("end\n\n");
+                }
+                let input = if inputs.is_empty() { "()" } else { "inputs" };
+                self.source.truncate(declaration_start);
+                self.source.push_str(&format!(
+                    "  let ctx : {name}.Ctx {env_names} := ⟨{input}, {witness_name}⟩\n  {}\n\n",
+                    constants(&constraint_call)
+                ));
+                bindings
+            } else {
+                String::new()
+            };
+            self.source.insert_str(
+                declaration_start,
+                &(record + &constraint_definition + &bindings + &body_header),
+            );
             let mut wrapper_header = final_header
                 .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)")
                 .replace(
@@ -1578,10 +1783,6 @@ impl<'a> Emitter<'a> {
             let hash = if self.requires_hash_model { "hashModel " } else { "" };
             let hash = if self.requires_tape { format!("{hash}tape path ") } else { hash.into() };
             let input = if inputs.is_empty() { "()" } else { "inputs" };
-            let loop_names = scope_loop_slots(self.graph, scope_id)
-                .into_iter()
-                .map(|slot| format!("i_{slot}"))
-                .collect::<Vec<_>>();
             if !loop_binders.is_empty() {
                 let named_binders =
                     loop_names.iter().map(|name| format!(" ({name} : Nat)")).collect::<String>();
@@ -1591,49 +1792,10 @@ impl<'a> Emitter<'a> {
                 loop_names.iter().map(|name| format!("{name} ")).collect::<String>();
             self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
             if self.options.facts {
-                let name = name.clone();
-                let mut env = Vec::new();
-                if self.requires_backend {
-                    env.push(("backend".to_owned(), "MxxRuntime.BackendContext".to_owned()));
-                }
-                if self.requires_hash_model {
-                    env.push(("hashModel".to_owned(), "MxxRuntime.HashModel".to_owned()));
-                }
-                if self.requires_tape {
-                    env.push(("tape".to_owned(), "MxxRuntime.SampleTape".to_owned()));
-                    env.push(("path".to_owned(), "List Nat".to_owned()));
-                }
-                env.push(("params".to_owned(), "Params".to_owned()));
-                env.extend(loop_names.iter().map(|index| (index.clone(), "Nat".to_owned())));
-                let wires = self
-                    .current_scope_values
-                    .iter()
-                    .map(|(wire, ty)| {
-                        (wire.clone(), ty.clone(), self.current_value_expressions[wire].clone())
-                    })
-                    .collect();
-                let fragments = fragment_calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(part, call)| {
-                        let start = (part * 32).min(relations.len());
-                        let end = ((part + 1) * 32).min(relations.len());
-                        (call, relations[start..end].to_vec())
-                    })
-                    .collect();
                 let scope_facts = facts::render(
-                    &facts::RecordScope {
-                        name: &name,
-                        env,
-                        input_type: &input_ty,
-                        output_type: &output_ty,
-                        wires,
-                        fragments,
-                        independent,
-                        output_tuple: output.clone(),
-                        loops: std::mem::take(&mut self.current_loops),
-                    },
+                    &scope_facts,
                     &self.record_scopes,
+                    if lifted { facts::Declarations::Facts } else { facts::Declarations::All },
                 );
                 self.facts.push_str(&scope_facts);
                 self.record_scopes.insert(name);
@@ -1644,12 +1806,15 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Select fragment parameters through a name index, preserving their scope order without
+    /// scanning every scope value for each independent fragment.
     fn scope_constraints(
         &self,
         scope_id: &FrozenGraphScopeId,
         body: &str,
         output_ty: &str,
         part: usize,
+        scope_value_positions: &BTreeMap<&str, Vec<usize>>,
     ) -> (String, String) {
         // Quoted parameter fields and string payloads are not local variables. In
         // particular params.«backend» must not introduce a free backend argument.
@@ -1678,6 +1843,13 @@ impl<'a> Emitter<'a> {
         let referenced = identifiers
             .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
             .collect::<BTreeSet<_>>();
+        let mut positions = referenced
+            .iter()
+            .filter_map(|name| scope_value_positions.get(name))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
         let mut constraint_arguments = Vec::new();
         if referenced.contains("backend") {
             constraint_arguments
@@ -1705,19 +1877,15 @@ impl<'a> Emitter<'a> {
             let name = format!("i_{slot}");
             if referenced.contains(name.as_str()) ||
                 names_identifier(output_ty, &name) ||
-                self.current_scope_values.iter().any(|(value, ty)| {
-                    referenced.contains(value.as_str()) && names_identifier(ty, &name)
+                positions.iter().any(|position| {
+                    names_identifier(&self.current_scope_values[*position].1, &name)
                 })
             {
                 constraint_arguments.push((name, "Nat".to_owned()));
             }
         }
-        constraint_arguments.extend(
-            self.current_scope_values
-                .iter()
-                .filter(|(name, _)| referenced.contains(name.as_str()))
-                .cloned(),
-        );
+        constraint_arguments
+            .extend(positions.iter().map(|position| self.current_scope_values[*position].clone()));
         // An independent fragment without the output equation does not name the outputs.
         if !self.options.facts || referenced.contains("outputs") {
             constraint_arguments.push(("outputs".to_owned(), output_ty.to_owned()));
@@ -2217,6 +2385,16 @@ impl<'a> Emitter<'a> {
                     ),
                 );
             }
+            NodeKind::Sha256BitColumns { seed, rows, columns, index_bits } => {
+                let seed = seed.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                self.bind_existential(&output(1), &self.output_type(scope, node_id, 1));
+                relations.push(format!(
+                    "MxxRuntime.sha256BitColumns [{seed}] {rows} {columns} {index_bits} {} {}",
+                    output(0),
+                    output(1)
+                ));
+            }
             NodeKind::HashIntFamily { modulus, tag_prefix, tag_components, .. } => {
                 append_expression_guards(modulus, env, relations);
                 let key = arg(0)?;
@@ -2574,6 +2752,14 @@ impl<'a> Emitter<'a> {
                     "{} {} {} {}",
                     self.options.primitives.polynomial_values,
                     evaluation,
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::BlockDiagonal { count } => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "MxxRuntime.blockDiagonalRuns {count} {} {}",
                     arg(0)?,
                     output(0)
                 ));
@@ -3121,6 +3307,73 @@ impl<'a> Emitter<'a> {
             }
         );
         let node_ref = scope.node(node).expect("node");
+        if let NodeKind::ParallelLoop(spec) = node_ref.kind() {
+            let child_scope = self.graph.scope(&child).expect("parallel child");
+            if spec.bindings.is_empty() &&
+                child_scope
+                    .nodes()
+                    .iter()
+                    .all(|node| matches!(node.kind(), NodeKind::Input { .. })) &&
+                spec.input_modes.iter().all(|mode| {
+                    matches!(
+                        mode,
+                        crate::node::LoopInputMode::Broadcast | crate::node::LoopInputMode::Zip
+                    )
+                }) &&
+                spec.input_modes.iter().zip(args).all(|(mode, wire)| {
+                    !matches!(mode, crate::node::LoopInputMode::Zip) ||
+                        matches!(
+                            self.validated.scopes[scope_id].wire_types[wire],
+                            ConcreteWireType::IndexedFamily { .. }
+                        )
+                }) &&
+                node_ref
+                    .output_types()
+                    .iter()
+                    .all(|ty| matches!(ty, WireType::IndexedFamily { .. }))
+            {
+                let count_expression = env.expr(&spec.count);
+                append_expression_guards(&spec.count, env, relations);
+                let ConcreteWireType::IndexedFamily { count, .. } = &self.validated.scopes
+                    [scope_id]
+                    .wire_types[&WireRef { node, port: crate::types::Port(0) }]
+                else {
+                    unreachable!("validated indexed family")
+                };
+                relations.push(format!("({count_expression}) = {count}"));
+                for (port, output) in child_scope.outputs().iter().enumerate() {
+                    let position = child_scope
+                        .inputs()
+                        .iter()
+                        .position(|input| input == output)
+                        .expect("input-only scope output");
+                    let input = wire_name(args[position]);
+                    let term = match spec.input_modes[position] {
+                        crate::node::LoopInputMode::Broadcast => format!("fun _ => {input}"),
+                        crate::node::LoopInputMode::Zip => {
+                            let target = match &self.validated.scopes[scope_id].wire_types
+                                [&args[position]]
+                            {
+                                ConcreteWireType::IndexedFamily { count, .. } => *count,
+                                _ => unreachable!("checked projection family"),
+                            };
+                            if *count == target {
+                                input
+                            } else {
+                                self.index_bounds.borrow_mut().insert((*count, target));
+                                format!("fun i => {input} (Fin.castLE index_le_{count}_{target} i)")
+                            }
+                        }
+                        _ => unreachable!("checked projection mode"),
+                    };
+                    self.let_output(
+                        &wire_name(WireRef { node, port: crate::types::Port(port as u32) }),
+                        &term,
+                    );
+                }
+                return Ok(());
+            }
+        }
         let outputs = (0..node_ref.output_types().len())
             .map(|port| wire_name(WireRef { node, port: crate::types::Port(port as u32) }))
             .collect::<Vec<_>>();
@@ -3140,7 +3393,9 @@ impl<'a> Emitter<'a> {
             let wire = WireRef { node, port: crate::types::Port(0) };
             let count = match self.validated.scopes[scope_id].wire_types.get(&wire) {
                 Some(crate::types::ConcreteWireType::IndexedFamily { count, .. }) => *count,
-                Some(crate::types::ConcreteWireType::DependentFamily { members }) => members.len(),
+                Some(crate::types::ConcreteWireType::DependentFamily { members }) => {
+                    members.len() as u128
+                }
                 _ => {
                     return self.unsupported(
                         scope_id,
@@ -3195,7 +3450,7 @@ impl<'a> Emitter<'a> {
                         let count = match &self.validated.scopes[scope_id].wire_types[wire] {
                             crate::types::ConcreteWireType::IndexedFamily { count, .. } => *count,
                             crate::types::ConcreteWireType::DependentFamily { members } => {
-                                members.len()
+                                members.len() as u128
                             }
                             _ => unreachable!("validated zip input is an indexed family"),
                         };
@@ -3204,15 +3459,40 @@ impl<'a> Emitter<'a> {
                         } else {
                             // A zip may read a prefix of a longer family. Validation proves
                             // its length covers the loop; Lean still needs the Fin coercion.
-                            format!("({} ⟨i.val, by omega⟩)", wire_name(*wire))
+                            let prefix = parallel_count.expect("parallel count");
+                            self.index_bounds.borrow_mut().insert((prefix, count));
+                            format!(
+                                "({} (Fin.castLE index_le_{prefix}_{count} i))",
+                                wire_name(*wire)
+                            )
                         }
                     }
                     crate::node::LoopInputMode::ZipOffset { offset } => {
-                        format!("({} ⟨i.val + {}, by omega⟩)", wire_name(*wire), offset)
+                        let prefix = parallel_count.expect("parallel count");
+                        let target = match &self.validated.scopes[scope_id].wire_types[wire] {
+                            ConcreteWireType::IndexedFamily { count, .. } => *count,
+                            ConcreteWireType::DependentFamily { members } => members.len() as u128,
+                            _ => unreachable!("validated zip family"),
+                        };
+                        let bound = format!("index_offset_{prefix}_{offset}_{target}");
+                        self.index_transforms.borrow_mut().entry(bound.clone()).or_insert_with(|| {
+                            format!("theorem {bound} (i : Fin {prefix}) : i.val + {offset} < {target} := by\n  have := i.isLt\n  omega\n\n")
+                        });
+                        format!("({} ⟨i.val + {offset}, {bound} i⟩)", wire_name(*wire))
                     }
                     crate::node::LoopInputMode::ZipQuotient { divisor } => {
+                        let prefix = parallel_count.expect("parallel count");
+                        let target = match &self.validated.scopes[scope_id].wire_types[wire] {
+                            ConcreteWireType::IndexedFamily { count, .. } => *count,
+                            ConcreteWireType::DependentFamily { members } => members.len() as u128,
+                            _ => unreachable!("validated zip family"),
+                        };
+                        let bound = format!("index_quotient_{prefix}_{divisor}_{target}");
+                        self.index_transforms.borrow_mut().entry(bound.clone()).or_insert_with(|| {
+                            format!("theorem {bound} (i : Fin {prefix}) : i.val / {divisor} < {target} := by\n  have := i.isLt\n  omega\n\n")
+                        });
                         let member =
-                            format!("({} ⟨i.val / {}, by omega⟩)", wire_name(*wire), divisor);
+                            format!("({} ⟨i.val / {divisor}, {bound} i⟩)", wire_name(*wire));
                         match &self.validated.scopes[scope_id].wire_types[wire] {
                             // Members over different rings: the member's modulus, a table at
                             // `i / divisor`, equals the instance's, a table at `i`, for every
@@ -3551,7 +3831,7 @@ impl<'a> Emitter<'a> {
                         (*count, element.as_ref())
                     }
                     ConcreteWireType::DependentFamily { members } if !members.is_empty() => {
-                        (members.len(), &members[0])
+                        (members.len() as u128, &members[0])
                     }
                     _ => return self.lean_type(concrete),
                 };
@@ -4071,6 +4351,188 @@ mod tests {
         )
         .output(0)
         .unwrap()
+    }
+
+    #[test]
+    fn export_zip_transforms_share_bounds_outside_the_scope_context() {
+        for (count, target, mode, theorem) in [
+            (3, 5, LoopInputMode::ZipOffset { offset: 2 }, "index_offset_3_2_5"),
+            (6, 3, LoopInputMode::ZipQuotient { divisor: 2 }, "index_quotient_6_2_3"),
+            (0, 0, LoopInputMode::ZipQuotient { divisor: 1 }, "index_quotient_0_1_0"),
+        ] {
+            let child = with_new_construction_scope(|scope| {
+                let left = scalar_input("left");
+                let right = scalar_input("right");
+                let sum = NodeHandle::new(
+                    NodeKind::IntBinary(IntBinaryOp::Add),
+                    vec![left.clone(), right.clone()],
+                    vec![WireType::Int],
+                )
+                .output(0)
+                .unwrap();
+                SubgraphHandle::new("sum", scope, vec![left, right], vec![sum]).unwrap()
+            });
+            let family_type =
+                WireType::IndexedFamily { element: Box::new(WireType::Int), count: target.into() };
+            let family = NodeHandle::new(
+                NodeKind::Input {
+                    name: "family".into(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![family_type],
+            )
+            .output(0)
+            .unwrap();
+            let output = NodeHandle::parallel_loop(
+                child,
+                vec![family.clone(), family],
+                vec![WireType::IndexedFamily {
+                    element: Box::new(WireType::Int),
+                    count: count.into(),
+                }],
+                ParallelLoop {
+                    count: count.into(),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: vec![],
+                    input_modes: vec![mode.clone(), mode],
+                },
+            )
+            .output(0)
+            .unwrap();
+            let (graph, _) = Graph::freeze(
+                "transformed-zip",
+                vec![],
+                BTreeMap::from([("out".into(), GraphOutput { value: output, availability: None })]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+            let artifact = export(&validated, &ExportOptions::default()).unwrap();
+            assert_eq!(artifact.source.matches(&format!("theorem {theorem} ")).count(), 1);
+            assert_eq!(artifact.source.matches("  omega\n").count(), 1);
+            assert!(!artifact.source.contains("by omega"));
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test_data/lean_ir_fixtures")
+                .join(theorem);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("Generated.lean"), artifact.source).unwrap();
+        }
+    }
+
+    #[test]
+    fn export_large_record_lifts_bindings_and_reuses_fact_definitions() {
+        let outputs = (0..600)
+            .map(|index| {
+                let input = scalar_input(&format!("input_{index}"));
+                let value = NodeHandle::new(
+                    NodeKind::IntBinary(IntBinaryOp::Add),
+                    vec![input.clone(), input],
+                    vec![WireType::Int],
+                )
+                .output(0)
+                .unwrap();
+                (format!("output_{index:04}"), GraphOutput { value, availability: None })
+            })
+            .collect();
+        let unused =
+            NodeHandle::new(NodeKind::ConstantInt(123.into()), vec![], vec![WireType::ConstantInt])
+                .output(0)
+                .unwrap();
+        let matrix_type =
+            MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
+        let polynomial = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix_type.clone(),
+                value: ConstantMatrix::Polynomial { coefficients: vec![3.into()] },
+            },
+            vec![],
+            vec![WireType::Matrix(matrix_type)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "large-record",
+            vec![],
+            outputs,
+            vec![unused, polynomial],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        for facts in [false, true] {
+            let artifact = export(
+                &validated,
+                &ExportOptions {
+                    facts,
+                    module_name: "Generated".into(),
+                    ..ExportOptions::default()
+                },
+            )
+            .unwrap();
+            let body = artifact.source.split("abbrev generatedRoot.body ").nth(1).unwrap();
+            let body = body.split("\n\ndef generatedRoot ").next().unwrap();
+            assert_eq!(body.lines().filter(|line| line.trim().starts_with("let ")).count(), 1);
+            assert!(artifact.source.contains("structure generatedRoot.Ctx"));
+            assert!(artifact.source.contains(": Int :=\n  123\n"));
+            assert!(artifact.source.contains("def generatedRoot.outs"));
+            assert!(artifact.source.contains("noncomputable section"));
+            assert!(artifact.source.contains("noncomputable def generatedRoot.w_"));
+            assert!(artifact.source.contains("noncomputable def generatedRoot.outs"));
+            if let Some(facts) = &artifact.facts_source {
+                assert!(!facts.contains("structure generatedRoot.Ctx"));
+                assert!(!facts.contains("def generatedRoot.w_"));
+                assert!(facts.contains("theorem generatedRoot.facts "));
+            }
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test_data/lean_ir_fixtures")
+                .join(format!("large_record_{facts}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("Generated.lean"), &artifact.source).unwrap();
+            if let Some(facts) = artifact.facts_source {
+                std::fs::write(directory.join("Generated_Facts.lean"), facts).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn export_large_independent_record_balances_fragment_facts() {
+        let matrix =
+            MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
+        let outputs = (0..600)
+            .map(|index| {
+                let value = NodeHandle::new(
+                    NodeKind::UniformResidueSample { matrix_type: matrix.clone() },
+                    vec![],
+                    vec![WireType::Matrix(matrix.clone())],
+                )
+                .output(0)
+                .unwrap();
+                (format!("output_{index:04}"), GraphOutput { value, availability: None })
+            })
+            .collect();
+        let (graph, _) =
+            Graph::freeze("balanced-facts", vec![], outputs, vec![], vec![], BTreeMap::new())
+                .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(
+            &validated,
+            &ExportOptions { facts: true, module_name: "Generated".into(), ..Default::default() },
+        )
+        .unwrap();
+        let facts = artifact.facts_source.as_ref().unwrap();
+        assert!(!facts.contains("have t0 := h"));
+        assert!(facts.contains("generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) h.1.1"));
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/balanced_facts");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("Generated.lean"), &artifact.source).unwrap();
+        std::fs::write(directory.join("Generated_Facts.lean"), facts).unwrap();
     }
 
     #[test]
@@ -4603,7 +5065,14 @@ mod tests {
     fn export_keeps_named_child_and_parallel_body_structural() {
         let child = with_new_construction_scope(|scope| {
             let value = scalar_input("value");
-            SubgraphHandle::new("identity", scope, vec![value.clone()], vec![value]).unwrap()
+            let doubled = NodeHandle::new(
+                NodeKind::IntBinary(IntBinaryOp::Add),
+                vec![value.clone(), value.clone()],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("double", scope, vec![value], vec![doubled]).unwrap()
         });
         let family = NodeHandle::new(
             NodeKind::Input {
@@ -4654,7 +5123,7 @@ mod tests {
         assert!(artifact.source.contains("∀ i : Fin 4"));
         assert!(artifact.source.contains("parallel_generatedRoot_1 params i "));
         assert!(artifact.source.contains("(_ : Nat) (inputs : Int)"));
-        assert_eq!(artifact.static_node_visits, 3);
+        assert_eq!(artifact.static_node_visits, 4);
     }
 
     #[test]
@@ -4761,8 +5230,9 @@ mod tests {
         for declaration in [
             "import GeneratedFacts\n",
             "structure generatedRoot.Ctx (params : Params) where",
-            "structure generatedRoot.Facts {params : Params}",
-            "theorem generatedRoot.facts {params : Params} (ctx : generatedRoot.Ctx params)",
+            "variable {params : Params}",
+            "structure generatedRoot.Facts  (ctx : generatedRootCtx)",
+            "theorem generatedRoot.facts  (ctx : generatedRootCtx)",
             "structure parallel_generatedRoot_1.Ctx (params : Params) (i_0 : Nat) where",
             "hout : outputs = parallel_generatedRoot_1.outs ctx",
             "∃ w : parallel_generatedRoot_1.Witness, parallel_generatedRoot_1.Facts",
@@ -4840,8 +5310,14 @@ mod tests {
         for count in [0, 1, 3, 4] {
             let child = with_new_construction_scope(|scope| {
                 let value = scalar_input("value");
-                SubgraphHandle::new("prefix-identity", scope, vec![value.clone()], vec![value])
-                    .unwrap()
+                let doubled = NodeHandle::new(
+                    NodeKind::IntBinary(IntBinaryOp::Add),
+                    vec![value.clone(), value.clone()],
+                    vec![WireType::Int],
+                )
+                .output(0)
+                .unwrap();
+                SubgraphHandle::new("prefix-double", scope, vec![value], vec![doubled]).unwrap()
             });
             let family_type =
                 WireType::IndexedFamily { element: Box::new(WireType::Int), count: 3.into() };
@@ -4893,11 +5369,99 @@ mod tests {
                 assert!(artifact.source.contains("(w_0_0 i)"));
                 assert!(!artifact.source.contains("⟨i.val, by omega⟩"));
             } else {
-                assert!(artifact.source.contains("(w_0_0 ⟨i.val, by omega⟩)"));
+                assert!(
+                    artifact.source.contains(&format!("(w_0_0 (Fin.castLE index_le_{count}_3 i))"))
+                );
             }
             let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../test_data/lean_ir_fixtures")
                 .join(format!("zip_prefix_{count}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("Generated.lean"), artifact.source).unwrap();
+        }
+    }
+
+    #[test]
+    fn export_input_only_parallel_projects_families_without_relational_witnesses() {
+        for count in [0, 1, 3] {
+            let child = with_new_construction_scope(|scope| {
+                let value = scalar_input("value");
+                let broadcast = scalar_input("broadcast");
+                SubgraphHandle::new(
+                    "projection",
+                    scope,
+                    vec![value.clone(), broadcast.clone()],
+                    vec![broadcast, value],
+                )
+                .unwrap()
+            });
+            let family_type =
+                WireType::IndexedFamily { element: Box::new(WireType::Int), count: 3.into() };
+            let family = NodeHandle::new(
+                NodeKind::Input {
+                    name: "family".into(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![family_type],
+            )
+            .output(0)
+            .unwrap();
+            let output_type =
+                WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.into() };
+            let output = NodeHandle::parallel_loop(
+                child,
+                vec![family, scalar_input("broadcast")],
+                vec![output_type.clone(), output_type],
+                ParallelLoop {
+                    count: count.into(),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: vec![],
+                    input_modes: vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
+                },
+            );
+            let (graph, _) = Graph::freeze(
+                "projection",
+                vec![],
+                BTreeMap::from([
+                    (
+                        "broadcast".into(),
+                        GraphOutput { value: output.output(0).unwrap(), availability: None },
+                    ),
+                    (
+                        "zipped".into(),
+                        GraphOutput { value: output.output(1).unwrap(), availability: None },
+                    ),
+                ]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+            let artifact = export(&validated, &ExportOptions::default()).unwrap();
+            assert!(artifact.source.contains("fun _ => w_1_0"));
+            if count == 3 {
+                assert!(artifact.source.contains(": Fin 3 → Int := w_0_0"));
+            } else {
+                assert!(
+                    artifact
+                        .source
+                        .contains(&format!("fun i => w_0_0 (Fin.castLE index_le_{count}_3 i)"))
+                );
+                assert_eq!(
+                    artifact.source.matches(&format!("theorem index_le_{count}_3")).count(),
+                    1
+                );
+            }
+            assert!(!artifact.source.contains("by omega"));
+            assert!(!artifact.source.contains(&format!("∀ i : Fin {count}")));
+            assert!(artifact.source.contains(&format!("({count}) = {count}")));
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test_data/lean_ir_fixtures")
+                .join(format!("parallel_projection_{count}"));
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(directory.join("Generated.lean"), artifact.source).unwrap();
         }

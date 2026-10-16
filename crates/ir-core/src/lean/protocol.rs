@@ -34,6 +34,8 @@ pub enum ProtocolExportError {
 /// and proves `GeneratedClaim.CorrectnessClaim`. With `facts`, each of these graph modules
 /// `M` also gets `M_Facts` ([`ExportOptions::facts`](crate::lean::ExportOptions::facts)): its
 /// record scopes' wire constants and named facts, for proofs that read atoms by name.
+/// Large graph/facts sources are partitioned at declaration boundaries into parts of at most
+/// three million bytes; the original module name re-exports the same declarations.
 pub fn export(
     protocol: &ProtocolDecl,
     directory: &std::path::Path,
@@ -121,9 +123,19 @@ pub fn export(
             };
             layouts.insert(key, merged);
         }
-        fs::write(directory.join(format!("{name}.lean")), &artifact.source)?;
+        for (module, source) in
+            super::modules::partition(&name, &artifact.source, super::modules::MODULE_BYTES)?
+        {
+            fs::write(directory.join(format!("{module}.lean")), source)?;
+        }
         if let Some(facts) = &artifact.facts_source {
-            fs::write(directory.join(format!("{name}_Facts.lean")), facts)?;
+            for (module, source) in super::modules::partition(
+                &format!("{name}_Facts"),
+                facts,
+                super::modules::MODULE_BYTES,
+            )? {
+                fs::write(directory.join(format!("{module}.lean")), source)?;
+            }
         }
         generated.insert(name, artifact);
     }

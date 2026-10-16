@@ -1,0 +1,46 @@
+name = "MxxIoDio2AverageN8P5x50V2"
+version = "0.1.0"
+defaultTargets = ["Dio2Generated"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = "../../../../exponent-lut/lean"
+
+# Every exported module, including relation and facts partitions.
+[[lean_lib]]
+name = "Dio2Generated"
+srcDir = "generated"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Backend", "Claim", "Ideal", "Ideal_Facts", "Requirement_0", "Requirement_0_Facts", "Stage_anchor_publics", "Stage_anchor_publics_Facts", "Stage_anchors", "Stage_anchors_Facts", "Stage_decode", "Stage_decode_Facts", "Stage_import_0", "Stage_import_0_Facts", "Stage_import_1", "Stage_import_1_Facts", "Stage_initial", "Stage_initial_Facts", "Stage_keys_import_0_0", "Stage_keys_import_0_0_Facts", "Stage_keys_import_1_1", "Stage_keys_import_1_1_Facts", "Stage_keys_online_0_0", "Stage_keys_online_0_0_Facts", "Stage_keys_online_1_1", "Stage_keys_online_1_1_Facts", "Stage_mask", "Stage_mask_Facts", "Stage_online_0", "Stage_online_0_Facts", "Stage_online_1", "Stage_online_1_Facts", "Stage_payload", "Stage_payload_Facts", "Stage_preimages_0_0", "Stage_preimages_0_0_Facts", "Stage_preimages_1_1", "Stage_preimages_1_1_Facts", "Stage_preprocess_0_0", "Stage_preprocess_0_0_Facts", "Stage_preprocess_1_1", "Stage_preprocess_1_1_Facts", "Stage_zero", "Stage_zero_Facts"]
+
+# Renamed worst-case exports, written by gen_bridge.py.
+[[lean_lib]]
+name = "Dio2Worst"
+srcDir = "worst"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["W_Claim", "W_Ideal", "W_Ideal_Facts", "W_Requirement_0", "W_Requirement_0_Facts", "W_Stage_anchor_publics", "W_Stage_anchor_publics_Facts", "W_Stage_anchors", "W_Stage_anchors_Facts", "W_Stage_decode", "W_Stage_decode_Facts", "W_Stage_import_0", "W_Stage_import_0_Facts", "W_Stage_import_1", "W_Stage_import_1_Facts", "W_Stage_initial", "W_Stage_initial_Facts", "W_Stage_keys_import_0_0", "W_Stage_keys_import_0_0_Facts", "W_Stage_keys_import_1_1", "W_Stage_keys_import_1_1_Facts", "W_Stage_keys_online_0_0", "W_Stage_keys_online_0_0_Facts", "W_Stage_keys_online_1_1", "W_Stage_keys_online_1_1_Facts", "W_Stage_mask", "W_Stage_mask_Facts", "W_Stage_online_0", "W_Stage_online_0_Facts", "W_Stage_online_1", "W_Stage_online_1_Facts", "W_Stage_payload", "W_Stage_payload_Facts", "W_Stage_preimages_0_0", "W_Stage_preimages_0_0_Facts", "W_Stage_preimages_1_1", "W_Stage_preimages_1_1_Facts", "W_Stage_preprocess_0_0", "W_Stage_preprocess_0_0_Facts", "W_Stage_preprocess_1_1", "W_Stage_preprocess_1_1_Facts", "W_Stage_zero", "W_Stage_zero_Facts"]
+
+# Every average-case run is a worst-case run, written by gen_bridge.py.
+[[lean_lib]]
+name = "Dio2Bridge"
+srcDir = "bridge"
+moreLeanArgs = ["--tstack=262144"]
+roots = ["BridgeRuns", "Bridge_Ideal", "Bridge_Requirement_0", "Bridge_Stage_anchor_publics", "Bridge_Stage_anchors", "Bridge_Stage_decode", "Bridge_Stage_import_0", "Bridge_Stage_import_1", "Bridge_Stage_initial", "Bridge_Stage_keys_import_0_0", "Bridge_Stage_keys_import_1_1", "Bridge_Stage_keys_online_0_0", "Bridge_Stage_keys_online_1_1", "Bridge_Stage_mask", "Bridge_Stage_online_0", "Bridge_Stage_online_1", "Bridge_Stage_payload", "Bridge_Stage_preimages_0_0", "Bridge_Stage_preimages_1_1", "Bridge_Stage_preprocess_0_0", "Bridge_Stage_preprocess_1_1", "Bridge_Stage_zero"]
+
+# The same parameter-independent refresh_top lemmas as the toy dio2 package.
+[[lean_lib]]
+name = "Dio2Generic"
+srcDir = "../../../../exponent-lut/lean/refresh_top/generic"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["GenFinal", "GenDecode", "TopCrtGeneric", "GenIface", "GenKey", "GenPbc", "ModularGlue", "GenRel", "GenLabel", "GenLut", "GenLoop", "GenRelLut", "GenReq", "GenFinalLink", "GenFinalFresh", "GenFinalValues", "GenSmudge", "GenInstLemmas"]
+
+# Port foundation; stage correctness proofs are added separately.
+[[lean_lib]]
+name = "Dio2Proof"
+srcDir = "proof"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Dio2Cell", "Dio2CellBridge", "Dio2Comp", "Dio2Decode", "Dio2Diag", "Dio2Final", "Dio2Generic", "Dio2Ideal", "Dio2Inv", "Dio2Keys", "Dio2KeysLoops", "Dio2Label", "Dio2Lut", "Dio2LutBridge", "Dio2Part", "Dio2PartRows", "Dio2Rel", "Dio2Requirement", "Dio2Sampler", "Dio2Sharp", "Dio2SmudgeCore", "Gen_W_Stage_anchor_publics_Scopes", "Gen_W_Stage_anchors_Scopes", "Gen_W_Stage_decode_Scopes", "Gen_W_Stage_import_0_Scopes", "Gen_W_Stage_import_1_Scopes", "Gen_W_Stage_initial_Scopes", "Gen_W_Stage_keys_import_0_0_Scopes", "Gen_W_Stage_keys_import_1_1_Scopes", "Gen_W_Stage_keys_online_0_0_Scopes", "Gen_W_Stage_keys_online_1_1_Scopes", "Gen_W_Stage_mask_Scopes", "Gen_W_Stage_online_0_Scopes", "Gen_W_Stage_online_1_Scopes", "Gen_W_Stage_payload_Scopes", "Gen_W_Stage_preimages_0_0_Scopes", "Gen_W_Stage_preimages_1_1_Scopes", "Gen_W_Stage_preprocess_0_0_Scopes", "Gen_W_Stage_preprocess_1_1_Scopes", "Gen_W_Stage_zero_Scopes"]

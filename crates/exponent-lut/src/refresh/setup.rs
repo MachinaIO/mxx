@@ -92,6 +92,9 @@ impl PrfSettings {
     /// the refresh without materializing one layout per member (`w_0 n d` per smudge child). Its
     /// claim has the graphs of a run with generated keys up to these commitments (the hash
     /// namespaces derived from them, and the order of the hash-key externals named after them).
+    /// Key counts remain `usize`, but their symbolic selector and coordinate-table cardinalities
+    /// may exceed it: the PRF computes the product of members and row width in 128 bits and
+    /// lowers its arithmetic through arbitrary-precision `IntExpr` values.
     pub fn declared_shape(
         &self,
         seed: u64,

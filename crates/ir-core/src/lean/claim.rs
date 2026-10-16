@@ -154,7 +154,7 @@ fn input_contract_predicate(
                 .iter()
                 .try_fold(0usize, |sum, length| sum.checked_add(*length))
                 .ok_or("one-hot family size overflows")?;
-            if total != *count || block_lengths.is_empty() || block_lengths.contains(&0) {
+            if total as u128 != *count || block_lengths.is_empty() || block_lengths.contains(&0) {
                 return Err("one-hot family blocks do not partition its nonempty type".into());
             }
             let element_predicate = input_contract_predicate(
@@ -186,7 +186,7 @@ fn input_contract_predicate(
             InputContract::Family { count, element },
             ConcreteWireType::IndexedFamily { count: actual, element: actual_element },
         ) => {
-            let expected = usize::try_from(evaluate(count)?)
+            let expected = u128::try_from(evaluate(count)?)
                 .map_err(|_| "input contract family count is not a valid size")?;
             if expected != *actual {
                 return Err("input contract family count/type mismatch".into());
@@ -482,7 +482,8 @@ pub fn assemble_claim(claim: &LinkedClaim<'_>, bindings: &ParamEnv) -> Result<St
         Some(_) => "\n/-- Executions whose endpoint differs from the ideal one are rare. -/\n",
     });
     source.push_str(&correctness(success));
-    Ok(source)
+    let at = source.find("structure ExternalInputs").ok_or("missing claim declarations")?;
+    Ok(super::abbreviate_long_literals(&source, at, at))
 }
 
 #[cfg(test)]

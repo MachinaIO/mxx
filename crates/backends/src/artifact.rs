@@ -154,14 +154,16 @@ pub type EncodeJob<T, E> = Box<dyn FnOnce() -> Result<(T, u64), E> + Send>;
 /// Captures exact serialized lengths for a scalar artifact or every member of
 /// a family. The returned indices are suitable for the estimator's private
 /// payload-size context and are intentionally not part of the public manifest.
+/// Symbolic families exceeding host addressability are rejected before iteration.
 pub fn load_artifact_payload_sizes<S: ArtifactStore>(
     store: &mut S,
     key: &ArtifactKey,
     descriptor: &ManifestArtifact,
-) -> Result<Vec<(Option<usize>, usize)>, S::Error> {
+) -> Result<Vec<(Option<usize>, usize)>, Box<dyn std::error::Error + Send + Sync>> {
     match descriptor.family_count {
         None => Ok(vec![(None, store.load_payload_size(key, descriptor)?)]),
         Some(count) => {
+            let count = usize::try_from(count)?;
             let mut sizes = Vec::with_capacity(count);
             for index in 0..count {
                 let member_key = ArtifactKey {
@@ -510,7 +512,11 @@ impl FileArtifactStore {
         let mut expected = BTreeMap::new();
         for (name, artifact) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count)
+                        .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
@@ -695,7 +701,7 @@ impl FileArtifactStore {
         let count = descriptor.family_count;
         match (count, key.index) {
             (None, None) => Ok(()),
-            (Some(count), Some(index)) if index < count => Ok(()),
+            (Some(count), Some(index)) if (index as u128) < count => Ok(()),
             _ => Err(FileArtifactError::FamilyIndexMismatch(key.clone())),
         }
     }
@@ -1387,6 +1393,8 @@ impl SessionStore for FileArtifactStore {
             };
             match artifact.family_count {
                 Some(count) => {
+                    let count = usize::try_from(count)
+                        .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?;
                     for index in 0..count {
                         check_index(Some(index))?;
                     }
@@ -1904,7 +1912,12 @@ impl MemoryArtifactStore {
         let mut payloads = Vec::new();
         for (name, descriptor) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
@@ -1994,7 +2007,12 @@ impl MemoryArtifactStore {
         let mut manifest_expected = BTreeMap::new();
         for (name, descriptor) in &snapshot.manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
@@ -2149,7 +2167,12 @@ impl MemoryArtifactStore {
         let mut expected = BTreeMap::new();
         for (name, artifact) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
@@ -2293,7 +2316,7 @@ impl ArtifactStore for MemoryArtifactStore {
         }
         match (manifest_artifact.family_count, key.index) {
             (None, None) => {}
-            (Some(count), Some(index)) if index < count => {}
+            (Some(count), Some(index)) if (index as u128) < count => {}
             _ => return Err(MemoryArtifactError::FamilyIndexMismatch(key.clone())),
         }
         let (artifact_type, availability, layout, payload) = self.stored_entry(key)?;
@@ -2621,6 +2644,9 @@ impl SessionStore for MemoryArtifactStore {
                 };
                 match artifact.family_count {
                     Some(count) => {
+                        let count = usize::try_from(count).map_err(|error| {
+                            MemoryArtifactError::InvalidManifest(error.to_string())
+                        })?;
                         for index in 0..count {
                             check_index(Some(index))?;
                         }
@@ -2674,7 +2700,12 @@ impl SessionStore for MemoryArtifactStore {
         let mut expected = BTreeMap::new();
         for (name, artifact) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
@@ -2795,6 +2826,20 @@ mod tests {
             name: "value".to_owned(),
             index: None,
         }
+    }
+
+    #[test]
+    fn symbolic_family_payload_sizes_reject_unaddressable_cardinality() {
+        let descriptor = ManifestArtifact {
+            artifact_type: ArtifactType::Bytes { length: 1 },
+            family_count: Some(usize::MAX as u128 + 1),
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        assert!(
+            load_artifact_payload_sizes(&mut MemoryArtifactStore::default(), &key(), &descriptor)
+                .is_err()
+        );
     }
 
     fn production(seed: u8) -> ProductionId {
@@ -3288,7 +3333,7 @@ mod tests {
                             if family { "family".to_owned() } else { format!("scalar-{index}") };
                         let descriptor = ManifestArtifact {
                             artifact_type: ArtifactType::Int,
-                            family_count: family.then_some(values.len()),
+                            family_count: family.then_some(values.len() as u128),
                             availability,
                             layout: None,
                         };

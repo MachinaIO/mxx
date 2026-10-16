@@ -6784,6 +6784,20 @@ impl GpuDeviceBuffer {
         stream: &GpuNativeLaunchStream,
         bytes: usize,
     ) -> Result<Self, GpuNativeGraphError> {
+        let buffer = Self::allocate_in_order(stream, bytes)?;
+        // Graphs read the buffer from other streams without waiting for this
+        // stream-ordered allocation, so it completes before it is returned.
+        buffer.wait_until_ready()?;
+        Ok(buffer)
+    }
+
+    /// A buffer of `bytes` on the stream's device, zeroed in stream order but not waited for:
+    /// the caller waits for it, or for a buffer allocated after it on the same stream
+    /// ([`Self::wait_until_ready`]), before another stream reads it.
+    pub(crate) fn allocate_in_order(
+        stream: &GpuNativeLaunchStream,
+        bytes: usize,
+    ) -> Result<Self, GpuNativeGraphError> {
         let mut raw = ptr::null_mut();
         let status = unsafe { gpu_device_buffer_alloc(stream.raw_ptr(), bytes, &mut raw) };
         if status != 0 || raw.is_null() {
@@ -6792,15 +6806,11 @@ impl GpuDeviceBuffer {
                 last_error_string()
             )));
         }
-        let buffer = Self {
+        Ok(Self {
             owner: NonNull::new(raw).expect("device allocation returned null"),
             bytes,
             stream: stream.clone(),
-        };
-        // Graphs read the buffer from other streams without waiting for this
-        // stream-ordered allocation, so it completes before it is returned.
-        buffer.wait_until_ready()?;
-        Ok(buffer)
+        })
     }
 
     /// Write the buffer's first contents, complete before any Graph on
@@ -6875,7 +6885,9 @@ impl GpuDeviceBuffer {
         Ok(())
     }
 
-    fn wait_until_ready(&self) -> Result<(), GpuNativeGraphError> {
+    /// Wait until the buffer's allocation and initial writes, and everything its stream ordered
+    /// before them, have completed.
+    pub(crate) fn wait_until_ready(&self) -> Result<(), GpuNativeGraphError> {
         let status = unsafe { gpu_device_buffer_wait(self.owner.as_ptr()) };
         if status != 0 {
             return Err(GpuNativeGraphError::Native(format!(

@@ -45,7 +45,8 @@
 use crate::{
     backend::{BoundStorage, GpuResidentValue, poly_gpu::GpuDcrtBackend},
     gpu_execution_plan::{
-        CompiledGpuOp, KernelArg, PhysicalEncoding, PhysicalValue, PhysicalValueId, StorageRef,
+        CompiledGpuOp, GpuNativePrimitive, KernelArg, PhysicalEncoding, PhysicalValue,
+        PhysicalValueId, StorageRef,
     },
     gpu_physical_lowering::{PhysicalFrame, matrix_physical_value},
     matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
@@ -237,7 +238,11 @@ pub(crate) struct GraphScratchPlan {
     pools: BTreeMap<i32, Arc<GpuDeviceBuffer>>,
 }
 
-fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool)) {
+fn visit(
+    frame: &PhysicalFrame,
+    op: &CompiledGpuOp,
+    each: &mut dyn FnMut(PhysicalValueId, bool),
+) -> Result<(), String> {
     for argument in op.arguments.iter() {
         if let KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) = argument {
             each(*id, false);
@@ -246,9 +251,53 @@ fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool)) {
     for output in op.outputs.iter() {
         each(*output, true);
     }
-    for inner in op.body.iter().flatten() {
-        visit(inner, each);
+    // Pointer-table operands are reads too. In particular, later waves'
+    // family members may use the arena even when scratch_protected excludes
+    // their views from region pools. Omitting these reads lets another wave
+    // reuse a member's bytes before its last dynamic selection.
+    let mut indexed_read = |resource: u32| -> Result<(), String> {
+        let table = frame
+            .indexed_tables
+            .get(resource as usize)
+            .filter(|table| table.resource_id == resource)
+            .ok_or("GPU scratch read has no indexed matrix table")?;
+        for &(id, _) in &table.candidates {
+            each(id, false);
+        }
+        Ok(())
+    };
+    match frame.program.implementations.resolve(op.implementation)?.primitive {
+        GpuNativePrimitive::MatrixIndexedCopy => {
+            let Some(KernelArg::U32(resource)) = op.arguments.first() else {
+                return Err("GPU indexed copy has no table resource".into());
+            };
+            indexed_read(*resource)?;
+        }
+        GpuNativePrimitive::SubgraphKernel => {
+            for operand in op.arguments.get(6..).unwrap_or_default().chunks_exact(4) {
+                if let [KernelArg::U32(1), _, KernelArg::U32(resource), _] = operand {
+                    indexed_read(*resource)?;
+                }
+            }
+        }
+        GpuNativePrimitive::HashSample => {
+            let Some(KernelArg::U32(resource)) = op.arguments.first() else {
+                return Err("GPU hash sample has no tag resource".into());
+            };
+            let spec = frame
+                .hash_resources
+                .get(resource)
+                .ok_or("GPU scratch read has no hash tag resource")?;
+            for &(id, _, _) in spec.operands.iter() {
+                each(id, false);
+            }
+        }
+        _ => {}
     }
+    for inner in op.body.iter().flatten() {
+        visit(frame, inner, each)?;
+    }
+    Ok(())
 }
 
 /// `owner` with every storage that views a replaced allocation swapped, or `None` if it views
@@ -389,7 +438,7 @@ pub(crate) fn plan_graph_scratch(
     for (index, op) in frame.program.operations.iter().enumerate() {
         // Operations of any device may share one allocation: its barriers
         // order every use, and only copies reach across devices.
-        visit(op, &mut |id, written| {
+        visit(frame, op, &mut |id, written| {
             for pointer in group_of.get(&id).into_iter().flatten() {
                 let Some(group) = groups.get_mut(pointer) else {
                     continue;
@@ -400,7 +449,7 @@ pub(crate) fn plan_graph_scratch(
                         Some(group.first_write.map_or(index, |first| first.min(index)));
                 }
             }
-        });
+        })?;
     }
     for (pointer, start) in replay_writes {
         if let Some(group) = groups.get_mut(&pointer) {
@@ -981,5 +1030,103 @@ impl GraphScratchPlan {
             self.push_memory_node(index_of, token);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        GpuRuntime, MemoryArtifactStore, RuntimeValue,
+        backend::{poly::cpu_backend, poly_gpu::gpu_backend},
+        executor::{ExecutionConfig, execute_in_session},
+        poly::{
+            Poly,
+            dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+        },
+    };
+    use mxx_dsl::{DslContext, HashTag, Int, IntType, Ring, parallel};
+    use mxx_ir_core::ParamEnv;
+    use std::{collections::BTreeMap, sync::Arc};
+
+    /// A later wave's family member must survive intervening waves until
+    /// its last dynamic read, even though the read uses a pointer table.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_replayed_family_survives_late_dynamic_read() {
+        let parameter = |name, default| {
+            std::env::var(name).map_or(default, |value| value.parse::<usize>().unwrap())
+        };
+        let dimension = parameter("MXX_TEST_SCRATCH_RING_DIMENSION", 16) as u32;
+        let columns = parameter("MXX_TEST_SCRATCH_COLUMNS", 4);
+        let count = parameter("MXX_TEST_SCRATCH_MEMBERS", 4);
+        assert!(count >= 2);
+        let params = DCRTPolyParams::new(dimension, 2, 20, 4, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(dimension, params.moduli().to_vec(), 4, None);
+        let ring = Ring::from_crt_moduli(
+            params.moduli().iter().copied().map(Into::into).collect(),
+            dimension,
+        );
+        let context = DslContext::new("late-dynamic-family-read");
+        let selector: Int = context.input("selector", IntType).unwrap();
+        let key = ring.bytes_input("key", 32);
+        let members = parallel(count, |index| {
+            let mut tag = HashTag::from(b"scratch-family".as_slice());
+            tag.push(index);
+            Ok(ring.hash_matrix(key.clone(), tag, (1, columns)))
+        })
+        .unwrap();
+        let mut sum = members.at(selector.clone());
+        for _ in 0..2 {
+            let previous = sum.clone();
+            let work = parallel(count, |index| {
+                let mut tag = HashTag::from(b"scratch-intervening".as_slice());
+                tag.push(index);
+                Ok(previous.clone() + ring.hash_matrix(key.clone(), tag, (1, columns)))
+            })
+            .unwrap();
+            sum = work.at(selector.clone()) + members.at(selector.clone());
+        }
+        let graph = context
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = BTreeMap::from([
+            ("key".into(), RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()))),
+            ("selector".into(), RuntimeValue::Int((count - 1).into())),
+        ]);
+        let expected = execute_in_session(
+            &graph,
+            &mut cpu_backend([params]),
+            inputs.clone(),
+            &mut MemoryArtifactStore::default(),
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+            panic!("matrix output")
+        };
+        let expected = expected.cpu_full_arc().expect("CPU reference matrix");
+        let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), 0.into()..=(count - 1).into());
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &inputs, columns, 1).unwrap();
+        for _ in 0..3 {
+            let actual = runtime.execute(&mut plan, inputs.clone()).unwrap();
+            let actual = runtime.download_matrix_output(&actual.output("sum").unwrap()).unwrap();
+            for column in 0..columns {
+                assert_eq!(
+                    actual.entry(0, column).coeffs_biguints(),
+                    expected.entry(0, column).coeffs_biguints()
+                );
+            }
+        }
     }
 }

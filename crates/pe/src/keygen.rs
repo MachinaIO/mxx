@@ -365,26 +365,15 @@ where
         ArtifactAvailability::Transferred,
     );
     // Contract a stored row once. Its positive terms go to row i and its
-    // negative gadget terms to row i*k, so no partner-row import is needed.
+    // negative gadget terms to row i*k, so no partner-row import is needed. Each
+    // term is added into one entry of a `1 x W` row through a unit row, which the
+    // GPU lowers to a single-column addition.
+    let unit = |index: IntExpr| mxx_exponent_lut::rns_bgg::unit_row(&ring, w, index);
     let contributions = mxx_dsl::parallel(w, |row| {
         let own = blocks.at(row.clone());
         let row = row.expression()?;
         let gadget_products = gadget_first_row.clone().mul_small_rhs(own.clone());
-        let column = |index: IntExpr| {
-            Mat::concat(
-                ConcatAxis::Rows,
-                (0..w)
-                    .map(|position| {
-                        Int::evaluate(index.clone())
-                            .equal(Int::constant(position))
-                            .to_int()
-                            .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
-                    })
-                    .collect(),
-            )
-        };
-        let own_column = column(row.clone());
-        mxx_dsl::iterate(p, ring.zero((w, 1)), |k, sum| {
+        mxx_dsl::iterate(p, ring.zero((1, w)), |k, sum| {
             let k = k.expression()?;
             let helper = setup
                 .helper_key(rns, hash_key.clone(), Group::select(&group.helpers, k.clone()))
@@ -396,12 +385,13 @@ where
                 .ring_automorphism(Group::select(&group.elements, row.clone()))
                 .mul_small_rhs(own.clone())
                 .slice(None, selected.clone());
-            let negative = gadget_products.clone().slice(None, selected);
+            let negative = ring.zero((1, 1)) - gadget_products.clone().slice(None, selected);
             let destination = Group::select(
                 &group.destinations,
                 (row.clone() * IntExpr::constant(p) + k).canonicalize(),
             );
-            Ok(sum + own_column.clone() * positive - column(destination) * negative)
+            let sum = sum + positive * unit(row.clone());
+            Ok(sum + negative * unit(destination))
         })
     })?;
     let residuals = match w {
@@ -419,8 +409,8 @@ where
     let targets = mxx_dsl::parallel(w, |row| {
         let row = row.expression()?;
         let residual = residuals.clone().slice(
-            Some(IndexRange { start: row.clone(), end: row.clone() + IntExpr::constant(1) }),
             None,
+            Some(IndexRange { start: row.clone(), end: row.clone() + IntExpr::constant(1) }),
         );
         let residual = match &compressed_residuals {
             Some(contributions) => residual + contributions.at(Int::evaluate(row.clone())),

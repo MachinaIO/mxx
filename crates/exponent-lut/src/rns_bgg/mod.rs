@@ -2488,7 +2488,7 @@ pub(crate) fn companion_tag(tag: &mxx_dsl::HashTag, a: IntExpr, j: IntExpr) -> m
 
 /// The `1 x width` unit row at a loop-dependent `index`: a window of one
 /// constant row, so no constant depends on the loop.
-pub(crate) fn unit_row(ring: &Ring, width: usize, index: IntExpr) -> Mat {
+pub fn unit_row(ring: &Ring, width: usize, index: IntExpr) -> Mat {
     let start = (IntExpr::constant(width - 1) - index).canonicalize();
     ring.constant(
         (1, 2 * width - 1),

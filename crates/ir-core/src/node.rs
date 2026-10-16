@@ -4,12 +4,12 @@
 //!
 //! | Category | Variants |
 //! | --- | --- |
-//! | Inputs and constants | `Input`, `ConstantInt`, `EvaluateInt`, `ConstantReal`, `ConstantBool`, `ConstantMatrix` |
+//! | Inputs and constants | `Input`, `ConstantInt`, `EvaluateInt`, `Sha256BitColumns`, `ConstantReal`, `ConstantBool`, `ConstantMatrix` |
 //! | Trapdoor structure | `GadgetTrapdoor`, `TrapdoorPublic` |
 //! | Scalar arithmetic | `IntBinary`, `IntCompare`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt`, `IntMatrixVectorProduct` |
 //! | Matrix arithmetic | `MatrixBinary`, `MatrixMulAccumulate`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism`, `MultiplyMonomial` |
 //! | Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase`, `CenteredRoundDivide`, `RnsModUp`, `RnsModDown`, `BlockModSwitch` |
-//! | Shape | `Transpose`, `Slice`, `Tensor`, `Concat` |
+//! | Shape | `Transpose`, `Slice`, `Tensor`, `BlockDiagonal`, `Concat` |
 //! | Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample`, `HashSample`, `HashIntFamily`, `TrapdoorSample`, `PreimageSample` |
 //! | Decomposition and coefficients | `GadgetDecompose`, `ExtractCoefficient`, `LiftIntegerToConstantPolynomial`, `PackPolynomialCoefficients`, `PolynomialFromValues`, `PolynomialValues` |
 //! | Decoding and CRT | `ThresholdDecode`, `CrtRecompose` |
@@ -71,6 +71,14 @@ pub enum NodeKind {
     },
     ConstantInt(#[serde(with = "crate::serde_support::bigint")] BigInt),
     EvaluateInt(IntExpr),
+    /// Public SHA-256 bit-matrix columns, packed ascending row indices and counts.
+    /// See [`crate::hash_columns::sha256_bit_columns`] for the exact stream convention.
+    Sha256BitColumns {
+        seed: [u8; 32],
+        rows: usize,
+        columns: usize,
+        index_bits: usize,
+    },
     ConstantReal(RealExpr),
     ConstantBool(bool),
     ConstantMatrix {
@@ -154,6 +162,11 @@ pub enum NodeKind {
         columns: Option<IndexRange>,
     },
     Tensor,
+    /// The Kronecker product `I_count ⊗ input`, with a positive repetition count.
+    /// One source and one result represent all blocks without concat intermediates.
+    BlockDiagonal {
+        count: usize,
+    },
     Concat {
         axis: ConcatAxis,
     },
@@ -427,12 +440,16 @@ pub enum LoopInputMode {
 
 impl LoopInputMode {
     /// The member a zipped mode (`Zip`, `ZipOffset`, `ZipQuotient`) gives instance `instance`;
-    /// `None` for `Broadcast` and `Gather` (or a zero divisor).
-    pub fn zipped_member(self, instance: usize) -> Option<usize> {
+    /// `None` for `Broadcast` and `Gather` (or a zero divisor). The index type can be `usize`
+    /// for execution or `u128` for symbolic cardinality validation; arithmetic stays checked.
+    pub fn zipped_member<Index>(self, instance: Index) -> Option<Index>
+    where
+        Index: num_traits::CheckedAdd + num_traits::CheckedDiv + TryFrom<usize>,
+    {
         match self {
             Self::Zip => Some(instance),
-            Self::ZipOffset { offset } => instance.checked_add(offset),
-            Self::ZipQuotient { divisor } => instance.checked_div(divisor),
+            Self::ZipOffset { offset } => instance.checked_add(&Index::try_from(offset).ok()?),
+            Self::ZipQuotient { divisor } => instance.checked_div(&Index::try_from(divisor).ok()?),
             Self::Broadcast | Self::Gather { .. } => None,
         }
     }

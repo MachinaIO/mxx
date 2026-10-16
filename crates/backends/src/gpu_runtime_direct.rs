@@ -176,7 +176,9 @@ use crate::{
         KernelArg, PhysicalEncoding, PhysicalValueId,
     },
     gpu_io_worker::{FrameGeneration, IoCompletion},
-    gpu_physical_control::{static_family_member, wave_family_member},
+    gpu_physical_control::{
+        host_family_count, static_family_member, wave_family_member, wave_family_members,
+    },
     gpu_physical_lowering::{
         ImportTemplate, PhysicalFrame, plan_physical_graph, single_root_physical_plan,
     },
@@ -1520,7 +1522,13 @@ impl DirectGraph {
         for bytes in frame.bytes_input_owners.values() {
             bytes.prepare_graph_launch(device_stream(bytes.physical_device())?)?;
         }
-        for replay in &frame.indexed_tables {
+        // Only the tables this region's copies read: rebuilding every table of the frame at every
+        // launch costs the frame's tables times their candidates per launch.
+        for replay in frame
+            .indexed_tables
+            .iter()
+            .filter(|replay| region.resources.uses_indexed_matrix(replay.resource_id))
+        {
             let members = replay
                 .candidates
                 .iter()
@@ -2039,7 +2047,7 @@ impl AllocationUses {
         let mut uses = BTreeMap::new();
         count_operations(frame, &frame.program.operations, &mut uses);
         let mut by_part = BTreeMap::new();
-        for (&value, owner) in &frame.owners {
+        for (&value, owner) in frame.owners.iter() {
             for (index, part) in owner.physical().parts.iter().enumerate() {
                 if let Some(storage) = owner.storage(part.storage) &&
                     let Some(&count) = uses.get(&Arc::as_ptr(&storage.owner).cast::<()>())
@@ -2596,6 +2604,7 @@ impl GpuRuntime {
                 ))
             }
         };
+        let count = host_family_count(count).map_err(GpuRuntimeError::Execution)?;
         let mut decoded = vec![None; count];
         for part in resident.physical().parts.iter() {
             let encoding = match resident.physical().encodings.get(part.leaf as usize) {
@@ -2892,7 +2901,8 @@ impl GpuRuntime {
                         "validated artifact descriptor has no input source".into(),
                     ));
                 };
-                let members = descriptor.family_count.map_or(1, |count| count);
+                let members = host_family_count(descriptor.family_count.unwrap_or(1))
+                    .map_err(GpuPlanError::InvalidInput)?;
                 for member in 0..members {
                     let key = ArtifactKey {
                         production: source.production_id.clone(),
@@ -4145,8 +4155,13 @@ impl GpuRuntime {
             let members = manifest
                 .artifacts
                 .values()
-                .map(|artifact| artifact.family_count.unwrap_or(1))
-                .sum::<usize>();
+                .try_fold(0usize, |total, artifact| {
+                    let count = host_family_count(artifact.family_count.unwrap_or(1))?;
+                    total.checked_add(count).ok_or_else(|| {
+                        "published artifact count exceeds host addressability".to_owned()
+                    })
+                })
+                .map_err(GpuRuntimeError::Execution)?;
             if let Some(trial) = self.io_trial.as_mut() {
                 trial.published = Some((
                     published,
@@ -4470,6 +4485,26 @@ impl GpuRuntime {
                 self.start_read_ahead(plan, pump, Some(ahead), &mut indices)?;
             }
         }
+        // The Zip members of every wave, selected per source family in one
+        // pass over its parts, while the family owner stays the one selected.
+        let mut zip_ranges = BTreeMap::<PhysicalValueId, (usize, usize)>::new();
+        for &wave_index in group.waves.iter().take(limit) {
+            for &(family_id, member_index, _) in &plan.frame.waves[wave_index].zip_sources {
+                let range = zip_ranges.entry(family_id).or_insert((member_index, member_index));
+                range.0 = range.0.min(member_index);
+                range.1 = range.1.max(member_index);
+            }
+        }
+        let mut zip_members = BTreeMap::new();
+        for (family_id, (first, last)) in zip_ranges {
+            let family =
+                plan.frame.owners.get(&family_id).ok_or_else(|| {
+                    GpuRuntimeError::Execution("Zip source family is absent".into())
+                })?;
+            let members =
+                wave_family_members(family, first..last + 1).map_err(GpuRuntimeError::Execution)?;
+            zip_members.insert(family_id, (Arc::clone(family), first, members));
+        }
         // Each wave's `owner_bindings` hold its plan-owned output members, and
         // the family owner was packed from those same members at plan time.
         for (ordinal, &wave_index) in group.waves.iter().enumerate().take(limit) {
@@ -4492,8 +4527,13 @@ impl GpuRuntime {
                 let family = plan.frame.owners.get(&family_id).ok_or_else(|| {
                     GpuRuntimeError::Execution("Zip source family is absent".into())
                 })?;
-                let member =
-                    wave_family_member(family, member_index).map_err(GpuRuntimeError::Execution)?;
+                let member = match zip_members.get(&family_id) {
+                    Some((selected, first, members)) if Arc::ptr_eq(selected, family) => {
+                        Arc::clone(&members[member_index - first])
+                    }
+                    _ => wave_family_member(family, member_index)
+                        .map_err(GpuRuntimeError::Execution)?,
+                };
                 plan.frame.waves[wave_index].owner_bindings.insert(value_id, member);
             }
             let bindings = plan.frame.waves[wave_index].owner_bindings.clone();
@@ -4694,7 +4734,7 @@ impl GpuRuntime {
                     GpuRuntimeError::Execution("Gather index family is too short".into())
                 })?;
                 let count = template.descriptor.family_count.unwrap_or(0);
-                key.index = Some(num_traits::ToPrimitive::to_usize(selected).filter(|index| *index < count).ok_or_else(
+                key.index = Some(num_traits::ToPrimitive::to_usize(selected).filter(|index| (*index as u128) < count).ok_or_else(
                     || {
                         GpuRuntimeError::Artifact(format!(
                             "gathered artifact index {selected} is outside its family of {count}"
@@ -4764,7 +4804,7 @@ impl GpuRuntime {
                 .evaluate(&env)
                 .ok()
                 .and_then(|index| num_traits::ToPrimitive::to_usize(&index))
-                .filter(|index| *index < count)
+                .filter(|index| (*index as u128) < count)
                 .ok_or_else(|| {
                     GpuRuntimeError::Artifact(
                         "host-selected artifact index is outside its family".into(),
@@ -4893,6 +4933,8 @@ fn planned_import_requests(
                 .descriptor
                 .family_count
                 .ok_or_else(|| invalid("selected artifact import has no finite family count"))?;
+            let family_count =
+                host_family_count(family_count).map_err(GpuRuntimeError::Execution)?;
             let encoding = match frame.program.values[import.selector.0 as usize].encodings.as_ref()
             {
                 [crate::gpu_execution_plan::PhysicalEncoding::Signed(encoding)] => *encoding,
@@ -4951,7 +4993,7 @@ fn planned_export_slots(
             let valid_index = match (site.index, descriptor.family_count) {
                 (None, None) => site.occurrence == 0,
                 // A streamed member is the first occurrence of its lane's site.
-                (Some(index), Some(count)) if index < count => {
+                (Some(index), Some(count)) if (index as u128) < count => {
                     u64::try_from(index).is_ok_and(|index| index == site.occurrence) ||
                         (site.streamed && site.occurrence == 0)
                 }

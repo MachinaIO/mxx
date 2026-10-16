@@ -1,6 +1,9 @@
-//! The indistinguishability-obfuscation interface ([`Obfuscation`]). Diamond iO and AKY24 iO were
-//! removed during the DSL migration; their latest implementations remain on the `main` branch at
+//! The indistinguishability-obfuscation interface ([`Obfuscation`]) and Diamond iO 2 ([`dio2`]),
+//! an obfuscation of streaming functions. Diamond iO and AKY24 iO were removed during the DSL
+//! migration; their latest implementations remain on the `main` branch at
 //! `d5d6fba26f1d20f11d4648a3fd1c9b35241ff4a9` (`src/io/diamond_io.rs` and `src/io/aky24_io.rs`).
+
+pub mod dio2;
 
 /// Common interface for indistinguishability obfuscation schemes.
 pub trait Obfuscation {

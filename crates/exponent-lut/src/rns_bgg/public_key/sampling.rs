@@ -29,15 +29,28 @@ pub(in crate::rns_bgg) fn matrix_from_hash(
 /// The deterministic public `A_sigma` of evaluation level `level`. Every
 /// stage that uses it samples it from the shared hash key, so preprocess,
 /// encryption, and online evaluation derive the same matrix without
-/// publishing it.
+/// publishing it. On a rooted chain it is the root helper key of `sigma`
+/// re-targeted to the state form of `level` (see [`super::RnsBggRoot`]), the key of the
+/// re-targeted root helper row.
 /// `sigma` is always a runtime integer tag component, so a constant sigma and
 /// one selected by a loop index derive the same tag.
 pub(in crate::rns_bgg) fn lut_public_matrix(
     parameters: &RnsBggParameters,
     key: Bytes,
+    root_key: Option<Bytes>,
     level: usize,
     sigma: Int,
 ) -> Result<RnsBggMatrix, RnsBggError> {
+    if parameters.root().is_some() {
+        let root_key =
+            root_key.ok_or(RnsBggError::Binding("a rooted chain reads the root hash key"))?;
+        return parameters.root_key(
+            root_key,
+            super::RnsBggRoot::helper_tag(sigma),
+            level,
+            super::RnsBggForm::State,
+        );
+    }
     let ring = parameters.ring(level)?;
     let columns = parameters.component_columns(level)?;
     let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/lut-a".to_vec());

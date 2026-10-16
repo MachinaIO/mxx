@@ -881,6 +881,7 @@ mod test {
         let mut lowerer = EncodingLowering {
             parameters,
             hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            root_hash_key: None,
             workload: Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap()),
             program: program.clone(),
             preprocess: production.clone(),

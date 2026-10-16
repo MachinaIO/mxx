@@ -718,6 +718,7 @@ impl ExecutionResult {
             let count = lease.descriptor.family_count.ok_or_else(|| {
                 ExecutionError::Manifest("staged family lease has no cardinality".to_owned())
             })?;
+            let count = addressable_family_count(count)?;
             for index in 0..count {
                 store
                     .remove_staged(&ArtifactKey {
@@ -1230,6 +1231,7 @@ impl<S: SessionStore> Executor<'_, S> {
                         "output {name} staged descriptor does not match validated metadata"
                     )));
                 }
+                let count = addressable_family_count(count)?;
                 for index in 0..count {
                     let staged_key = ArtifactKey {
                         production: staged_production.clone(),
@@ -1285,7 +1287,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 continue;
             }
             if let RuntimeValue::IndexedFamily { values: members, .. } = output {
-                if family_count != Some(members.len()) {
+                if family_count != Some(members.len() as u128) {
                     return Err(ExecutionError::Manifest(format!(
                         "output {name} family count does not match validated metadata"
                     )));
@@ -1460,7 +1462,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 )));
             }
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new((0..addressable_family_count(count)?).map(Some)),
                 None => Box::new(std::iter::once(None)),
             };
             let output_handles = indices
@@ -1495,7 +1497,7 @@ impl<S: SessionStore> Executor<'_, S> {
         else {
             return Ok(None);
         };
-        if *validated_count != count {
+        if *validated_count != count as u128 {
             return Err(ExecutionError::MissingMetadata(wire_id));
         }
         let Some(artifact_type) = ArtifactType::from_wire_type(element) else {
@@ -1507,7 +1509,7 @@ impl<S: SessionStore> Executor<'_, S> {
         let name = format!("runtime-staged-{}", hex_bytes(&digest));
         let descriptor = ManifestArtifact {
             artifact_type,
-            family_count: Some(count),
+            family_count: Some(count as u128),
             // This is a materialized value produced by the active runtime
             // scope.  It has no public deterministic regeneration recipe;
             // staging therefore carries the payload across the scope
@@ -1545,6 +1547,7 @@ impl<S: SessionStore> Executor<'_, S> {
             let Some(count) = descriptor.family_count else {
                 return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
             };
+            let count = addressable_family_count(count)?;
             for index in 0..count {
                 let key = ArtifactKey {
                     production: production.clone(),
@@ -1566,6 +1569,7 @@ impl<S: SessionStore> Executor<'_, S> {
             let Some(count) = descriptor.family_count else {
                 return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
             };
+            let count = addressable_family_count(count)?;
             for index in 0..count {
                 let key = ArtifactKey {
                     production: production.clone(),
@@ -2374,7 +2378,7 @@ pub(crate) fn hash_runtime_value(
                     "indexed input has non-family metadata".into(),
                 ));
             };
-            if values.len() != *count || element_type != element.as_ref() {
+            if values.len() as u128 != *count || element_type != element.as_ref() {
                 return Err(ExecutionError::Manifest(
                     "indexed input does not match validated family metadata".into(),
                 ));
@@ -2441,7 +2445,7 @@ fn scratch_production_id(
 
 fn collect_staged_families(
     value: &RuntimeValue,
-    families: &mut BTreeMap<(ProductionId, String), usize>,
+    families: &mut BTreeMap<(ProductionId, String), u128>,
 ) {
     match value {
         RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
@@ -2495,6 +2499,13 @@ pub(crate) fn materialize_runtime_value<S: ArtifactStore>(
     }
 }
 
+/// Converts a symbolic family cardinality only at a concrete execution boundary.
+fn addressable_family_count(count: u128) -> Result<usize, ExecutionError> {
+    usize::try_from(count).map_err(|_| {
+        ExecutionError::Manifest(format!("family cardinality {count} exceeds host addressability"))
+    })
+}
+
 fn materialize_artifact_family<S: ArtifactStore>(
     production: ProductionId,
     name: String,
@@ -2506,6 +2517,7 @@ fn materialize_artifact_family<S: ArtifactStore>(
     let count = descriptor
         .family_count
         .ok_or_else(|| ExecutionError::Manifest("artifact family has no cardinality".into()))?;
+    let count = addressable_family_count(count)?;
     let element_type = artifact_wire_type(&descriptor.artifact_type);
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
@@ -2572,7 +2584,7 @@ fn artifact_wire_type(artifact: &ArtifactType) -> ConcreteWireType {
                 Some(first) if members.iter().all(|member| member == first) => {
                     ConcreteWireType::IndexedFamily {
                         element: Box::new(first.clone()),
-                        count: members.len(),
+                        count: members.len() as u128,
                     }
                 }
                 _ => ConcreteWireType::DependentFamily { members },
@@ -2712,6 +2724,12 @@ mod tests {
             rows: 1,
             columns: 1,
         }
+    }
+
+    #[test]
+    fn symbolic_family_execution_rejects_unaddressable_cardinality() {
+        assert_eq!(addressable_family_count(7).unwrap(), 7);
+        assert!(addressable_family_count(usize::MAX as u128 + 1).is_err());
     }
 
     #[test]

@@ -212,19 +212,34 @@ fn mod_down_moments(
     level: usize,
     moments: &NoiseMoments,
 ) -> Result<NoiseMoments, RnsBggError> {
-    let p = parameters.scale(level)?.clone();
+    let n = BigUint::from(parameters.level(level)?.ring_dimension());
+    mod_down_moments_by(&n, parameters.scale(level)?, moments)
+}
+
+/// The moments `M` of a carrier of ring dimension `n` after a ModDown by the ratio `p`: `M / p`
+/// plus the public-key rounding under the mask secret, `(2n+3)(p^2-1)/(36 p^2)`, and the
+/// encoding rounding.
+pub(crate) fn mod_down_moments_by(
+    n: &BigUint,
+    p: &BigUint,
+    moments: &NoiseMoments,
+) -> Result<NoiseMoments, RnsBggError> {
+    let p = p.clone();
     let scaled = NoiseMoments {
         mean_numerator: moments.mean_numerator.clone(),
         mean_denominator: &moments.mean_denominator * &p,
         mean_radius: moments.mean_radius.scaled_ratio(&BigUint::one(), &p),
         variance: moments.variance.scaled_ratio(&BigUint::one(), &(&p * &p)),
     };
-    let rounding = zero_mean_moments(parameters.lut_public_rounding_variance(level)?)
-        .add_with_covariance(
-            &NoiseMoments::discrete_rounding_residue(&p)
-                .map_err(|error| RnsBggError::Graph(error.to_string()))?,
-            NoiseCorrelation::Independent,
-        );
+    let p_squared = &p * &p;
+    let public_rounding =
+        NonnegativeRational::new((n * 2u8 + 3u8) * (&p_squared - 1u8), 36u8 * &p_squared)
+            .expect("positive scale");
+    let rounding = zero_mean_moments(public_rounding).add_with_covariance(
+        &NoiseMoments::discrete_rounding_residue(&p)
+            .map_err(|error| RnsBggError::Graph(error.to_string()))?,
+        NoiseCorrelation::Independent,
+    );
     Ok(scaled.add_with_covariance(&rounding, NoiseCorrelation::Independent))
 }
 
@@ -255,32 +270,6 @@ fn tail_bound(moments: &NoiseMoments, z_squared: &NonnegativeRational) -> BigUin
     .expect("positive variance denominator");
     let root = (&spread.numerator * &spread.denominator).sqrt() / &spread.denominator + 1u8;
     mean.numerator / mean.denominator + 1u8 + root
-}
-
-/// Moments of `count` products of a value with `moments` by independent
-/// uniform digits of variance `digit_variance` (zero mean): zero-mean, with
-/// variance `count (Var + (|mean| + radius)^2) digit_variance`.
-fn digit_action(
-    moments: &NoiseMoments,
-    count: &BigUint,
-    digit_variance: &NonnegativeRational,
-) -> NoiseMoments {
-    let mean = NonnegativeRational::new(
-        moments.mean_numerator.magnitude().clone(),
-        moments.mean_denominator.clone(),
-    )
-    .expect("positive mean denominator")
-    .add(&moments.mean_radius);
-    let second = moments.variance.add(
-        &NonnegativeRational::new(
-            &mean.numerator * &mean.numerator,
-            &mean.denominator * &mean.denominator,
-        )
-        .expect("positive denominator"),
-    );
-    zero_mean_moments(
-        second.scaled(count).scaled_ratio(&digit_variance.numerator, &digit_variance.denominator),
-    )
 }
 
 /// The noise of part `part` (`(chain, component)`) of `declaration`'s refresh of output
@@ -430,11 +419,8 @@ fn compose_refresh_noise(
     let digit_variance = NonnegativeRational::new(&base * &base + 2u8, BigUint::from(12u8))
         .expect("positive denominator");
     let block_count = BigUint::from(columns) * &n;
-    let fresh_block_moments = digit_action(
-        &zero_mean_moments(parameters.encoding_error_variance()),
-        &block_count,
-        &digit_variance,
-    );
+    let fresh_block_moments = zero_mean_moments(parameters.encoding_error_variance())
+        .uniform_digit_action(&block_count, &digit_variance);
     let unmask_moments = zero_mean_moments(
         parameters.encoding_error_variance().scaled(&(&unmask_terms * preimage_bound.pow(2u32))),
     );
@@ -448,7 +434,7 @@ fn compose_refresh_noise(
         })?;
         (
             fresh_block_moments.add_with_covariance(&unmask_moments, NoiseCorrelation::Independent),
-            Some(digit_action(sigma, &block_count, &digit_variance)),
+            Some(sigma.uniform_digit_action(&block_count, &digit_variance)),
         )
     } else {
         (fresh_block_moments, None)

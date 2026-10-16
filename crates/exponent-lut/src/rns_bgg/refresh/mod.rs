@@ -82,7 +82,7 @@ pub(crate) fn hash_key_input_name(namespace: Option<&[u8; 32]>) -> String {
 /// The digit actions of the output prime `q` (`Q_q = Q / q`): `x` is
 /// `(I_2 ⊗ G_Q)^-1(Q_q A'_(j))` (`2m x w_0`), `y` is `G^st^-1(R_q)` (`w x w_0`, the target
 /// weight of [`RnsBggParameters::top_target_weight`]) and `z` is `G_Q^-1(Q_q)` (`m x 1`).
-pub(crate) struct RefreshActions {
+pub struct RefreshActions {
     pub(crate) x: SmallMatrix,
     pub(crate) y: SmallMatrix,
     pub(crate) z: SmallMatrix,
@@ -222,26 +222,29 @@ impl RnsBggParameters {
         Ok(super::public_key::matrix_from_hash(&ring, hash_key, tag, columns))
     }
 
-    /// The digit actions of the part `declaration`'s output prime at level `level` for its
-    /// public `a_prime = A'_(j)`.
-    pub(crate) fn refresh_actions(
+    /// The digit actions of decoding the prime at index `output_prime` of the basis of level
+    /// `level` of a row refreshed to the format `reference` under the public `a_prime = A'_(j)`
+    /// (`1 x w_0` in the ring of `level`): a part's actions (see [`crate::refresh`]), or a row
+    /// target's (see [`crate::rns_bgg::RnsBggParameters::retarget_encoding`]).
+    pub fn refresh_actions(
         &self,
         level: usize,
         a_prime: Mat,
-        declaration: &RefreshPartDeclaration,
+        output_prime: usize,
+        reference: &TopReference,
     ) -> Result<RefreshActions, RnsBggError> {
         let parameters = self.level(level)?;
         let modulus: BigUint = parameters.modulus().as_ref().clone();
         let q_i = parameters
             .to_crt()
             .0
-            .get(declaration.output_prime())
+            .get(output_prime)
             .copied()
             .ok_or(RnsBggError::Parameters("refresh prime index out of range"))?;
         let cofactor = &modulus / q_i;
         let cofactor_scalar = self.scalar(level, BigInt::from(cofactor.clone()))?;
         let x = self.gadget_inverse(level, level, cofactor_scalar * a_prime)?;
-        let weight = self.top_target_weight(level, q_i, declaration.reference())?;
+        let weight = self.top_target_weight(level, q_i, reference)?;
         let y = self.gadget_inverse(level + 1, level, weight)?;
         let z = self.gadget_inverse(level, level, self.scalar(level, BigInt::from(cofactor))?)?;
         Ok(RefreshActions { x, y, z })
@@ -358,13 +361,30 @@ pub(crate) fn top_residue_term(
     part: &RefreshPartDeclaration,
     residue: Mat,
 ) -> Result<Mat, RnsBggError> {
-    let primes = part.output_moduli();
+    residue_term(
+        part.output_moduli(),
+        part.output_modulus(),
+        part.reference().ring_dimension,
+        residue,
+    )
+}
+
+/// The term of a residue `residue` (`y mod q`, a row in the ring of the prime `q`) of the
+/// recombination of `y` modulo the product `P` of `primes` (`q` among them, ring dimension
+/// `ring_dimension`): the centered residue in the ring of `P` times its CRT coefficient
+/// `P / q ((P / q)^-1 mod q)`. The terms of every prime of `P` sum to `y mod P`.
+pub fn residue_term(
+    primes: &[u64],
+    q: u64,
+    ring_dimension: u32,
+    residue: Mat,
+) -> Result<Mat, RnsBggError> {
     if primes.len() == 1 {
         return Ok(residue);
     }
-    let ring = output_ring(primes, part.reference().ring_dimension);
+    let ring = output_ring(primes, ring_dimension);
     let modulus: BigUint = primes.iter().map(|prime| BigUint::from(*prime)).product();
-    let prime = BigUint::from(part.output_modulus());
+    let prime = BigUint::from(q);
     let cofactor = &modulus / &prime;
     let coefficient = (&cofactor % &prime)
         .modinv(&prime)
@@ -428,7 +448,7 @@ impl RnsBggParameters {
 /// component-1 row of `columns` blocks `fresh_k` (`1 x m` each, the row `Sum` of the child, see
 /// [`crate::refresh::FreshNoiseProgram`]). Applied to the key rows it gives the decoded key `K`,
 /// applied to the rows it gives the decoded row `d` (`1 x columns`).
-pub(crate) fn refresh_combination(
+pub fn refresh_combination(
     one: (Mat, Mat),
     target: Mat,
     (fresh, columns): (Mat, usize),
@@ -670,7 +690,14 @@ pub(crate) mod tests {
         let refreshed = s0.clone() * row(0) + row(1) - x * target_weight +
             Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, fresh_noise);
         let modulus: BigUint = parameters.level(level).unwrap().modulus().as_ref().clone();
-        let actions = parameters.refresh_actions(level, a_prime.clone(), declaration).unwrap();
+        let actions = parameters
+            .refresh_actions(
+                level,
+                a_prime.clone(),
+                declaration.output_prime(),
+                declaration.reference(),
+            )
+            .unwrap();
         // The fresh carriers as one row of column blocks, as the fresh child's row `Sum` returns
         // them.
         let blocks =

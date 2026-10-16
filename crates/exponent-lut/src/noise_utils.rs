@@ -568,6 +568,26 @@ impl NoiseMoments {
         }
     }
 
+    /// Moments of a sum of `count` products of a value with these moments by independent
+    /// uniform digits of variance `digit_variance` (zero mean), such as the digits of the
+    /// decomposition of a uniform matrix: zero-mean, with variance
+    /// `count (Var + (|mean| + radius)^2) digit_variance`.
+    pub fn uniform_digit_action(
+        &self,
+        count: &BigUint,
+        digit_variance: &NonnegativeRational,
+    ) -> Self {
+        Self {
+            mean_numerator: BigInt::zero(),
+            mean_denominator: BigUint::one(),
+            mean_radius: NonnegativeRational::zero(),
+            variance: self
+                .second_moment_bound()
+                .scaled(count)
+                .scaled_ratio(&digit_variance.numerator, &digit_variance.denominator),
+        }
+    }
+
     /// Uniform integer interval starting at `lower` with positive `size`.
     /// The support contract is established by parameter construction.
     pub fn uniform_interval(lower: BigInt, size: BigUint) -> Self {
@@ -938,6 +958,13 @@ pub(crate) struct ReductionCounts {
 }
 
 /// The contributions of one noise value.
+///
+/// Normalization first merges identical sample coordinates, preserving the
+/// original arithmetic for small breakdowns. If more than
+/// `MAX_NOISE_CONTRIBUTIONS` terms or `MAX_NOISE_COORDINATES` total member
+/// coordinates remain, their envelope replaces them with one opaque term.
+/// It cannot establish independence, sample identity,
+/// lane injectivity, or a covariance-energy bound in subsequent transfers.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NoiseBreakdown {
     terms: Vec<NoiseContribution>,
@@ -945,6 +972,14 @@ pub(crate) struct NoiseBreakdown {
     /// carry, when the element was produced by a parallel body.
     lane_depth: Option<usize>,
 }
+
+/// Bound the source lists retained by long products and nested PRF programs.
+/// This is an analysis precision limit, not a limit on the evaluated circuit.
+const MAX_NOISE_CONTRIBUTIONS: usize = 256;
+
+/// Residual identities carry one coordinate per operand source. Limiting only
+/// the term count would still allow quadratic storage for these tuples.
+const MAX_NOISE_COORDINATES: usize = 4096;
 
 /// Fraction bits kept by the outward rounding of propagated moments. The
 /// exact alignment and scale ratios otherwise grow every denominator along a
@@ -1143,7 +1178,11 @@ impl NoiseBreakdown {
                 NoiseContribution {
                     moments: term.moments.linear_image(&mean_gain, variance).rounded_up(PRECISION),
                     covariance_bounded,
-                    ..term.clone()
+                    source: term.source,
+                    origin: term.origin,
+                    sample: term.sample.clone(),
+                    kind: term.kind,
+                    per_member: term.per_member,
                 }
             })
             .collect();
@@ -1184,7 +1223,36 @@ impl NoiseBreakdown {
                 }
             }
         }
-        Self { terms: grouped.into_values().collect(), lane_depth }
+        let normalized = Self { terms: grouped.into_values().collect(), lane_depth };
+        let coordinates = normalized.terms.iter().map(|term| term.sample.len()).sum::<usize>();
+        if normalized.terms.len() <= MAX_NOISE_CONTRIBUTIONS && coordinates <= MAX_NOISE_COORDINATES
+        {
+            return normalized;
+        }
+        normalized.coherent_envelope()
+    }
+
+    /// Forget the decomposition, never its possible correlations. The mean
+    /// radius sums absolute mean bounds, so opposite signed means cannot
+    /// cancel before a later unknown action. `total()` already bounds the
+    /// centered variance of the complete sum, including shared-source and
+    /// unknown covariance. Once opaque, that sum is coherent with every
+    /// later contribution, including any reuse of one of its hidden sources.
+    fn coherent_envelope(self) -> Self {
+        let mut envelope = zero_moments();
+        for term in &self.terms {
+            let magnitude = NonnegativeRational::new(
+                term.moments.mean_numerator.magnitude().clone(),
+                term.moments.mean_denominator.clone(),
+            )
+            .expect("positive mean denominator");
+            envelope.mean_radius =
+                envelope.mean_radius.add(&magnitude).add(&term.moments.mean_radius);
+        }
+        envelope.variance = self.total().variance;
+        let mut compacted = Self::opaque("compacted-noise", envelope.rounded_up(PRECISION));
+        compacted.lane_depth = self.lane_depth;
+        compacted
     }
 
     /// Sum a family of `count` lanes at `depth` whose lane index is `lane`.
@@ -1289,6 +1357,16 @@ impl NoiseBreakdown {
             // A source summed over a lane or read at an unknown member may
             // overlap every other read of it.
             let summarized = terms.iter().any(|term| term.summarized());
+            if summarized {
+                let mut coherent = terms[0].moments.clone();
+                for term in &terms[1..] {
+                    coherent =
+                        coherent.add_with_covariance(&term.moments, NoiseCorrelation::SharedSource);
+                }
+                independent =
+                    independent.add_with_covariance(&coherent, NoiseCorrelation::Independent);
+                continue;
+            }
             let mut parent = (0..terms.len()).collect::<Vec<_>>();
             fn root(parent: &mut [usize], mut index: usize) -> usize {
                 while parent[index] != index {
@@ -1299,7 +1377,7 @@ impl NoiseBreakdown {
             }
             for left in 0..terms.len() {
                 for right in left + 1..terms.len() {
-                    if summarized || !provably_distinct(&terms[left].sample, &terms[right].sample) {
+                    if !provably_distinct(&terms[left].sample, &terms[right].sample) {
                         let (left, right) = (root(&mut parent, left), root(&mut parent, right));
                         parent[right] = left;
                     }
@@ -1475,6 +1553,154 @@ fn independent_sum(moments: &NoiseMoments, count: &BigUint, squares: &BigUint) -
 #[cfg(test)]
 mod breakdown_tests {
     use super::*;
+
+    fn distinct_samples(count: usize) -> NoiseBreakdown {
+        let mut breakdown = NoiseBreakdown::empty();
+        for index in 0..count {
+            let sample =
+                NoiseBreakdown::sampled(stable_source_id(&index), "test", moments(1), true);
+            breakdown.terms.extend(sample.terms);
+        }
+        breakdown
+    }
+
+    fn assert_encloses(upper: &NoiseBreakdown, lower: &NoiseBreakdown) {
+        let (upper, lower) = (upper.total(), lower.total());
+        assert!(
+            &upper.variance.numerator * &lower.variance.denominator >=
+                &lower.variance.numerator * &upper.variance.denominator
+        );
+        let magnitude = |moments: &NoiseMoments| {
+            NonnegativeRational::new(
+                moments.mean_numerator.magnitude().clone(),
+                moments.mean_denominator.clone(),
+            )
+            .unwrap()
+            .add(&moments.mean_radius)
+        };
+        let (upper, lower) = (magnitude(&upper), magnitude(&lower));
+        assert!(upper.numerator * lower.denominator >= lower.numerator * upper.denominator);
+    }
+
+    #[test]
+    fn test_noise_compaction_only_after_normalized_limit() {
+        let exact = distinct_samples(MAX_NOISE_CONTRIBUTIONS).normalize();
+        assert_eq!(exact.terms.len(), MAX_NOISE_CONTRIBUTIONS);
+        assert_eq!(exact.total(), moments(MAX_NOISE_CONTRIBUTIONS as u64));
+        assert!(exact.operand().is_some());
+        let next = distinct_samples(MAX_NOISE_CONTRIBUTIONS + 1);
+        let compacted = next.clone().normalize();
+        assert_eq!(compacted.terms.len(), 1);
+        assert_eq!(compacted.terms[0].kind, ContributionKind::Opaque);
+        assert!(!compacted.terms[0].covariance_bounded);
+        assert!(!compacted.terms[0].per_member);
+        assert!(compacted.operand().is_none());
+        assert_eq!(compacted.total(), next.total());
+        assert_encloses(&compacted, &next);
+
+        let sample = NoiseBreakdown::sampled([1; 32], "test", moments(1), true);
+        let copies = MAX_NOISE_CONTRIBUTIONS * 2;
+        let repeated =
+            NoiseBreakdown { terms: vec![sample.terms[0].clone(); copies], lane_depth: None }
+                .normalize();
+        assert_eq!(repeated.terms.len(), 1);
+        assert_eq!(repeated.terms[0].kind, ContributionKind::SampledError);
+        assert_eq!(repeated.total(), moments((copies as u64).pow(2)));
+    }
+
+    #[test]
+    fn test_noise_compaction_bounds_coordinate_storage_too() {
+        let mut exact = distinct_samples(16);
+        for term in &mut exact.terms {
+            term.sample = vec![SampleCoordinate::Fixed; MAX_NOISE_COORDINATES / 16];
+        }
+        assert_eq!(exact.clone().normalize().terms.len(), 16);
+        let mut extra = exact.terms[0].clone();
+        extra.source = stable_source_id(&16usize);
+        exact.terms.push(extra);
+        let compacted = exact.clone().normalize();
+        assert_eq!(compacted.terms.len(), 1);
+        assert_eq!(compacted.total(), exact.total());
+        assert!(compacted.terms[0].sample.is_empty());
+        assert!(compacted.operand().is_none());
+    }
+
+    #[test]
+    fn test_noise_compaction_encloses_biased_correlated_family_actions() {
+        let mut exact = distinct_samples(MAX_NOISE_CONTRIBUTIONS + 1);
+        for (index, term) in exact.terms.iter_mut().enumerate() {
+            term.moments.mean_numerator = if index % 2 == 0 { 1.into() } else { (-1).into() };
+            term.moments.mean_denominator = 3u8.into();
+            term.moments.mean_radius = NonnegativeRational::new(1u8.into(), 7u8.into()).unwrap();
+            term.moments.variance =
+                NonnegativeRational::new(BigUint::from(index + 1), BigUint::from(index % 5 + 1))
+                    .unwrap();
+            term.per_member = true;
+        }
+        exact.lane_depth = Some(1);
+        let compacted = exact.clone().normalize();
+        assert_eq!(compacted.lane_depth, exact.lane_depth);
+        assert_encloses(&compacted, &exact);
+        let action = |breakdown: &NoiseBreakdown| {
+            breakdown.transform(|term| {
+                let gain = NonnegativeRational::new(3u8.into(), 2u8.into()).unwrap();
+                let variance_gain = if term.covariance_bounded { 2u8 } else { 9u8 };
+                (gain, term.moments.variance.scaled(&variance_gain.into()), false)
+            })
+        };
+        assert_encloses(&action(&compacted), &action(&exact));
+        let lane = IntExpr::LoopIndex(0);
+        let reduce = |breakdown: &NoiseBreakdown| {
+            breakdown.member(1, &lane, true).reduce(
+                1,
+                &lane,
+                &BigUint::from(17u8),
+                &mut ReductionCounts::default(),
+            )
+        };
+        let mut reduced_exact = NoiseBreakdown::empty();
+        for term in &exact.terms {
+            let singleton = NoiseBreakdown { terms: vec![term.clone()], lane_depth: Some(1) };
+            reduced_exact.terms.extend(reduce(&singleton).terms);
+        }
+        assert_encloses(&reduce(&compacted), &reduced_exact);
+        let shared = exact.terms[0].clone();
+        let exact_shared = NoiseBreakdown { terms: vec![shared], lane_depth: None };
+        let mut unbounded_merge = exact.clone();
+        unbounded_merge.terms.extend(exact_shared.terms.clone());
+        assert_encloses(&compacted.merge(&exact_shared), &unbounded_merge);
+        assert_encloses(&compacted.member_unknown(1), &exact.member_unknown(1));
+    }
+
+    #[test]
+    fn test_noise_compaction_never_makes_reused_members_independent() {
+        let count = MAX_NOISE_CONTRIBUTIONS + 1;
+        let mut exact = NoiseBreakdown::empty();
+        for index in 0..count {
+            exact.terms.extend(
+                NoiseBreakdown::sampled_member(
+                    [1; 32],
+                    "test",
+                    0,
+                    IntExpr::constant(index),
+                    moments(1),
+                    true,
+                )
+                .terms,
+            );
+        }
+        let compacted = exact.clone().normalize();
+        assert_eq!(compacted.total(), exact.total());
+        let mut reused = NoiseBreakdown::empty();
+        reused.terms.push(exact.terms[0].clone());
+        let mut with_reuse = exact.clone();
+        with_reuse.terms.extend(reused.terms.clone());
+        assert_eq!(with_reuse.total(), moments(count as u64 + 3));
+        assert_encloses(&compacted.merge(&reused), &with_reuse);
+        let mut repeated = exact.clone();
+        repeated.terms.extend(exact.terms.clone());
+        assert_encloses(&compacted.merge(&compacted), &repeated);
+    }
 
     fn moments(variance: u64) -> NoiseMoments {
         NoiseMoments {

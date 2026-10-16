@@ -120,15 +120,17 @@ impl ExponentLutProgramBuilder {
     /// ([`Operand::Selected`]) and holds LUT values ([`LutTable::from_data`]). Lowerings read it
     /// as an integer family input; the Program identity covers its count and bound, not its
     /// values. With a `bound`, every entry is below it, and the family may also select members
-    /// of a wire family of at least `bound` members.
+    /// of a wire family of at least `bound` members. The count may exceed `usize` for graph-only
+    /// declarations; lowering its arithmetic uses arbitrary-precision integer expressions.
     pub fn data_family(
         &mut self,
-        count: usize,
+        count: impl TryInto<u128>,
         bound: Option<usize>,
     ) -> Result<DataId, ProgramValidationError> {
         if self.bodies.len() != 1 {
             return Err(ProgramValidationError::InputInNestedBody);
         }
+        let count = count.try_into().map_err(|_| ProgramValidationError::InvalidFamilyRange)?;
         if count == 0 || bound == Some(0) {
             return Err(ProgramValidationError::InvalidFamilyRange);
         }

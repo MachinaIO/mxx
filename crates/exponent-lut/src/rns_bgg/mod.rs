@@ -14,6 +14,7 @@ mod noise;
 mod public_key;
 mod public_lut;
 mod refresh;
+mod rows;
 mod setup;
 mod workload;
 
@@ -41,7 +42,7 @@ pub use dynamic::{compact_expansion_bound, expand_compact_entry};
 pub use encoding::{
     EncodingLowering, REFRESH_TERMS_INPUT, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret,
     RnsEncryptBuild, RnsOnlineEvalBuild, decode_output, decode_public_output, decode_refresh,
-    refresh_error, verify_output,
+    refresh_error, root_helper_input_name, root_row_input_name, verify_output,
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
@@ -52,8 +53,9 @@ pub use noise::{
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 pub use refresh::{
-    REFRESH_MATRIX_INPUT, RefreshChain, RefreshRun, RefreshSecurity, RefreshSigma,
-    RefreshSigmaRequest, RnsBggRefresh, SIGMA_ROW_OUTPUT, refresh_noise_accepted,
+    REFRESH_MATRIX_INPUT, RefreshActions, RefreshChain, RefreshRun, RefreshSecurity, RefreshSigma,
+    RefreshSigmaRequest, RnsBggRefresh, SIGMA_ROW_OUTPUT, refresh_combination,
+    refresh_noise_accepted, residue_term,
 };
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
@@ -313,6 +315,133 @@ pub struct RnsBggParameters {
     encoding_error_bound: BigUint,
     operations_per_drop: usize,
     rhs_mode: RhsMode,
+    root: Option<std::sync::Arc<RnsBggRoot>>,
+}
+
+/// The root of a Static chain whose input keys and LUT helper keys, and so the rows of its
+/// inputs and helpers, are derived from one root modulus `Q_0` rather than sampled per level.
+///
+/// A root object is a row or key at `Q_0` in the full public form `G_(Q_0)`. A rooted chain
+/// reads it at its level `l` (whose modulus `Q_l` divides `Q_0`) in the form `F'` of that level
+/// by the re-targeting `Gamma`:
+///
+/// `Gamma(c) = ModDown_(Q_0 -> Q_l)(c G_(Q_0)^-1((Q_0 / Q_l) F'))`,
+///
+/// applied alike to a row and to every block of its key, so the target `T` of
+/// `c = s K - T G_(Q_0) + e` is kept and becomes `T F'` (the ModDown is exact on the target).
+/// `F'` is the state form `Delta_l G^st_l` of a private input or a helper, or the public
+/// gadget `G_(Q_l)` of a public input. The error becomes
+/// `(e D - r_c + s_bar r_0 + r_1) / (Q_0 / Q_l)` for the digit matrix `D` and the rounding
+/// remainders of the row and of the key blocks (`Rel.modDown`). `Gamma` is the identity when
+/// `F'` is `G_(Q_0)` itself.
+///
+/// Root keys are hash-sampled at `Q_0` under the root hash key (graph input
+/// [`RnsBggRoot::hash_key_input_name`]), an input's under its root tag, a helper's under its
+/// automorphism, so
+/// every chain and every Program reading the same root object derives the key of the same
+/// root row. Diamond iO 2 (`mxx-io`) roots every chain of a step at the modulus of its refreshed
+/// rows.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RnsBggRoot {
+    parameters: DCRTPolyParams,
+    hash_key: [u8; 32],
+}
+
+impl RnsBggRoot {
+    pub fn new(parameters: DCRTPolyParams, hash_key: [u8; 32]) -> Self {
+        Self { parameters, hash_key }
+    }
+
+    /// The parameters of the root modulus `Q_0`.
+    pub fn parameters(&self) -> &DCRTPolyParams {
+        &self.parameters
+    }
+
+    pub fn hash_key(&self) -> &[u8; 32] {
+        &self.hash_key
+    }
+
+    /// The ring of `Q_0`.
+    pub fn ring(&self) -> Ring {
+        Ring::from_crt_moduli(
+            self.parameters.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            self.parameters.ring_dimension(),
+        )
+    }
+
+    /// The columns `m_0` of a root row: the digits of `Q_0`.
+    pub fn columns(&self) -> usize {
+        self.parameters.modulus_digits()
+    }
+
+    /// The name of the graph input of the root hash key, distinct per key, so that one graph
+    /// may read the keys of several roots (a refresh reads the next root's keys).
+    pub fn hash_key_input_name(&self) -> String {
+        let digest: [u8; 32] = Sha256::digest(self.hash_key).into();
+        let hex = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        format!("rns-bgg/root-hash-key/{hex}")
+    }
+
+    /// The graph input of the root hash key. A stage creates it once in its root scope and
+    /// passes the handle wherever a root key is sampled, as it does the stage hash key: a loop
+    /// body reads it from the enclosing scope.
+    pub fn hash_key_input(&self) -> Bytes {
+        self.ring().bytes_input(self.hash_key_input_name(), 32)
+    }
+
+    /// The root key of the root object tagged `tag`: four `1 x m_0` blocks hashed at `Q_0` under
+    /// the root hash key `hash_key` ([`Self::hash_key_input`]).
+    pub fn key(&self, hash_key: Bytes, tag: impl Into<mxx_dsl::HashTag>) -> RnsBggMatrix {
+        public_key::matrix_from_hash(&self.ring(), hash_key, tag, self.columns())
+    }
+
+    /// The root row `c_j = s_bar K_(0j) + K_(1j) - T_j G_(Q_0) + e_j` of the target
+    /// `T = (T_0, T_1)` (two `1 x 1` polynomials at `Q_0`) under the key `key`, the mask row
+    /// `mask = (s_bar, 1)` and the error row `error` (two `1 x m_0` rows), all at `Q_0`: the
+    /// form in which a rooted chain reads its input and helper rows (see [`RnsBggRoot`]).
+    pub fn encode(
+        &self,
+        key: &RnsBggMatrix,
+        mask: &RnsBggRow,
+        target: (Mat, Mat),
+        error: RnsBggRow,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        let gadget =
+            self.ring().gadget(1, public_gadget_base(self.parameters.base_bits())?, self.columns());
+        Ok((
+            mask.0.clone() * key.0.0.clone() + mask.1.clone() * key.1.0.clone() -
+                target.0 * gadget.clone() +
+                error.0,
+            mask.0.clone() * key.0.1.clone() + mask.1.clone() * key.1.1.clone() - target.1 * gadget +
+                error.1,
+        ))
+    }
+
+    /// The root tag of the LUT helper of automorphism `sigma`.
+    pub fn helper_tag(sigma: mxx_dsl::Int) -> mxx_dsl::HashTag {
+        let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/root-lut-a".to_vec());
+        tag.push(sigma);
+        tag
+    }
+
+    /// The root tag of an input's root object `tag`, or of its member `member`.
+    pub fn input_tag(tag: &str, member: Option<mxx_dsl::Int>) -> mxx_dsl::HashTag {
+        let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/root-input/{tag}").into_bytes());
+        if let Some(member) = member {
+            tag.push("member");
+            tag.push_u64_le(member);
+        }
+        tag
+    }
+}
+
+/// The form `F'` a rooted chain reads a root object in (see [`RnsBggRoot`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RnsBggForm {
+    /// The state form `Delta_l G^st_l` of a private input or a LUT helper at level `l`.
+    State,
+    /// The public gadget `G_(Q_l)` of a public input at level `l`.
+    Public,
 }
 
 /// Validated source-to-target route for a public operand.
@@ -399,6 +528,7 @@ impl RnsBggParameters {
             encoding_error_bound,
             operations_per_drop,
             rhs_mode: RhsMode::Static,
+            root: None,
         })
     }
 
@@ -674,6 +804,11 @@ impl RnsBggParameters {
         if self.rhs_mode == RhsMode::Dynamic {
             digest.update(b"dynamic-rhs");
         }
+        if let Some(root) = &self.root {
+            digest.update(b"root");
+            digest.update(root.parameters.modulus().to_bytes_be());
+            digest.update(root.hash_key);
+        }
         digest.finalize().into()
     }
 
@@ -708,6 +843,119 @@ impl RnsBggParameters {
             return Err(RnsBggError::Parameters("a Dynamic evaluation level needs a successor"));
         }
         Ok(())
+    }
+
+    /// These Static parameters rooted at `root` (see [`RnsBggRoot`]): every level's CRT basis
+    /// must be a sub-basis of the root's, with its ring dimension and gadget base.
+    pub fn with_root(mut self, root: RnsBggRoot) -> Result<Self, RnsBggError> {
+        let primes = root.parameters.to_crt().0;
+        if self.rhs_mode != RhsMode::Static ||
+            self.levels.iter().any(|level| {
+                level.ring_dimension() != root.parameters.ring_dimension() ||
+                    level.base_bits() != root.parameters.base_bits() ||
+                    level.to_crt().0.iter().any(|prime| !primes.contains(prime))
+            })
+        {
+            return Err(RnsBggError::Parameters("a rooted chain must divide its root modulus"));
+        }
+        self.root = Some(std::sync::Arc::new(root));
+        Ok(self)
+    }
+
+    /// The root of these parameters, if they are rooted.
+    pub fn root(&self) -> Option<&RnsBggRoot> {
+        self.root.as_deref()
+    }
+
+    fn rooted(&self) -> Result<&RnsBggRoot, RnsBggError> {
+        self.root().ok_or(RnsBggError::Parameters("the chain has no root"))
+    }
+
+    /// The form `F'` of `form` at `level`, in that level's ring.
+    pub fn form(&self, level: usize, form: RnsBggForm) -> Result<Mat, RnsBggError> {
+        Ok(match form {
+            RnsBggForm::State => {
+                self.scalar(level, self.message_scale(level)?)? * self.state_gadget(level)?
+            }
+            RnsBggForm::Public => self.public_gadget(level)?,
+        })
+    }
+
+    /// The digit matrix `D = G_(Q_0)^-1((Q_0 / Q_l) F')` of re-targeting a root object to `form`
+    /// at `level` (see [`RnsBggRoot`]), `None` when `F'` is `G_(Q_0)` itself.
+    fn root_action(&self, level: usize, form: RnsBggForm) -> Result<Option<Preimage>, RnsBggError> {
+        let root = self.rooted()?;
+        let target = self.level(level)?;
+        let full = target.to_crt() == root.parameters.to_crt();
+        let identity = full &&
+            match form {
+                RnsBggForm::Public => true,
+                // The state gadget of `level` is the public gadget of `level + 1`.
+                RnsBggForm::State => self
+                    .levels
+                    .get(level + 1)
+                    .is_some_and(|next| next.to_crt() == root.parameters.to_crt()),
+            };
+        if identity {
+            return Ok(None);
+        }
+        let ratio = root.parameters.modulus().as_ref() / target.modulus().as_ref();
+        let ring = root.ring();
+        let lifted = self.form(level, form)?.centered_rebase(&ring) *
+            ring.polynomial([IntExpr::from(BigInt::from(ratio))]);
+        let base = public_gadget_base(root.parameters.base_bits())?;
+        Ok(Some(lifted.decompose(base, root.columns())))
+    }
+
+    /// `Gamma` of the root row `row` (two `1 x m_0` rows at `Q_0`) to `form` at `level`.
+    pub fn retarget_row(
+        &self,
+        level: usize,
+        form: RnsBggForm,
+        row: RnsBggRow,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        let Some(action) = self.root_action(level, form)? else { return Ok(row) };
+        let acted = (row.0.mul_small_rhs(action.clone()), row.1.mul_small_rhs(action));
+        if self.level(level)?.modulus() == self.rooted()?.parameters.modulus() {
+            return Ok(acted);
+        }
+        checked_mod_down_encoding(acted, &self.ring(level)?)
+    }
+
+    /// `Gamma` of the root key `matrix` (four `1 x m_0` blocks at `Q_0`) to `form` at `level`.
+    pub fn retarget_matrix(
+        &self,
+        level: usize,
+        form: RnsBggForm,
+        matrix: RnsBggMatrix,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let Some(action) = self.root_action(level, form)? else { return Ok(matrix) };
+        let acted = (
+            (matrix.0.0.mul_small_rhs(action.clone()), matrix.0.1.mul_small_rhs(action.clone())),
+            (matrix.1.0.mul_small_rhs(action.clone()), matrix.1.1.mul_small_rhs(action)),
+        );
+        if self.level(level)?.modulus() == self.rooted()?.parameters.modulus() {
+            return Ok(acted);
+        }
+        checked_mod_down_public(acted, &self.ring(level)?)
+    }
+
+    /// The key at `level` in `form` of the root object tagged `tag`, under the root hash key
+    /// `hash_key` ([`RnsBggRoot::hash_key_input`]).
+    pub fn root_key(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<mxx_dsl::HashTag>,
+        level: usize,
+        form: RnsBggForm,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        self.retarget_matrix(level, form, self.rooted()?.key(hash_key, tag))
+    }
+
+    /// The root hash key input of a rooted chain ([`RnsBggRoot::hash_key_input`]), `None`
+    /// otherwise: a stage creates it in its root scope.
+    pub(crate) fn root_hash_key_input(&self) -> Option<Bytes> {
+        self.root().map(RnsBggRoot::hash_key_input)
     }
 
     pub(crate) fn state_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
@@ -951,7 +1199,7 @@ impl RnsBggParameters {
     /// base-`B` digits of the centered residue of `k`, exactly as the runtime
     /// decomposition computes them. The level's gadget must be exact (no
     /// dropped moduli), so that `G G^-1(k) = k`.
-    pub(crate) fn gadget_inverse_norms(
+    pub fn gadget_inverse_norms(
         &self,
         level: usize,
         k: &BigUint,
@@ -1331,11 +1579,7 @@ pub(crate) fn canonical_lut_helper_keys(
     for level in 0..nonterminal_levels {
         let ring_dimension = parameters.level(level)?.ring_dimension() as usize;
         for table in inputs.luts() {
-            let layout = table.input_layout();
-            layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-            for sigma in
-                layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?
-            {
+            for sigma in table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)? {
                 keys.insert((level, sigma));
             }
         }
@@ -1408,8 +1652,18 @@ pub(crate) fn encryption_projection_identity(
 /// do not depend on the Program.
 #[derive(Clone)]
 pub enum InputKeySource {
-    Static { level: usize, knowledge: crate::program::AttributeKnowledge },
-    Dynamic { setup: std::sync::Arc<RnsBggDynamicSetup>, coordinate: u32 },
+    /// A key sampled from the stage hash key per wire and level, or, with a root tag on a
+    /// rooted chain, the re-targeted root key of that tag under the root hash key handle (see
+    /// [`RnsBggRoot`]).
+    Static {
+        level: usize,
+        knowledge: crate::program::AttributeKnowledge,
+        root: Option<(String, Bytes)>,
+    },
+    Dynamic {
+        setup: std::sync::Arc<RnsBggDynamicSetup>,
+        coordinate: u32,
+    },
 }
 
 impl InputKeySource {
@@ -1425,7 +1679,22 @@ impl InputKeySource {
         member: Option<mxx_dsl::Int>,
     ) -> Result<RnsBggPublicKey, RnsBggError> {
         match self {
-            Self::Static { level, knowledge } => {
+            Self::Static { level, knowledge, root: Some((tag, root_hash_key)) } => {
+                let form = match knowledge {
+                    crate::program::AttributeKnowledge::PublicPayload => RnsBggForm::Public,
+                    crate::program::AttributeKnowledge::PrivatePayload => RnsBggForm::State,
+                };
+                Ok(RnsBggPublicKey::new(
+                    wire,
+                    parameters.root_key(
+                        root_hash_key.clone(),
+                        RnsBggRoot::input_tag(tag, member),
+                        *level,
+                        form,
+                    )?,
+                ))
+            }
+            Self::Static { level, knowledge, root: None } => {
                 public_key::sampled_key(parameters, *level, hash_key, wire, *knowledge, member)
             }
             Self::Dynamic { setup, coordinate } => {
@@ -1964,7 +2233,7 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
                 .unzip();
             runtime.insert(coefficient_name, RuntimeValue::integer_values(coefficients));
             runtime.insert(exponent_name, RuntimeValue::integer_values(exponents));
-            InputBinding::Family(values.len())
+            InputBinding::Family(IntExpr::constant(values.len()))
         }
     };
     plaintext_handles(ring, name, shape)
@@ -1974,11 +2243,12 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
 /// a family of `count` members) that [`plaintext_inputs`] binds, without
 /// values: a graph that binds its plaintexts by shape only is the graph of
 /// any plaintexts of that shape, which can be validated and exported but not
-/// executed.
+/// executed. Family counts remain integer expressions, so shape-only bindings do not require
+/// an addressable host vector or truncate large symbolic PRF selector tables.
 pub(crate) fn plaintext_handles(
     ring: &Ring,
     name: &str,
-    shape: InputBinding<(), usize>,
+    shape: InputBinding<(), IntExpr>,
 ) -> Result<InputBinding<Mat, PlaintextFamily>, String> {
     let (coefficient_name, exponent_name) =
         (format!("{name}.coefficient"), format!("{name}.exponent"));
@@ -1995,7 +2265,7 @@ pub(crate) fn plaintext_handles(
             ))
         }
         InputBinding::Family(count) => InputBinding::Family(PlaintextFamily {
-            coefficients: context.int_family_input(coefficient_name, count),
+            coefficients: context.int_family_input(coefficient_name, count.clone()),
             exponents: context.int_family_input(exponent_name, count),
         }),
     })

@@ -497,7 +497,8 @@ impl ApiError {
         Self::Compatibility { message: message.into() }
     }
 
-    pub(crate) fn scheme<E>(error: E) -> Self
+    /// Wrap a scheme error, such as one of a composing caller (see [`online_eval`]).
+    pub fn scheme<E>(error: E) -> Self
     where
         E: Error + Send + Sync + 'static,
     {

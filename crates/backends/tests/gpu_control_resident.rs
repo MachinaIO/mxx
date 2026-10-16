@@ -64,7 +64,7 @@ fn gpu_integer_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> Runt
         )
         .expect("upload signed integer family"),
     );
-    bind_integer_family(owner, values.len())
+    bind_integer_family(owner, values.len() as u128)
 }
 
 /// A resident input binds directly, so replays with values of different sizes
@@ -78,10 +78,10 @@ fn gpu_integer_family_with_words(
         GpuSignedValues::from_bigints_with_words(parameters, 0, values, words)
             .expect("upload signed integer family"),
     );
-    bind_integer_family(owner, values.len())
+    bind_integer_family(owner, values.len() as u128)
 }
 
-fn bind_integer_family(owner: Arc<GpuSignedValues>, count: usize) -> RuntimeValue {
+fn bind_integer_family(owner: Arc<GpuSignedValues>, count: u128) -> RuntimeValue {
     RuntimeValue::gpu_signed_family(
         ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
         owner,
@@ -114,7 +114,7 @@ fn gpu_boolean_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> Runt
     RuntimeValue::gpu_signed_family(
         ConcreteWireType::IndexedFamily {
             element: Box::new(ConcreteWireType::Bool),
-            count: values.len(),
+            count: values.len() as u128,
         },
         owner,
     )

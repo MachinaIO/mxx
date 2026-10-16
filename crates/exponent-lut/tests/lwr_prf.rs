@@ -1288,7 +1288,7 @@ fn lwr_protocol(
         let name = format!("selector_{block}");
         externals.push(claim::external(
             &name,
-            family_range(family.members, 0, 1),
+            family_range(family.members as usize, 0, 1),
             vec![
                 rhs("coefficient"),
                 ProtocolInputDestination::Ideal { input: name.clone() },
@@ -1297,7 +1297,7 @@ fn lwr_protocol(
         ));
         externals.push(claim::external(
             &format!("selector_exponent_{block}"),
-            family_range(family.members, 0, 0),
+            family_range(family.members as usize, 0, 0),
             vec![rhs("exponent")],
         ));
     }

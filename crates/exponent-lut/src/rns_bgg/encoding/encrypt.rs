@@ -22,7 +22,7 @@ fn validate_decoder_smudge_input_key_artifacts(
                 count
                     .evaluate(&ParamEnv::default())
                     .ok()
-                    .and_then(|value| value.to_usize())
+                    .and_then(|value| value.to_u128())
                     .ok_or(RnsBggError::Binding("decoder smudge family count is not concrete"))?,
             ),
         };
@@ -68,12 +68,256 @@ impl<'a> RnsEncryptBuild<'a> {
             hash_namespace: None,
             refresh: None,
             inputs_by_shape: false,
+            root_rows: None,
         }
+    }
+
+    /// Bind an *imported* encryption of `inputs` on a rooted chain (see
+    /// [`crate::rns_bgg::RnsBggRoot`]): instead of encoding plaintexts under secrets, the stage
+    /// publishes, under the artifact names an encryption uses, `Gamma` of the root row of every
+    /// input (its tag in `root_inputs`, read from [`super::root_row_input_name`]) to the input's
+    /// level and form, and of the root helper row of every LUT branch automorphism (read from
+    /// [`super::root_helper_input_name`]) to the state form of every non-terminal level. A public
+    /// input's payload is its plaintext in `lhs`, which holds the public inputs only. The rows
+    /// are the encodings of a mask secret no stage knows, so the stage binds no secret.
+    /// With [`Self::with_inputs_by_shape`], public plaintexts are symbolic graph inputs and
+    /// `lhs` must be empty; no family payloads are allocated or made executable.
+    pub fn bind_root_rows<P: Poly>(
+        &mut self,
+        inputs: &crate::program::EncryptionInputs,
+        parameters: &mxx_ir_core::ParamEnv,
+        lhs: &PlaintextInputs<WireId, P>,
+        root_inputs: BTreeMap<WireId, String>,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        if self.parameters.root().is_none() || self.parameters.rhs_mode() != RhsMode::Static {
+            return Err(ApiError::input("an imported encryption needs a rooted Static chain"));
+        }
+        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "input");
+        for (wire, declaration) in inputs.inputs() {
+            if !root_inputs.contains_key(wire) {
+                return Err(ApiError::input("an imported input has no root tag"));
+            }
+            let public = declaration.knowledge() == AttributeKnowledge::PublicPayload;
+            if self.inputs_by_shape {
+                if !lhs.is_empty() {
+                    return Err(ApiError::input("shape-only imported plaintexts must be empty"));
+                }
+                if public {
+                    let shape = match declaration.shape() {
+                        InputBinding::Scalar(()) => InputBinding::Scalar(()),
+                        InputBinding::Family(count) => InputBinding::Family(IntExpr::constant(
+                            count.evaluate(parameters).map_err(|_| {
+                                ApiError::input("imported input family count is not concrete")
+                            })?,
+                        )),
+                    };
+                    let name = format!("{prefix}/input/{wire:?}");
+                    self.plaintexts.insert(
+                        *wire,
+                        super::plaintext_handles(&ring, &name, shape).map_err(ApiError::input)?,
+                    );
+                }
+                continue;
+            }
+            match (public, lhs.get(wire)) {
+                (true, Some(value)) => {
+                    let name = format!("{prefix}/input/{wire:?}");
+                    let plaintext = super::plaintext_inputs(&ring, &name, value, &mut self.runtime)
+                        .map_err(ApiError::input)?;
+                    self.plaintexts.insert(*wire, plaintext);
+                }
+                (false, None) => {}
+                _ => return Err(ApiError::input("lhs must hold exactly the public inputs")),
+            }
+        }
+        self.inputs = Some(inputs.clone());
+        self.projection_identity = Some(
+            encryption_projection_identity(inputs, parameters, self.parameters)
+                .map_err(ApiError::scheme)?,
+        );
+        self.hash_key_commitment = hash_key_commitment(hash_key);
+        self.hash_key = hash_key.to_vec();
+        self.root_rows = Some(root_inputs);
+        Ok(())
+    }
+
+    /// Run an imported encryption (see [`Self::bind_root_rows`]) of `inputs` against the
+    /// preprocessing `preprocess`, reading the root rows `rows` (graph input values by
+    /// [`super::root_row_input_name`] and [`super::root_helper_input_name`]): the stage an online
+    /// evaluation binds as its encryption. `before_execute` observes its validated graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import<E, S, P>(
+        mut self,
+        inputs: &crate::program::EncryptionInputs,
+        parameters: &mxx_ir_core::ParamEnv,
+        lhs: &PlaintextInputs<WireId, P>,
+        root_inputs: BTreeMap<WireId, String>,
+        rows: BTreeMap<String, RuntimeValue>,
+        preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
+        hash_key: &[u8],
+        execution: &mut E,
+        store: &mut S,
+        before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
+    ) -> Result<StageArtifacts<RnsBggEncryptionDescriptor>, ApiError>
+    where
+        E: StageExecution<S>,
+        S: SessionStore,
+        P: Poly,
+    {
+        self.bind_root_rows(inputs, parameters, lhs, root_inputs, hash_key)?;
+        self.bind_preprocess_artifacts_inner(Some(preprocess))?;
+        self.runtime.extend(rows);
+        // The rows are runtime inputs, so an import is never reused: every run is its own
+        // production, whatever rows an earlier import of the same Program published.
+        let mut digest = sha2::Sha256::new();
+        digest.update(<Self as EncryptBuild<P>>::artifact_identity(&self));
+        digest.update(b"import");
+        digest.update(rand::random::<[u8; 32]>());
+        let identity: [u8; 32] = digest.finalize().into();
+        let (graph, descriptor) = <Self as EncryptBuild<P>>::build_graph(self)?;
+        crate::api::execute_artifacts(
+            graph,
+            parameters,
+            descriptor,
+            identity,
+            execution,
+            store,
+            before_execute,
+        )
+    }
+
+    /// The imported encryption's published rows (see [`Self::bind_root_rows`]).
+    fn imported_rows(
+        &self,
+        mut graph: DslContext,
+        inputs: &crate::program::EncryptionInputs,
+        root_inputs: &BTreeMap<WireId, String>,
+    ) -> Result<DslContext, ApiError> {
+        let root = self
+            .parameters
+            .root()
+            .ok_or_else(|| ApiError::input("an imported encryption needs a rooted chain"))?;
+        let root_ring = root.ring();
+        let columns = root.columns();
+        let retarget = |level: usize, form: crate::rns_bgg::RnsBggForm, row: RnsBggRow| {
+            self.parameters.retarget_row(level, form, row).map_err(|_| DslError::Schema)
+        };
+        for level in 0..self.parameters.levels().len().saturating_sub(1) {
+            let ring_dimension =
+                self.parameters.level(level).map_err(ApiError::scheme)?.ring_dimension() as usize;
+            let tables = inputs
+                .luts()
+                .iter()
+                .map(|table| (table.helper_family_key(), table))
+                .collect::<BTreeMap<_, _>>();
+            for (key, table) in tables {
+                let count = table
+                    .branch_automorphisms(ring_dimension)
+                    .map_err(|_| ApiError::scheme(RnsBggError::Lut))?
+                    .len();
+                let ports = [0, 1].map(|port| {
+                    root_ring.input_family(
+                        super::root_helper_input_name(&key, port),
+                        count,
+                        (1, columns),
+                    )
+                });
+                let family = mxx_dsl::parallel(count, |index| {
+                    retarget(
+                        level,
+                        crate::rns_bgg::RnsBggForm::State,
+                        (ports[0].at(index.clone()), ports[1].at(index)),
+                    )
+                })
+                .map_err(ApiError::scheme)?;
+                graph = graph
+                    .transferred_output(format!("lut-helper/{level}/{key}"), family)
+                    .map_err(ApiError::scheme)?;
+            }
+        }
+        let binding =
+            self.binding.as_ref().ok_or_else(|| ApiError::input("preprocess is not bound"))?;
+        for (wire, declaration) in inputs.inputs() {
+            let level = binding.input_levels().get(wire).copied().unwrap_or(0);
+            let tag = &root_inputs[wire];
+            let public = declaration.knowledge() == AttributeKnowledge::PublicPayload;
+            let form = if public {
+                crate::rns_bgg::RnsBggForm::Public
+            } else {
+                crate::rns_bgg::RnsBggForm::State
+            };
+            let input_ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
+            let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+            let name = format!("input-{wire:?}");
+            let port = |port: usize| super::root_row_input_name(tag, port);
+            graph = match declaration.shape() {
+                InputBinding::Scalar(()) => {
+                    let row = retarget(
+                        level,
+                        form,
+                        (
+                            root_ring.input(port(0), (1, columns)),
+                            root_ring.input(port(1), (1, columns)),
+                        ),
+                    )
+                    .map_err(ApiError::scheme)?;
+                    if public {
+                        let Some(InputBinding::Scalar(plaintext)) = self.plaintexts.get(wire)
+                        else {
+                            return Err(ApiError::input("missing public plaintext"));
+                        };
+                        let payload = checked_modulus_convert(plaintext.clone(), &input_ring)
+                            .map_err(ApiError::scheme)?;
+                        graph.transferred_output(name, (row.0, row.1, payload))
+                    } else {
+                        graph.transferred_output(name, row)
+                    }
+                }
+                InputBinding::Family(count) => {
+                    let ports = [0, 1].map(|index| {
+                        root_ring.input_family(port(index), count.clone(), (1, columns))
+                    });
+                    if public {
+                        let Some(InputBinding::Family(plaintexts)) = self.plaintexts.get(wire)
+                        else {
+                            return Err(ApiError::input("missing public plaintexts"));
+                        };
+                        let stored = mxx_dsl::parallel(count.clone(), |index| {
+                            let row = retarget(
+                                level,
+                                form,
+                                (ports[0].at(index.clone()), ports[1].at(index.clone())),
+                            )?;
+                            let payload = checked_modulus_convert(
+                                plaintexts.member(&plaintext_ring, index),
+                                &input_ring,
+                            )
+                            .map_err(|_| DslError::Schema)?;
+                            Ok((row.0, row.1, payload))
+                        })
+                        .map_err(ApiError::scheme)?;
+                        graph.transferred_output(name, stored)
+                    } else {
+                        let stored = mxx_dsl::parallel(count.clone(), |index| {
+                            retarget(level, form, (ports[0].at(index.clone()), ports[1].at(index)))
+                        })
+                        .map_err(ApiError::scheme)?;
+                        graph.transferred_output(name, stored)
+                    }
+                }
+            }
+            .map_err(ApiError::scheme)?;
+        }
+        Ok(graph)
     }
 
     /// This builder binding the inputs' plaintexts by their declared shapes only, whatever the
     /// stage ([`crate::api::encrypt`]) is given, as [`Self::bind_lhs_inputs`] with `None` does:
-    /// the stage graph is recorded and exported but cannot be executed.
+    /// the stage graph is recorded and exported but cannot be executed. Shape-only family
+    /// cardinalities retain arbitrary-precision integers; concrete bindings still check their
+    /// addressable vector lengths against the declarations.
     pub fn with_inputs_by_shape(mut self) -> Self {
         self.inputs_by_shape = true;
         self
@@ -358,8 +602,14 @@ impl<'a> RnsEncryptBuild<'a> {
             .mask_secret
             .as_ref()
             .ok_or_else(|| ApiError::input("decoder smudge child mask secret is not bound"))?;
-        for (role, family) in
-            child.lut_helper_families(mask, hash_key, inputs).map_err(ApiError::scheme)?
+        for (role, family) in child
+            .lut_helper_families(
+                mask,
+                hash_key,
+                child.parameters.root_hash_key_input().as_ref(),
+                inputs,
+            )
+            .map_err(ApiError::scheme)?
         {
             graph = graph.transferred_output(name(&role), family).map_err(ApiError::scheme)?;
         }
@@ -618,19 +868,20 @@ impl<'a> RnsEncryptBuild<'a> {
         &self,
         mask: &RnsBggMaskSecret,
         hash_key: &Bytes,
+        root_hash_key: Option<&Bytes>,
         inputs: &crate::program::EncryptionInputs,
     ) -> Result<Vec<(String, Family<RnsBggRow>)>, RnsBggError> {
         let mut families = Vec::new();
         for level in 0..self.parameters.levels().len().saturating_sub(1) {
             let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
-            let layouts = inputs
+            let tables = inputs
                 .luts()
                 .iter()
-                .map(|table| (format!("{:?}", table.input_layout()), table.input_layout()))
+                .map(|table| (table.helper_family_key(), table))
                 .collect::<BTreeMap<_, _>>();
-            for (name, layout) in layouts {
+            for (name, table) in tables {
                 let sigmas =
-                    layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+                    table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
                 let family = mxx_dsl::parallel(sigmas.len(), |index| {
                     let sigma = IntExpr::Select {
                         selector: Box::new(index.expression()?),
@@ -639,6 +890,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     let public_data = super::public_key::lut_public_matrix(
                         self.parameters,
                         hash_key.clone(),
+                        root_hash_key.cloned(),
                         level,
                         Int::from(sigma.clone()),
                     )
@@ -740,7 +992,11 @@ impl RnsEncryptBuild<'_> {
                 None => {
                     let shape = match declaration.shape() {
                         InputBinding::Scalar(()) => InputBinding::Scalar(()),
-                        InputBinding::Family(count) => InputBinding::Family(concrete(count)?),
+                        InputBinding::Family(count) => InputBinding::Family(IntExpr::constant(
+                            count.evaluate(parameters).map_err(|_| {
+                                ApiError::input("encryption input family count is not concrete")
+                            })?,
+                        )),
                     };
                     super::plaintext_handles(&ring, &name, shape)
                 }
@@ -913,6 +1169,28 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         if self.binding.is_none() || (!dynamic && self.preprocess.is_none()) {
             return Err(ApiError::input("preprocess artifacts are not bound"));
         }
+        if let Some(root_inputs) = self.root_rows.take() {
+            if self.decoder_smudge_child.is_some() || self.refresh.is_some() {
+                return Err(ApiError::input("an imported encryption binds no decoder or refresh"));
+            }
+            let graph = self
+                .imported_rows(DslContext::new("rns-bgg-encrypt"), &inputs, &root_inputs)?
+                .build()
+                .map_err(ApiError::scheme)?;
+            if let Some(root) = self.parameters.root() {
+                self.runtime.insert(
+                    root.hash_key_input_name(),
+                    RuntimeValue::Bytes(root.hash_key().as_slice().into()),
+                );
+            }
+            let descriptor =
+                self.binding.ok_or_else(|| ApiError::input("artifact binding is not available"))?;
+            let runtime = declared_runtime_inputs(&graph, self.runtime);
+            return Ok((
+                StageGraph::new(graph, runtime, self.manifests),
+                RnsBggEncryptionDescriptor::from_binding(descriptor),
+            ));
+        }
         let payload = self
             .payload_secret
             .clone()
@@ -959,8 +1237,14 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         if dynamic {
             graph = self.dynamic_material(graph, &hash_key, |role| role)?;
         } else {
-            for (name, family) in
-                self.lut_helper_families(&mask, &hash_key, &inputs).map_err(ApiError::scheme)?
+            for (name, family) in self
+                .lut_helper_families(
+                    &mask,
+                    &hash_key,
+                    self.parameters.root_hash_key_input().as_ref(),
+                    &inputs,
+                )
+                .map_err(ApiError::scheme)?
             {
                 graph = graph.transferred_output(name, family).map_err(ApiError::scheme)?;
             }
@@ -1039,6 +1323,12 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             self.runtime
                 .insert(hash_key_input, RuntimeValue::Bytes(self.hash_key.as_slice().into()));
         }
+        if let Some(root) = self.parameters.root() {
+            self.runtime.insert(
+                root.hash_key_input_name(),
+                RuntimeValue::Bytes(root.hash_key().as_slice().into()),
+            );
+        }
         let mut descriptor =
             self.binding.ok_or_else(|| ApiError::input("artifact binding is not available"))?;
         if let Some((production, manifest)) = self.prelude.clone() {
@@ -1056,6 +1346,213 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Rows encrypted at the root modulus and imported through `Gamma` (see
+    /// [`crate::rns_bgg::RnsBggRoot`]) evaluate as encryptions do: a private LUT followed by a
+    /// public product, noise-free, ending at the terminal level, on a chain whose level 0 is the
+    /// root (every `Gamma` is the identity) and on a chain of fewer primes (every `Gamma`
+    /// ModDowns).
+    #[test]
+    fn imported_root_rows_evaluate_as_encryptions() {
+        use crate::{
+            program::{
+                ExpLayout, ExponentLutProgramBuilder, LutOutputRepresentation, LutTable, Operand,
+            },
+            rns_bgg::{RnsBggRoot, RnsOutputUse, RnsPreprocessBuild, verify_output},
+        };
+        use mxx_backends::{
+            artifact::MemoryArtifactStore,
+            authority::CpuExecution,
+            backend::poly::cpu_backend,
+            poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        };
+        let n = 16u32;
+        let primes = crate::test_support::primes(n, 4, 17);
+        let pool = DCRTPolyParams::try_new(n, 4, 17, 4, Some(primes.clone()), None).unwrap();
+        let select = |count: usize| {
+            pool.select_modulus(
+                &primes[..count].iter().map(|prime| BigUint::from(*prime)).product(),
+            )
+            .unwrap()
+        };
+        let root = RnsBggRoot::new(pool.clone(), rand::random());
+        let root_parameters = RnsBggParameters::new(vec![pool.clone()], 0, 1).unwrap();
+        let layout = ExpLayout { stride_log2: 1, width_log2: 2 };
+        let table = vec![2usize, 0, 3, 1];
+        let mut builder = ExponentLutProgramBuilder::new();
+        let x = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let alpha = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let lut = builder
+            .register_lut(
+                LutTable::unary(
+                    4,
+                    layout,
+                    4,
+                    table.clone(),
+                    LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let looked = builder.lut(Operand::Scalar(x), lut).unwrap();
+        let product = builder.mul_public(Operand::Scalar(alpha), Operand::Scalar(looked)).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(product)]).unwrap();
+        let tags = BTreeMap::from([(x, "x".to_owned()), (alpha, "alpha".to_owned())]);
+        // `mono(e) = X^(2e)` in the negacyclic ring of dimension 16.
+        let monomial = |parameters: &DCRTPolyParams, e: usize| {
+            let rotation = 2 * (e % 16);
+            let value = DCRTPoly::const_rotate_poly(parameters, rotation % 16);
+            if rotation >= 16 { -value } else { value }
+        };
+        for depths in [vec![4, 4], vec![3, 2]] {
+            let parameters =
+                RnsBggParameters::new(depths.iter().map(|d| select(*d)).collect(), 0, 1)
+                    .unwrap()
+                    .with_root(root.clone())
+                    .unwrap();
+            let mut execution = CpuExecution::new(cpu_backend(
+                parameters.levels().iter().cloned().chain(std::iter::once(pool.clone())),
+            ));
+            let mut store = MemoryArtifactStore::default();
+            let (hash_key, context) = (rand::random::<[u8; 32]>(), rand::random::<[u8; 32]>());
+            let payload = RnsEncryptBuild::new(&root_parameters, context)
+                .sample_payload_secret(&mut execution, &mut store, |_| Ok(()))
+                .unwrap();
+            let mask = RnsEncryptBuild::new(&root_parameters, rand::random())
+                .sample_mask_secret(&mut execution, &mut store, |_| Ok(()))
+                .unwrap();
+            let (preprocess, online_eval) = crate::api::preprocess(
+                &program,
+                &ParamEnv::default(),
+                &PlaintextInputs::<crate::program::RhsId, DCRTPoly>::new(),
+                Some(&payload),
+                &hash_key,
+                RnsPreprocessBuild::new(&parameters, context).with_root_inputs(tags.clone()),
+                &mut execution,
+                &mut store,
+                |_, outputs| Ok(outputs),
+                |_| Ok(()),
+            )
+            .unwrap();
+            // The root rows of the inputs and of every helper, noise-free, at the root.
+            let (x_value, alpha_value) =
+                (rand::random::<u8>() as usize % 4, rand::random::<u8>() as usize % 8);
+            let ring = root.ring();
+            let mono = |e: usize| ring.identity(1).multiply_monomial(Int::constant(2 * e as i64));
+            let zero = || (ring.zero((1, root.columns())), ring.zero((1, root.columns())));
+            let (s, t) = (mask.row().clone(), payload.row().clone());
+            let root_hash_key = root.hash_key_input();
+            let input = |tag: &str, target: (Mat, Mat)| {
+                let key = root.key(root_hash_key.clone(), RnsBggRoot::input_tag(tag, None));
+                root.encode(&key, &s, target, zero()).unwrap()
+            };
+            let x_row = input("x", (mono(x_value) * t.0.clone(), mono(x_value) * t.1.clone()));
+            let alpha_row =
+                input("alpha", (mono(alpha_value) * s.0.clone(), mono(alpha_value) * s.1.clone()));
+            let mut graph = DslContext::new("root-rows");
+            for (tag, row) in [("x", x_row), ("alpha", alpha_row)] {
+                graph = graph
+                    .output(root_row_input_name(tag, 0), row.0)
+                    .unwrap()
+                    .output(root_row_input_name(tag, 1), row.1)
+                    .unwrap();
+            }
+            for table in program.encryption_inputs().luts() {
+                let sigmas = table.branch_automorphisms(n as usize).unwrap();
+                for port in 0..2 {
+                    let family = mxx_dsl::parallel(sigmas.len(), |index| {
+                        let sigma = IntExpr::Select {
+                            selector: Box::new(index.expression()?),
+                            branches: sigmas
+                                .iter()
+                                .map(|sigma| IntExpr::constant(*sigma))
+                                .collect(),
+                        };
+                        let key = root.key(
+                            root_hash_key.clone(),
+                            RnsBggRoot::helper_tag(Int::from(sigma.clone())),
+                        );
+                        let target = (s.0.clone().ring_automorphism(sigma), ring.identity(1));
+                        let row =
+                            root.encode(&key, &s, target, zero()).map_err(|_| DslError::Schema)?;
+                        Ok(if port == 0 { row.0 } else { row.1 })
+                    })
+                    .unwrap();
+                    graph = graph
+                        .output(root_helper_input_name(&table.helper_family_key(), port), family)
+                        .unwrap();
+                }
+            }
+            let mut runtime = BTreeMap::from([(
+                root.hash_key_input_name(),
+                RuntimeValue::Bytes(root.hash_key().as_slice().into()),
+            )]);
+            payload.bind_runtime(&mut runtime);
+            mask.bind_runtime(&mut runtime);
+            let graph = graph.build().unwrap();
+            let runtime = declared_runtime_inputs(&graph, runtime);
+            let rows = crate::api::execute_graph(
+                StageGraph::new(graph, runtime, BTreeMap::new()),
+                &ParamEnv::default(),
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap()
+            .outputs;
+            let lhs = BTreeMap::from([(
+                alpha,
+                InputBinding::Scalar(monomial(&parameters.levels()[0], alpha_value)),
+            )]);
+            let encrypted = RnsEncryptBuild::new(&parameters, context)
+                .import(
+                    &program.encryption_inputs(),
+                    &ParamEnv::default(),
+                    &lhs,
+                    tags.clone(),
+                    rows,
+                    &preprocess,
+                    &hash_key,
+                    &mut execution,
+                    &mut store,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let result = crate::api::online_eval(
+                &program,
+                &ParamEnv::default(),
+                &online_eval,
+                &encrypted,
+                &hash_key,
+                RnsOnlineEvalBuild::new(&parameters, context).with_root_inputs(tags.clone()),
+                &mut execution,
+                &mut store,
+                |_, outputs| Ok(outputs),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let terminal = parameters.levels().last().unwrap();
+            let expected = monomial(terminal, alpha_value + table[x_value]);
+            let verify = |value: &DCRTPoly, execution: &mut CpuExecution, store: &mut _| {
+                verify_output(
+                    &program,
+                    &result,
+                    0,
+                    value,
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    RnsOutputUse::DirectDecode,
+                    execution,
+                    store,
+                )
+            };
+            verify(&expected, &mut execution, &mut store)
+                .unwrap_or_else(|error| panic!("depths {depths:?}: {error:?}"));
+            let wrong = monomial(terminal, alpha_value + table[x_value] + 1);
+            assert!(verify(&wrong, &mut execution, &mut store).is_err());
+        }
+    }
 
     #[test]
     fn encryption_lut_helper_produces_one_compact_member() {

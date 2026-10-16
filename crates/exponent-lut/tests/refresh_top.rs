@@ -632,10 +632,13 @@ fn claim_failure_exponent(row: Option<&ParameterRow>) -> Option<u32> {
     }
 }
 
-/// The directory receiving the exported claim: `lean/refresh_top/<id>/generated` for a recorded
-/// set, else `MXX_EXPONENT_LUT_REFRESH_TOP_EXPORT_DIRECTORY` (an export-only run of the settings
-/// without a recorded row, under the noise model `NOISE_MODEL`).
+/// `MXX_EXPONENT_LUT_REFRESH_TOP_EXPORT_DIRECTORY` overrides the destination, including for a
+/// recorded set, so reproducibility checks never overwrite committed fixtures. Without the
+/// override, recorded sets use `lean/refresh_top/<id>/generated`; unrecorded exports require it.
 fn export_directory(recorded: Option<&(String, ParameterRow)>) -> std::path::PathBuf {
+    if let Ok(directory) = env::var(format!("{PREFIX}EXPORT_DIRECTORY")) {
+        return directory.into();
+    }
     match recorded {
         Some((id, _)) => common::generated_directory("refresh_top", id),
         None => env::var(format!("{PREFIX}EXPORT_DIRECTORY"))

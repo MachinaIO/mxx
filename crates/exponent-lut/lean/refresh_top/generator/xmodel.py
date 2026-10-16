@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Structural model of a refresh_top export (`generated/`): scopes, loops, atoms, wires, facts.
 
-For every module `M` (`Stage_*`, `Requirement_0`) the model reads `M.lean` (scope definitions,
+For every module `M` (`Stage_*`, `Requirement_0`) the model reads `M.lean` and its imported
+partitions in dependency order (scope definitions,
 `constraints_k` fragments, `Witness` structures) and `M_Facts.lean` (per record scope: `Ctx`,
 wire definitions `S.w_<n>_<p>`, fragment records `S.Facts_k`, `_at` lemmas), and `Claim.lean`
-(`Runs`: the stage calls and their argument tuples).
+(`Runs`: the stage calls and their argument tuples). Facts partitions are read the same way;
+local matrix and numeral notations are expanded separately in each physical module.
 
 Scope model (`Scope`):
   name, module, binders (index variables `i_k` in order, `_` for unused), kind
@@ -25,6 +27,9 @@ import collections
 import json
 import re
 import sys
+from pathlib import Path
+
+from xmodules import module_sources, partition_base
 
 PAIRS = {'(': ')', '[': ']', '⟨': '⟩', '{': '}'}
 CLOSE = set(PAIRS.values())
@@ -323,13 +328,35 @@ def split_conj(body):
     return [c.strip() for c in split_top(body.strip(), ' ∧\n')]
 
 
+def expand_matrix_notations(text):
+    """Replace the export's local notations, the matrix types `mxxMat<k>` and the numerals
+    `mxxNat<k>`, by what they name (a module reading the scopes cannot see them)."""
+    numerals = dict(re.findall(r'^local notation "(mxxNat\d+)" => (\d+)$', text, re.M))
+    text = re.sub(r'\bmxxNat\d+\b', lambda m: numerals.get(m.group(0), m.group(0)), text)
+    notations = dict(re.findall(r'^local notation "(mxxMat\d+)" => (.+)$', text, re.M))
+    if not notations:
+        return text
+    # A type ascription `(t : mxxMat<k>)` takes the type bare, as the exports without notations
+    # write it; elsewhere (an argument of a product or a family type) it is parenthesized.
+    text = re.sub(r'(: )(mxxMat\d+)\)', lambda m: m.group(1) + notations.get(m.group(2), m.group(2)) + ')',
+                  text)
+    return re.sub(r'\bmxxMat\d+\b', lambda m: f'({notations[m.group(0)]})'
+                  if m.group(0) in notations else m.group(0), text)
+
+
 def parse_module(gdir, module):
-    text = open(f'{gdir}/{module}.lean').read()
+    sources = module_sources(gdir, module)
     scopes = collections.OrderedDict()
     frags = collections.defaultdict(dict)   # scope -> k -> (params, body)
     defs = {}
     witness = {}
-    for kind, name, src in split_decls(text):
+    wire_definitions = collections.defaultdict(list)
+    declarations = []
+    for name, text in sources:
+        if name != partition_base(name):
+            text = re.sub(r'\nend \w+\s*\Z', '\n', text)
+        declarations.extend(split_decls(expand_matrix_notations(text)))
+    for kind, name, src in declarations:
         if kind == 'set_option':
             continue
         base = name.split('.')[0]
@@ -337,6 +364,13 @@ def parse_module(gdir, module):
             continue
         if kind == 'structure' and name.endswith('.Witness'):
             witness[base] = re.findall(r'^\s+(w_\d+(?:_\d+)?(?:_concat_\d+)?) : (.*)$', src, re.M)
+            continue
+        wire = re.match(r'^(\w+)\.(w_\d+(?:_\d+)?(?:_concat_\d+)?)$', name)
+        if kind == 'def' and wire:
+            sig, term = src.split(' :=\n', 1)
+            ty = sig.rsplit(' : ', 1)[1]
+            term = norm_wires(term.strip()).replace('ctx.inputs', 'inputs').replace('ctx.witness', 'witness')
+            wire_definitions[base].append((wire.group(2), ty, term))
             continue
         m = re.match(r'.*\.constraints_(\d+)$', name)
         if m:
@@ -351,7 +385,7 @@ def parse_module(gdir, module):
     for base, d in defs.items():
         if 'def' not in d:
             continue
-        sc = Scope(module, base)
+        sc = Scope(partition_base(module), base)
         sig, body = d['def'].split(' : Prop :=\n', 1)
         params = binders_of(sig)
         sc.params = [n for n, t in params if t in ('MxxRuntime.BackendContext', 'MxxRuntime.HashModel', 'Params')
@@ -368,6 +402,9 @@ def parse_module(gdir, module):
         sc.witness = witness.get(base, [])
         sc.sig = params
         src_body = d.get('body', d['def'])
+        for nm, ty, term in wire_definitions[base]:
+            source = 'input' if term.startswith('inputs') else 'witness' if term.startswith('witness.') else 'let'
+            sc.wires[nm] = Wire(nm, ty, source, term)
         # wires from let / ∃ / witness
         for m in re.finditer(r'let (w_\d+(?:_\d+)?(?:_concat_\d+)?)(?: : (.*?))? := (.*)$', src_body, re.M):
             nm, ty, term = m.group(1), m.group(2), m.group(3).strip()
@@ -388,12 +425,13 @@ def parse_module(gdir, module):
 
 
 def parse_facts(gdir, module, scopes):
-    """Attach record fields (names), wire definitions and `_at` lemmas from `M_Facts.lean`."""
-    try:
-        text = open(f'{gdir}/{module}_Facts.lean').read()
-    except FileNotFoundError:
+    """Attach fields, wires and `_at` lemmas from `M_Facts.lean` and its partitions."""
+    facts_module = f'{partition_base(module)}_Facts'
+    if not (Path(gdir) / f'{facts_module}.lean').exists():
         return
-    for m in re.finditer(r'^def ([A-Za-z_0-9]+)\.(w_\d+(?:_\d+)?(?:_concat_\d+)?) \{[^\n]*\) : ([^\n]*) :=\n  ([^\n]*)', text, re.M):
+    sources = module_sources(gdir, facts_module)
+    text = '\n'.join(expand_matrix_notations(source) for _, source in sources)
+    for m in re.finditer(r'^def ([A-Za-z_0-9]+)\.(w_\d+(?:_\d+)?(?:_concat_\d+)?) [^\n]*\) : ([^\n]*) :=\n  ([^\n]*)', text, re.M):
         sc = scopes.get(m.group(1))
         if sc is None:
             continue
@@ -417,12 +455,12 @@ def parse_facts(gdir, module, scopes):
         sc.atoms = [a for a in sc.atoms if a.frag != k] + new
         sc.atoms.sort(key=lambda a: a.frag)
         sc.kind = 'record'
-    for m in re.finditer(r'^theorem ([A-Za-z_0-9]+)\.(h\w+)_at \{', text, re.M):
+    for m in re.finditer(r'^theorem ([A-Za-z_0-9]+)\.(h\w+)_at\s+\{', text, re.M):
         sc = scopes.get(m.group(1))
         if sc is not None:
             sc.at.append(m.group(2))
     # record fragment counts (Facts has c0..cK)
-    for m in re.finditer(r'^structure ([A-Za-z_0-9]+)\.Facts \{[^\n]*\n((?:  [^\n]*\n)*)', text, re.M):
+    for m in re.finditer(r'^structure ([A-Za-z_0-9]+)\.Facts [^\n]*\n((?:  [^\n]*\n)*)', text, re.M):
         sc = scopes.get(m.group(1))
         if sc is not None:
             sc.record_fields = [l.strip().split(' : ')[0] for l in m.group(2).splitlines()]

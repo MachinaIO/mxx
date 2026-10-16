@@ -56,4 +56,4 @@ roots = [
 [[lean_lib]]
 name = "RuntimeExamples"
 leanOptions = { relaxedAutoImplicit = false }
-roots = ["RuntimeLayoutExamples"]
+roots = ["RuntimeLayoutExamples", "RuntimeHashColumnsExamples"]

@@ -1,5 +1,6 @@
 //! Operations on the rows of a Static chain outside a Program: the re-targeting `Gamma` of an
-//! encoding to another form and level, and the public multiplication of a general row.
+//! encoding to another form and level, and the public multiplication of a general row. Key-only
+//! operations are shared with the full encodings, so their key subgraphs are identical.
 //!
 //! A Program's lowered output is an encoding in the form its carrier names: the state form
 //! `Delta_l G^st_l` of a private wire at level `l` (a raw coefficient wire is one too), or the
@@ -42,6 +43,27 @@ impl RnsBggParameters {
         target: Mat,
         (row, key): (RnsBggRow, RnsBggMatrix),
     ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let key = self.retarget_key(level, form, target_level, target.clone(), key)?;
+        let (digits, target_ring) = self.retarget_action(level, form, target_level, target)?;
+        let row = map_row(row, |entry| entry.mul_small_rhs(digits.clone()));
+        let row = match target_ring {
+            Some(ring) => checked_mod_down_encoding(row, &ring)?,
+            None => row,
+        };
+        Ok((row, key))
+    }
+
+    /// The right-action digits of `Gamma` from `form` at `level` to `target` at
+    /// `target_level`, and the destination ring when a rounded modulus drop is needed.
+    /// The bounded compact digits live in the source ring; the target modulus must divide the
+    /// form's gadget. They retain their coefficient bound for `mul_small_rhs` consumers.
+    pub fn retarget_action(
+        &self,
+        level: usize,
+        form: RnsBggForm,
+        target_level: usize,
+        target: Mat,
+    ) -> Result<(SmallMatrix, Option<Ring>), RnsBggError> {
         let gadget_level = Self::gadget_level(level, form);
         let gadget = self.level(gadget_level)?;
         let target_parameters = self.level(target_level)?;
@@ -57,14 +79,30 @@ impl RnsBggParameters {
         let digits = scaled
             .decompose(public_gadget_base(gadget.base_bits())?, gadget.modulus_digits())
             .centered_rebase(&self.ring(level)?);
-        let act = |entry: Mat| entry.mul_small_rhs(digits.clone());
-        let row = map_row(row, act);
-        let key = map_matrix(key, act);
-        if self.level(level)?.modulus() == target_parameters.modulus() {
-            return Ok((row, key));
+        let target_ring = if self.level(level)?.modulus() == target_parameters.modulus() {
+            None
+        } else {
+            Some(self.ring(target_level)?)
+        };
+        Ok((digits, target_ring))
+    }
+
+    /// The key of [`Self::retarget_encoding`], computed without encoding rows or secrets.
+    /// Every block uses [`Self::retarget_action`] and the same rounded modulus drop as a row.
+    pub fn retarget_key(
+        &self,
+        level: usize,
+        form: RnsBggForm,
+        target_level: usize,
+        target: Mat,
+        key: RnsBggMatrix,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let (digits, target_ring) = self.retarget_action(level, form, target_level, target)?;
+        let key = map_matrix(key, |entry| entry.mul_small_rhs(digits.clone()));
+        match target_ring {
+            Some(ring) => checked_mod_down_public(key, &ring),
+            None => Ok(key),
         }
-        let ring = self.ring(target_level)?;
-        Ok((checked_mod_down_encoding(row, &ring)?, checked_mod_down_public(key, &ring)?))
     }
 
     /// The public multiplication `MulPub(P, c)` at `level` of the public encoding `public`
@@ -84,35 +122,52 @@ impl RnsBggParameters {
         (public_row, public_key, alpha): (&RnsBggRow, &RnsBggMatrix, &Mat),
         (row, key): (&RnsBggRow, &RnsBggMatrix),
     ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let output_key = self.mul_public_key(level, public_key, key)?;
+        let digits = self.mul_public_digits(level, key)?;
+        let product = Self::mul_public_row_action(public_row, &digits);
+        Ok((
+            (product.0 + alpha.clone() * row.0.clone(), product.1 + alpha.clone() * row.1.clone()),
+            output_key,
+        ))
+    }
+
+    /// The key of [`Self::mul_public_rows`], depending only on the two public keys.
+    /// Neither the public plaintext nor either encoding row enters this subgraph.
+    pub fn mul_public_key(
+        &self,
+        level: usize,
+        public_key: &RnsBggMatrix,
+        key: &RnsBggMatrix,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let digits = self.mul_public_digits(level, key)?;
+        Ok((
+            Self::mul_public_row_action(&public_key.0, &digits),
+            Self::mul_public_row_action(&public_key.1, &digits),
+        ))
+    }
+
+    /// Decomposes each key column once for reuse across the two public-key row contractions.
+    fn mul_public_digits(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+    ) -> Result<RnsBggDigits, RnsBggError> {
         let parameters = self.level(level)?;
         let base = public_gadget_base(parameters.base_bits())?;
         let digits = parameters.modulus_digits();
-        let product = |column: usize| {
-            let (top, bottom) = match column {
-                0 => (
-                    key.0.0.clone().decompose(base, digits),
-                    key.1.0.clone().decompose(base, digits),
-                ),
-                _ => (
-                    key.0.1.clone().decompose(base, digits),
-                    key.1.1.clone().decompose(base, digits),
-                ),
-            };
-            let entry = |left: &Mat, right: &Mat| {
-                left.clone().mul_small_rhs(top.clone()) +
-                    right.clone().mul_small_rhs(bottom.clone())
-            };
-            let row_entry = entry(&public_row.0, &public_row.1);
-            let key_entries =
-                (entry(&public_key.0.0, &public_key.0.1), entry(&public_key.1.0, &public_key.1.1));
-            (row_entry, key_entries)
-        };
-        let (row_0, (key_00, key_10)) = product(0);
-        let (row_1, (key_01, key_11)) = product(1);
         Ok((
-            (row_0 + alpha.clone() * row.0.clone(), row_1 + alpha.clone() * row.1.clone()),
-            ((key_00, key_01), (key_10, key_11)),
+            (key.0.0.clone().decompose(base, digits), key.1.0.clone().decompose(base, digits)),
+            (key.0.1.clone().decompose(base, digits), key.1.1.clone().decompose(base, digits)),
         ))
+    }
+
+    /// Contracts a public row with the gadget-decomposed key columns, without new decompositions.
+    fn mul_public_row_action(public_row: &RnsBggRow, digits: &RnsBggDigits) -> RnsBggRow {
+        let product = |column: &(Preimage, Preimage)| {
+            public_row.0.clone().mul_small_rhs(column.0.clone()) +
+                public_row.1.clone().mul_small_rhs(column.1.clone())
+        };
+        (product(&digits.0), product(&digits.1))
     }
 
     /// The integer entries of the form `form` of `level` ([`Self::form`]) modulo `Q_level`.
@@ -228,4 +283,148 @@ fn canonical_residue(value: BigInt, modulus: &BigInt) -> BigUint {
     let residue =
         if residue.sign() == num_bigint::Sign::Minus { residue + modulus } else { residue };
     residue.to_biguint().expect("a nonnegative residue")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{execute_cpu, full, validate};
+    use mxx_backends::{RuntimeValue, poly::Poly};
+    use mxx_dsl::{BuiltGraph, DslContext};
+
+    /// Small overridable parameters for key-action tests, with two genuine modulus drops.
+    fn parameters() -> RnsBggParameters {
+        let dimension = std::env::var("MXX_ROWS_TEST_RING_DIMENSION")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(8);
+        let bits = std::env::var("MXX_ROWS_TEST_PRIME_BITS")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(17);
+        let base_bits = std::env::var("MXX_ROWS_TEST_BASE_BITS")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(4);
+        let pool = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);
+        let primes = pool.to_crt().0;
+        let middle = pool.select_modulus(&(BigUint::from(primes[0]) * primes[1])).unwrap();
+        let bottom = pool.select_modulus(&BigUint::from(primes[0])).unwrap();
+        RnsBggParameters::new(vec![pool, middle, bottom], 0, 1).unwrap()
+    }
+
+    /// Hash-derived random rows and blocks, with a fresh runtime hash key for every run.
+    fn random_row(ring: &Ring, tag: &str, columns: usize) -> RnsBggRow {
+        let hash = ring.bytes_input("hash-key", 32);
+        let entry = |component| {
+            ring.hash_matrix(hash.clone(), format!("{tag}-{component}").into_bytes(), (1, columns))
+        };
+        (entry(0), entry(1))
+    }
+
+    /// Checks canonical key subgraph identity and executes both versions on random inputs.
+    fn check_keys(parameters: &RnsBggParameters, expected: RnsBggMatrix, actual: RnsBggMatrix) {
+        let build =
+            |key| DslContext::new("key-action").output("key", key).unwrap().build().unwrap();
+        let expected_graph = build(expected.clone());
+        let actual_graph = build(actual.clone());
+        assert_eq!(
+            mxx_ir_core::encoding::spec_hash(&expected_graph.graph, &Default::default()).unwrap(),
+            mxx_ir_core::encoding::spec_hash(&actual_graph.graph, &Default::default()).unwrap(),
+            "key-only and full key subgraphs differ",
+        );
+        let difference = (
+            (actual.0.0 - expected.0.0, actual.0.1 - expected.0.1),
+            (actual.1.0 - expected.1.0, actual.1.1 - expected.1.1),
+        );
+        check_zero(parameters, &build(difference));
+    }
+
+    /// Runs a difference graph and checks every CRT polynomial coefficient is zero.
+    fn check_zero(parameters: &RnsBggParameters, graph: &BuiltGraph) {
+        let result = execute_cpu(
+            &validate(graph),
+            parameters.levels().to_vec(),
+            BTreeMap::from([(
+                "hash-key".to_owned(),
+                RuntimeValue::Bytes(rand::random::<[u8; 32]>().as_slice().into()),
+            )]),
+        );
+        for (name, output) in &result.outputs {
+            let matrix = full(output);
+            let (rows, columns) = matrix.size();
+            for row in 0..rows {
+                for column in 0..columns {
+                    assert!(
+                        matrix.entry(row, column).coeffs_biguints().iter().all(Zero::is_zero),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Public and state forms share key graphs, both with and without a modulus drop.
+    #[test]
+    fn retarget_key_matches_full_encoding() {
+        let parameters = parameters();
+        let ring = parameters.ring(0).unwrap();
+        for (form, target_level) in [
+            (RnsBggForm::Public, 0),
+            (RnsBggForm::Public, 1),
+            (RnsBggForm::Public, 2),
+            (RnsBggForm::State, 1),
+            (RnsBggForm::State, 2),
+        ] {
+            let columns = match form {
+                RnsBggForm::Public => parameters.level(0).unwrap().modulus_digits(),
+                RnsBggForm::State => parameters.component_columns(0).unwrap(),
+            };
+            let row = random_row(&ring, "row", columns);
+            let key = (random_row(&ring, "top", columns), random_row(&ring, "bottom", columns));
+            for target_form in [RnsBggForm::Public, RnsBggForm::State] {
+                let target = parameters.form(target_level, target_form).unwrap();
+                let expected = parameters
+                    .retarget_key(0, form, target_level, target.clone(), key.clone())
+                    .unwrap();
+                let actual = parameters
+                    .retarget_encoding(0, form, target_level, target, (row.clone(), key.clone()))
+                    .unwrap();
+                check_keys(&parameters, expected, actual.1);
+            }
+        }
+    }
+
+    /// Public multiplication keys never depend on rows or the public plaintext, for either form.
+    #[test]
+    fn mul_public_key_matches_full_rows() {
+        let parameters = parameters();
+        for level in 0..parameters.levels().len() {
+            let ring = parameters.ring(level).unwrap();
+            let public_columns = parameters.level(level).unwrap().modulus_digits();
+            let public_row = random_row(&ring, "public-row", public_columns);
+            let public_key = (
+                random_row(&ring, "public-top", public_columns),
+                random_row(&ring, "public-bottom", public_columns),
+            );
+            let alpha = random_row(&ring, "alpha", 1).0;
+            for columns in [public_columns, parameters.component_columns(level).unwrap()] {
+                let row = random_row(&ring, "row", columns);
+                let key = (random_row(&ring, "top", columns), random_row(&ring, "bottom", columns));
+                let expected = parameters.mul_public_key(level, &public_key, &key).unwrap();
+                let actual = parameters
+                    .mul_public_rows(level, (&public_row, &public_key, &alpha), (&row, &key))
+                    .unwrap();
+                check_keys(&parameters, expected, actual.1);
+            }
+        }
+    }
+
+    /// The extracted action preserves the divisor restriction of full re-targeting.
+    #[test]
+    fn retarget_action_rejects_upward_state_target() {
+        let parameters = parameters();
+        assert!(
+            parameters
+                .retarget_action(0, RnsBggForm::State, 0, parameters.public_gadget(0).unwrap())
+                .is_err()
+        );
+    }
 }

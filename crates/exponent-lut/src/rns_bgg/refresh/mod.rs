@@ -224,29 +224,31 @@ impl RnsBggParameters {
 
     /// The digit actions of decoding the prime at index `output_prime` of the basis of level
     /// `level` of a row refreshed to the format `reference` under the public `a_prime = A'_(j)`
-    /// (`1 x w_0` in the ring of `level`): a part's actions (see [`crate::refresh`]), or a row
-    /// target's (see [`crate::rns_bgg::RnsBggParameters::retarget_encoding`]).
+    /// (`2 x w_0` in the ring of `level`): a part's actions (see [`crate::refresh`]), or a row
+    /// target's (see [`crate::rns_bgg::RnsBggParameters::retarget_encoding`]). The index may be
+    /// a constant or a symbolic loop index. It must name a prime surviving at `level + 1`.
+    /// Constant tables hold the prime-dependent scalars; the action graph has fixed size.
     pub fn refresh_actions(
         &self,
         level: usize,
         a_prime: Mat,
-        output_prime: usize,
+        output_prime: impl Into<mxx_dsl::Int>,
         reference: &TopReference,
     ) -> Result<RefreshActions, RnsBggError> {
         let parameters = self.level(level)?;
+        let output_prime = output_prime.into().expression()?;
+        let primes = parameters.to_crt().0;
+        validate_prime_index(&output_prime, primes.len())?;
         let modulus: BigUint = parameters.modulus().as_ref().clone();
-        let q_i = parameters
-            .to_crt()
-            .0
-            .get(output_prime)
-            .copied()
-            .ok_or(RnsBggError::Parameters("refresh prime index out of range"))?;
-        let cofactor = &modulus / q_i;
-        let cofactor_scalar = self.scalar(level, BigInt::from(cofactor.clone()))?;
-        let x = self.gadget_inverse(level, level, cofactor_scalar * a_prime)?;
-        let weight = self.top_target_weight(level, q_i, reference)?;
+        let cofactor = prime_selection(
+            &output_prime,
+            primes.iter().map(|prime| IntExpr::from(&modulus / prime)),
+        );
+        let cofactor_scalar = self.ring(level)?.polynomial([cofactor]);
+        let x = self.gadget_inverse(level, level, cofactor_scalar.clone() * a_prime)?;
+        let weight = self.top_target_weight(level, &output_prime, reference)?;
         let y = self.gadget_inverse(level + 1, level, weight)?;
-        let z = self.gadget_inverse(level, level, self.scalar(level, BigInt::from(cofactor))?)?;
+        let z = self.gadget_inverse(level, level, cofactor_scalar)?;
         Ok(RefreshActions { x, y, z })
     }
 
@@ -254,37 +256,67 @@ impl RnsBggParameters {
     /// of level `level` (`1 x w_0`, ring of level `level + 1`):
     /// `R_q = (Delta_l^-1 Q_q T_q mod q)` modulo `q` and `0` modulo the other
     /// primes of level `l + 1`, with `T_q = Delta_0 G^st_0 mod q` of the
-    /// reference. Then `Delta_l G^st_l G^-1(R_q) = Q_q T_q (mod Q)`: modulo
+    /// reference. `output_prime` indexes the level's basis, including inside a graph loop.
+    /// Then `Delta_l G^st_l G^-1(R_q) = Q_q T_q (mod Q)`: modulo
     /// `q` because `q` is a plaintext prime (`Delta_l` is invertible), and
     /// modulo every other prime both sides vanish (see [`crate::refresh`]).
+    /// A non-surviving symbolic index selects an out-of-bounds plaintext-ring slice rather
+    /// than silently producing a valid zero action. Constant invalid indices fail here.
     pub(crate) fn top_target_weight(
         &self,
         level: usize,
-        q: u64,
+        output_prime: &IntExpr,
         reference: &TopReference,
     ) -> Result<Mat, RnsBggError> {
-        let invalid = RnsBggError::Parameters("the refresh does not match its chain");
-        let modulus: BigUint = self.level(level)?.modulus().as_ref().clone();
+        let invalid = || RnsBggError::Parameters("the refresh does not match its chain");
+        let parameters = self.level(level)?;
+        let primes = parameters.to_crt().0;
+        validate_prime_index(output_prime, primes.len())?;
+        let modulus: BigUint = parameters.modulus().as_ref().clone();
         let next_parameters = self.level(level + 1)?;
+        let next_primes = next_parameters.to_crt().0;
         let next_modulus: BigUint = next_parameters.modulus().as_ref().clone();
-        let prime = BigUint::from(q);
-        if !(&next_modulus % &prime).is_zero() {
-            return Err(invalid);
+        if let IntExpr::Const(index) = output_prime.clone().canonicalize() {
+            let prime = primes[index.to_usize().ok_or_else(invalid)?];
+            if !next_primes.contains(&prime) {
+                return Err(invalid());
+            }
         }
         let delta = &modulus / &next_modulus;
-        let cofactor = &modulus / &prime;
-        let kappa = (delta % &prime).modinv(&prime).ok_or(invalid)? * (cofactor % &prime) % &prime;
-        let next_cofactor = &next_modulus / &prime;
-        let idempotent = (&next_cofactor % &prime)
-            .modinv(&prime)
-            .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
-            &next_cofactor %
-            &next_modulus;
-        let ring_q = Ring::from_crt_moduli(vec![IntExpr::from(q)], reference.ring_dimension);
-        let scalar = |ring: &Ring, value: BigUint| ring.polynomial([BigInt::from(value).into()]);
-        let target = top_reference_target(reference, &ring_q, q) * scalar(&ring_q, kappa);
+        let reference_top: BigUint = reference.top.iter().copied().map(BigUint::from).product();
+        let reference_next: BigUint = reference.next.iter().copied().map(BigUint::from).product();
+        let reference_delta = reference_top / reference_next;
+        let mut indices = Vec::with_capacity(primes.len());
+        let mut scales = Vec::with_capacity(primes.len());
+        let mut idempotents = Vec::with_capacity(primes.len());
+        for prime_value in primes {
+            let Some(index) = next_primes.iter().position(|prime| *prime == prime_value) else {
+                indices.push(IntExpr::constant(next_primes.len()));
+                scales.push(IntExpr::constant(0));
+                idempotents.push(IntExpr::constant(0));
+                continue;
+            };
+            let prime = BigUint::from(prime_value);
+            let cofactor = &modulus / &prime;
+            let kappa = (&delta % &prime).modinv(&prime).ok_or_else(invalid)? * (cofactor % &prime) %
+                &prime;
+            let next_cofactor = &next_modulus / &prime;
+            let idempotent = (&next_cofactor % &prime)
+                .modinv(&prime)
+                .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
+                &next_cofactor %
+                &next_modulus;
+            indices.push(IntExpr::constant(index));
+            scales.push(IntExpr::from(&reference_delta * kappa % &prime));
+            idempotents.push(IntExpr::from(idempotent));
+        }
         let next = self.ring(level + 1)?;
-        Ok(target.centered_rebase(&next) * scalar(&next, idempotent))
+        let index = prime_selection(output_prime, indices);
+        let ring_q = next.slice_crt(index.clone(), index + 1);
+        let target = top_reference_gadget(reference).reduce_modulus(&ring_q) *
+            ring_q.polynomial([prime_selection(output_prime, scales)]);
+        Ok(target.centered_rebase(&next) *
+            next.polynomial([prime_selection(output_prime, idempotents)]))
     }
 }
 
@@ -305,20 +337,25 @@ pub(crate) fn top_reference_ring(reference: &TopReference) -> Ring {
 
 /// `T_q = Delta_0 G^st_0 mod q` of `reference` (`1 x w_0`, in `ring_q`):
 /// `G^st_0` is the gadget of the level-1 primes, its centered entries
-/// re-encoded at level 0 as the state gadget is.
+/// re-encoded at level 0 as the state gadget is. This independent reference
+/// expression checks the combined scalar selection used by the production weight action.
+#[cfg(test)]
 pub(crate) fn top_reference_target(reference: &TopReference, ring_q: &Ring, q: u64) -> Mat {
-    let next = Ring::from_crt_moduli(
-        reference.next.iter().copied().map(IntExpr::from).collect(),
-        reference.ring_dimension,
-    );
-    let gadget = next
-        .gadget(1, 1u64 << reference.base_bits, reference.columns())
-        .centered_rebase(&top_reference_ring(reference))
-        .reduce_modulus(ring_q);
+    let gadget = top_reference_gadget(reference).reduce_modulus(ring_q);
     let top: BigUint = reference.top.iter().map(|prime| BigUint::from(*prime)).product();
     let next_modulus: BigUint = reference.next.iter().map(|prime| BigUint::from(*prime)).product();
     let delta = (top / next_modulus) % q;
     gadget * ring_q.polynomial([BigInt::from(delta).into()])
+}
+
+/// The reference state gadget, centered in its plaintext ring and lifted to its top ring.
+fn top_reference_gadget(reference: &TopReference) -> Mat {
+    let next = Ring::from_crt_moduli(
+        reference.next.iter().copied().map(IntExpr::from).collect(),
+        reference.ring_dimension,
+    );
+    next.gadget(1, 1u64 << reference.base_bits, reference.columns())
+        .centered_rebase(&top_reference_ring(reference))
 }
 
 /// The caller's `A' = [A'_(0) | A'_(1)]` as the graph input [`REFRESH_MATRIX_INPUT`] of the
@@ -363,7 +400,10 @@ pub(crate) fn top_residue_term(
 ) -> Result<Mat, RnsBggError> {
     residue_term(
         part.output_moduli(),
-        part.output_modulus(),
+        part.output_moduli()
+            .iter()
+            .position(|prime| *prime == part.output_modulus())
+            .ok_or(RnsBggError::Parameters("refresh prime index out of range"))?,
         part.reference().ring_dimension,
         residue,
     )
@@ -372,26 +412,49 @@ pub(crate) fn top_residue_term(
 /// The term of a residue `residue` (`y mod q`, a row in the ring of the prime `q`) of the
 /// recombination of `y` modulo the product `P` of `primes` (`q` among them, ring dimension
 /// `ring_dimension`): the centered residue in the ring of `P` times its CRT coefficient
-/// `P / q ((P / q)^-1 mod q)`. The terms of every prime of `P` sum to `y mod P`.
+/// `P / q ((P / q)^-1 mod q)`. `output_prime` is its zero-based index in `primes`, either
+/// constant or symbolic; the residue's ring must be `output_ring.slice_crt(index, index + 1)`.
+/// The terms of every prime of `P` sum to `y mod P`. Only scalar tables grow with the basis.
 pub fn residue_term(
     primes: &[u64],
-    q: u64,
+    output_prime: impl Into<mxx_dsl::Int>,
     ring_dimension: u32,
     residue: Mat,
 ) -> Result<Mat, RnsBggError> {
-    if primes.len() == 1 {
-        return Ok(residue);
-    }
+    let output_prime = output_prime.into().expression()?;
+    validate_prime_index(&output_prime, primes.len())?;
     let ring = output_ring(primes, ring_dimension);
     let modulus: BigUint = primes.iter().map(|prime| BigUint::from(*prime)).product();
-    let prime = BigUint::from(q);
-    let cofactor = &modulus / &prime;
-    let coefficient = (&cofactor % &prime)
-        .modinv(&prime)
-        .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
-        cofactor %
-        &modulus;
-    Ok(residue.centered_rebase(&ring) * ring.polynomial([BigInt::from(coefficient).into()]))
+    let coefficients = primes
+        .iter()
+        .map(|prime| {
+            let prime = BigUint::from(*prime);
+            let cofactor = &modulus / &prime;
+            let inverse = (&cofactor % &prime)
+                .modinv(&prime)
+                .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))?;
+            Ok(IntExpr::from(inverse * cofactor % &modulus))
+        })
+        .collect::<Result<Vec<_>, RnsBggError>>()?;
+    let prime_ring = ring.slice_crt(output_prime.clone(), output_prime.clone() + 1);
+    let residue = residue.reduce_modulus(&prime_ring).centered_rebase(&ring);
+    Ok(residue * ring.polynomial([prime_selection(&output_prime, coefficients)]))
+}
+
+/// Selects one integer table entry without unrolling any matrix graph operations.
+fn prime_selection(index: &IntExpr, branches: impl IntoIterator<Item = IntExpr>) -> IntExpr {
+    IntExpr::Select { selector: Box::new(index.clone()), branches: branches.into_iter().collect() }
+        .canonicalize()
+}
+
+/// Rejects empty bases and invalid constant indices; symbolic bounds are checked on execution.
+fn validate_prime_index(index: &IntExpr, count: usize) -> Result<(), RnsBggError> {
+    if count == 0 ||
+        matches!(index.clone().canonicalize(), IntExpr::Const(value) if value.to_usize().is_none_or(|index| index >= count))
+    {
+        return Err(RnsBggError::Parameters("refresh prime index out of range"));
+    }
+    Ok(())
 }
 
 impl RnsBggParameters {
@@ -506,6 +569,208 @@ pub(crate) mod tests {
     use mxx_dsl::DslContext;
     use std::collections::BTreeSet;
 
+    /// Small two-level chains for symbolic-prime tests, with overridable arithmetic sizes.
+    fn symbolic_chain(kept: usize) -> (RnsBggParameters, TopReference) {
+        let dimension = std::env::var("MXX_REFRESH_TEST_RING_DIMENSION")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(8);
+        let bits = std::env::var("MXX_REFRESH_TEST_PRIME_BITS")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(17);
+        let base_bits = std::env::var("MXX_REFRESH_TEST_BASE_BITS")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(4);
+        let pool = DCRTPolyParams::new(dimension, kept + 1, bits, base_bits, None, None);
+        let primes = pool.to_crt().0;
+        let next = primes[..kept].to_vec();
+        let modulus = next.iter().copied().map(BigUint::from).product::<BigUint>();
+        let low = pool.select_modulus(&modulus).unwrap();
+        let reference = TopReference { top: primes, next, ring_dimension: dimension, base_bits };
+        (RnsBggParameters::new(vec![pool, low], 0, 1).unwrap(), reference)
+    }
+
+    /// Materializes bounded action digits without losing any digit coordinate.
+    fn action_matrices(ring: &Ring, actions: RefreshActions) -> (Mat, Mat, Mat) {
+        let materialize = |action: SmallMatrix| {
+            ring.identity(action.matrix_type().rows.clone()).mul_small_rhs(action)
+        };
+        (materialize(actions.x), materialize(actions.y), materialize(actions.z))
+    }
+
+    /// Executes difference matrices using a fresh random hash input and checks every entry.
+    fn assert_symbolic_zero(parameters: &RnsBggParameters, graph: mxx_dsl::BuiltGraph) {
+        let pool = parameters.level(0).unwrap();
+        let mut rings = parameters.levels().to_vec();
+        rings.extend(
+            pool.to_crt()
+                .0
+                .into_iter()
+                .map(|prime| pool.select_modulus(&BigUint::from(prime)).unwrap()),
+        );
+        let result = execute_cpu(
+            &validate(&graph),
+            rings,
+            BTreeMap::from([(
+                "symbolic-hash".to_owned(),
+                RuntimeValue::Bytes(rand::random::<[u8; 32]>().as_slice().into()),
+            )]),
+        );
+        for (name, output) in &result.outputs {
+            let matrix = full(output);
+            let (rows, columns) = matrix.size();
+            for row in 0..rows {
+                for column in 0..columns {
+                    assert!(
+                        matrix.entry(row, column).coeffs_biguints().iter().all(Zero::is_zero),
+                        "{name} at ({row}, {column})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every digit of symbolic actions equals the constant-index action on random matrices.
+    #[test]
+    fn symbolic_prime_actions_match_constant_indices() {
+        let kept = std::env::var("MXX_REFRESH_TEST_PRIMES")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(3);
+        let (parameters, reference) = symbolic_chain(kept);
+        let ring = parameters.ring(0).unwrap();
+        let matrix = ring.hash_matrix(
+            ring.bytes_input("symbolic-hash", 32),
+            b"a-prime".to_vec(),
+            (2, reference.columns()),
+        );
+        let actions = mxx_dsl::parallel(kept, |prime| {
+            let actions = parameters.refresh_actions(0, matrix.clone(), prime, &reference).unwrap();
+            Ok(action_matrices(&ring, actions))
+        })
+        .unwrap();
+        let mut graph = DslContext::new("symbolic-prime-actions");
+        for prime in 0..kept {
+            let actual = actions.at(prime);
+            let expected = action_matrices(
+                &ring,
+                parameters.refresh_actions(0, matrix.clone(), prime, &reference).unwrap(),
+            );
+            graph = graph
+                .output(
+                    format!("prime-{prime}"),
+                    (actual.0 - expected.0, actual.1 - expected.1, actual.2 - expected.2),
+                )
+                .unwrap();
+        }
+        assert_symbolic_zero(&parameters, graph.build().unwrap());
+    }
+
+    /// Symbolic CRT terms match all constant indices and reconstruct a random matrix,
+    /// including a singleton basis. The iterate body reads a symbolic CRT slice.
+    #[test]
+    fn symbolic_prime_residues_match_constants_and_reconstruct() {
+        let kept = std::env::var("MXX_REFRESH_TEST_PRIMES")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(3);
+        let (parameters, reference) = symbolic_chain(kept);
+        let mut graph = DslContext::new("symbolic-prime-residues");
+        for primes in [&reference.top[..1], reference.top.as_slice()] {
+            let ring = output_ring(primes, reference.ring_dimension);
+            let value = ring.hash_matrix(
+                ring.bytes_input("symbolic-hash", 32),
+                b"residue".to_vec(),
+                (1, 2),
+            );
+            let terms = mxx_dsl::parallel(primes.len(), |prime| {
+                let index = prime.expression()?;
+                let residue =
+                    value.clone().reduce_modulus(&ring.slice_crt(index.clone(), index + 1));
+                Ok(residue_term(primes, prime, reference.ring_dimension, residue).unwrap())
+            })
+            .unwrap();
+            for prime in 0..primes.len() {
+                let residue = value.clone().reduce_modulus(&ring.slice_crt(prime, prime + 1));
+                let expected =
+                    residue_term(primes, prime, reference.ring_dimension, residue).unwrap();
+                graph = graph
+                    .output(
+                        format!("basis-{}-prime-{prime}", primes.len()),
+                        terms.at(prime) - expected,
+                    )
+                    .unwrap();
+            }
+            let sum = mxx_dsl::iterate(primes.len(), ring.zero((1, 2)), |prime, sum| {
+                Ok(sum + terms.at(prime))
+            })
+            .unwrap();
+            graph = graph.output(format!("basis-{}-roundtrip", primes.len()), sum - value).unwrap();
+        }
+        assert_symbolic_zero(&parameters, graph.build().unwrap());
+    }
+
+    /// Builds both prime loops once; only integer metadata tables scale with the basis.
+    fn symbolic_loop_graph(kept: usize) -> mxx_dsl::BuiltGraph {
+        let (parameters, reference) = symbolic_chain(kept);
+        let ring = parameters.ring(0).unwrap();
+        let matrix = ring.input("a-prime", (2, reference.columns()));
+        let value = ring.input("residue", (1, 2));
+        let actions = mxx_dsl::parallel(kept, |prime| {
+            Ok(action_matrices(
+                &ring,
+                parameters.refresh_actions(0, matrix, prime, &reference).unwrap(),
+            ))
+        })
+        .unwrap();
+        let residue = mxx_dsl::iterate(reference.top.len(), ring.zero((1, 2)), |prime, sum| {
+            let index = prime.expression()?;
+            let residue = value.reduce_modulus(&ring.slice_crt(index.clone(), index + 1));
+            Ok(sum +
+                residue_term(&reference.top, prime, reference.ring_dimension, residue).unwrap())
+        })
+        .unwrap();
+        DslContext::new("symbolic-prime-loops")
+            .output("actions", actions)
+            .unwrap()
+            .output("residue", residue)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Both nested-body and total node counts are independent of the number of primes.
+    #[test]
+    fn symbolic_prime_loop_node_count_is_constant() {
+        let small = std::env::var("MXX_REFRESH_TEST_SMALL_PRIMES")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(2);
+        let large = std::env::var("MXX_REFRESH_TEST_LARGE_PRIMES")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(5);
+        assert!(small > 0 && large > small);
+        let counts = |graph: mxx_dsl::BuiltGraph| {
+            validate(&graph);
+            graph.graph.scopes().values().map(|scope| scope.nodes().len()).collect::<Vec<_>>()
+        };
+        assert_eq!(counts(symbolic_loop_graph(small)), counts(symbolic_loop_graph(large)));
+    }
+
+    /// Constant invalid, negative and dropped prime indices fail during graph construction.
+    #[test]
+    fn symbolic_prime_helpers_reject_invalid_constants() {
+        let (parameters, reference) = symbolic_chain(2);
+        let ring = parameters.ring(0).unwrap();
+        let matrix = ring.zero((2, reference.columns()));
+        for prime in [-1, 2, 3] {
+            assert!(parameters.refresh_actions(0, matrix.clone(), prime, &reference).is_err());
+        }
+        for prime in [-1, 3] {
+            assert!(
+                residue_term(&reference.top, prime, reference.ring_dimension, ring.zero((1, 1)))
+                    .is_err()
+            );
+        }
+        assert!(residue_term(&[], 0, reference.ring_dimension, ring.zero((1, 1))).is_err());
+    }
+
     /// On every chain of a refresh, the target action of the output prime
     /// `q` maps the level-`L` payload scale to the reference format:
     /// `Delta_L G^st_L G^-1(R_q) = Q_q (Delta_0 G^st_0 mod q)` modulo `Q_L`,
@@ -538,7 +803,17 @@ pub(crate) mod tests {
             let ring = chain_parameters.ring(level).unwrap();
             let modulus: BigUint =
                 chain_parameters.level(level).unwrap().modulus().as_ref().clone();
-            let weight = chain_parameters.top_target_weight(level, q, &reference).unwrap();
+            let index = chain_parameters
+                .level(level)
+                .unwrap()
+                .to_crt()
+                .0
+                .iter()
+                .position(|prime| *prime == q)
+                .unwrap();
+            let weight = chain_parameters
+                .top_target_weight(level, &IntExpr::constant(index), &reference)
+                .unwrap();
             let y = chain_parameters.gadget_inverse(level + 1, level, weight).unwrap();
             let delta = chain_parameters
                 .scalar(level, chain_parameters.message_scale(level).unwrap())

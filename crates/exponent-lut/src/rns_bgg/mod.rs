@@ -3,7 +3,8 @@
 //! This module intentionally contains only the contracts shared by the stage
 //! owners. Public-key preparation, encoding/encryption, and noise evaluation
 //! live in their respective modules; this file does not provide a scheme
-//! facade or an artifact/material wrapper hierarchy.
+//! facade or an artifact/material wrapper hierarchy. Member-group companion loops share each
+//! expansion across the parent digit sets of all branches using that member.
 
 mod dynamic;
 mod encoding;
@@ -305,10 +306,11 @@ pub struct RnsOutputCarrier {
 }
 
 /// Validated modulus-chain and encoding-noise parameters.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RnsBggParameters {
     levels: Vec<DCRTPolyParams>,
     drops: Vec<BigUint>,
+    #[serde(with = "crate::noise_utils::bigdecimal_string")]
     encoding_error_sigma: BigDecimal,
     encoding_error_bound: BigUint,
     operations_per_drop: usize,
@@ -316,6 +318,7 @@ pub struct RnsBggParameters {
     root: Option<std::sync::Arc<RnsBggRoot>>,
     /// Components appended to the tag of every public matrix a Program's preprocessing and
     /// evaluation hash on this chain (see [`Self::with_hash_domain`]).
+    #[serde(default, with = "empty_graph_domain")]
     hash_domain: Vec<mxx_dsl::Int>,
 }
 
@@ -361,11 +364,13 @@ impl std::fmt::Debug for RnsBggParameters {
 /// iO 2 reads every step's objects in one loop) separates them by a hash domain
 /// ([`Self::with_domain`]), whose components follow every root tag. An input whose root key is
 /// a public function of other root keys is declared with [`Self::with_derived_input`].
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RnsBggRoot {
     parameters: DCRTPolyParams,
     hash_key: [u8; 32],
+    #[serde(default, with = "empty_graph_domain")]
     domain: Vec<mxx_dsl::Int>,
+    #[serde(default, with = "empty_derived_roots")]
     derived: BTreeMap<String, DerivedRootKey>,
 }
 
@@ -2558,12 +2563,60 @@ pub(crate) fn push_digest(tag: &mut mxx_dsl::HashTag, digest: &[u8]) {
         .expect("a constant is a compile-time integer");
 }
 
-/// Artifact role of a Dynamic root site's public action in the
-/// preprocessing production: `part` is `key` (the site's output key, ports
-/// `.0` to `.3`) or `branches` (a LUT's product keys `T_k`, every switched
-/// branch side by side, ports `.0` and `.1`).
+/// Artifact role of a Dynamic root site's public action in preprocessing: `key` names
+/// the output key (ports `.0` to `.3`); `branches` prefixes product-key row families
+/// indexed by internal depth or leaf member group and slot (see [`branch_keys_role`]).
 pub(crate) fn public_action_role(wire: WireId, part: &str) -> String {
     format!("public-action/{wire:?}/{part}")
+}
+
+/// The branch layout of a published product-key family. Internal lanes are branches at
+/// one depth; leaf lanes are switch members, with a separate family for each branch slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BranchGroup {
+    Internal { depth: usize },
+    Leaf { group: usize, slot: usize },
+}
+
+/// Two row families of product keys `T_b`, each lane holding two `1 x m` rows
+/// (`m = 2 * component_columns`). Leaf families are direct fields of the member-group
+/// loop, so publishing a lane does not retain the other members' rows.
+#[derive(Clone)]
+pub(crate) struct BranchKeys {
+    pub(crate) group: BranchGroup,
+    pub(crate) rows: [mxx_dsl::Family<Mat>; 2],
+}
+
+/// Artifact role of product-key row `port`: `branches.d{depth}.internal.{port}` or
+/// `branches.leaf.g{group}.s{slot}.{port}`, under the root site's public-action prefix.
+pub(crate) fn branch_keys_role(wire: WireId, group: BranchGroup, port: usize) -> String {
+    let suffix = match group {
+        BranchGroup::Internal { depth } => format!("d{depth}.internal"),
+        BranchGroup::Leaf { group, slot } => format!("leaf.g{group}.s{slot}"),
+    };
+    format!("{}.{suffix}.{port}", public_action_role(wire, "branches"))
+}
+
+/// The sum of the `count` members of `family`, in the shape a GPU plan fuses into its producing
+/// root parallel loop (members 0 and 1 added, then a loop adding member `index + 2`), so that no
+/// member stays resident.
+pub(crate) fn member_sum<T: mxx_dsl::GraphValue + Clone + 'static>(
+    family: &mxx_dsl::Family<T>,
+    count: usize,
+    add: impl Fn(T, T) -> T + Clone + 'static,
+) -> Result<T, RnsBggError> {
+    if count == 0 {
+        return Err(RnsBggError::Binding("a member sum needs a member"));
+    }
+    let first = family.at(mxx_dsl::Int::constant(0));
+    if count == 1 {
+        return Ok(first);
+    }
+    let first = add(first, family.at(mxx_dsl::Int::constant(1)));
+    let rest = family.clone();
+    Ok(mxx_dsl::iterate(count - 2, first, move |index, state| {
+        Ok(add(state, rest.at(index.add(2))))
+    })?)
 }
 
 /// The public key `B_{a,j}` of digit row `a` of output column `j` of the
@@ -2610,7 +2663,7 @@ pub(crate) fn companion_tag(tag: &mxx_dsl::HashTag, a: IntExpr, j: IntExpr) -> m
 
 /// The `1 x width` unit row at a loop-dependent `index`: a window of one
 /// constant row, so no constant depends on the loop.
-pub(crate) fn unit_row(ring: &Ring, width: usize, index: IntExpr) -> Mat {
+pub fn unit_row(ring: &Ring, width: usize, index: IntExpr) -> Mat {
     let start = (IntExpr::constant(width - 1) - index).canonicalize();
     ring.constant(
         (1, 2 * width - 1),
@@ -2799,6 +2852,115 @@ pub(crate) fn companion_columns(
             .zip(blocks)
             .map(|(row, block)| row + place.clone().tensor(block))
             .collect())
+    })?)
+}
+
+/// Companion blocks for branches sharing one member. Each companion is expanded once per
+/// `(a, j)` and contracted with every branch's digits. Results are branch-major, with two key
+/// rows and/or one encoding row per branch. Companion read-ahead is shared by the whole group.
+pub(crate) fn companion_block(
+    parameters: &RnsBggParameters,
+    level: usize,
+    output_columns: usize,
+    branches: usize,
+    key_entry: &dyn Fn(usize, usize, IntExpr) -> Result<Mat, RnsBggError>,
+    companion_key: Option<&dyn Fn(IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>>,
+    companion: Option<&dyn Fn(IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
+    public_rows: Option<(usize, &dyn Fn() -> Result<Mat, RnsBggError>)>,
+) -> Result<Vec<Mat>, RnsBggError> {
+    if companion_key.is_none() && companion.is_none() {
+        return Err(RnsBggError::Binding("a companion loop accumulates no row"));
+    }
+    let ring = parameters.ring(level)?;
+    let current = parameters.level(level)?;
+    let base = public_gadget_base(current.base_bits())?;
+    let digits = current.modulus_digits();
+    let first_row = public_rows.as_ref().map_or(0, |(rows, _)| *rows);
+    if first_row > digits {
+        return Err(RnsBggError::Binding("public digit rows exceed one entry's digits"));
+    }
+    let digit_rows = 2 * parameters.component_columns(level)? - first_row;
+    let block = 2 * output_columns;
+    let schema = |_| mxx_dsl::DslError::Schema;
+    let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
+    let mut rows = vec![ring.zero((1, block)); sums * branches];
+    // The public rows' keys `A_{:,a} Dec(top)_{a,:}`: the top row is decomposed once and each
+    // of its digit rows scales one key entry.
+    if let (Some((count, top)), true) = (&public_rows, companion_key.is_some()) {
+        let decomposition = top()?.decompose(base, digits).centered_rebase(&ring);
+        let keys = mxx_dsl::iterate(
+            *count,
+            vec![ring.zero((1, block)); 2 * branches],
+            |a, keys: Vec<Mat>| {
+                let a = a.expression()?;
+                let digit = unit_row(&ring, digits, a.clone()).mul_small_rhs(decomposition.clone());
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(r, key)| {
+                        Ok(key +
+                            key_entry(r / 2, r % 2, a.clone()).map_err(schema)? * digit.clone())
+                    })
+                    .collect()
+            },
+        )?;
+        for (branch, key) in keys.chunks(2).enumerate() {
+            rows[branch * sums..branch * sums + 2].clone_from_slice(key);
+        }
+    }
+    Ok(mxx_dsl::iterate(digit_rows, rows, |row, rows: Vec<Mat>| {
+        let a = (row.expression()? + IntExpr::constant(first_row)).canonicalize();
+        let digits = (0..branches)
+            .map(|branch| {
+                let u0 = key_entry(branch, 0, a.clone())?.decompose(base, digits);
+                let u1 = key_entry(branch, 1, a.clone())?.decompose(base, digits);
+                Ok((u0, u1))
+            })
+            .collect::<Result<Vec<_>, RnsBggError>>()
+            .map_err(schema)?;
+        let read = |j: IntExpr| companion.map(|companion| companion(a.clone(), j)).transpose();
+        // The inner loop accumulates into the outer rows directly (no per-row scratch sums).
+        // Each inner iteration reads the next companion (the first again after the last) and
+        // carries it, so that load overlaps this iteration's work.
+        let mut initial = rows;
+        if let Some((left, right)) = read(IntExpr::constant(0)).map_err(schema)? {
+            initial.extend([left, right]);
+        }
+        let mut rows = mxx_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
+            let j = j.expression()?;
+            let next = IntExpr::Rem(
+                Box::new(j.clone() + IntExpr::constant(1)),
+                Box::new(IntExpr::constant(block)),
+            )
+            .canonicalize();
+            let key =
+                companion_key.map(|key| key(a.clone(), j.clone())).transpose().map_err(schema)?;
+            let current = if let Some((left, right)) = read(next).map_err(schema)? {
+                let current = carried.split_off(sums * branches);
+                carried.extend([left, right]);
+                Some((current[0].clone(), current[1].clone()))
+            } else {
+                None
+            };
+            let mut terms = Vec::with_capacity(sums * branches);
+            for (u0, u1) in &digits {
+                let act = |(left, right): &RnsBggRow| {
+                    left.clone().mul_small_rhs(u0.clone()) + right.clone().mul_small_rhs(u1.clone())
+                };
+                if let Some((top, bottom)) = &key {
+                    terms.extend([act(top), act(bottom)]);
+                }
+                if let Some(current) = &current {
+                    terms.push(act(current));
+                }
+            }
+            let unit = unit_row(&ring, block, j);
+            for (row, term) in carried.iter_mut().zip(terms) {
+                *row = row.clone() + term * unit.clone();
+            }
+            Ok(carried)
+        })?;
+        rows.truncate(sums * branches);
+        Ok(rows)
     })?)
 }
 
@@ -3547,6 +3709,36 @@ mod tests {
         RnsBggParameters::new(vec![high.clone(), high, low], 1, 1).unwrap()
     }
 
+    #[test]
+    fn test_parameter_snapshot_rejects_live_graph_configuration() {
+        let parameters = helper_test_parameters();
+        let snapshot = serde_json::to_value(&parameters).unwrap();
+        let restored: RnsBggParameters = serde_json::from_value(snapshot.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), snapshot);
+        let bound = parameters.with_hash_domain(vec![mxx_dsl::Int::constant(1)]);
+        assert!(serde_json::to_value(bound).unwrap_err().to_string().contains("bound graph"));
+        let mut unbound = snapshot.clone();
+        unbound.as_object_mut().unwrap().remove("hash_domain");
+        assert!(serde_json::from_value::<RnsBggParameters>(unbound).is_ok());
+        let mut invalid = snapshot;
+        invalid["hash_domain"] = serde_json::json!([1]);
+        assert!(serde_json::from_value::<RnsBggParameters>(invalid).is_err());
+        let root = RnsBggRoot::new(helper_test_parameters().levels[0].clone(), rand::random());
+        let snapshot = serde_json::to_value(&root).unwrap();
+        let restored: RnsBggRoot = serde_json::from_value(snapshot.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), snapshot);
+        assert!(
+            serde_json::to_value(root.clone().with_domain(vec![mxx_dsl::Int::constant(1)]))
+                .is_err()
+        );
+        let derived =
+            root.with_derived_input("derived", std::sync::Arc::new(|_, _, _| unreachable!()));
+        assert!(serde_json::to_value(derived).unwrap_err().to_string().contains("closures"));
+        let mut invalid = snapshot;
+        invalid["derived"] = serde_json::json!({"derived": null});
+        assert!(serde_json::from_value::<RnsBggRoot>(invalid).is_err());
+    }
+
     fn helper_test_program(depth: usize) -> crate::program::ExponentLutProgram {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
@@ -3628,5 +3820,52 @@ mod tests {
             TypeId::of::<RnsBggPreprocessOnlineEvalDescriptor>(),
             TypeId::of::<RnsBggEncryptionDescriptor>()
         );
+    }
+}
+
+// Graph handles and derived-key closures belong to one live DSL context. Parameter
+// snapshots may contain only unbound domains; reject instead of silently discarding them.
+mod empty_graph_domain {
+    pub fn serialize<S: serde::Serializer>(
+        value: &[mxx_dsl::Int],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if !value.is_empty() {
+            return Err(serde::ser::Error::custom("cannot serialize a bound graph hash domain"));
+        }
+        serializer.collect_seq(std::iter::empty::<()>())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<mxx_dsl::Int>, D::Error> {
+        let values = <Vec<serde::de::IgnoredAny> as serde::Deserialize>::deserialize(deserializer)?;
+        if !values.is_empty() {
+            return Err(serde::de::Error::custom("cannot deserialize a bound graph hash domain"));
+        }
+        Ok(Vec::new())
+    }
+}
+mod empty_derived_roots {
+    use super::DerivedRootKey;
+    use std::collections::BTreeMap;
+    pub fn serialize<S: serde::Serializer>(
+        value: &BTreeMap<String, DerivedRootKey>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if !value.is_empty() {
+            return Err(serde::ser::Error::custom("cannot serialize derived root closures"));
+        }
+        serializer.collect_map(std::iter::empty::<(String, ())>())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, DerivedRootKey>, D::Error> {
+        let values = <BTreeMap<String, serde::de::IgnoredAny> as serde::Deserialize>::deserialize(
+            deserializer,
+        )?;
+        if !values.is_empty() {
+            return Err(serde::de::Error::custom("cannot deserialize derived root closures"));
+        }
+        Ok(BTreeMap::new())
     }
 }

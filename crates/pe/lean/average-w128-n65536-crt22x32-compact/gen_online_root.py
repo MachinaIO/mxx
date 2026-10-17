@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate PeOnlineRoot{1,2,3}.lean: the online steps after the first at the root wires."""
+"""Generate PeOnlineRoot{0,1,2,3}.lean: each online step at the root wires."""
 import re
 
 facts = open("generated/Stage_online_eval_Facts.lean").read()
@@ -17,38 +17,71 @@ for line in facts[start:].splitlines():
     if m and cur is not None:
         chunk_of.setdefault(m.group(1), cur)
 
-STEPS = {
-    1: dict(r0="70_0", r1="70_1", C="71", pos="72", t0="73", t1="74", top="75", y0="76", y1="77", bot="78",
-            col="79", a00="81", a01="82", A0="83", a10="84", a11="85", A1="86", mul="87", P="88", h0="89",
-            h1="98", coef="92", g="94", V="96", m00="100", m01="102", m10="104", m11="106", M0="111",
-            M1="112", lut="113", T0="108", T1="109", int="114", sum="115", leaf="116", lut2="118",
-            leaf2="119", off="128", C_="", ),
-    2: dict(r0="119_0", r1="119_1", C="120", pos="121", t0="122", t1="123", top="124", y0="125", y1="126",
-            bot="127", col="128", a00="130", a01="131", A0="132", a10="133", a11="134", A1="135", mul="136",
-            P="137", h0="138", h1="147", coef="141", g="143", V="145", m00="149", m01="151", m10="153",
-            m11="155", M0="160", M1="161", lut="162", T0="157", T1="158", int="163", sum="164",
-            leaf="165", lut2="167", leaf2="168", off="256", C_=""),
-    3: dict(r0="168_0", r1="168_1", C="169", pos="170", t0="171", t1="172", top="173", y0="174", y1="175",
-            bot="176", col="177", a00="179", a01="180", A0="181", a10="182", a11="183", A1="184", mul="185",
-            P="186", h0="187", h1="196", coef="190", g="192", V="194", m00="198", m01="200", m10="202",
-            m11="204", M0="209", M1="210", lut="211", T0="206", T1="207", int="212", sum="213",
-            leaf="214", lut2="216", leaf2="217", off="384", C_="C"),
-}
+
+def step(base: int, k: int) -> dict:
+    """The root wires of step `k`; `base` is the step's state concatenation."""
+    w = lambda o: str(base + o)
+    d = dict(C=w(0), pos=w(1), t0=w(2), t1=w(3), top=w(4), y0=w(5), y1=w(6), bot=w(7), col=w(8),
+             a00=w(10), a01=w(11), A0=w(12), a10=w(13), a11=w(14), A1=w(15), mul=w(16), P=w(17),
+             h0=w(18), coef=w(21), g=w(23), V=w(25), TI0=w(27), TI1=w(28), h1=w(29), m00=w(30),
+             m01=w(31), M0=w(32), m10=w(33), m11=w(34), M1=w(35), int=w(36), sa=w(37),
+             sb=w(38), s0=w(39), sc=w(40), sd=w(41), s1=w(42), sum=w(43), TL0=w(45),
+             TL1=w(46), out0=w(112), out1=w(118), k=str(k))
+    d.update(group_fields(base + 53))
+    d['families0'] = '![%s]' % ', '.join(f'generatedRoot.w_{base + 45 + 17 * group + 2 * slot}_0 ctx'
+                                      for group in range(4) for slot in range(4))
+    d['families1'] = '![%s]' % ', '.join(f'generatedRoot.w_{base + 46 + 17 * group + 2 * slot}_0 ctx'
+                                      for group in range(4) for slot in range(4))
+    return d
+
+
+def group_fields(first):
+    fields = {}
+    for group in range(4):
+        root = first + 17 * group
+        for key, offset in [('leaf', 0), ('ms_a', 1), ('ms_b', 2), ('ms0', 3),
+                            ('ms_c', 4), ('ms_d', 5), ('ms1', 6), ('msum', 7)]:
+            fields[f'{key}{group}'] = str(root + offset)
+    return fields
+
+
+# Step 0 differs before its product: its state is an input and its key the hashed input key.
+S0 = dict(C="10", pos="14", t0="15", t1="16", top="17", y0="19", y1="21", bot="22", col="23", mul="33",
+          P="34", h0="35", coef="39", g="41", V="43", h1="49", TI0="47", TI1="48", m00="52", m01="53",
+          M0="54", m10="55", m11="56", M1="57", int="58", sa="59", sb="60", s0="61", sc="62",
+          sd="63", s1="64", sum="65", TL0="67", TL1="68", out0="134", out1="140",
+          r0="8_0", r1="9_0", k="0",
+          families0='![%s]' % ', '.join(f'generatedRoot.w_{67 + 17 * group + 2 * slot}_0 ctx'
+                                      for group in range(4) for slot in range(4)),
+          families1='![%s]' % ', '.join(f'generatedRoot.w_{68 + 17 * group + 2 * slot}_0 ctx'
+                                      for group in range(4) for slot in range(4)), **group_fields(75))
+STEPS = {0: dict(S0, kind="FIRST", off="0", C_="")}
+for k, base, prev in ((1, 141, (134, 140)), (2, 260, (253, 259)), (3, 379, (372, 378))):
+    d = step(base, k)
+    d.update(r0=f"{prev[0]}_0", r1=f"{prev[1]}_0", kind="MID", off=str(128 * k), C_="C" if k == 3 else "")
+    STEPS[k] = d
 
 TEMPLATE = open("PeOnlineRoot.lean.in").read()
 
 for k, d in STEPS.items():
-    d = dict(d, k=str(k), table="tableConst" if d["C_"] else "tableMono")
-    keep = "--CONST" if d["C_"] else "--MONO"
-    drop = "--MONO" if d["C_"] else "--CONST"
+    d = dict(d, table="tableConst" if d["C_"] else "tableMono")
+    d['runs'] = ' '.join(f'((lanes{group} member).1 {slot})'
+                         for group in range(4) for slot in range(4))
+    keep = {d["kind"], "CONST" if d["C_"] else "MONO"}
     lines = []
     for line in TEMPLATE.splitlines():
-        if line.endswith(drop):
-            continue
-        if line.endswith(keep):
-            line = line[: -len(keep)].rstrip()
+        m = re.search(r" --(FIRST|MID|MONO|CONST)$", line)
+        if m:
+            if m.group(1) not in keep:
+                continue
+            line = line[: m.start()]
         lines.append(line)
     text = "\n".join(lines) + "\n"
+    text = re.sub(r'«GROUPS»(.*?)«ENDGROUPS»',
+                  lambda match: '\n'.join(re.sub(r'«(\w+)g»',
+                    lambda field: '«' + field[1] + str(group) + '»',
+                    match[1].replace('«group»', str(group))) for group in range(4)),
+                  text, flags=re.S)
     text = re.sub(r"«(\w+)»", lambda m: d[m.group(1)], text)
     text = re.sub(r"@@(h[0-9_]+)@@", lambda m: f"F.c{chunk_of[m.group(1)]}.{m.group(1)}", text)
     open(f"PeOnlineRoot{k}.lean", "w").write(text)

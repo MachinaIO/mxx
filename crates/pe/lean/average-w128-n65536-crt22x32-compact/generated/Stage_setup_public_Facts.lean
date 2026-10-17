@@ -4,16 +4,18 @@ set_option maxRecDepth 16384
 set_option maxHeartbeats 2000000
 set_option linter.unusedVariables false
 
+-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a
+-- projection against its field type expands it at the ring dimension.
+attribute [local irreducible] Mxx.Primitives.negacyclicModulus
+
 noncomputable section
 
 namespace Stage_setup_public
 
-local notation "mxxNat0" => 78079523927896127712009307999974412043135143141543941570119110821624764686494582648421232630165133436275519032254680972082541026053657846674805178959586229420520814546267827301225593318349477307602951695899164673
-local notation "mxxNat1" => 5278087253403224991333645099610003021785206966119564254171942298247993190952980821552692773158302798199939315804484105262715072792529872674621368544490941390506983498620144494214222200022752952511718466872729239793477806438096725442738627984346925320228738380148171996792888816066148390509478988805065937247347127262069050805334354391385613933775075315634469785233518480876460832181155068060520232362595000272223451214118913
-local notation "mxxNat2" => 67598865718973452911259282735194974463966008168342023559927392187609292957345997883634735633837025843140326117569327049993577673305918340947654355600136203031252562778990577685529163020701990351591297285624954881
-local notation "mxxMat0" => Mxx.Primitives.ExactMatrix mxxNat0 65536 1 501
-local notation "mxxMat1" => Mxx.Primitives.ExactMatrix mxxNat1 65536 1 1
-local notation "mxxMat2" => Mxx.Primitives.ExactMatrix mxxNat1 65536 1 501
+local notation "mxxNat0" => 67598865718973452911259282735194974463966008168342023559927392187609292957345997883634735633837025843140326117569327049993577673305918340947654355600136203031252562778990577685529163020701990351591297285624954881
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 501
+local notation "mxxMat1" => Mxx.Primitives.ExactMatrix modulus_1 65536 1 1
+local notation "mxxMat2" => Mxx.Primitives.ExactMatrix modulus_1 65536 1 501
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -25,7 +27,7 @@ def generatedRoot.w_1_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params
   ctx.inputs
 
 def generatedRoot.w_0_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : mxxMat1 :=
-  (MxxRuntime.matrixPolynomial [(mxxNat2)] : mxxMat1)
+  (MxxRuntime.matrixPolynomial [(mxxNat0)] : mxxMat1)
 
 def generatedRoot.w_2_0 {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) : mxxMat2 :=
   ctx.witness.w_2_0
@@ -72,7 +74,8 @@ structure generatedRoot.Facts {tape : MxxRuntime.SampleTape} {path : List Nat} {
 theorem generatedRoot.facts {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) {outputs : mxxMat2}
     (h : generatedRoot.body tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
-  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) h
+  have t0 := h
+  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
   ⟨r0⟩
 
 end Stage_setup_public

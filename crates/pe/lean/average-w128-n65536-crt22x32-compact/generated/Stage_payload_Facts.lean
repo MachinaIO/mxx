@@ -4,12 +4,15 @@ set_option maxRecDepth 16384
 set_option maxHeartbeats 2000000
 set_option linter.unusedVariables false
 
+-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a
+-- projection against its field type expands it at the ring dimension.
+attribute [local irreducible] Mxx.Primitives.negacyclicModulus
+
 noncomputable section
 
 namespace Stage_payload
 
-local notation "mxxNat0" => 78079523927896127712009307999974412043135143141543941570119110821624764686494582648421232630165133436275519032254680972082541026053657846674805178959586229420520814546267827301225593318349477307602951695899164673
-local notation "mxxMat0" => Mxx.Primitives.ExactMatrix mxxNat0 65536 1 1
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 1
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -38,7 +41,8 @@ structure generatedRoot.Facts {tape : MxxRuntime.SampleTape} {path : List Nat} {
 theorem generatedRoot.facts {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx tape path params) {outputs : mxxMat0}
     (h : generatedRoot.body tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
-  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) h
+  have t0 := h
+  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
   ⟨r0⟩
 
 end Stage_payload

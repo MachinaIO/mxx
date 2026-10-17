@@ -51,9 +51,12 @@ pub(crate) fn digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// Serialization restores internal handles written by this crate; referenced store
+/// productions must remain available. It is not an untrusted-input format.
+///
 /// The master public key: the parameters, the public seed, the Dynamic
 /// setup, and the production publishing `B^(1)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PePublicKey {
     parameters: PeParameters,
     context: [u8; 32],
@@ -64,7 +67,7 @@ pub struct PePublicKey {
 }
 
 /// The master secret key: the production holding the trapdoor of `B^(1)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PeMasterSecretKey {
     public: [u8; 32],
     trapdoor: (ProductionId, Manifest),

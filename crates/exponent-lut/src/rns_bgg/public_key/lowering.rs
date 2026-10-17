@@ -649,6 +649,217 @@ impl<'a> PublicKeyLowering<'a> {
         Ok((sum, Some(branches)))
     }
 
+    /// Build internal parents in root parallel loops, one lane per branch and one loop per
+    /// depth. Then process leaves in member groups across depths: a lane expands companions
+    /// once for all its parents, switches each product key, and returns the original `T_b`
+    /// rows and weighted terms. Each leaf slot publishes the original member-loop row families.
+    /// With `S` slots, a lane returns `2S` product rows and a two-row summed term; no root
+    /// consumer gathers the product families. Companion accumulation adds into the `2S`
+    /// product rows in place, independently of the number of members.
+    fn streamed_dynamic_lut_key(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+        table: &LutTable,
+    ) -> Result<(RnsBggMatrix, Vec<super::BranchKeys>), RnsBggError> {
+        use crate::rns_bgg::dynamic::{
+            automorphism_public_top, lut_automorphisms, scalar_action, scalar_action_matrix, select,
+        };
+        let (setup, _) = self.dynamic_state()?;
+        let automorphisms =
+            lut_automorphisms(self.parameters, setup.automorphisms(), level, table)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.data)?;
+        let layout = table.input_layout();
+        let representation = table.output_representation();
+        let columns = self.parameters.component_columns(level)?;
+        let coefficient = |k: IntExpr| {
+            EncodingLowering::lut_coefficient(
+                self.parameters,
+                level,
+                layout,
+                representation,
+                k,
+                values.clone(),
+            )
+        };
+        let identity = scalar_action(self.parameters, level, coefficient(IntExpr::constant(1))?)?;
+        let mut sum = scalar_action_matrix(key.clone(), &identity);
+        let switched = automorphisms[1..].to_vec();
+        if switched.is_empty() {
+            return Ok((sum, Vec::new()));
+        }
+        let plan = crate::rns_bgg::dynamic::radix_plan(setup, &switched)?;
+        let split = |row: &Mat| super::split_row(row, columns);
+        let schema = |_| DslError::Schema;
+        let public_rows = super::automorphism_public_rows(self.parameters, level)?;
+        let input_rows = [&key.0, &key.1].map(super::join_row);
+        let mut parents: Vec<mxx_dsl::Family<RnsBggMatrix>> = Vec::new();
+        let mut published = Vec::new();
+        let product = |rows: &[[Mat; 2]], k: IntExpr, inverse: IntExpr| {
+            let tag = setup.package_tag(&RnsBggPackage::Automorphism(k.clone()));
+            super::companion_block(
+                self.parameters,
+                level,
+                columns,
+                rows.len(),
+                &|branch, r, a| {
+                    Ok(super::row_entry(&rows[branch][r], a).ring_automorphism(k.clone()))
+                },
+                Some(&|a, j| {
+                    super::companion_key(
+                        self.parameters,
+                        setup,
+                        level,
+                        self.hash_key.clone(),
+                        &tag,
+                        a,
+                        j,
+                    )
+                }),
+                None,
+                Some((public_rows, &|| {
+                    automorphism_public_top(
+                        self.parameters,
+                        setup,
+                        self.hash_key.clone(),
+                        k.clone(),
+                        inverse.clone(),
+                    )
+                })),
+            )
+        };
+        let finish = |depth: &crate::rns_bgg::dynamic::RadixDepth,
+                      b: IntExpr,
+                      product: &[Mat]|
+         -> Result<(RnsBggMatrix, RnsBggMatrix), RnsBggError> {
+            let k = select(&depth.switches, b.clone());
+            let public = setup.helper_key(self.parameters, self.hash_key.clone(), k)?;
+            let actions = super::column_action(
+                self.parameters,
+                level,
+                level,
+                &(split(&product[0]), split(&product[1])),
+                columns,
+                vec![super::join_row(&public.0), super::join_row(&public.1)],
+            )?;
+            let switched = (split(&actions[0]), split(&actions[1]));
+            let action =
+                scalar_action(self.parameters, level, coefficient(select(&depth.branches, b))?)?;
+            let term = scalar_action_matrix(switched.clone(), &action);
+            Ok((switched, term))
+        };
+        for (depth_index, depth) in plan.iter().enumerate() {
+            if depth.internal == 0 {
+                continue;
+            }
+            let family = mxx_dsl::parallel(depth.internal, |position| {
+                let b = position.expression()?;
+                let rows = if depth_index == 0 {
+                    input_rows.clone()
+                } else {
+                    let key = parents[depth_index - 1]
+                        .at(Int::evaluate(select(&depth.parents, b.clone())));
+                    [super::join_row(&key.0), super::join_row(&key.1)]
+                };
+                let product = product(
+                    &[rows],
+                    select(&depth.switches, b.clone()),
+                    select(
+                        &depth
+                            .switches
+                            .iter()
+                            .map(|k| setup.automorphism_inverse(*k))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(schema)?,
+                        b.clone(),
+                    ),
+                )
+                .map_err(schema)?;
+                let (switched, term) = finish(depth, b, &product).map_err(schema)?;
+                Ok((product[0].clone(), product[1].clone(), switched, term))
+            })
+            .map_err(graph)?;
+            parents.push(family.field(|(_, _, switched, _)| switched).map_err(graph)?);
+            let terms = family.field(|(_, _, _, term)| term).map_err(graph)?;
+            sum = super::add_public_matrices(
+                sum,
+                crate::rns_bgg::member_sum(&terms, depth.internal, super::add_public_matrices)?,
+            );
+            published.push(super::BranchKeys {
+                group: super::BranchGroup::Internal { depth: depth_index },
+                rows: [
+                    family.field(|(top, _, _, _)| top).map_err(graph)?,
+                    family.field(|(_, bottom, _, _)| bottom).map_err(graph)?,
+                ],
+            });
+        }
+        for (group_index, group) in
+            crate::rns_bgg::dynamic::leaf_members(&plan).into_iter().enumerate()
+        {
+            let family = mxx_dsl::parallel(group.switches.len(), |member| {
+                let member = member.expression()?;
+                let rows = group
+                    .depths
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, d)| {
+                        if *d == 0 {
+                            input_rows.clone()
+                        } else {
+                            let b = select(&group.positions[slot], member.clone());
+                            let key =
+                                parents[d - 1].at(Int::evaluate(select(&plan[*d].parents, b)));
+                            [super::join_row(&key.0), super::join_row(&key.1)]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let products = product(
+                    &rows,
+                    select(&group.switches, member.clone()),
+                    select(
+                        &group
+                            .switches
+                            .iter()
+                            .map(|k| setup.automorphism_inverse(*k))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(schema)?,
+                        member.clone(),
+                    ),
+                )
+                .map_err(schema)?;
+                let mut terms = Vec::new();
+                for (slot, d) in group.depths.iter().enumerate() {
+                    let b = select(&group.positions[slot], member.clone());
+                    terms.push(
+                        finish(&plan[*d], b, &products[2 * slot..2 * slot + 2]).map_err(schema)?.1,
+                    );
+                }
+                let term = terms.into_iter().reduce(super::add_public_matrices).unwrap();
+                Ok((products, term))
+            })
+            .map_err(graph)?;
+            let terms = family.field(|(_, term)| term).map_err(graph)?;
+            sum = super::add_public_matrices(
+                sum,
+                crate::rns_bgg::member_sum(
+                    &terms,
+                    group.switches.len(),
+                    super::add_public_matrices,
+                )?,
+            );
+            for slot in 0..group.depths.len() {
+                published.push(super::BranchKeys {
+                    group: super::BranchGroup::Leaf { group: group_index, slot },
+                    rows: [
+                        family.field(|(rows, _)| rows[2 * slot].clone()).map_err(graph)?,
+                        family.field(|(rows, _)| rows[2 * slot + 1].clone()).map_err(graph)?,
+                    ],
+                });
+            }
+        }
+        Ok((sum, published))
+    }
+
     /// Record the public action of a Dynamic site at root scope for
     /// preprocessing to publish (see [`super::public_action_role`]); a site
     /// in a family body has one value per member, and online evaluation
@@ -656,7 +867,7 @@ impl<'a> PublicKeyLowering<'a> {
     fn record_public_action(
         &mut self,
         key: &RnsBggMatrix,
-        branches: Option<[Mat; 2]>,
+        branches: Vec<super::BranchKeys>,
     ) -> Result<(), RnsBggError> {
         let output = self.output()?;
         if self.program.root_private_sites().contains(&output) {
@@ -954,7 +1165,7 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             self.parameters.dynamic_route(level)?;
             self.parameters.dynamic_route(self.workload.level(self.output()?)?)?;
             let key = self.dynamic_mul_key(level, &input.matrix, rhs)?;
-            self.record_public_action(&key, None)?;
+            self.record_public_action(&key, Vec::new())?;
             return Ok(RnsBggPublicKey::new(self.output()?, key));
         }
         let streamed = self.streamed_rhs_member(rhs)?;
@@ -1035,13 +1246,19 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             // is a finished public encoding.
             let (result, branches) = if public {
                 self.parameters.dynamic_route(source_level)?;
-                (self.dynamic_public_lut_key(source_level, &input.matrix, table)?, None)
+                (self.dynamic_public_lut_key(source_level, &input.matrix, table)?, Vec::new())
             } else {
                 let normalized =
                     source_level + usize::from(table.output_representation().is_coefficient());
                 self.parameters
                     .dynamic_route(normalized.max(self.workload.level(self.output()?)?))?;
-                self.dynamic_lut_key(source_level, &input.matrix, table)?
+                // A root site publishes its branch keys and streams them; a site in a family body
+                // publishes nothing and builds its key whole.
+                if self.program.root_private_sites().contains(&self.output()?) {
+                    self.streamed_dynamic_lut_key(source_level, &input.matrix, table)?
+                } else {
+                    (self.dynamic_lut_key(source_level, &input.matrix, table)?.0, Vec::new())
+                }
             };
             self.record_public_action(&result, branches)?;
             return self.finish_lut(lut_id, source_level, result);

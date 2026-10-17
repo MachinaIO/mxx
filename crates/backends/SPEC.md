@@ -25,7 +25,7 @@ passed to the next GPU program without copying them to the host.
 
 **Plan (GPU only).** Before a program first runs on a GPU, the runtime builds a *plan*. The plan
 fixes how much parallelism to use (how many loop iterations and matrix columns are processed at
-once) and when GPU memory is allocated and freed, and compiles the program into CUDA Graphs.
+once) and when GPU memory is allocated and freed, and compiles the program into GPU graph regions.
 Planning tries several degrees of parallelism, discards those that do not fit in GPU memory, and
 keeps the fastest. After that, the plan runs any number of times on new inputs without being
 planned again.
@@ -101,6 +101,15 @@ store)` removes the staged members afterwards.
 
 ## 4. Running on GPUs (`gpu` feature)
 
+The native backend is selected at build time by `MXX_GPU_BACKEND=cuda|hip`; CUDA is the
+default. This leaves the `gpu` feature and Rust calls below unchanged. HIP requires ROCm/HIP
+and an explicit `HIP_ARCH`; `HIPCC` and `ROCM_PATH` select its toolchain. CPU builds do not
+require a GPU SDK. See [backend selection and validation evidence](README.md#gpu-backend-selection).
+CUDA uses native conditional graphs. HIP schedules reusable graph regions after reading
+GPU-produced control records at D2H boundaries, and measurements must include that cost.
+Native subgraph callers use `crates/backends/gpu/include/SubgraphKernel.h`; backend-specific
+plan identity must not be reused across CUDA/HIP builds, while canonical artifacts are portable.
+
 ### 4.1 Backend and runtime
 
 | Call | Meaning |
@@ -163,7 +172,7 @@ program.
 | --- | --- | --- | --- |
 | `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 | The most parallel-loop iterations one wave runs. |
 | `measurement_warmups`, `measurement_iterations` | `MXX_GPU_MEASUREMENT_WARMUPS`, `MXX_GPU_MEASUREMENT_ITERATIONS` | 1, 2 | Trials per candidate during planning. |
-| `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset | Waves of each root wave group (and iterations of each root host-driven loop) that `plan_with_store` executes with artifact I/O to add an I/O-inclusive estimate to the report. A host or file store always runs this trial, with 2 waves when unset; a GPU-resident store runs it only when set. |
+| `io_trial` | `MXX_GPU_IO_TRIAL` | false | Enable an artifact I/O trial for GPU-resident stores. Host and file stores always run it. Each root group measures one cold and one steady wave or iteration (only one for count-one groups). |
 | `integer_input_ranges` | (code only) | empty | Declared value ranges of host integer inputs. |
 | `subgraph_kernels` | (code only) | empty | Native kernels that replace named subgraphs on the GPU. |
 | — | `MXX_GPU_MEMORY_FRACTION` | 0.8 | The fraction of each GPU's memory one plan may use. |

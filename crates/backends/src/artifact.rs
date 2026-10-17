@@ -294,7 +294,14 @@ pub struct FileArtifactStore {
     /// read context. Member reads retain their own descriptor/codec checks.
     finalized_snapshot: Option<(ProductionId, Manifest)>,
     raw_stages: BTreeMap<ArtifactKey, FileRawStage>,
+    /// The committed artifacts of each open session: its session file's list plus its
+    /// append-only commit log, loaded once, so a commit costs one log append rather than a
+    /// rewrite of the whole session.
+    committed: BTreeMap<ProductionId, BTreeMap<ArtifactKey, CommittedDescriptor>>,
 }
+
+/// The descriptor a committed artifact was stored with.
+type CommittedDescriptor = (ArtifactType, ArtifactAvailability, Option<String>);
 
 /// Descriptive alias for callers that prefer the storage medium in the name.
 pub type FilesystemArtifactStore = FileArtifactStore;
@@ -347,6 +354,7 @@ impl FileArtifactStore {
             loads: BTreeMap::new(),
             finalized_snapshot: None,
             raw_stages: BTreeMap::new(),
+            committed: BTreeMap::new(),
         })
     }
 
@@ -383,6 +391,40 @@ impl FileArtifactStore {
 
     fn session_path(&self, production: &ProductionId) -> PathBuf {
         self.production_dir(production).join("session.bin")
+    }
+
+    /// The append-only log of a session's commits, one JSON record per line, merged into the
+    /// session file at finalization.
+    fn commits_path(&self, production: &ProductionId) -> PathBuf {
+        self.production_dir(production).join("commits.jsonl")
+    }
+
+    /// The committed artifacts of the open session `production` (see [`Self::committed`]).
+    fn committed_artifacts(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<&mut BTreeMap<ArtifactKey, CommittedDescriptor>, FileArtifactError> {
+        if !self.committed.contains_key(production) {
+            let session = self.session(production)?;
+            let mut committed = session.committed_artifacts.into_iter().collect::<BTreeMap<_, _>>();
+            let path = self.commits_path(production);
+            if path.exists() {
+                let bytes = fs::read(&path)
+                    .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+                for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+                    let (key, expected): (ArtifactKey, CommittedDescriptor) =
+                        serde_json::from_slice(line).map_err(|source| {
+                            FileArtifactError::Decode {
+                                path: path.clone(),
+                                message: source.to_string(),
+                            }
+                        })?;
+                    committed.insert(key, expected);
+                }
+            }
+            self.committed.insert(production.clone(), committed);
+        }
+        Ok(self.committed.get_mut(production).unwrap())
     }
 
     fn lock_path(&self, production: &ProductionId) -> PathBuf {
@@ -1284,6 +1326,7 @@ impl SessionStore for FileArtifactStore {
         if self.active_sessions.contains(production) {
             self.release_session(production)?;
         }
+        self.committed.remove(production);
         let directory = self.production_dir(production);
         match fs::remove_dir_all(&directory) {
             Ok(()) => Ok(()),
@@ -1356,19 +1399,32 @@ impl SessionStore for FileArtifactStore {
         {
             return Err(FileArtifactError::DescriptorMismatch(handle.key.clone()));
         }
-        let mut session = self.session(&handle.key.production)?;
         let expected = (handle.artifact_type.clone(), handle.availability, handle.layout.clone());
-        match session.committed_artifacts.iter().position(|(key, _)| key == &handle.key) {
-            None => session.committed_artifacts.push((handle.key.clone(), expected)),
-            Some(position) if session.committed_artifacts[position].1 == expected => return Ok(()),
+        let committed = self.committed_artifacts(&handle.key.production)?;
+        match committed.get(&handle.key) {
+            Some(existing) if *existing == expected => return Ok(()),
             Some(_) => return Err(FileArtifactError::DescriptorMismatch(handle.key.clone())),
+            None => {}
         }
-        self.store_session(&session)
+        committed.insert(handle.key.clone(), expected.clone());
+        let path = self.commits_path(&handle.key.production);
+        let mut line = serde_json::to_vec(&(&handle.key, &expected))
+            .map_err(|error| FileArtifactError::Encode(error.to_string()))?;
+        line.push(b'\n');
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+        log.write_all(&line)
+            .and_then(|()| log.sync_data())
+            .map_err(|source| FileArtifactError::Io { path, source })
     }
 
     fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
         let production = manifest.production_id.clone();
         self.ensure_session_mutable(&production)?;
+        let committed = self.committed_artifacts(&production)?.clone();
         let mut session = self.session(&production)?;
         let mut expected_keys = BTreeSet::new();
         for (name, artifact) in &manifest.artifacts {
@@ -1380,12 +1436,7 @@ impl SessionStore for FileArtifactStore {
                     artifact.availability,
                     artifact.layout.clone(),
                 );
-                if session
-                    .committed_artifacts
-                    .iter()
-                    .find_map(|(stored_key, value)| (stored_key == &key).then_some(value)) !=
-                    Some(&expected)
-                {
+                if committed.get(&key) != Some(&expected) {
                     Err(FileArtifactError::UncommittedArtifact(key))
                 } else {
                     Ok(())
@@ -1402,14 +1453,21 @@ impl SessionStore for FileArtifactStore {
                 None => check_index(None)?,
             }
         }
-        if let Some((key, _)) =
-            session.committed_artifacts.iter().find(|(key, _)| !expected_keys.contains(key))
-        {
+        if let Some(key) = committed.keys().find(|key| !expected_keys.contains(key)) {
             return Err(FileArtifactError::UnexpectedCommittedArtifact(key.clone()));
         }
         self.store_manifest(manifest)?;
+        session.committed_artifacts = committed.into_iter().collect();
         session.status = SessionStatus::Finalized;
-        self.store_session(&session)
+        self.store_session(&session)?;
+        self.committed.remove(&production);
+        let log = self.commits_path(&production);
+        match fs::remove_file(&log) {
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                Err(FileArtifactError::Io { path: log, source })
+            }
+            _ => Ok(()),
+        }
     }
 
     fn load_finalized_manifest(

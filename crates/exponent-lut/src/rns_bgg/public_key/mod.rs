@@ -139,7 +139,7 @@ pub struct PublicKeyLowering<'a> {
     /// Dynamic: the public action of every root-scope `MulPrivate` and
     /// `Lut` site, its output key and a LUT's product keys `T_k`, which
     /// preprocessing publishes for online evaluation to import.
-    pub(crate) public_actions: BTreeMap<WireId, (RnsBggMatrix, Option<[Mat; 2]>)>,
+    pub(crate) public_actions: BTreeMap<WireId, (RnsBggMatrix, Vec<super::BranchKeys>)>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.
     parallel_bodies: Vec<(IntExpr, IntExpr, Vec<(RhsId, RnsBggMatrix)>)>,

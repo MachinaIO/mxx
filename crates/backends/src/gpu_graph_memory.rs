@@ -56,7 +56,8 @@ mod gpu_body_scratch;
 use crate::{
     backend::{BoundStorage, GpuResidentValue, poly_gpu::GpuDcrtBackend},
     gpu_execution_plan::{
-        CompiledGpuOp, KernelArg, PhysicalEncoding, PhysicalValue, PhysicalValueId, StorageRef,
+        CompiledGpuOp, GpuNativePrimitive, KernelArg, PhysicalEncoding, PhysicalValue,
+        PhysicalValueId, StorageRef,
     },
     gpu_physical_lowering::{PhysicalFrame, matrix_physical_value},
     matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
@@ -78,6 +79,9 @@ pub(crate) struct GpuDeferredScratch {
     /// A full matrix, a compact bounded matrix, or an address-bound byte allocation.
     ty: ConcreteWireType,
     device: i32,
+    /// A later wave's member of a parallel loop output, which the host binds
+    /// for its wave: it holds memory from its loop to the family's last read.
+    replayed: bool,
 }
 
 /// Whether `bound` has no memory yet: its allocation is deferred to
@@ -104,7 +108,23 @@ pub(crate) fn deferred_scratch_storage(
         device,
         address: placeholder_address(),
         bytes,
-        owner: Arc::new(GpuDeferredScratch { ty, device }),
+        owner: Arc::new(GpuDeferredScratch { ty, device, replayed: false }),
+    }
+}
+
+/// Storage of `bytes` for a later wave's member of a parallel loop output of
+/// type `ty` on `device`. Its memory is a range of the plan's arena, live from
+/// the loop to the last read of the member.
+pub(crate) fn deferred_replay_storage(
+    device: i32,
+    ty: ConcreteWireType,
+    bytes: u64,
+) -> BoundStorage {
+    BoundStorage {
+        device,
+        address: placeholder_address(),
+        bytes,
+        owner: Arc::new(GpuDeferredScratch { ty, device, replayed: true }),
     }
 }
 
@@ -121,7 +141,7 @@ pub(crate) fn deferred_scratch_compact(
         device,
         address: placeholder_address(),
         bytes: u64::try_from(payload_bytes).map_err(|_| "GPU compact scratch size exceeds u64")?,
-        owner: Arc::new(GpuDeferredScratch { ty, device }),
+        owner: Arc::new(GpuDeferredScratch { ty, device, replayed: false }),
     };
     GpuResidentValue::new(Arc::new(physical), BTreeMap::from([(storage, bound)]), Box::new([]))
         .map(Arc::new)
@@ -173,7 +193,11 @@ pub(crate) fn deferred_scratch_matrix(
         device: limb_device,
         address: placeholder_address(),
         bytes: u64::try_from(data_bytes).map_err(|_| "GPU scratch size exceeds u64")?,
-        owner: Arc::new(GpuDeferredScratch { ty: ConcreteWireType::Matrix(ty.clone()), device }),
+        owner: Arc::new(GpuDeferredScratch {
+            ty: ConcreteWireType::Matrix(ty.clone()),
+            device,
+            replayed: false,
+        }),
     };
     let resident = GpuResidentValue::new(
         Arc::new(physical.clone()),
@@ -232,24 +256,6 @@ fn visit_node(
     op: &CompiledGpuOp,
     each: &mut dyn FnMut(PhysicalValueId, bool),
 ) -> Result<(), String> {
-    if matches!(
-        frame.program.implementations.resolve(op.implementation).map_err(str::to_owned)?.primitive,
-        crate::gpu_execution_plan::GpuNativePrimitive::MatrixIndexedCopy
-    ) {
-        let Some(KernelArg::U32(resource)) = op.arguments.first() else {
-            return Err("GPU indexed copy has no table resource".into());
-        };
-        let table = frame
-            .indexed_tables
-            .get(*resource as usize)
-            .filter(|table| table.resource_id == *resource)
-            .ok_or("GPU indexed copy table is absent")?;
-        // The kernel reads through a pointer table rather than Value arguments.
-        // Every candidate must survive this read, but need not survive the plan.
-        for &(id, _) in &table.candidates {
-            each(id, false);
-        }
-    }
     for argument in op.arguments.iter() {
         if let KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) = argument {
             each(*id, false);
@@ -257,6 +263,49 @@ fn visit_node(
     }
     for output in op.outputs.iter() {
         each(*output, true);
+    }
+    // Pointer-table operands are reads too. In particular, later waves'
+    // family members may use the arena even when scratch_protected excludes
+    // their views from region pools. Omitting these reads lets another wave
+    // reuse a member's bytes before its last dynamic selection.
+    let mut indexed_read = |resource: u32| -> Result<(), String> {
+        let table = frame
+            .indexed_tables
+            .get(resource as usize)
+            .filter(|table| table.resource_id == resource)
+            .ok_or("GPU scratch read has no indexed matrix table")?;
+        for &(id, _) in &table.candidates {
+            each(id, false);
+        }
+        Ok(())
+    };
+    match frame.program.implementations.resolve(op.implementation)?.primitive {
+        GpuNativePrimitive::MatrixIndexedCopy => {
+            let Some(KernelArg::U32(resource)) = op.arguments.first() else {
+                return Err("GPU indexed copy has no table resource".into());
+            };
+            indexed_read(*resource)?;
+        }
+        GpuNativePrimitive::SubgraphKernel => {
+            for operand in op.arguments.get(6..).unwrap_or_default().chunks_exact(4) {
+                if let [KernelArg::U32(1), _, KernelArg::U32(resource), _] = operand {
+                    indexed_read(*resource)?;
+                }
+            }
+        }
+        GpuNativePrimitive::HashSample => {
+            let Some(KernelArg::U32(resource)) = op.arguments.first() else {
+                return Err("GPU hash sample has no tag resource".into());
+            };
+            let spec = frame
+                .hash_resources
+                .get(resource)
+                .ok_or("GPU scratch read has no hash tag resource")?;
+            for &(id, _, _) in spec.operands.iter() {
+                each(id, false);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -298,9 +347,18 @@ fn rebind(
     replacements: &BTreeMap<*const (), BoundStorage>,
 ) -> Result<(), String> {
     for owner in owners.values_mut() {
-        if let Some(rebound) = rebound(owner, replacements)? {
-            *owner = Arc::new(rebound);
-        }
+        rebind_owner(owner, replacements)?;
+    }
+    Ok(())
+}
+
+/// Materialize a replay destination using the same allocation spans as its views.
+fn rebind_owner(
+    owner: &mut Arc<GpuResidentValue>,
+    replacements: &BTreeMap<*const (), BoundStorage>,
+) -> Result<(), String> {
+    if let Some(rebound) = rebound(owner, replacements)? {
+        *owner = Arc::new(rebound);
     }
     Ok(())
 }
@@ -332,28 +390,31 @@ pub(crate) fn plan_graph_scratch(
     }
     let mut groups = BTreeMap::<*const (), Group>::new();
     let mut group_of = BTreeMap::<PhysicalValueId, BTreeSet<*const ()>>::new();
-    let mut collect =
-        |id: PhysicalValueId, owner: &GpuResidentValue, eligible: bool, packable: bool| {
-            for (_, bound) in owner.storages() {
-                if !bound.owner.is::<GpuDeferredScratch>() {
-                    continue;
-                }
-                let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
-                let group = groups.entry(pointer).or_insert_with(|| Group {
-                    placeholder: bound.clone(),
-                    members: Vec::new(),
-                    eligible: true,
-                    packable: true,
-                    references: BTreeSet::new(),
-                    first_write: None,
-                    wave_import: false,
-                });
-                group.members.push(id);
-                group.eligible &= eligible;
-                group.packable &= packable;
-                group_of.entry(id).or_default().insert(pointer);
-            }
-        };
+    let mut collect = |id: PhysicalValueId,
+                       owner: &GpuResidentValue,
+                       eligible: bool,
+                       packable: bool,
+                       host_read: bool| {
+        for (_, bound) in owner.storages() {
+            let Some(deferred) = bound.owner.downcast_ref::<GpuDeferredScratch>() else {
+                continue;
+            };
+            let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+            let group = groups.entry(pointer).or_insert_with(|| Group {
+                placeholder: bound.clone(),
+                members: Vec::new(),
+                eligible: true,
+                packable: true,
+                references: BTreeSet::new(),
+                first_write: None,
+                wave_import: false,
+            });
+            group.members.push(id);
+            group.eligible &= eligible;
+            group.packable &= if deferred.replayed { !host_read } else { packable };
+            group_of.entry(id).or_default().insert(pointer);
+        }
+    };
     for (&id, owner) in frame.owners.iter() {
         let physical = &frame.program.values[id.0 as usize];
         let packable = !frame.scratch_protected.contains(&id);
@@ -369,20 +430,37 @@ pub(crate) fn plan_graph_scratch(
                         PhysicalEncoding::CompactCoeffPerCrtLimb { .. }
                 )
             });
-        collect(id, owner, eligible, packable);
+        collect(
+            id,
+            owner,
+            eligible,
+            packable,
+            frame.output_ids.values().any(|&output| output == id),
+        );
     }
     // Wave bindings are swapped in by the host between launches. They must
     // remain host-addressable, but their persistent arena ranges can be reused
     // outside their widened replay lifetimes.
+    let mut replay_writes = Vec::new();
     for wave in &frame.waves {
         for (&id, owner) in &wave.owner_bindings {
-            collect(id, owner, false, !frame.scratch_protected.contains(&id));
+            let host_read = wave.family_members.values().flatten().any(|&(_, member)| member == id);
+            collect(id, owner, false, !frame.scratch_protected.contains(&id), host_read);
+            for (_, bound) in owner.storages() {
+                if bound.owner.downcast_ref::<GpuDeferredScratch>().is_some_and(|d| d.replayed) {
+                    replay_writes
+                        .push((Arc::as_ptr(&bound.owner).cast::<()>(), wave.body_start as usize));
+                }
+            }
+        }
+        for (_, id, owner) in &wave.nested_owner_bindings {
+            collect(*id, owner, false, false, true);
         }
     }
     // Read-ahead has a separate staging allocation with the same logical destination.
     for body in &frame.external_io_loops {
         for import in &body.ahead {
-            collect(import.template.destination, &import.staging, false, false);
+            collect(import.template.destination, &import.staging, false, false, true);
         }
     }
     for (index, op) in frame.program.operations.iter().enumerate() {
@@ -400,6 +478,12 @@ pub(crate) fn plan_graph_scratch(
                 }
             }
         })?;
+    }
+    for (pointer, start) in replay_writes {
+        if let Some(group) = groups.get_mut(&pointer) {
+            group.references.insert(start);
+            group.first_write = Some(group.first_write.map_or(start, |first| first.min(start)));
+        }
     }
     // A placed import is written by the host from its load site on: every
     // owner of its destination (a wave's read-ahead twin too) spans from
@@ -672,6 +756,9 @@ pub(crate) fn plan_graph_scratch(
     frame.owners.rebind(|_, owner| rebound(owner, &persistent))?;
     for wave in &mut frame.waves {
         rebind(&mut wave.owner_bindings, &persistent)?;
+        for (_, _, owner) in &mut wave.nested_owner_bindings {
+            rebind_owner(owner, &persistent)?;
+        }
     }
     for body in &mut frame.external_io_loops {
         for import in &mut body.ahead {
@@ -1106,6 +1193,100 @@ mod tests {
             assert_eq!(sizes[&0], 3072);
             let graph = overlapping.allocations[0].offset;
             assert!(graph + 1024 <= offsets[0] || offsets[0] + 2048 <= graph);
+        }
+    }
+
+    use crate::{
+        GpuRuntime, MemoryArtifactStore, RuntimeValue,
+        backend::{poly::cpu_backend, poly_gpu::gpu_backend},
+        executor::{ExecutionConfig, execute_in_session},
+        poly::{
+            Poly,
+            dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+        },
+    };
+    use mxx_dsl::{DslContext, HashTag, Int, IntType, Ring, parallel};
+    use mxx_ir_core::ParamEnv;
+
+    /// A later wave's family member must survive intervening waves until
+    /// its last dynamic read, even though the read uses a pointer table.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_replayed_family_survives_late_dynamic_read() {
+        let parameter = |name, default| {
+            std::env::var(name).map_or(default, |value| value.parse::<usize>().unwrap())
+        };
+        let dimension = parameter("MXX_TEST_SCRATCH_RING_DIMENSION", 16) as u32;
+        let columns = parameter("MXX_TEST_SCRATCH_COLUMNS", 4);
+        let count = parameter("MXX_TEST_SCRATCH_MEMBERS", 4);
+        assert!(count >= 2);
+        let params = DCRTPolyParams::new(dimension, 2, 20, 4, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(dimension, params.moduli().to_vec(), 4, None);
+        let ring = Ring::from_crt_moduli(
+            params.moduli().iter().copied().map(Into::into).collect(),
+            dimension,
+        );
+        let context = DslContext::new("late-dynamic-family-read");
+        let selector: Int = context.input("selector", IntType).unwrap();
+        let key = ring.bytes_input("key", 32);
+        let members = parallel(count, |index| {
+            let mut tag = HashTag::from(b"scratch-family".as_slice());
+            tag.push(index);
+            Ok(ring.hash_matrix(key.clone(), tag, (1, columns)))
+        })
+        .unwrap();
+        let mut sum = members.at(selector.clone());
+        for _ in 0..2 {
+            let previous = sum.clone();
+            let work = parallel(count, |index| {
+                let mut tag = HashTag::from(b"scratch-intervening".as_slice());
+                tag.push(index);
+                Ok(previous.clone() + ring.hash_matrix(key.clone(), tag, (1, columns)))
+            })
+            .unwrap();
+            sum = work.at(selector.clone()) + members.at(selector.clone());
+        }
+        let graph = context
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = BTreeMap::from([
+            ("key".into(), RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()))),
+            ("selector".into(), RuntimeValue::Int((count - 1).into())),
+        ]);
+        let expected = execute_in_session(
+            &graph,
+            &mut cpu_backend([params]),
+            inputs.clone(),
+            &mut MemoryArtifactStore::default(),
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+            panic!("matrix output")
+        };
+        let expected = expected.cpu_full_arc().expect("CPU reference matrix");
+        let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), 0.into()..=(count - 1).into());
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &inputs, columns, 1).unwrap();
+        for _ in 0..3 {
+            let actual = runtime.execute(&mut plan, inputs.clone()).unwrap();
+            let actual = runtime.download_matrix_output(&actual.output("sum").unwrap()).unwrap();
+            for column in 0..columns {
+                assert_eq!(
+                    actual.entry(0, column).coeffs_biguints(),
+                    expected.entry(0, column).coeffs_biguints()
+                );
+            }
         }
     }
 }

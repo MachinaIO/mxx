@@ -16,7 +16,7 @@ set_option maxHeartbeats 8000000 in
 theorem keyInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray}
     {U : Fin 2 → ExactMatrix Q N 44 1} {a j : Nat} (ha : a < 44) (_hj : j < 88) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_sequential_generatedRoot_204_11 Backend.backend model tape path
+    (h : Stage_preprocess.sequential_sequential_generatedRoot_330_11 Backend.backend model tape path
       params a j (s.1, s.2.1, key, U 0, U 1, ()) t) :
     t.1 = s.1 + (expand (rhsCompKey model key 3 j (44 + a) 0 0) * U 0 +
         expand (rhsCompKey model key 3 j (44 + a) 0 1) * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
@@ -47,7 +47,7 @@ theorem keyInner {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44) (a : Fin 44) {final : KeyRows}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyRows) ↦
-      Stage_preprocess.sequential_sequential_generatedRoot_204_11 Backend.backend model tape
+      Stage_preprocess.sequential_sequential_generatedRoot_330_11 Backend.backend model tape
         (path ++ [11, i]) params a i
         (current.1, (current.2.1, (key, (keyDigits A ⟨44 + a, by omega⟩ 0,
           (keyDigits A ⟨44 + a, by omega⟩ 1, ()))))) next) (Int.toNat 88) (0, (0, ())) final)
@@ -56,7 +56,7 @@ theorem keyInner {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hcount : Int.toNat 88 = 88 := rfl
   rw [hcount] at h
   have hk := fun (proj : KeyRows → ExactMatrix Q N 1 88) (r : Fin 2)
-      (hp : ∀ i s t (hi : i < 88), Stage_preprocess.sequential_sequential_generatedRoot_204_11 Backend.backend
+      (hp : ∀ i s t (hi : i < 88), Stage_preprocess.sequential_sequential_generatedRoot_330_11 Backend.backend
         model tape (path ++ [11, i]) params a i (s.1, (s.2.1, (key, (keyDigits A ⟨44 + a, by omega⟩ 0,
           (keyDigits A ⟨44 + a, by omega⟩ 1, ()))))) t →
         ∀ w, proj t 0 w = proj s 0 w + keyCompanionSum model key 3 A r ⟨i, hi⟩ a *
@@ -91,13 +91,13 @@ theorem keyLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {i : Nat} (hi : i < 44) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_generatedRoot_204 Backend.backend model tape path params i
+    (h : Stage_preprocess.sequential_generatedRoot_330 Backend.backend model tape path params i
       (s.1, s.2.1, key, A0, A1, ()) t) (k : Fin 2) (jj : Fin 88) :
     ![t.1, t.2.1] k 0 jj = ![s.1, s.2.1] k 0 jj + keyCompanionSum model key 3 A k jj ⟨i, hi⟩ := by
   obtain ⟨w, hbody⟩ := h
-  let ctx : Stage_preprocess.sequential_generatedRoot_204.Ctx Backend.backend model tape path params i :=
+  let ctx : Stage_preprocess.sequential_generatedRoot_330.Ctx Backend.backend model tape path params i :=
     ⟨(s.1, s.2.1, key, A0, A1, ()), w⟩
-  have F := Stage_preprocess.sequential_generatedRoot_204.facts ctx hbody
+  have F := Stage_preprocess.sequential_generatedRoot_330.facts ctx hbody
   have hdiv : Int.fdiv (Int.ofNat i) 44 = 0 := by
     rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]; simp only [Int.ofNat_eq_natCast]; omega
   have hrow : Int.fmod (Int.ofNat i) 44 = ((i : Nat) : Int) := by
@@ -117,20 +117,20 @@ theorem keyLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hin := F.c1.h11_1
   rw [hu0, hu1] at hin
   have hblock := keyInner (model := model) (tape := tape) (path := path) A ⟨i, hi⟩ hin k jj
-  have hone : Stage_preprocess.sequential_generatedRoot_204.w_2_0 ctx 0 0 = 1 := by rw [hw2]; simp [unitRow]
-  have ht : ∀ {y z : ExactMatrix Q N 1 88}, tensorRuns (Stage_preprocess.sequential_generatedRoot_204.w_2_0 ctx) y z →
+  have hone : Stage_preprocess.sequential_generatedRoot_330.w_2_0 ctx 0 0 = 1 := by rw [hw2]; simp [unitRow]
+  have ht : ∀ {y z : ExactMatrix Q N 1 88}, tensorRuns (Stage_preprocess.sequential_generatedRoot_330.w_2_0 ctx) y z →
       z 0 jj = y 0 jj := by
     intro y z hyz
-    calc z 0 jj = Stage_preprocess.sequential_generatedRoot_204.w_2_0 ctx 0 0 * y 0 jj :=
+    calc z 0 jj = Stage_preprocess.sequential_generatedRoot_330.w_2_0 ctx 0 0 * y 0 jj :=
           tensorRuns_scalar hyz jj.val jj.isLt
       _ = y 0 jj := by rw [hone, one_mul]
   rw [F.c1.hout]
   fin_cases k
-  · show (matrixAdd s.1 (Stage_preprocess.sequential_generatedRoot_204.w_12_0 ctx)) 0 jj = _
+  · show (matrixAdd s.1 (Stage_preprocess.sequential_generatedRoot_330.w_12_0 ctx)) 0 jj = _
     simp only [matrixAdd, Matrix.add_apply]
     rw [ht F.c1.h12_0]
     exact congrArg _ hblock
-  · show (matrixAdd s.2.1 (Stage_preprocess.sequential_generatedRoot_204.w_15_0 ctx)) 0 jj = _
+  · show (matrixAdd s.2.1 (Stage_preprocess.sequential_generatedRoot_330.w_15_0 ctx)) 0 jj = _
     simp only [matrixAdd, Matrix.add_apply]
     rw [ht F.c1.h15_0]
     exact congrArg _ hblock
@@ -143,7 +143,7 @@ theorem keyLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {init final : KeyRows}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyRows) ↦
-      Stage_preprocess.sequential_generatedRoot_204 Backend.backend model tape (path ++ [204, i]) params i
+      Stage_preprocess.sequential_generatedRoot_330 Backend.backend model tape (path ++ [330, i]) params i
         (current.1, (current.2.1, (key, (A0, (A1, ()))))) next) (Int.toNat 44) init final)
     (k : Fin 2) (jj : Fin 88) :
     ![final.1, final.2.1] k 0 jj = ![init.1, init.2.1] k 0 jj + ∑ a, keyCompanionSum model key 3 A k jj a := by
@@ -163,7 +163,7 @@ set_option maxHeartbeats 8000000 in
 theorem topInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {i0 : Nat} {A0 A1 : ExactMatrix Q N 1 88} {D : ExactMatrix Q N 44 88}
     {i : Nat} (hi : i < 44) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_sequential_generatedRoot_203_12 Backend.backend model tape path
+    (h : Stage_preprocess.sequential_sequential_generatedRoot_329_12 Backend.backend model tape path
       params i0 i (s.1, s.2.1, A0, D, A1, ()) t) (w : Fin 88) :
     t.1 0 w = s.1 0 w + A0 0 ⟨i, by omega⟩ * D ⟨i, hi⟩ w ∧
       t.2.1 0 w = s.2.1 0 w + A1 0 ⟨i, by omega⟩ * D ⟨i, hi⟩ w := by
@@ -192,23 +192,23 @@ set_option maxHeartbeats 16000000 in
 theorem topStep {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_preprocess.Params} {key : ByteArray} {A0 A1 : ExactMatrix Q N 1 88}
     {i : Nat} (hi : i < 1) {s t : KeyRows}
-    (h : Stage_preprocess.sequential_generatedRoot_203 Backend.backend model tape path params i
+    (h : Stage_preprocess.sequential_generatedRoot_329 Backend.backend model tape path params i
       (s.1, s.2.1, A0, key, A1, ()) t) (r : Fin 2) (w : Fin 88) :
     ![t.1, t.2.1] r 0 w = ![s.1, s.2.1] r 0 w + ∑ a : Fin 44, ![A0, A1] r 0 ⟨a, by omega⟩ *
       rowDigits (joinRow ![rhsTop model key 3 0, rhsTop model key 3 1]) a w := by
   obtain ⟨wit, hbody⟩ := h
-  let ctx : Stage_preprocess.sequential_generatedRoot_203.Ctx Backend.backend model tape path params i :=
+  let ctx : Stage_preprocess.sequential_generatedRoot_329.Ctx Backend.backend model tape path params i :=
     ⟨(s.1, s.2.1, A0, key, A1, ()), wit⟩
-  have F := Stage_preprocess.sequential_generatedRoot_203.facts ctx hbody
+  have F := Stage_preprocess.sequential_generatedRoot_329.facts ctx hbody
   have hi0 : i = 0 := by omega
   subst hi0
   have h2 := F.c0.h2_0
   have hw2 := unitRow_window (c := 0) (by simp) h2
-  have e6 : Stage_preprocess.sequential_generatedRoot_203.w_6_0 ctx = rhsTop model key 3 0 := hashSample_eq F.c0.h6_0
-  have e7 : Stage_preprocess.sequential_generatedRoot_203.w_7_0 ctx = rhsTop model key 3 1 := hashSample_eq F.c0.h7_0
+  have e6 : Stage_preprocess.sequential_generatedRoot_329.w_6_0 ctx = rhsTop model key 3 0 := hashSample_eq F.c0.h6_0
+  have e7 : Stage_preprocess.sequential_generatedRoot_329.w_7_0 ctx = rhsTop model key 3 1 := hashSample_eq F.c0.h7_0
   have h8 := F.c0.h8_0
   rw [e6, e7] at h8
-  have e8 : Stage_preprocess.sequential_generatedRoot_203.w_8_0 ctx = joinRow ![rhsTop model key 3 0, rhsTop model key 3 1] :=
+  have e8 : Stage_preprocess.sequential_generatedRoot_329.w_8_0 ctx = joinRow ![rhsTop model key 3 0, rhsTop model key 3 1] :=
     concat_joinRow (r := ![rhsTop model key 3 0, rhsTop model key 3 1]) h8
   have h9 := F.c0.h9_0
   rw [e8] at h9
@@ -219,7 +219,7 @@ theorem topStep {model : HashModel} {tape : SampleTape} {path : List Nat}
   rw [hcount] at hin
   set D := rowDigits (joinRow ![rhsTop model key 3 0, rhsTop model key 3 1]) with hD
   have hacc := fun (proj : KeyRows → ExactMatrix Q N 1 88) (X : ExactMatrix Q N 1 88)
-      (hp : ∀ j (x y : KeyRows) (hj : j < 44), Stage_preprocess.sequential_sequential_generatedRoot_203_12
+      (hp : ∀ j (x y : KeyRows) (hj : j < 44), Stage_preprocess.sequential_sequential_generatedRoot_329_12
         Backend.backend model tape (path ++ [12, j]) params 0 j (x.1, (x.2.1, (A0, (D, (A1, ()))))) y →
         proj y 0 w = proj x 0 w + X 0 ⟨j, by omega⟩ * D ⟨j, hj⟩ w) ↦
     IterRuns.accumulate (fun x : KeyRows ↦ proj x 0 w)
@@ -235,21 +235,21 @@ theorem topStep {model : HashModel} {tape : SampleTape} {path : List Nat}
   obtain ⟨f1, -⟩ := hacc (fun x ↦ x.2.1) A1 (fun j x y hj hb ↦ (topInner_step hj hb w).2)
   dsimp only at f0 f1
   rw [hsum] at f0 f1
-  have hone : Stage_preprocess.sequential_generatedRoot_203.w_2_0 ctx 0 0 = 1 := by rw [hw2]; simp [unitRow]
-  have ht : ∀ {y z : ExactMatrix Q N 1 88}, tensorRuns (Stage_preprocess.sequential_generatedRoot_203.w_2_0 ctx) y z →
+  have hone : Stage_preprocess.sequential_generatedRoot_329.w_2_0 ctx 0 0 = 1 := by rw [hw2]; simp [unitRow]
+  have ht : ∀ {y z : ExactMatrix Q N 1 88}, tensorRuns (Stage_preprocess.sequential_generatedRoot_329.w_2_0 ctx) y z →
       z 0 w = y 0 w := by
     intro y z hyz
-    calc z 0 w = Stage_preprocess.sequential_generatedRoot_203.w_2_0 ctx 0 0 * y 0 w :=
+    calc z 0 w = Stage_preprocess.sequential_generatedRoot_329.w_2_0 ctx 0 0 * y 0 w :=
           tensorRuns_scalar hyz w.val w.isLt
       _ = y 0 w := by rw [hone, one_mul]
   rw [F.c0.hout]
   fin_cases r
-  · show (matrixAdd s.1 (Stage_preprocess.sequential_generatedRoot_203.w_13_0 ctx)) 0 w = _
+  · show (matrixAdd s.1 (Stage_preprocess.sequential_generatedRoot_329.w_13_0 ctx)) 0 w = _
     simp only [matrixAdd, Matrix.add_apply]
     rw [ht F.c0.h13_0, f0]
     simp
     rfl
-  · show (matrixAdd s.2.1 (Stage_preprocess.sequential_generatedRoot_203.w_16_0 ctx)) 0 w = _
+  · show (matrixAdd s.2.1 (Stage_preprocess.sequential_generatedRoot_329.w_16_0 ctx)) 0 w = _
     simp only [matrixAdd, Matrix.add_apply]
     rw [ht F.c0.h16_0, f1]
     simp

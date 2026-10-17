@@ -22,7 +22,7 @@
 // add its products with both key rows into a 64-bit product accumulator.
 // Each block has N / 4 threads running radix-4 register-blocked NTT passes.
 
-#include "SubgraphKernel.cuh"
+#include "SubgraphKernel.h"
 
 #include <cooperative_groups.h>
 

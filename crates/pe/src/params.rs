@@ -87,14 +87,18 @@ pub struct PeParameterRequest {
     pub lattice_security_bits: Option<u64>,
 }
 
+/// Serialization restores internal handles written by this crate; referenced store
+/// productions must remain available. It is not an untrusted-input format.
+///
 /// Validated scheme parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PeParameters {
     class: PeClass,
     rns: RnsBggParameters,
     trapdoor_sigma: f64,
     instantiation: TrapdoorInstantiation,
     error: RnsBggGaussian,
+    #[serde(with = "decimal_string")]
     key_width: BigDecimal,
     key_cutoff: BigUint,
     anchor_columns: usize,
@@ -780,5 +784,17 @@ mod tests {
         assert_eq!(width_16.level().ring_dimension(), 16);
         assert!(width_16.clone().with_lut_radix(2).is_err());
         assert_eq!(width_16.with_lut_radix(16).unwrap().lut_radix(), None);
+    }
+}
+
+// Preserve decimal widths exactly without requiring BigDecimal's optional serde feature.
+mod decimal_string {
+    use bigdecimal::BigDecimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &BigDecimal, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BigDecimal, D::Error> {
+        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
     }
 }

@@ -37,6 +37,7 @@ impl GpuDcrtBackend {
         &self,
         validated: &ValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
+        kernels: &[crate::gpu_subgraph_kernel::GpuSubgraphKernel],
     ) -> Result<GpuPlanContract, String> {
         let mut shape_descriptor = Vec::new();
         let mut expected_names = BTreeSet::new();
@@ -71,8 +72,28 @@ impl GpuDcrtBackend {
         }
         let graph_specification_hash =
             spec_hash(&validated.source, &validated.bindings).map_err(|error| error.to_string())?.0;
-        let shape_contract_hash =
-            hash_canonical(&shape_descriptor).map_err(|error| error.to_string())?;
+        for kernel in kernels {
+            kernel.build_identity.validate_current()?;
+        }
+        let kernel_descriptor = kernels
+            .iter()
+            .map(|kernel| {
+                (
+                    &kernel.name,
+                    &kernel.build_identity,
+                    &kernel.inputs,
+                    &kernel.outputs,
+                    &kernel.parameters,
+                    kernel.scratch_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let shape_contract_hash = hash_canonical(&(
+            &shape_descriptor,
+            &kernel_descriptor,
+            crate::gpu_execution_plan::GpuControlExecution::current(),
+        ))
+        .map_err(|error| error.to_string())?;
         let logical_to_physical_devices = self
             .physical_device_ids()
             .into_iter()
@@ -86,7 +107,7 @@ impl GpuDcrtBackend {
             logical_to_physical_devices,
             device_budgets: self.runtime_device_budgets().map_err(|error| error.to_string())?,
             shape_contract_hash,
-            backend_revision: env!("CARGO_PKG_VERSION").to_owned(),
+            backend_revision: env!("MXX_NATIVE_KERNEL_BUILD_REVISION").to_owned(),
         };
         contract.validate().map_err(|error| error.to_string())?;
         Ok(contract)

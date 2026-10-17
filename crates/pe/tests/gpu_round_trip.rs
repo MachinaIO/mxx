@@ -31,7 +31,8 @@
 //! `test_gpu_pe_time_window` runs the time window predicate of the implementation specification
 //! (`BranchingProgram::time_window` for `[0900, 1759]`, class `PeClass::decimal_range(4)`) on its
 //! test vectors with the same parameter search, and exports the same claim with `LEAN_EXPORT`
-//! (and `EXPORT_ONLY`).
+//! (and `EXPORT_ONLY`). `test_gpu_pe_date` does the same for the date predicate
+//! (`BranchingProgram::date_range` for `[01-15, 03-15]`, class `PeClass::date()`).
 //!
 //! With `MXX_PE_ROUND_TRIP_LEAN_EXPORT=<parameter id>`, `test_gpu_pe_round_trip` exports the Lean
 //! correctness claim of the executed graphs to `lean/<parameter id>/generated`. The claim does not
@@ -54,14 +55,25 @@
 //! | `NOISE_MODEL`, `FAILURE_EXPONENT` | `worst`, 128 | Noise model of the correctness check |
 //! | `SECURITY_BITS` | 128 | Required lattice security of the encryption secret |
 //! | `STORAGE` | `device` | Stage artifacts: `device` (matrices in GPU memory, others in host memory), `host`, `file` (a temporary directory), or `file:<directory>` |
-//! | `CRT_DEPTH` | unset | `test_gpu_pe_time_window`: the parameters at this CRT depth and the smallest ring dimension, without the noise simulation and the security estimate (parameters a search already accepted) |
-//! | `SINGLE_TIME` | 0 | `test_gpu_pe_time_window`: 1 encrypts and decrypts once, at a random accepted time of `[0900, 1759]`, instead of every vector of `TIME_VECTORS` |
-//! | `ESTIMATE_FROM` | unset | `test_gpu_pe_time_window`: `encrypt` runs setup and key generation, then only plans the encryption and the online evaluation (`MXX_EXPONENT_LUT_ESTIMATE_ONLY` from then on) |
-//! | `DISCARD_CIPHERTEXTS` | 0 | `test_gpu_pe_time_window` with `file` storage: 1 deletes each vector's ciphertext productions after its decryption, so the store holds one ciphertext at a time |
+//! | `CHECKPOINT` | unset | Date/time predicate workflows: directory of atomic JSON checkpoints; requires persistent `STORAGE=file:<directory>` with the same root on every run. Incompatible with estimates and Lean export. Restores setup, each keygen stage, encryption, and decryption; runtime plans are rebuilt. Contains secret handles and plaintext test messages; retain alongside the store. |
+//! | `CRT_DEPTH` | unset | `test_gpu_pe_time_window`, `test_gpu_pe_date`: the parameters at this CRT depth and the smallest ring dimension, without the noise simulation and the security estimate (parameters a search already accepted) |
+//! | `SINGLE_VECTOR` | 0 | `test_gpu_pe_time_window`, `test_gpu_pe_date`: 1 encrypts and decrypts once, at a random accepted attribute, instead of every test vector |
+//! | `ESTIMATE_FROM` | unset | `test_gpu_pe_time_window`, `test_gpu_pe_date`: `encrypt` runs setup and key generation, then only plans the encryption and the online evaluation (`MXX_EXPONENT_LUT_ESTIMATE_ONLY` from then on); `keygen` runs setup only and plans every later stage |
+//! | `DISCARD_CIPHERTEXTS` | 0 | `test_gpu_pe_time_window`, `test_gpu_pe_date` with `file` storage: 1 deletes each vector's ciphertext productions after its decryption, so the store holds one ciphertext at a time |
+//!
+//! Checkpoint layout: `run.json` binds parameters, class, program data, vectors, and store root;
+//! `setup.json` holds both setup handles and parameters; `keygen.json` is replaced after
+//! preprocessing and helper sampling; `key.json` holds the completed predicate key.
+//! `vectors.json` preserves the selected attributes (including `SINGLE_VECTOR` randomness),
+//! and `vector-<index>-{encryption,decryption}.json` holds each ciphertext with its message
+//! and the decoded result. Writes use a synced temporary file followed by rename. Use one
+//! writer per directory. Completed decryptions are checked and skipped even if their ciphertext
+//! productions were discarded. Full-workflow measurements are omitted in checkpoint mode.
 //!
 //! With `MXX_EXPONENT_LUT_ESTIMATE_ONLY=1` (see `mxx_exponent_lut::gpu_execution`),
-//! `test_gpu_pe_time_window` plans every stage and logs its estimate without executing the stages
-//! with artifact I/O; it stops after planning the first vector's online evaluation.
+//! `test_gpu_pe_time_window` and `test_gpu_pe_date` plan every stage and logs its estimate without
+//! executing the stages with artifact I/O; they stop after planning the first vector's online
+//! evaluation.
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{
@@ -316,13 +328,14 @@ impl StageExecution<StageStore> for GraphOnly {
 }
 
 /// The stage of every graph the authorized workflow executes, by graph name.
-const STAGES: [(&str, &str); 9] = [
+const STAGES: [(&str, &str); 10] = [
     ("mxx-pe/setup-trapdoor", "setup_trapdoor"),
     ("mxx-pe/setup-public", "setup_public"),
     ("rns-bgg-secret", "payload"),
     ("mxx-pe/encrypt-prelude", "prelude"),
     ("rns-bgg-encrypt", "encrypt"),
     ("rns-bgg-preprocess", "preprocess"),
+    ("mxx-pe/keygen-helpers", "keygen_helpers"),
     ("mxx-pe/keygen", "keygen"),
     ("rns-bgg-online-eval", "online_eval"),
     ("mxx-pe/decrypt", "decode"),
@@ -433,7 +446,7 @@ fn report_measurements(graphs: &[Recorded]) {
     for (object, stages) in [
         ("public_key", &["setup_public"][..]),
         ("ciphertext", &["prelude", "encrypt"][..]),
-        ("secret_key", &["keygen"][..]),
+        ("secret_key", &["keygen_helpers", "keygen"][..]),
         ("evaluation_key", &["preprocess"][..]),
     ] {
         let mut size = ArtifactSize::default();
@@ -486,7 +499,7 @@ fn root_inputs(graph: &Graph) -> Vec<String> {
 /// The executed authorized workflow as a closed protocol: setup, payload sampling, the prelude
 /// and the Dynamic encryption, the predicate's preprocessing and key generation, online
 /// evaluation, and decryption, compared with the message. External inputs are the hash key, the
-/// attribute exponents `Bz x_t`, the message bits, the fixed initial-state plaintext `X^0`, and
+/// attribute exponents `Bz x_t`, the message bit, the fixed initial-state plaintext `X^0`, and
 /// the program as the class Program's data (its reads and its `T_max` tables of `W` entries,
 /// read by preprocessing and online evaluation); the requirement checks that the exponents
 /// encode an attribute in the alphabet, that the program is one of the class (intermediate
@@ -512,7 +525,6 @@ fn pe_protocol(
     assert_eq!(graphs.len(), STAGES.len(), "every stage must execute once");
 
     let class = parameters.class();
-    let dimension = parameters.level().ring_dimension() as usize;
     let attributes = class.attribute_length();
     let width = class.state_width();
     let lookup = class.lookup_width();
@@ -563,7 +575,7 @@ fn pe_protocol(
                 hash_key.push(to(&name));
             } else if name == "mxx-pe/attribute-exponents" {
                 exponents.push(to(&name));
-            } else if name == "mxx-pe/message-coefficients" {
+            } else if name == "mxx-pe/message-bit" {
                 message.push(to(&name));
             } else if name.ends_with(".coefficient") {
                 unit.push(to(&name));
@@ -614,7 +626,7 @@ fn pe_protocol(
             .unwrap();
     // The ideal decryption is the message itself.
     let ideal = DslContext::new("pe-message");
-    let bits = ideal.int_family_input("message", dimension);
+    let bits = ideal.int_family_input("message", 1);
     let ideal =
         IdealSpec::new(ideal.output("message", bits).unwrap().build().unwrap().graph).unwrap();
 
@@ -648,7 +660,7 @@ fn pe_protocol(
         ),
         external(
             "message",
-            InputValueContract::Family { count: dimension.into(), element: Box::new(range(0, 1)) },
+            InputValueContract::Family { count: 1u8.into(), element: Box::new(range(0, 1)) },
             message,
         ),
         external("unit_coefficient", range(1, 1), unit),
@@ -760,7 +772,7 @@ fn test_gpu_pe_round_trip() {
 /// The time window predicate of the implementation specification (`impl-spec-time-bp.md`): the key
 /// of [`BranchingProgram::time_window`] for `[0900, 1759]` over [`PeClass::decimal_range`] with
 /// four digits, and one encryption of a random message under each of the specification's test
-/// vectors (see [`time_window_round_trip`]). The class is fixed, so the class variables are
+/// vectors (see [`predicate_round_trip`]). The class is fixed, so the class variables are
 /// ignored; the parameter variables apply. With `LEAN_EXPORT`, it exports the Lean correctness
 /// claim of the authorized workflow (setup, the window's key generation, and the encryption and
 /// decryption of the first vector, `0900`), as [`test_gpu_pe_round_trip`] does; with
@@ -769,13 +781,35 @@ fn test_gpu_pe_round_trip() {
 #[sequential(dcrt_runtime)]
 fn test_gpu_pe_time_window() {
     let window = BranchingProgram::time_window(900, 1759).unwrap();
-    for (attribute, expected) in TIME_VECTORS {
-        assert_eq!(window.evaluate(&attribute).unwrap(), expected, "{attribute:?}");
+    predicate_workflow(
+        &window,
+        &TIME_VECTORS.map(|(attribute, expected)| (attribute.to_vec(), expected)),
+    );
+}
+
+/// The date predicate of the implementation specification (`impl-spec-date-bp.md`): the key of
+/// [`BranchingProgram::date_range`] for `[01-15, 03-15]` over [`PeClass::date`], with the
+/// specification's test vectors, as [`test_gpu_pe_time_window`] runs the time window.
+#[test]
+#[sequential(dcrt_runtime)]
+fn test_gpu_pe_date() {
+    let range = BranchingProgram::date_range((1, 15), (3, 15)).unwrap();
+    predicate_workflow(
+        &range,
+        &DATE_VECTORS.map(|(attribute, expected)| (attribute.to_vec(), expected)),
+    );
+}
+
+/// Check `program` on `vectors` in the clear, then run (or, with `EXPORT_ONLY`, build) its
+/// workflow and export the Lean claim with `LEAN_EXPORT`.
+fn predicate_workflow(program: &BranchingProgram, vectors: &[(Vec<usize>, usize)]) {
+    for (attribute, expected) in vectors {
+        assert_eq!(program.evaluate(attribute).unwrap(), *expected, "{attribute:?}");
     }
     let (graphs, parameters, failure_exponent) = if export_only() {
-        export_graphs(*window.class(), &|_, _, _| window.clone())
+        export_graphs(*program.class(), &|_, _, _| program.clone())
     } else {
-        time_window_round_trip(&window)
+        predicate_round_trip(program, vectors)
     };
     if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
         let directory = lean_directory().join(&id).join("generated");
@@ -800,13 +834,72 @@ const TIME_VECTORS: [([usize; 4], usize); 9] = [
     ([2, 4, 0, 0], 1),
 ];
 
+/// The test vectors of the date range `[01-15, 03-15]` as `(month, day)` and their outputs
+/// `F(x)`: the endpoints, dates inside, then dates outside the range and non-dates (`02-30`,
+/// `02-00`, `00-20`, `13-01`).
+const DATE_VECTORS: [([usize; 2], usize); 12] = [
+    ([1, 15], 0),
+    ([3, 15], 0),
+    ([2, 10], 0),
+    ([2, 29], 0),
+    ([1, 31], 0),
+    ([1, 14], 1),
+    ([3, 16], 1),
+    ([4, 1], 1),
+    ([2, 30], 1),
+    ([2, 0], 1),
+    ([0, 20], 1),
+    ([13, 1], 1),
+];
+
+/// Internal handles only; a checkpoint directory belongs to one run and one writer.
+struct Checkpoints(Option<PathBuf>);
+
+impl Checkpoints {
+    fn load<T: serde::de::DeserializeOwned>(&self, name: &str) -> Option<T> {
+        let path = self.0.as_ref()?.join(format!("{name}.json"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("read {}: {error}", path.display()),
+        };
+        let value = serde_json::from_slice(&bytes).expect("valid internal checkpoint");
+        eprintln!("restored PE {name}");
+        Some(value)
+    }
+
+    fn save(&self, name: &str, value: &impl serde::Serialize) {
+        use std::io::Write;
+        if let Some(root) = &self.0 {
+            let temporary = root.join(format!("{name}.tmp"));
+            let mut file = std::fs::File::create(&temporary).expect("checkpoint temporary file");
+            file.write_all(&serde_json::to_vec(value).expect("serialize checkpoint"))
+                .expect("write checkpoint");
+            file.sync_all().expect("sync checkpoint");
+            std::fs::rename(temporary, root.join(format!("{name}.json")))
+                .expect("publish checkpoint");
+            std::fs::File::open(root).unwrap().sync_all().expect("sync checkpoint directory");
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncryptedVector {
+    message: bool,
+    ciphertext: mxx_pe::PeCiphertext,
+    productions: Vec<PathBuf>,
+}
+
 /// Search the parameters of `window`'s class, then run on the GPU setup, key generation for
-/// `window`, and one encryption of a random message under each vector of [`TIME_VECTORS`] with
-/// its decryption. The accepted times must decrypt their messages; the rejected ones must
-/// complete, and their rounded phases are not constrained. Returns the first execution of every
-/// stage graph (setup, key generation, and the first vector's encryption and decryption: the
-/// authorized workflow), the parameters, and the failure exponent of the noise model.
-fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParameters, Option<u32>) {
+/// `window`, and one encryption of a random message under each of `vectors` with its decryption.
+/// The accepted times must decrypt their messages; the rejected ones must complete, and their
+/// rounded phases are not constrained. Returns the first execution of every stage graph (setup, key
+/// generation, and the first vector's encryption and decryption: the authorized workflow), the
+/// parameters, and the failure exponent of the noise model.
+fn predicate_round_trip(
+    window: &BranchingProgram,
+    vectors: &[(Vec<usize>, usize)],
+) -> (Vec<Recorded>, PeParameters, Option<u32>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -815,7 +908,7 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
         .try_init();
     let class = *window.class();
     let devices = detected_gpu_device_ids();
-    assert!(!devices.is_empty(), "the PE time window round trip needs a CUDA device");
+    assert!(!devices.is_empty(), "the PE predicate round trip needs a CUDA device");
     let started = Instant::now();
     let (parameters, failure_exponent) = match fixed_parameters(class) {
         Some(parameters) => {
@@ -856,9 +949,43 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     ))
     .expect("GPU runtime");
     let (storage, _directory) = storage();
+    let checkpoints = Checkpoints(env::var_os(variable("CHECKPOINT")).map(PathBuf::from));
+    if let Some(root) = &checkpoints.0 {
+        assert!(
+            !estimate &&
+                env::var_os(variable("ESTIMATE_FROM")).is_none() &&
+                env::var_os(variable("LEAN_EXPORT")).is_none(),
+            "checkpointing requires execution without estimates or Lean export"
+        );
+        assert!(
+            env::var(variable("STORAGE")).is_ok_and(|v| v.starts_with("file:") && v.len() > 5),
+            "checkpointing requires persistent STORAGE=file:<directory>"
+        );
+        std::fs::create_dir_all(root).expect("checkpoint directory");
+        let StageStorage::File(store_root) = &storage else { unreachable!() };
+        std::fs::create_dir_all(store_root).expect("store directory");
+        let compiled = class.compile().unwrap();
+        let identity = serde_json::json!({
+            "parameters": parameters.identity(), "class": class,
+            "program": compiled.program().id(), "data": window.data(&compiled).commitment(),
+            "store": std::fs::canonicalize(store_root).unwrap(),
+            "vectors": vectors, "single_vector": count("SINGLE_VECTOR", 0) != 0,
+        });
+        if let Some(saved) = checkpoints.load::<serde_json::Value>("run") {
+            assert_eq!(
+                saved, identity,
+                "checkpoint parameters/class/program/store/vectors mismatch"
+            );
+        } else {
+            checkpoints.save("run", &identity);
+        }
+    }
     let discard = count("DISCARD_CIPHERTEXTS", 0) != 0;
     let productions = match (&storage, discard) {
-        (StageStorage::File(root), true) => Some(root.join("productions")),
+        (StageStorage::File(root), _) => {
+            std::fs::create_dir_all(root).expect("store directory");
+            Some(std::fs::canonicalize(root).unwrap().join("productions"))
+        }
         (_, false) => None,
         _ => panic!("{} needs file storage", variable("DISCARD_CIPHERTEXTS")),
     };
@@ -866,18 +993,55 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
     let mut execution = Recording { inner: &mut runtime, graphs: Vec::new() };
 
     let stage = Instant::now();
-    let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+    let (public_key, master, saved_parameters): (
+        mxx_pe::PePublicKey,
+        mxx_pe::PeMasterSecretKey,
+        PeParameters,
+    ) = checkpoints.load("setup").unwrap_or_else(|| {
+        let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+        let saved = (public_key, master, parameters.clone());
+        checkpoints.save("setup", &saved);
+        saved
+    });
+    assert_eq!(saved_parameters.identity(), parameters.identity(), "setup parameter mismatch");
     eprintln!("setup: {:?}", stage.elapsed());
     report_device_bytes(&store);
+    // `ESTIMATE_FROM=keygen`: setup runs, so key generation, which reads its artifacts, can be
+    // planned; it and every later stage are then only planned.
+    let estimate_from = env::var(variable("ESTIMATE_FROM"));
+    if estimate_from.as_deref() == Ok("keygen") {
+        // SAFETY: set before the key generation stages read it; this test is the only thread
+        // touching the environment.
+        unsafe { env::set_var("MXX_EXPONENT_LUT_ESTIMATE_ONLY", "1") };
+        eprintln!("estimate mode from key generation on: the remaining stages are only planned");
+    }
     let stage = Instant::now();
-    let key = keygen(&public_key, &master, window, &mut execution, &mut store).unwrap();
-    eprintln!("key generation ([0900, 1759]): {:?}", stage.elapsed());
+    let key = checkpoints.load::<mxx_pe::PePredicateKey>("key").unwrap_or_else(|| {
+        let mut progress = checkpoints.load("keygen").unwrap_or_default();
+        let key = mxx_pe::keygen::keygen_resumable(
+            &public_key,
+            &master,
+            window,
+            &mut execution,
+            &mut store,
+            &mut progress,
+            |progress| {
+                checkpoints.save("keygen", progress);
+                Ok(())
+            },
+        )
+        .unwrap();
+        checkpoints.save("key", &key);
+        key
+    });
+    eprintln!("key generation: {:?}", stage.elapsed());
     report_device_bytes(&store);
     // `ESTIMATE_FROM=encrypt`: setup and key generation run, so the encryption and online
     // evaluation that read their artifacts can be planned; those are then only planned.
     let estimate = estimate ||
-        match env::var(variable("ESTIMATE_FROM")).as_deref() {
+        match estimate_from.as_deref() {
             Err(_) => false,
+            Ok("keygen") => true,
             Ok("encrypt") => {
                 // SAFETY: set before the encryption stages read it; this test is the only thread
                 // touching the environment.
@@ -887,31 +1051,74 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
                 );
                 true
             }
-            Ok(value) => panic!("{} must be `encrypt`, got `{value}`", variable("ESTIMATE_FROM")),
+            Ok(value) => {
+                panic!("{} must be `keygen` or `encrypt`, got `{value}`", variable("ESTIMATE_FROM"))
+            }
         };
     let listing = |directory: &PathBuf| -> std::collections::BTreeSet<PathBuf> {
         std::fs::read_dir(directory)
             .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
             .unwrap_or_default()
     };
-    // `SINGLE_TIME=1`: one encryption and decryption, at a random accepted time of the window.
-    let vectors = if count("SINGLE_TIME", 0) != 0 {
-        let minute = 9 * 60 + rand::random::<u32>() as usize % (18 * 60 - 9 * 60);
-        let (hour, minute) = (minute / 60, minute % 60);
-        let attribute = [hour / 10, hour % 10, minute / 10, minute % 10];
-        assert_eq!(window.evaluate(&attribute).unwrap(), 0, "{attribute:?} is accepted");
-        vec![(attribute, 0)]
-    } else {
-        TIME_VECTORS.to_vec()
-    };
-    for (attribute, expected) in vectors {
-        let message =
-            (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-        let before = productions.as_ref().map(listing);
-        let stage = Instant::now();
-        let ciphertext =
-            encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
-        eprintln!("encryption of {attribute:?}: {:?}", stage.elapsed());
+    // `SINGLE_VECTOR=1`: one encryption and decryption, at a random accepted attribute.
+    let vectors = checkpoints.load::<Vec<(Vec<usize>, usize)>>("vectors").unwrap_or_else(|| {
+        let selected = if count("SINGLE_VECTOR", 0) != 0 {
+            let class = *window.class();
+            let accepted = (0..class.alphabet_size().pow(class.attribute_length() as u32))
+                .map(|mut value| {
+                    (0..class.attribute_length())
+                        .map(|_| {
+                            let symbol = value % class.alphabet_size();
+                            value /= class.alphabet_size();
+                            symbol
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|attribute| window.evaluate(attribute).unwrap() == 0)
+                .collect::<Vec<_>>();
+            vec![(accepted[rand::random::<u32>() as usize % accepted.len()].clone(), 0)]
+        } else {
+            vectors.to_vec()
+        };
+        checkpoints.save("vectors", &selected);
+        selected
+    });
+    for (index, (attribute, expected)) in vectors.into_iter().enumerate() {
+        let encryption_name = format!("vector-{index}-encryption");
+        let decryption_name = format!("vector-{index}-decryption");
+        if let Some(decrypted) = checkpoints.load::<bool>(&decryption_name) {
+            let saved: EncryptedVector =
+                checkpoints.load(&encryption_name).expect("encryption checkpoint");
+            if expected == 0 {
+                assert_eq!(decrypted, saved.message);
+            }
+            if discard {
+                for path in saved.productions {
+                    if path.exists() {
+                        std::fs::remove_dir_all(path).expect("discard ciphertext");
+                    }
+                }
+            }
+            continue;
+        }
+        let saved: EncryptedVector = checkpoints.load(&encryption_name).unwrap_or_else(|| {
+            let message = rand::random::<bool>();
+            let before = productions.as_ref().map(listing);
+            let stage = Instant::now();
+            let ciphertext =
+                encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
+            eprintln!("encryption of {attribute:?}: {:?}", stage.elapsed());
+            let created = match (&productions, &before) {
+                (Some(directory), Some(before)) => {
+                    listing(directory).difference(before).cloned().collect()
+                }
+                _ => Vec::new(),
+            };
+            let saved = EncryptedVector { message, ciphertext, productions: created };
+            checkpoints.save(&encryption_name, &saved);
+            saved
+        });
+        let EncryptedVector { message, ciphertext, productions: created } = saved;
         let stage = Instant::now();
         let decrypted = decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store);
         if estimate {
@@ -923,12 +1130,13 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
         eprintln!("decryption of {attribute:?} (F(x) = {expected}): {:?}", stage.elapsed());
         report_device_bytes(&store);
         if expected == 0 {
-            assert_eq!(decrypted, message, "the time {attribute:?} must decrypt the message");
+            assert_eq!(decrypted, message, "the attribute {attribute:?} must decrypt the message");
         }
+        checkpoints.save(&decryption_name, &decrypted);
         // `DISCARD_CIPHERTEXTS=1`: delete the productions this vector's encryption wrote.
-        if let (Some(directory), Some(before)) = (&productions, before) {
-            for created in listing(directory).difference(&before) {
-                std::fs::remove_dir_all(created).expect("discard a ciphertext production");
+        if discard {
+            for path in created {
+                std::fs::remove_dir_all(path).expect("discard a ciphertext production");
             }
         }
     }
@@ -938,7 +1146,13 @@ fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParame
         .into_iter()
         .filter(|record| seen.insert(record.graph.name().to_owned()))
         .collect();
-    report_measurements(&graphs);
+    if checkpoints.0.is_none() {
+        report_measurements(&graphs);
+    } else {
+        eprintln!(
+            "checkpoint mode: full-workflow measurements omitted because restored stages have no runtime plans"
+        );
+    }
     (graphs, parameters, failure_exponent)
 }
 
@@ -1003,10 +1217,9 @@ fn round_trip(
     let attribute = (0..class.attribute_length())
         .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
         .collect::<Vec<_>>();
-    let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+    let message = rand::random::<bool>();
     let stage = Instant::now();
-    let ciphertext =
-        encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+    let ciphertext = encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
     eprintln!("encryption: {:?}", stage.elapsed());
     report_device_bytes(&store);
     let authorized = program(class, &attribute, 0);
@@ -1036,8 +1249,8 @@ fn round_trip(
 
 /// [`round_trip`]'s authorized workflow as graphs only (see [`GraphOnly`]): the parameter search,
 /// then setup, the encryption of a random attribute, and key generation and decryption for an
-/// authorized program, none of them executed. The decryption of the placeholder outputs fails
-/// after its graph is recorded.
+/// authorized program, none of them executed. Decryption consumes a placeholder bit after its
+/// graph is recorded; that value is not a correctness result.
 fn export_graphs(
     class: PeClass,
     program: &dyn Fn(PeClass, &[usize], usize) -> BranchingProgram,
@@ -1081,15 +1294,11 @@ fn export_graphs(
     let attribute = (0..class.attribute_length())
         .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
         .collect::<Vec<_>>();
-    let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-    let ciphertext =
-        encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+    let message = rand::random::<bool>();
+    let ciphertext = encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
     let authorized = program(class, &attribute, 0);
     let key = keygen(&public_key, &master, &authorized, &mut execution, &mut store).unwrap();
-    assert!(
-        decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).is_err(),
-        "the export-only decryption graph is not executed"
-    );
+    let _placeholder = decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
     let graphs = std::mem::take(&mut execution.graphs);
     report_measurements(&graphs);
     (graphs, parameters, failure_exponent)

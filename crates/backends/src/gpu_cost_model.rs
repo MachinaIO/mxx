@@ -10,7 +10,7 @@
 //! |---|---|
 //! | `ntt_forward`, `ntt_inverse` | one-limb negacyclic transforms |
 //! | `shoup_mul` | Shoup modular multiplies (one `__umul64hi` and two low 64-bit multiplies) on limbs with `q >= 2^31` |
-//! | `shoup_mul32` | Shoup multiplies on limbs with `q < 2^31`, which run on 32-bit words |
+//! | `shoup_mul32` | 32-bit Shoup multiplies: NTT limbs with `q < 2^31`, or fused gadget scales when every source limb fits `u32` |
 //! | `wide_mul` | 64x64->128 products of `raw_matrix_mul_kernel` |
 //! | `wide_mod_calls` | `raw_wide_mod` calls of that kernel (a 128-bit `%`, a 64-bit `%`, or nothing) |
 //! | `mulmod_u64` | `mul_mod_u64` calls of the gadget-scale, 1x1-scalar, scale, and tensor kernels |
@@ -22,12 +22,16 @@
 //! | `unsupported(<reason>)` | sites costed by extrapolating beyond what the backend executes |
 //!
 //! The lowering keeps every matrix in the evaluation (NTT) or coefficient domain, or compact for
-//! bounded digits. The model tracks the same domain per value and charges a transform the first
-//! time a consumer needs the other domain, sharing it through the same bidirectional conversion
-//! cache: one cache for the root, inlined subgraph calls, and parallel lanes, and a fresh one per
-//! sequential-loop iteration. Samples, constants, and lifted integers start in the coefficient
-//! domain; imports, products, sums, selections, family packs, and child outputs are in the
-//! evaluation domain.
+//! bounded digits. Decompositions read exclusively by small-RHS products inside
+//! loops (excluding identity expansions) are expanded and transformed once outside those loops. A
+//! fused gadget/modulus switch charges its gadget scales as Shoup multiplies and never materializes
+//! the source-ring digits. The model tracks the same domain per value and charges a transform the
+//! first time a consumer needs the other domain, sharing it through the same bidirectional
+//! conversion cache: one cache for the root, inlined subgraph calls, and parallel lanes, and a
+//! fresh one per sequential-loop iteration. Identity small-RHS products expand compact coefficients
+//! without materializing the identity. Samples, constants, and lifted integers start in the
+//! coefficient domain; imports, products, sums, selections, family packs, and child outputs are in
+//! the evaluation domain.
 //!
 //! A parallel loop runs `ceil(count / W)` waves of `W` lanes, the tail wave included; `W` is the
 //! loop count inside a sequential body and `min(wave_instances, count)` elsewhere. Lane 0 is
@@ -45,7 +49,10 @@ use mxx_ir_core::{
     types::ConcreteWireType,
 };
 use num_traits::ToPrimitive;
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+};
 
 /// The largest ring the GPU NTT accepts (`MatrixNTT.cu`).
 const MAX_NTT_RING_DIMENSION: u32 = 1024 * 128;
@@ -72,6 +79,7 @@ pub fn gpu_operation_counts(
     }
     let mut model = Model {
         graph,
+        identity_small_rhs: IdentitySmallRhs::new(graph, &[]),
         dependencies: graph.shape_dependencies(),
         wave_instances,
         ntt_radix,
@@ -107,10 +115,14 @@ enum Form {
 struct Value {
     form: Form,
     ty: ConcreteWireType,
+    /// A static constant, whose evaluation-domain twin the plan uploads once
+    /// (`static_evaluation`): its forward transform costs no device work.
+    constant: bool,
 }
 
 struct Model<'a> {
     graph: &'a Graph,
+    identity_small_rhs: IdentitySmallRhs,
     dependencies: BTreeMap<FrozenGraphScopeId, ShapeDependencies>,
     wave_instances: Option<NonZeroU64>,
     ntt_radix: u32,
@@ -122,7 +134,7 @@ struct Model<'a> {
     device_body: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Forward,
     Inverse,
@@ -190,7 +202,7 @@ impl Model<'_> {
     }
 
     fn value(&mut self, form: Form, ty: ConcreteWireType) -> usize {
-        self.values.push(Value { form, ty });
+        self.values.push(Value { form, ty, constant: false });
         self.values.len() - 1
     }
 
@@ -240,7 +252,9 @@ impl Model<'_> {
             return Ok(converted);
         }
         let ty = self.values[id].ty.clone();
-        self.charge_ntt(direction, &ty)?;
+        if !(self.values[id].constant && direction == Direction::Forward) {
+            self.charge_ntt(direction, &ty)?;
+        }
         let converted = self.value(to, ty);
         self.converted.insert(id, converted);
         self.converted.insert(converted, id);
@@ -339,12 +353,35 @@ impl Model<'_> {
                 wires.insert(output(port), id);
             }
         };
+        if self.identity_small_rhs.omits(scope_id, first) {
+            fresh(self, wires, Form::Other);
+            return Ok(());
+        }
+        if unit_row_intermediate(scope, first, env) {
+            return Ok(());
+        }
+        if let Some((sum, term, _, _, _)) = unit_row_add(scope, first, env) {
+            self.need_eval(wires[&sum])?;
+            self.need_eval(wires[&term])?;
+            fresh(self, wires, Form::Eval);
+            return Ok(());
+        }
         match node.kind() {
+            NodeKind::ModulusSwitch { .. } if wires.contains_key(&first) => {}
             NodeKind::Input { .. } if wires.contains_key(&first) => {}
             NodeKind::Input { .. } => fresh(self, wires, Form::Eval),
             NodeKind::ConstantMatrix { .. } | NodeKind::CenteredRebase { .. }
                 if lazy_gadget(scope, first, types) => {}
-            NodeKind::ConstantMatrix { .. } |
+            // `lower_zero_matrix_node`: a zero matrix is written in the evaluation domain.
+            NodeKind::ConstantMatrix { value: ConstantMatrix::Zero, .. } => {
+                fresh(self, wires, Form::Eval)
+            }
+            // `plan_static_matrix`: a static constant, uploaded in the coefficient domain.
+            NodeKind::ConstantMatrix { .. } => {
+                fresh(self, wires, Form::Coeff);
+                let id = wires[&first];
+                self.values[id].constant = true;
+            }
             NodeKind::LiftIntegerToConstantPolynomial { .. } |
             NodeKind::UniformResidueSample { .. } |
             NodeKind::UniformIntervalSample { .. } |
@@ -354,11 +391,37 @@ impl Model<'_> {
                 if !wires.contains_key(&arguments[1]) &&
                     lazy_gadget(scope, arguments[1], types) =>
             {
-                // `lower_gadget_product`: one gadget-scale multiply per output limb coefficient.
+                // `lower_gadget_product`: one gadget-scale multiply per output limb coefficient,
+                // in the coefficient domain when the left factor is there and every reader
+                // switches moduli.
                 let left = argument(wires, 0)?;
-                self.need_eval(left)?;
-                self.coefficientwise_multiply(&output_ty()?)?;
-                fresh(self, wires, Form::Eval);
+                let coefficients = self.values[left].form == Form::Coeff &&
+                    gadget_product_in_coefficients(scope, first);
+                if !coefficients {
+                    self.need_eval(left)?;
+                }
+                if let Some(switch) =
+                    coefficients.then(|| fused_gadget_switch(scope, first)).flatten()
+                {
+                    // The fused operation writes only the target-ring digits.
+                    let ty = output_ty()?;
+                    let (polys, ring) = layout(&ty).unwrap();
+                    let counter = if ring.crt_moduli().iter().all(|&q| q <= u64::from(u32::MAX)) {
+                        "shoup_mul32"
+                    } else {
+                        "shoup_mul"
+                    };
+                    self.charge(
+                        counter,
+                        polys * u128::from(ring.ring_dimension()) * ring.crt_depth() as u128,
+                    )?;
+                    let id = self.value(Form::Coeff, types[&switch].clone());
+                    wires.insert(switch, id);
+                    self.charge("unmodeled(ModulusSwitch)", 1)?;
+                } else {
+                    self.coefficientwise_multiply(&output_ty()?)?;
+                    fresh(self, wires, if coefficients { Form::Coeff } else { Form::Eval });
+                }
             }
             NodeKind::MatrixBinary(op) => {
                 // `lower_matrix_node`: both operands in the evaluation domain.
@@ -376,13 +439,19 @@ impl Model<'_> {
                 }
                 fresh(self, wires, Form::Eval);
             }
+            NodeKind::MatrixMulSmallRhs if self.identity_small_rhs.expands(scope_id, first) => {
+                fresh(self, wires, Form::Coeff);
+            }
             NodeKind::MatrixMulSmallRhs => {
-                // `lower_matrix_mul_small_rhs`: every digit polynomial is transformed again.
+                // Loop-invariant digits already have an evaluation-domain matrix.
+                // Other compact right operands are transformed at every call.
                 let left = argument(wires, 0)?;
                 let left = self.need_eval(left)?;
                 let right = argument(wires, 1)?;
                 let right_ty = self.values[right].ty.clone();
-                self.charge_ntt(Direction::Forward, &right_ty)?;
+                if self.values[right].form != Form::Eval {
+                    self.charge_ntt(Direction::Forward, &right_ty)?;
+                }
                 let (lhs, rhs) = (matrix(left, &self.values)?, matrix(right, &self.values)?);
                 self.matrix_product(lhs.rows, lhs.columns, rhs.columns, &lhs.ring)?;
                 fresh(self, wires, Form::Eval);
@@ -439,7 +508,13 @@ impl Model<'_> {
                 self.charge("gadget_decomposed_words", polys * n * kept)?;
                 self.charge("gadget_digit_polynomials", digits)?;
                 self.charge("gadget_digit_coefficients", digits * n)?;
-                fresh(self, wires, Form::Compact);
+                if hoist_small_rhs(self.graph, scope_id, first, &self.identity_small_rhs) {
+                    self.charge_ntt(Direction::Forward, &output)?;
+                    let id = self.value(Form::Eval, output);
+                    wires.insert(first, id);
+                } else {
+                    fresh(self, wires, Form::Compact);
+                }
             }
             NodeKind::Concat { .. } |
             NodeKind::BlockDiagonal { .. } |
@@ -458,6 +533,14 @@ impl Model<'_> {
                 }
                 self.coefficientwise_multiply(&output_ty()?)?;
                 fresh(self, wires, Form::Eval);
+            }
+            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+                // `lower_modulus_switch`, `lower_modulus_reduce`: coefficient-domain kernels
+                // whose arithmetic is not counted.
+                let input = argument(wires, 0)?;
+                self.need_coeff(input)?;
+                self.charge(&format!("unmodeled({})", kind_name(node.kind())), 1)?;
+                fresh(self, wires, Form::Coeff);
             }
             NodeKind::ExtractCoefficient { .. } | NodeKind::ThresholdDecode { .. } => {
                 let input = argument(wires, 0)?;
@@ -761,6 +844,305 @@ fn read_by_row_products(
     read
 }
 
+/// Whether the lazy gadget product `wire` (see `lower_gadget_product`) is
+/// computed in the coefficient domain: every reader is a modulus switch, which
+/// reads coefficients, and it is not a scope output. A gadget product scales
+/// each limb residue of every coefficient, which commutes with the NTT, so a
+/// left factor already in the coefficient domain needs no transform there and
+/// no reader needs the product transformed back.
+pub(crate) fn gadget_product_in_coefficients(scope: &GraphScope, wire: WireRef) -> bool {
+    if scope.outputs().contains(&wire) {
+        return false;
+    }
+    let mut read = false;
+    for consumer in scope.nodes() {
+        let Some(arguments) = scope.arguments(consumer) else { return false };
+        if !arguments.contains(&wire) {
+            continue;
+        }
+        read = true;
+        if !matches!(consumer.kind(), NodeKind::ModulusSwitch { .. }) {
+            return false;
+        }
+    }
+    read
+}
+
+/// Recognize `sum + term * slice(UnitRow, ...)`. The sole-reader checks let
+/// lowering omit the slice and product; an out-of-window unit contributes zero.
+pub(crate) fn unit_row_add(
+    scope: &GraphScope,
+    wire: WireRef,
+    env: &ParamEnv,
+) -> Option<(WireRef, WireRef, WireRef, WireRef, mxx_ir_core::IntExpr)> {
+    let node = scope.node(wire.node)?;
+    if !matches!(node.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add)) {
+        return None;
+    }
+    let arguments = scope.arguments(node)?;
+    let (sum, product) = (arguments[0], arguments[1]);
+    let product_node = scope.node(product.node)?;
+    if !matches!(product_node.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)) {
+        return None;
+    }
+    let factors = scope.arguments(product_node)?;
+    let (term, slice) = (factors[0], factors[1]);
+    let mxx_ir_core::types::WireType::Matrix(ty) =
+        &scope.node(term.node)?.output_types()[term.port.0 as usize]
+    else {
+        return None;
+    };
+    if ty.rows.evaluate(env).ok()?.to_usize()? != 1 ||
+        ty.columns.evaluate(env).ok()?.to_usize()? != 1
+    {
+        return None;
+    }
+    let slice_node = scope.node(slice.node)?;
+    let NodeKind::Slice { rows: None, columns: Some(columns) } = slice_node.kind() else {
+        return None;
+    };
+    let source = scope.arguments(slice_node)?[0];
+    let source_node = scope.node(source.node)?;
+    let NodeKind::ConstantMatrix { value: ConstantMatrix::UnitRow { index }, .. } =
+        source_node.kind()
+    else {
+        return None;
+    };
+    let mxx_ir_core::types::WireType::Matrix(ty) =
+        &source_node.output_types()[source.port.0 as usize]
+    else {
+        return None;
+    };
+    if ty.rows.evaluate(env).ok()?.to_usize()? != 1 {
+        return None;
+    }
+    for (value, reader) in [(product, wire.node), (slice, product.node)] {
+        if scope.outputs().contains(&value) ||
+            scope.nodes().iter().enumerate().any(|(index, node)| {
+                NodeId(index as u64) != reader && scope.arguments(node).unwrap().contains(&value)
+            })
+        {
+            return None;
+        }
+    }
+    Some((sum, term, slice, product, (index.clone() - columns.start.clone()).canonicalize()))
+}
+
+/// Slice and product nodes consumed by a fused unit-row addition: `wire` is the product read by
+/// the addition, or the slice read by that product (both sole readers, see [`unit_row_add`]).
+pub(crate) fn unit_row_intermediate(scope: &GraphScope, wire: WireRef, env: &ParamEnv) -> bool {
+    let readers = |wire: WireRef| {
+        scope
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(move |(_, node)| scope.arguments(node).unwrap().contains(&wire))
+            .map(|(index, _)| WireRef { node: NodeId(index as u64), port: Port(0) })
+    };
+    let fused = |add: WireRef| {
+        unit_row_add(scope, add, env)
+            .is_some_and(|(_, _, slice, product, _)| wire == slice || wire == product)
+    };
+    readers(wire).any(|reader| fused(reader) || readers(reader).any(fused))
+}
+
+/// Shared identity-expansion decisions, indexed once per graph. Capture edges only
+/// preserve identities for broadcasts and non-carried inputs. Reader lists keep
+/// omission checks proportional to the uses of each identity, including captures.
+pub(crate) struct IdentitySmallRhs {
+    products: BTreeSet<(FrozenGraphScopeId, WireRef)>,
+    omitted: BTreeSet<(FrozenGraphScopeId, WireRef)>,
+}
+
+impl IdentitySmallRhs {
+    pub(crate) fn new(
+        graph: &Graph,
+        kernels: &[crate::gpu_subgraph_kernel::GpuSubgraphKernel],
+    ) -> Self {
+        type Key = (FrozenGraphScopeId, WireRef);
+        let mut identities = BTreeSet::new();
+        let mut readers = BTreeMap::<Key, Vec<(Key, usize)>>::new();
+        let mut captures = BTreeMap::<(Key, usize), Key>::new();
+        let mut sources = BTreeMap::<Key, Vec<(Key, bool)>>::new();
+        let mut outputs = BTreeSet::new();
+        let mut products = Vec::new();
+        for (scope_id, scope) in graph.scopes() {
+            outputs.extend(scope.outputs().iter().map(|wire| (scope_id.clone(), *wire)));
+            for (index, node) in scope.nodes().iter().enumerate() {
+                let node_id = NodeId(index as u64);
+                let key = (scope_id.clone(), WireRef { node: node_id, port: Port(0) });
+                if let NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, matrix_type } =
+                    node.kind()
+                {
+                    if matrix_type.rows == matrix_type.columns {
+                        identities.insert(key.clone());
+                    }
+                }
+                let arguments = scope.arguments(node).unwrap();
+                if matches!(node.kind(), NodeKind::MatrixMulSmallRhs) {
+                    products.push((key.clone(), (scope_id.clone(), arguments[0])));
+                }
+                for (position, wire) in arguments.into_iter().enumerate() {
+                    let source = (scope_id.clone(), wire);
+                    readers.entry(source.clone()).or_default().push((key.clone(), position));
+                    if let Some(child_id) = graph.child_scope_id(scope_id, node_id) {
+                        let child = graph.scope(&child_id).unwrap();
+                        let input = (child_id, child.inputs()[position]);
+                        let preserves = match node.kind() {
+                            // Registered kernels read their operands instead of lowering the body.
+                            NodeKind::SubgraphCall(call) => {
+                                !kernels.iter().any(|kernel| kernel.name == call.definition)
+                            }
+                            NodeKind::ParallelLoop(spec) => {
+                                spec.input_modes[position] == LoopInputMode::Broadcast
+                            }
+                            NodeKind::SequentialLoop(spec) => position >= spec.carried_count,
+                            _ => false,
+                        };
+                        // Include non-preserving sources so a shared subgraph input
+                        // qualifies only when all its callers supply an identity.
+                        sources.entry(input.clone()).or_default().push((source, preserves));
+                        if preserves {
+                            captures.insert((key.clone(), position), input);
+                        }
+                    }
+                }
+            }
+        }
+        loop {
+            let before = identities.len();
+            for (input, parents) in &sources {
+                if parents
+                    .iter()
+                    .all(|(source, preserves)| *preserves && identities.contains(source))
+                {
+                    identities.insert(input.clone());
+                }
+            }
+            if identities.len() == before {
+                break;
+            }
+        }
+        let products = products
+            .into_iter()
+            .filter_map(|(product, left)| identities.contains(&left).then_some(product))
+            .collect::<BTreeSet<_>>();
+        let mut omitted = BTreeSet::new();
+        loop {
+            let before = omitted.len();
+            for identity in &identities {
+                if !outputs.contains(identity) &&
+                    readers.get(identity).is_some_and(|uses| {
+                        uses.iter().all(|(reader, position)| {
+                            (*position == 0 && products.contains(reader)) ||
+                                captures
+                                    .get(&(reader.clone(), *position))
+                                    .is_some_and(|input| omitted.contains(input))
+                        })
+                    })
+                {
+                    omitted.insert(identity.clone());
+                }
+            }
+            if omitted.len() == before {
+                break;
+            }
+        }
+        Self { products, omitted }
+    }
+
+    /// Whether this product expands its right operand into full coefficients.
+    pub(crate) fn expands(&self, scope: &FrozenGraphScopeId, wire: WireRef) -> bool {
+        self.products.contains(&(scope.clone(), wire))
+    }
+
+    /// Whether this constant or captured identity has no physical readers.
+    pub(crate) fn omits(&self, scope: &FrozenGraphScopeId, wire: WireRef) -> bool {
+        self.omitted.contains(&(scope.clone(), wire))
+    }
+}
+
+/// Expand loop-invariant decomposition digits once when every use is a
+/// non-identity small-RHS multiply inside a loop. Identity expansions, carries,
+/// zipped inputs and scope outputs retain the compact representation.
+pub(crate) fn hoist_small_rhs(
+    graph: &Graph,
+    scope_id: &FrozenGraphScopeId,
+    wire: WireRef,
+    identities: &IdentitySmallRhs,
+) -> bool {
+    fn readers(
+        graph: &Graph,
+        scope_id: &FrozenGraphScopeId,
+        wire: WireRef,
+        in_loop: bool,
+        identities: &IdentitySmallRhs,
+    ) -> bool {
+        let scope = graph.scope(scope_id).unwrap();
+        if scope.outputs().contains(&wire) {
+            return false;
+        }
+        let mut read = false;
+        for (index, node) in scope.nodes().iter().enumerate() {
+            let arguments = scope.arguments(node).unwrap();
+            for (position, argument) in arguments.iter().enumerate() {
+                if *argument != wire {
+                    continue;
+                }
+                read = true;
+                let enters_loop = match node.kind() {
+                    NodeKind::MatrixMulSmallRhs
+                        if in_loop &&
+                            position == 1 &&
+                            !identities.expands(
+                                scope_id,
+                                WireRef { node: NodeId(index as u64), port: Port(0) },
+                            ) =>
+                    {
+                        continue
+                    }
+                    NodeKind::SequentialLoop(spec) if position >= spec.carried_count => true,
+                    NodeKind::ParallelLoop(spec)
+                        if spec.input_modes[position] == LoopInputMode::Broadcast =>
+                    {
+                        true
+                    }
+                    NodeKind::SubgraphCall(_) => false,
+                    _ => return false,
+                };
+                let child_id = graph.child_scope_id(scope_id, NodeId(index as u64)).unwrap();
+                let child = graph.scope(&child_id).unwrap();
+                if !readers(
+                    graph,
+                    &child_id,
+                    child.inputs()[position],
+                    in_loop || enters_loop,
+                    identities,
+                ) {
+                    return false;
+                }
+            }
+        }
+        read
+    }
+    readers(graph, scope_id, wire, false, identities)
+}
+
+/// A sole modulus-switch reader can consume gadget digits directly without
+/// storing the source-ring product. Both lowering and accounting use this choice.
+pub(crate) fn fused_gadget_switch(scope: &GraphScope, wire: WireRef) -> Option<WireRef> {
+    if !gadget_product_in_coefficients(scope, wire) {
+        return None;
+    }
+    let mut readers = scope
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| scope.arguments(node).unwrap().contains(&wire));
+    let (index, _) = readers.next()?;
+    readers.next().is_none().then_some(WireRef { node: NodeId(index as u64), port: Port(0) })
+}
+
 /// Whether `wire`, a gadget constant or its centered rebase, is never stored:
 /// every product reading it scales its row by the gadget's entries (see
 /// `lower_gadget_product`). A gadget constant qualifies when each reader is
@@ -853,6 +1235,24 @@ mod tests {
     }
 
     #[test]
+    fn a_switched_gadget_product_of_coefficients_is_not_transformed() {
+        let moduli = mxx_ir_core::generate_crt_basis(8, 2, 33).unwrap();
+        let full = ring();
+        let single = Ring::from_crt_moduli(vec![moduli[0].into()], 8);
+        let gadget = || single.gadget(1, 4, 3).centered_rebase(&full);
+        // Read only by a modulus switch: scaled in the coefficient domain of the sample.
+        let switched =
+            counts((full.uniform_residue((1, 1)) * gadget()).modulus_switch(&single), None);
+        assert_eq!(get(&switched, "ntt_inverse"), 0);
+        assert_eq!(get(&switched, "ntt_forward"), 3, "only the 1 x 3 one-limb output");
+        // Read by a product: scaled in the evaluation domain, so the sample is transformed.
+        let multiplied =
+            counts((full.uniform_residue((1, 1)) * gadget()) * full.input("c", (3, 1)), None);
+        assert_eq!(get(&multiplied, "ntt_forward"), 2);
+        assert_eq!(get(&multiplied, "ntt_inverse"), 0);
+    }
+
+    #[test]
     fn conversions_are_shared_through_the_cache_and_inlined_calls() {
         let ring = ring();
         let (a, b) = (ring.input("a", (1, 1)), ring.input("b", (1, 1)));
@@ -871,6 +1271,49 @@ mod tests {
         assert_eq!(get(&digits, "gadget_digit_coefficients"), 34 * 8);
         // Two 33-bit limbs of 17 base-4 digits each: every coefficient decomposes two residues.
         assert_eq!(get(&digits, "gadget_decomposed_words"), 8 * 2);
+    }
+
+    #[test]
+    fn identity_small_rhs_expands_coefficients_and_preserves_other_readers() {
+        let ring = ring();
+        let identity = ring.identity(34);
+        let digits = ring.uniform_residue((1, 1)).decompose(4, 34);
+        let expanded = identity.clone().mul_small_rhs(digits.clone());
+        let cost = counts(expanded.clone(), None);
+        assert_eq!(get(&cost, "wide_mul"), 0);
+        assert_eq!(get(&cost, "ntt_forward"), 34 * 2);
+        assert_eq!(get(&cost, "ntt_inverse"), 0);
+        let coefficients =
+            counts(ring.identity(34 * 34).mul_small_rhs(expanded.decompose(4, 34)), None);
+        assert_eq!(get(&coefficients, "ntt_forward"), 34 * 34 * 2);
+        assert_eq!(get(&coefficients, "ntt_inverse"), 0);
+
+        let build = |other_reader| {
+            let mut context = DslContext::new("identity-readers")
+                .output("expanded", identity.clone().mul_small_rhs(digits.clone()))
+                .unwrap();
+            if other_reader {
+                context = context.output("identity", identity.clone()).unwrap();
+            }
+            context.build().unwrap()
+        };
+        for other_reader in [false, true] {
+            let built = build(other_reader);
+            let decisions = IdentitySmallRhs::new(&built.graph, &[]);
+            let scope = built.graph.root_scope();
+            for (index, node) in scope.nodes().iter().enumerate() {
+                let wire = WireRef { node: NodeId(index as u64), port: Port(0) };
+                if matches!(
+                    node.kind(),
+                    NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. }
+                ) {
+                    assert_eq!(decisions.omits(scope.id(), wire), !other_reader);
+                }
+                if matches!(node.kind(), NodeKind::MatrixMulSmallRhs) {
+                    assert!(decisions.expands(scope.id(), wire));
+                }
+            }
+        }
     }
 
     #[test]

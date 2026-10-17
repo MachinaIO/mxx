@@ -3,9 +3,10 @@ import PeProductGlue
 /-!
 # One online step from the conclusions of its runtime scopes
 
-The internal branches, the first-depth and second-depth leaf loops, the LUT companion loops and
-the branch sums of one online step, with the encryption's helpers and LUT companions and the
-preprocessed branch keys, give `step_correct`.
+The runtime layer regroups the first-depth and second-depth leaves into seven member lanes and
+sixteen slots per lane. After `memberTerms_sum` restores the branch sums, the internal branches,
+leaf decompositions, encryption helpers, LUT companions and preprocessed branch keys give
+`step_correct`. The mathematical interface is independent of the runtime artifact layout.
 -/
 
 namespace PeProof
@@ -42,8 +43,7 @@ theorem online_step {model : HashModel} {s : ErrorPoly N} (hs : polyNorm s ≤ 1
             ⟨(i / 88) % 44, by omega⟩ *
             unitPair (substitution (kSw (i / 3872)) (kSw_odd ⟨i / 3872, by omega⟩) s) j)))
         ![zc0 i, zc1 i] (ez i) ∧ ∀ j, CoeffBound (ez i j) 31)
-    (hE1 : ∀ p : Fin 1936, d1.E 0 p = ∑ a, lutCompanionSum M (expandFam zc0) (expandFam zc1)
-      ⟨(p : Nat) / 88, by omega⟩ ⟨(p : Nat) % 88, by omega⟩ a)
+    (hE1 : ∀ b : Fin 22, d1.E b = lutCompRow M (expandFam zc0) (expandFam zc1) b)
     (hT1 : ∀ (b : Fin 22) r jj, ![d1.Tb0 b b.isLt, d1.Tb1 b b.isLt] r 0 jj =
       ∑ a, lutKeyCompanionSum model d1.key b M r jj a +
       ∑ a : Fin 44, substitution (kSw b) (kSw_odd b) (M r 0 0 a) * rowDigits (switchTopRow model d1.key b) a jj)
@@ -54,8 +54,8 @@ theorem online_step {model : HashModel} {s : ErrorPoly N} (hs : polyNorm s ≤ 1
     (hleaf1 : ∀ i (hi : i < 7), d1.Runs model (15 + i) (by omega))
     (hkey2 : d2.key = d1.key) (hf2 : d2.hf0 = d1.hf0 ∧ d2.hf1 = d1.hf1)
     (hc2 : d2.c0 = o0 ∧ d2.c1 = o1)
-    (hE2 : ∀ p : Fin 9240, d2.E 0 p = ∑ a, lutCompanionSum (parentKeys o2 o3 o4 o5 ⟨(p : Nat) / 88 % 15, by omega⟩)
-      (expandFam zc0) (expandFam zc1) (member2 ((p : Nat) / 88) (by omega)) ⟨(p : Nat) % 88, by omega⟩ a)
+    (hE2 : ∀ l : Fin 105, d2.E l = lutCompRow (parentKeys o2 o3 o4 o5 ⟨l % 15, by omega⟩)
+      (expandFam zc0) (expandFam zc1) (member2 l l.isLt))
     (hT2 : ∀ (l : Fin 105) r jj, ![d2.Tb0 l l.isLt, d2.Tb1 l l.isLt] r 0 jj =
       ∑ a, lutKeyCompanionSum model d1.key (member2 l l.isLt) (d1.key1 model ⟨l % 15, by omega⟩) r jj a +
       ∑ a : Fin 44, substitution (kSw (15 + l / 15)) (kSw_odd (member2 l l.isLt))
@@ -76,11 +76,9 @@ theorem online_step {model : HashModel} {s : ErrorPoly N} (hs : polyNorm s ≤ 1
   have H : BranchHyps model s e M d1 d2 zc0 zc1 ez := by
     refine ⟨hhelp, hcomp, fun b jj ↦ ?_, hT1, fun b ↦ ?_, hkey2, hf2, fun p ↦ ?_, fun l jj ↦ ?_, hT2,
       fun l ↦ hleaf2 l l.isLt⟩
-    · show d1.E 0 ⟨88 * (b : Nat) + jj, by omega⟩ = _
+    · show d1.E b 0 jj = _
       rw [hE1]
-      refine Finset.sum_congr rfl fun a _ ↦ ?_
-      exact congrArg₂ (fun x y ↦ lutCompanionSum M (expandFam zc0) (expandFam zc1) x y a)
-        (Fin.ext (by simp only; omega)) (Fin.ext (by simp only; omega))
+      rfl
     · obtain ⟨bv, hbv⟩ := b
       by_cases hb : bv < 15
       · exact (hint ⟨bv, hb⟩).1
@@ -88,20 +86,13 @@ theorem online_step {model : HashModel} {s : ErrorPoly N} (hs : polyNorm s ≤ 1
         exact hleaf1 i (by omega)
     · rw [hc2.1, hc2.2]
       exact ⟨((hint p).2.1 0).trans rfl, ((hint p).2.1 1).trans rfl⟩
-    · show d2.E 0 ⟨88 * (l : Nat) + jj, by omega⟩ = _
-      rw [hE2]
-      refine Finset.sum_congr rfl fun a _ ↦ ?_
-      have hk : parentKeys o2 o3 o4 o5 ⟨(88 * (l : Nat) + jj) / 88 % 15, by omega⟩ =
-          d1.key1 model ⟨l % 15, by omega⟩ := by
-        have e1 : (⟨(88 * (l : Nat) + jj) / 88 % 15, by omega⟩ : Fin 15) = ⟨l % 15, by omega⟩ :=
-          Fin.ext (by simp only; omega)
-        rw [e1]
+    · show d2.E l 0 jj = _
+      have hk : parentKeys o2 o3 o4 o5 ⟨l % 15, by omega⟩ = d1.key1 model ⟨l % 15, by omega⟩ := by
         funext r j
         rw [← (hint ⟨l % 15, by omega⟩).2.2 r j]
         fin_cases r <;> fin_cases j <;> rfl
-      rw [hk]
-      exact congrArg₂ (fun x y ↦ lutCompanionSum (d1.key1 model ⟨l % 15, by omega⟩) (expandFam zc0)
-        (expandFam zc1) x y a) (Fin.ext (by simp only [member2]; omega)) (Fin.ext (by simp only; omega))
+      rw [hE2, hk]
+      rfl
   have h := step_correct hs he hP H table coef hcoef
   have hrows : (fun j ↦ ![d1.c0, d1.c1] j * scalarV (coef 1) +
         ∑ b : Fin 15, d1.row model b (by omega) j * scalarV (coef (kSw b)) +

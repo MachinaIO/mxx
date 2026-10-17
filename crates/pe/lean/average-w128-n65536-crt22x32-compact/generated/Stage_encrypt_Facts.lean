@@ -4,15 +4,17 @@ set_option maxRecDepth 16384
 set_option maxHeartbeats 2000000
 set_option linter.unusedVariables false
 
+-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a
+-- projection against its field type expands it at the ring dimension.
+attribute [local irreducible] Mxx.Primitives.negacyclicModulus
+
 noncomputable section
 
 namespace Stage_encrypt
 
-local notation "mxxNat0" => 78079523927896127712009307999974412043135143141543941570119110821624764686494582648421232630165133436275519032254680972082541026053657846674805178959586229420520814546267827301225593318349477307602951695899164673
-local notation "mxxNat1" => 5278087253403224991333645099610003021785206966119564254171942298247993190952980821552692773158302798199939315804484105262715072792529872674621368544490941390506983498620144494214222200022752952511718466872729239793477806438096725442738627984346925320228738380148171996792888816066148390509478988805065937247347127262069050805334354391385613933775075315634469785233518480876460832181155068060520232362595000272223451214118913
-local notation "mxxMat0" => Mxx.Primitives.ExactMatrix mxxNat0 65536 1 1
-local notation "mxxMat1" => Mxx.Primitives.ExactMatrix mxxNat0 65536 1 44
-local notation "mxxMat2" => Mxx.Primitives.ExactMatrix mxxNat1 65536 1 1
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 1
+local notation "mxxMat1" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 44
+local notation "mxxMat2" => Mxx.Primitives.ExactMatrix modulus_1 65536 1 1
 
 set_option genInjectivity false in
 set_option genSizeOf false in
@@ -204,7 +206,8 @@ structure generatedRoot.Facts {backend : MxxRuntime.BackendContext} {hashModel :
 theorem generatedRoot.facts {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {tape : MxxRuntime.SampleTape} {path : List Nat} {params : Params} (ctx : generatedRoot.Ctx backend hashModel tape path params) {outputs : (Fin 85184 → mxxMat2) × (Fin 85184 → mxxMat2) × (Fin 37 → mxxMat1) × (Fin 37 → mxxMat1) × mxxMat1 × mxxMat1 × (Fin 15488 → mxxMat2) × (Fin 15488 → mxxMat2) × Unit}
     (h : generatedRoot.body backend hashModel tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
-  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) h
+  have t0 := h
+  have r0 := generatedRoot.facts_0 (ctx := ctx) (outputs := outputs) t0
   ⟨r0⟩
 
 end Stage_encrypt

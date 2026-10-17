@@ -10,7 +10,11 @@ structure Params where
   unit : Unit
 
 local notation "mxxNat0" => 78079523927896127712009307999974412043135143141543941570119110821624764686494582648421232630165133436275519032254680972082541026053657846674805178959586229420520814546267827301225593318349477307602951695899164673
-local notation "mxxMat0" => Mxx.Primitives.ExactMatrix mxxNat0 65536 1 501
+
+/-- The modulus of a matrix type. -/
+abbrev modulus_0 : Nat := mxxNat0
+
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 65536 1 501
 
 set_option genInjectivity false in
 set_option genSizeOf false in

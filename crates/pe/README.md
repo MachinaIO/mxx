@@ -1,7 +1,8 @@
 # mxx-pe
 
 `mxx-pe` implements predicate encryption for branching programs over key-homomorphic encodings,
-without FHE. A ciphertext encrypts a binary message under an attribute `x`. A key for a branching
+without FHE. A ciphertext encrypts one bit in the constant polynomial coefficient under an attribute `x`.
+All other plaintext coefficients are zero. `encrypt` accepts a `bool`, and `decrypt` returns a `bool`. A key for a branching
 program `F` decrypts it exactly when `F(x) = 0`. Encryption needs no predicate, so one ciphertext
 serves keys for every program of the setup's function class. The scheme runs on the Dynamic
 RNS-BGG evaluator of [`mxx-exponent-lut`](../exponent-lut/README.md), and every stage is a graph
@@ -18,7 +19,7 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 | `setup` | `setup`: the anchor `B` from the statistical TrapGen `[ā \| g - ā T]`, the class's Dynamic setup, and the public message row. `PePublicKey` and `PeMasterSecretKey` keep public and secret material apart. |
 | `encryption` | `encrypt(mpk, x, m)`: the anchor encoding, the attribute gadget ciphertexts `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t) G` (with a fresh uniform `a_t` and `e_t` from `chi`), the message component, and the Dynamic packages, under one fresh secret and session. |
 | `keygen` | `keygen(msk, F)`: the predicate's public evaluation on its program data, including its output key `A_F`, and a short `k` with `M_F k = d_1 delta_1` for the implicit family matrix `M_F`. |
-| `decryption` | `decrypt(sk_F, ct)`: the predicate evaluated on the ciphertext's packages and the family row contracted with the key, rounded to the message bits. |
+| `decryption` | `decrypt(sk_F, ct)`: the predicate evaluated on the ciphertext's packages and the family row contracted with the key, rounded at the constant coefficient to recover the message bit. |
 | `noise` | `simulate`: the evaluation bound `E_F` from the exponent-lut simulator, the decryption bound `E_PE`, and the condition `4 E_PE + 2 < q`. |
 
 ## Design

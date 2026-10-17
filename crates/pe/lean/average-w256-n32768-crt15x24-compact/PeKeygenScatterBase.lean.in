@@ -1,0 +1,38 @@
+import PeKeygen
+
+set_option maxRecDepth 200000
+
+namespace PeProof
+
+open Mxx.Primitives MxxRuntime MxxExponentLut
+
+def scatterList : List Int := ⟦SCATTER_LIST⟧
+
+set_option maxRecDepth 1000000 in
+set_option maxHeartbeats 0 in
+theorem scatterList_eq : scatterList = List.ofFn (fun pair : Fin 11520 ↦
+    (((pair / 45 + helperIdx (pair % 45)) % 256 : Nat) : Int)) := by
+  decide +kernel
+
+theorem scatterList_read (row lane : Nat) (row_bound : row < 256) (lane_bound : lane < 45) :
+    MxxIR.selectInt (45 * Int.ofNat row + Int.ofNat lane) scatterList =
+      (((row + helperIdx lane) % 256 : Nat) : Int) := by
+  have index : 45 * Int.ofNat row + Int.ofNat lane = Int.ofNat (45 * row + lane) := by
+    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]
+  rw [index]
+  unfold MxxIR.selectInt
+  rw [scatterList_eq, show (Int.ofNat (45 * row + lane)).toNat = 45 * row + lane from rfl,
+    List.getElem?_ofFn, dif_pos (show 45 * row + lane < 11520 by omega), Option.getD_some]
+  have div : (45 * row + lane) / 45 = row := by omega
+  have mod : (45 * row + lane) % 45 = lane := by omega
+  simp only [div, mod]
+
+noncomputable def scatterTerm (model : HashModel) (key : ByteArray)
+    (packed : ExactMatrix Q N 60 45) (row : Fin 256) (lane : Fin 45) :
+    ExactMatrix Q N 1 256 := fun _ target ↦
+  (if target = row then
+    (substituteMatrix (slotAut row) (slotAut_odd row)
+      (joinRow (helperKey model key (kHelp lane) 0)) * packed) 0 lane else 0) -
+  (if target.val = (row.val + helperIdx lane) % 256 then (gZero * packed) 0 lane else 0)
+
+end PeProof

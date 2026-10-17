@@ -79,8 +79,6 @@ pub enum PeError {
     Parameters(String),
     #[error("the attribute does not belong to the class")]
     Attribute,
-    #[error("the message must have binary coefficients and at most n of them")]
-    Message,
     #[error("the artifacts belong to another setup, predicate, or ciphertext")]
     Mismatch,
     #[error(transparent)]

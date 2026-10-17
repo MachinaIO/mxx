@@ -2,10 +2,10 @@
 
 Apply these requirements to GPU implementation and review. Passing tests does not establish the required ownership, asynchronous execution, or memory complexity; check the production path as well.
 
-Native CUDA sources, GPU wrappers, and the concrete GPU runtime are owned by `mxx-backends` under `crates/backends/cuda/` and `crates/backends/src/`. Higher-level application graphs use its public APIs. A higher crate may own the native kernel of one of its named subgraphs (a subgraph kernel, `gpu_subgraph_kernel` in `mxx-backends`), built against `crates/backends/cuda/include/SubgraphKernel.cuh` only; the rules below apply to that code too.
+Native CUDA/HIP sources, GPU wrappers, and the concrete GPU runtime are owned by `mxx-backends` under `crates/backends/gpu/` and `crates/backends/src/`. Higher-level application graphs use its public APIs. A higher crate may own the native kernel of one of its named subgraphs (a subgraph kernel, `gpu_subgraph_kernel` in `mxx-backends`), built against `crates/backends/gpu/include/SubgraphKernel.h` only; the rules below apply to that code too.
 
 1. Minimize memory transfers (and transfer frequency) between the device and the host.
-2. Minimize synchronization. Do not use `cudaDeviceSynchronize`. Use per-stream events and avoid `cudaStreamSynchronize` in asynchronous wrappers. Use `cudaMallocAsync`, `cudaFreeAsync`, and `cudaMemcpyAsync` rather than `cudaMalloc`, `cudaFree`, and `cudaMemcpy`.
+2. Minimize synchronization. Do not use device-wide synchronization (`cudaDeviceSynchronize` or `hipDeviceSynchronize`). Use per-stream events and avoid stream synchronization (`cudaStreamSynchronize` or `hipStreamSynchronize`) in asynchronous wrappers. Use stream-ordered allocation/free and asynchronous copies through `GpuPlatform.h`; do not replace them with synchronizing allocation or copies.
 3. Make effective use of streams. Assign separate streams whenever computations can proceed independently, and avoid introducing unnecessary blocking among device threads.
 4. For any wrapper function that does **not** involve transferring data from device to host, guarantee that the host-side execution is not blocked by the device (i.e., the host-side wrapper function must not wait for completion of the device work it launches within the function).
 5. Minimize the number of kernel launches. Do not repeatedly launch the same kernel in a loop over different inputs; instead, design a single kernel launch so that different device threads handle different data.
@@ -21,7 +21,7 @@ Native CUDA sources, GPU wrappers, and the concrete GPU runtime are owned by `mx
 - Multi-GPU: enumerate devices via `detected_gpu_device_ids`, not a fixed `gpu_id` in parameters; these are logical device ids (`backend::poly_gpu::fleet` in `mxx-backends`). Distribute work evenly, keep all limbs of a matrix on one device, and load shared data onto each device once before loops. Move data between devices only with copy nodes, and select devices in native code only through `mxx_set_device`.
 - Matrices stay in evaluation format by default. Align NTT formats before comparing or concatenating them.
 - Peak VRAM/RAM must scale with configured parallelism, not `num_slots` or total gate count. Matrices of order `d x m_b` or `d x m_g` are acceptable; `m_b^2`, `m_g^2`, and `m_b x m_g` are not. Chunk, stream, and store to disk; release large data promptly and pipeline load, compute, and store.
-- CUDA headers (`.cuh`) declare only cross-file and Rust-facing functions; put bodies in `crates/backends/cuda/src/*.cu`.
+- Shared GPU headers (`.h`) declare only cross-file and Rust-facing functions; put bodies in `crates/backends/gpu/src/*.cu`.
 
 ## Runtime Validation
 
@@ -29,4 +29,19 @@ Run GPU-using tests outside the sandbox using the approved execution mechanism. 
 
 To exercise multi-device code on one GPU, set `MXX_GPU_LOGICAL_DEVICES=0,0` (or `0,0,0`), which maps two (or three) logical devices onto physical GPU 0. For multi-device changes, run the affected GPU tests in identity mode (variable unset) and in `0,0` and `0,0,0` modes; this does not validate multiple physical GPUs or their memory capacity.
 
-For CUDA/synchronization changes, compile once with `cargo test -r --workspace --lib --features gpu --no-run`, then run the relevant built test binary with the same exact test filter, parameters, and command for the full repetition set: 300 runs for synchronization bugs, or 3–5 for round-trip smoke checks. Continue through test failures to collect the failure count, unless the user cancels or a resource/permission limit prevents execution. For other GPU changes, choose enough repetitions to assess the relevant intermittent risk. Report the command, completed repetition count, and failures. Rebuild and rerun affected checks when code changes; do not repeat a completed successful set without a new reason.
+For CUDA/HIP synchronization changes, compile once per selected backend with `MXX_GPU_BACKEND=cuda` or `MXX_GPU_BACKEND=hip` and `cargo test -r --workspace --lib --features gpu --no-run`, then run the relevant built test binary with the same exact test filter, parameters, and command for the full repetition set: 300 runs for synchronization bugs, or 3–5 for round-trip smoke checks. Continue through test failures to collect the failure count, unless the user cancels or a resource/permission limit prevents execution. For other GPU changes, choose enough repetitions to assess the relevant intermittent risk. Report the command, completed repetition count, and failures. Rebuild and rerun affected checks when code changes; do not repeat a completed successful set without a new reason.
+
+HIP control regions may read a small device-produced predicate or retry record at an explicit
+D2H boundary, wait for that transfer's completion event, and schedule the selected region on
+the host. Arithmetic and predicate generation remain on the GPU. Include transfer, event
+wait, and resubmission costs in planning trials, profiles, and production measurements.
+Logical duplicate mappings exercise scheduling only; multiple physical AMD GPUs, peer access,
+and forced host staging require separate device evidence.
+
+`scripts/run_tests.sh --gpu-compile` explicitly compiles the selected backend. Its `--gpu-run`
+option runs conditional ignored GPU unit validation for edited GPU paths. Use
+`PYTHONPATH=scripts/lib python3 -m repo_validation maybe-run-gpu-repeat --force` for a clean
+checkout. `GPU_TEST_FILTER` narrows the built binary's filter; `GPU_REPEAT_COUNT` defaults to
+300. These commands do not authorize device execution or integration tests. Record source
+identity, SDK/compiler/driver versions, architecture, environment, command, exit status,
+repetition count, and failures with device results; compilation alone proves no device behavior.

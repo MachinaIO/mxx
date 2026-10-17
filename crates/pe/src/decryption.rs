@@ -15,7 +15,9 @@
 //! when `F(x) = 0`; its coefficients are rounded to bits. The contraction is
 //! accumulated by blocks: the anchor blocks as `sigma_i((b - B^(2)) k~_i)`
 //! with the stored inverse-coordinate blocks, the helper blocks against
-//! their extension coordinates, and the output block. Decryption reads no
+//! their extension coordinates (one compact matrix per row, helpers in columns),
+//! and the output block. Family members are imported inside the sequential contractions,
+//! retaining only the current member and read-ahead rather than all group rows. Decryption reads no
 //! secret: not `s` or the trapdoor.
 //!
 //! With compact encodings (the manuscript's Appendix C), the ciphertext carries
@@ -29,9 +31,9 @@
 use crate::{
     PeCiphertext, PeError, PePredicateKey, PePublicKey,
     encryption::{ANCHOR_ENCODING, MESSAGE_ENCODING},
-    keygen::{COMPRESSED_KEY, Group, HELPER_KEY, OUTPUT_KEY, anchor_key},
+    keygen::{COMPRESSED_KEY, Group, HELPER_KEY, OUTPUT_KEY, anchor_keys},
 };
-use mxx_backends::{RuntimeValue, SessionStore, poly::PolyParams};
+use mxx_backends::{RuntimeValue, SessionStore};
 use mxx_dsl::{DslContext, Int, Mat};
 use mxx_exponent_lut::{
     api::{self, StageExecution, StageGraph, StageOutputs},
@@ -41,7 +43,7 @@ use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::Conca
 use std::collections::BTreeMap;
 
 pub(crate) const OUTPUT_ROW: &str = "mxx-pe/output-row";
-/// The decoded message bits: one integer family of `n` members.
+/// The decoded constant-coefficient message bit: an integer family with one member.
 pub(crate) const MESSAGE_OUTPUT: &str = "mxx-pe/message";
 
 /// Evaluate the key's predicate on the ciphertext: the gadget carrier `c_F`
@@ -79,14 +81,14 @@ where
     )?)
 }
 
-/// `Dec(sk_F, F, ct)`: the bits of the rounded phase, one per coefficient.
+/// `Dec(sk_F, F, ct)`: the bit decoded from the constant coefficient of the phase.
 pub fn decrypt<E, S>(
     public_key: &PePublicKey,
     key: &PePredicateKey,
     ciphertext: &PeCiphertext,
     execution: &mut E,
     store: &mut S,
-) -> Result<Vec<bool>, PeError>
+) -> Result<bool, PeError>
 where
     E: StageExecution<S>,
     S: SessionStore,
@@ -95,7 +97,7 @@ where
     decode(public_key, key, ciphertext, &evaluated, execution, store)
 }
 
-/// The bits of the rounded phase of an evaluated predicate.
+/// Decode only the constant coefficient of an evaluated predicate.
 fn decode<E, S>(
     public_key: &PePublicKey,
     key: &PePredicateKey,
@@ -103,15 +105,14 @@ fn decode<E, S>(
     evaluated: &StageOutputs,
     execution: &mut E,
     store: &mut S,
-) -> Result<Vec<bool>, PeError>
+) -> Result<bool, PeError>
 where
     E: StageExecution<S>,
     S: SessionStore,
 {
     let (graph, runtime, manifests) = phase_graph(public_key, key, ciphertext, evaluated)?;
-    let dimension = public_key.parameters().level().ring_dimension() as usize;
     let decoded = DslContext::new("mxx-pe/decrypt")
-        .output(MESSAGE_OUTPUT, graph.threshold_decode_int_family(2u8, dimension))?;
+        .output(MESSAGE_OUTPUT, graph.threshold_decode_int_family(2u8, 1))?;
     let outputs = api::execute_graph(
         StageGraph::new(decoded.build()?, runtime, manifests),
         &ParamEnv::default(),
@@ -121,10 +122,10 @@ where
     )?;
     let value = outputs.outputs.get(MESSAGE_OUTPUT).ok_or(PeError::Mismatch)?;
     let bits = execution.download_integers(value)?;
-    if bits.len() != dimension {
+    if bits.len() != 1 {
         return Err(PeError::Mismatch);
     }
-    Ok(bits.iter().map(|bit| *bit == num_bigint::BigInt::from(1u8)).collect())
+    Ok(bits[0] == num_bigint::BigInt::from(1u8))
 }
 
 /// The phase `c_m - d_2 - (y_F - kappa_F) k` as a graph value, with its
@@ -191,14 +192,6 @@ pub(crate) fn phase_graph(
     let (_, d_2) = public_key.message_row(hash_key.clone())?;
     let key_production = key.key().production().clone();
     let cutoff = num_bigint::BigInt::from(parameters.key_cutoff().clone());
-    let helper_keys = ring.small_matrix_family_artifact_input(
-        key_production.clone(),
-        HELPER_KEY,
-        w * p,
-        (width, 1),
-        cutoff.clone(),
-        ArtifactAvailability::Transferred,
-    );
     // `sum_i sigma_i(b'' - B''^(2)) v''_i` with compact encodings.
     let compressed = match public_key.compressed_anchor_rows(hash_key.clone())? {
         Some((_, second_row)) => {
@@ -231,27 +224,42 @@ pub(crate) fn phase_graph(
         Mat::concat(ConcatAxis::Columns, vec![ring.zero((1, columns)), rns.public_gadget(0)?]);
     let setup = public_key.setup();
     let masked = anchor - second;
-    let anchors = group.elements.iter().enumerate().fold(ring.zero((1, 1)), |sum, (row, i)| {
-        sum + masked
-            .clone()
-            .mul_small_rhs(anchor_key(&ring, parameters, key, row))
-            .ring_automorphism(IntExpr::constant(*i))
-    });
-    let helpers = mxx_dsl::iterate(w * p, ring.zero((1, 1)), |pair, sum| {
-        let pair = pair.expression()?;
-        let quotient = IntExpr::FloorDiv(Box::new(pair.clone()), Box::new(IntExpr::constant(p)))
-            .canonicalize();
-        let k_index =
-            IntExpr::Rem(Box::new(pair.clone()), Box::new(IntExpr::constant(p))).canonicalize();
-        let i = Group::select(&group.elements, quotient);
-        let k = Group::select(&group.helpers, k_index.clone());
-        let public =
-            setup.helper_key(rns, hash_key.clone(), k).map_err(|_| mxx_dsl::DslError::Schema)?;
-        let member = Int::evaluate(k_index);
-        let helper = read_helper(&helper_rows, member);
-        let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
-        let value = (helper - public_second_row).ring_automorphism(i) + gadget_second_row.clone();
-        Ok(sum + value.mul_small_rhs(helper_keys.at(Int::evaluate(pair))))
+    let anchor_keys = anchor_keys(&ring, parameters, key);
+    let anchors = mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+        let i = Group::select(&group.elements, row.expression()?);
+        Ok(sum + masked.clone().mul_small_rhs(anchor_keys.at(row)).ring_automorphism(i))
+    })?;
+    let helper_keys = ring.small_matrix_family_artifact_input(
+        key.helpers().production().clone(),
+        HELPER_KEY,
+        w,
+        (width, p),
+        num_bigint::BigInt::from(parameters.key_cutoff().clone()),
+        ArtifactAvailability::Transferred,
+    );
+    // Read a compact row once and consume its helper columns sequentially.
+    let helpers = mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+        let own = helper_keys.at(row.clone());
+        let i = Group::select(&group.elements, row.expression()?);
+        mxx_dsl::iterate(p, sum, |k_index, sum| {
+            let k_expr = k_index.expression()?;
+            let k = Group::select(&group.helpers, k_expr.clone());
+            let public = setup
+                .helper_key(rns, hash_key.clone(), k)
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+            let helper = read_helper(&helper_rows, k_index);
+            let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
+            let value = (helper - public_second_row).ring_automorphism(i.clone()) +
+                gadget_second_row.clone();
+            let contribution = value.mul_small_rhs(own.clone()).slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: k_expr.clone(),
+                    end: k_expr + IntExpr::constant(1),
+                }),
+            );
+            Ok(sum + contribution)
+        })
     })?;
     let outputs = (output_row - output_second_row).mul_small_rhs(output_key_block);
     let phase = message - d_2 - (anchors + compressed + helpers + outputs);
@@ -260,6 +268,7 @@ pub(crate) fn phase_graph(
         (ciphertext.prelude().production(), ciphertext.prelude().manifest()),
         (ciphertext.packages().production(), ciphertext.packages().manifest()),
         (key.key().production(), key.key().manifest()),
+        (key.helpers().production(), key.helpers().manifest()),
         (key.evaluation().production(), key.evaluation().manifest()),
     ] {
         manifests.insert(production.clone(), manifest.clone());
@@ -299,7 +308,7 @@ mod tests {
         BranchingProgram, PeClass, encryption::encrypt, keygen::keygen, setup::setup,
         test_support::*,
     };
-    use mxx_backends::{MemoryArtifactStore, authority::CpuExecution};
+    use mxx_backends::{MemoryArtifactStore, authority::CpuExecution, poly::PolyParams};
     use num_bigint::BigUint;
 
     fn bits(value: usize, length: usize) -> Vec<usize> {
@@ -313,7 +322,7 @@ mod tests {
         key: &PePredicateKey,
         ciphertext: &PeCiphertext,
         evaluated: &StageOutputs,
-        message: &[bool],
+        message: bool,
         execution: &mut CpuExecution,
         store: &mut MemoryArtifactStore,
     ) -> BigUint {
@@ -335,7 +344,7 @@ mod tests {
         phase
             .coeffs_biguints()
             .into_iter()
-            .zip(message.iter().copied().chain(std::iter::repeat(false)))
+            .zip(std::iter::once(message).chain(std::iter::repeat(false)))
             .map(|(coefficient, bit)| {
                 let shifted = (coefficient + &q - if bit { half.clone() } else { 0u8.into() }) % &q;
                 shifted.clone().min(&q - shifted)
@@ -373,7 +382,7 @@ mod tests {
     /// `sigma_i(h_k - H_k^(2)) + G^(2) - sigma_i(s_bar) sigma_i(H_k^(1)) +
     /// sigma_(ik)(s_bar) G^(1)` within the helper cutoff, and the output
     /// block `c_F - A_F^(2) - s_bar A_F^(1) + F(x) s G` within the simulated
-    /// `E_F`. One ciphertext of the all-one message serves an authorized
+    /// `E_F`. One ciphertext of the message bit one serves an authorized
     /// predicate that reads attribute 0 twice (`F = 0` everywhere), whose
     /// key decrypts it, and an unauthorized one (`F(x) = 1`), whose output
     /// keeps the predicate term `-s G`. With the default noise-free test
@@ -404,11 +413,11 @@ mod tests {
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
         let dimension = parameters.level().ring_dimension() as usize;
         let attribute = bits(rand::random::<u32>() as usize % 4, 2);
-        let message = vec![true; dimension];
+        let message = true;
         let (ciphertext, secret) = crate::encryption::encrypt_with_secret(
             &public_key,
             &attribute,
-            &message,
+            message,
             &mut execution,
             &mut store,
         )
@@ -616,13 +625,12 @@ mod tests {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-        let dimension = parameters.level().ring_dimension() as usize;
         let attribute = (0..class.attribute_length())
             .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
             .collect::<Vec<_>>();
-        let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let message = rand::random::<bool>();
         let ciphertext =
-            encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+            encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
         let predicate = random_program(class, &attribute, 0);
         let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
         let evaluated =
@@ -635,7 +643,7 @@ mod tests {
             &key,
             &ciphertext,
             &evaluated,
-            &message,
+            message,
             &mut execution,
             &mut store,
         );
@@ -660,9 +668,8 @@ mod tests {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-        let dimension = parameters.level().ring_dimension() as usize;
-        let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-        let ciphertext = encrypt(&public_key, &[0], &message, &mut execution, &mut store).unwrap();
+        let message = rand::random::<bool>();
+        let ciphertext = encrypt(&public_key, &[0], message, &mut execution, &mut store).unwrap();
         let predicate = BranchingProgram::new(class, vec![0], vec![vec![0, 1]]).unwrap();
         let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
         let evaluated =
@@ -675,7 +682,7 @@ mod tests {
             &key,
             &ciphertext,
             &evaluated,
-            &message,
+            message,
             &mut execution,
             &mut store,
         );
@@ -686,12 +693,11 @@ mod tests {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-        let dimension = parameters.level().ring_dimension() as usize;
         let value = rand::random::<u32>() as usize % 4;
         let attribute = bits(value, 2);
-        let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-        let zeros = vec![false; dimension];
-        let [ciphertext, zero_ciphertext] = [&message, &zeros].map(|message| {
+        let message = rand::random::<bool>();
+        let zeros = false;
+        let [ciphertext, zero_ciphertext] = [message, zeros].map(|message| {
             encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap()
         });
         let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class)).unwrap();
@@ -704,13 +710,13 @@ mod tests {
                 decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
                 continue;
             }
-            for (ciphertext, message) in [(&ciphertext, &message), (&zero_ciphertext, &zeros)] {
+            for (ciphertext, message) in [(&ciphertext, message), (&zero_ciphertext, zeros)] {
                 let evaluated =
                     evaluate(&public_key, &key, ciphertext, &mut execution, &mut store).unwrap();
                 let decrypted =
                     decode(&public_key, &key, ciphertext, &evaluated, &mut execution, &mut store)
                         .unwrap();
-                assert_eq!(&decrypted, message, "pattern {pattern}, value {value}");
+                assert_eq!(decrypted, message, "pattern {pattern}, value {value}");
                 let measured = phase_error(
                     &public_key,
                     &key,

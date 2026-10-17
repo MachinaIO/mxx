@@ -2471,10 +2471,11 @@ mod test {
 }
 
 /// Publish the public actions of Dynamic root sites (see
-/// [`super::public_action_role`]) under the artifact names `name` gives.
+/// [`super::public_action_role`]) under the artifact names `name` gives. Leaf row families
+/// are direct member-loop outputs, exported per lane without a root repacking consumer.
 fn publish_public_actions(
     mut graph: DslContext,
-    actions: &BTreeMap<WireId, (RnsBggMatrix, Option<[Mat; 2]>)>,
+    actions: &BTreeMap<WireId, (RnsBggMatrix, Vec<super::BranchKeys>)>,
     name: impl Fn(String) -> String,
 ) -> Result<DslContext, ApiError> {
     for (wire, (key, branches)) in actions {
@@ -2484,11 +2485,15 @@ fn publish_public_actions(
                 .transferred_output(name(format!("{role}.{port}")), entry)
                 .map_err(ApiError::scheme)?;
         }
-        let role = super::public_action_role(*wire, "branches");
-        for (port, row) in branches.iter().flatten().enumerate() {
-            graph = graph
-                .transferred_output(name(format!("{role}.{port}")), row.clone())
-                .map_err(ApiError::scheme)?;
+        for keys in branches {
+            for (port, rows) in keys.rows.iter().enumerate() {
+                graph = graph
+                    .transferred_output(
+                        name(super::branch_keys_role(*wire, keys.group, port)),
+                        rows.clone(),
+                    )
+                    .map_err(ApiError::scheme)?;
+            }
         }
     }
     Ok(graph)

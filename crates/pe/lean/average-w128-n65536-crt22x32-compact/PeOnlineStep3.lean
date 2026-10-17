@@ -20,7 +20,7 @@ every column decomposition runs. -/
 theorem colLoop0 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {c top bot final : ExactMatrix Q N 1 88}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 88) ↦
-      Stage_online_eval.sequential_generatedRoot_177 Backend.backend model tape (path ++ [177, i])
+      Stage_online_eval.sequential_generatedRoot_387 Backend.backend model tape (path ++ [387, i])
         params i (current, (c, (top, (bot, ())))) next) (Int.toNat 88) 0 final) (jj : Fin 88) :
     final 0 jj = (c * rhsDigits top bot jj) 0 0 ∧
       ∃ D' : ExactMatrix Q N (44 + 44) 1,
@@ -75,7 +75,7 @@ theorem mulInner0_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {a j : Nat} (ha : a < 44) (hj : j < 88) {s t : MulBlock}
     (hs : s.2.1 = expand (zc0 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)) ∧
       s.2.2.1 = expand (zc1 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)))
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_185_26 Backend.backend model tape path
+    (h : Stage_online_eval.sequential_sequential_generatedRoot_395_26 Backend.backend model tape path
       params a j (s.1, s.2.1, s.2.2.1, U 0, U 1, zc0, ((x : Nat) : Int), zc1, ()) t) :
     t.1 = s.1 + (expand (zc0 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)) * U 0 +
         expand (zc1 (mulIndex x ⟨a, ha⟩ ⟨j, hj⟩)) * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
@@ -108,7 +108,7 @@ theorem mulInner0 {model : HashModel} {tape : SampleTape} {path : List Nat}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44) {zc0 zc1 : Fin 15488 → ExactMatrix PQ N 1 1}
     (x : Fin 4) (a : Fin 44) {final : MulBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_185_26 Backend.backend model tape
+      Stage_online_eval.sequential_sequential_generatedRoot_395_26 Backend.backend model tape
         (path ++ [26, i]) params a i
         (current.1, (current.2.1, (current.2.2.1, (keyDigits A ⟨44 + a, by omega⟩ 0,
           (keyDigits A ⟨44 + a, by omega⟩ 1, (zc0, (((x : Nat) : Int), (zc1, ())))))))) next)
@@ -124,7 +124,7 @@ theorem mulInner0 {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hInv0 : Inv 0 (0, (expand (zc0 (mulIndex x a 0)), (expand (zc1 (mulIndex x a 0)), ()))) :=
     ⟨congrArg z0 (by simp [mulIndex]), congrArg z1 (by simp [mulIndex])⟩
   have hstep : ∀ i (s t : MulBlock) (hi : i < 88), Inv i s →
-      Stage_online_eval.sequential_sequential_generatedRoot_185_26 Backend.backend model tape
+      Stage_online_eval.sequential_sequential_generatedRoot_395_26 Backend.backend model tape
         (path ++ [26, i]) params a i
         (s.1, (s.2.1, (s.2.2.1, (keyDigits A ⟨44 + a, by omega⟩ 0, (keyDigits A ⟨44 + a, by omega⟩ 1,
           (zc0, (((x : Nat) : Int), (zc1, ())))))))) t →
@@ -156,11 +156,10 @@ theorem mulLoop0_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {zc0 zc1 : Fin 15488 → ExactMatrix PQ N 1 1} {x : Fin 4} {i : Nat} (hi : i < 44)
     {s t : ExactMatrix Q N 1 88}
-    (h : Stage_online_eval.sequential_generatedRoot_185 Backend.backend model tape path
+    (h : Stage_online_eval.sequential_generatedRoot_395 Backend.backend model tape path
       params i (s, zc0, ((x : Nat) : Int), zc1, A0, A1, ()) t) (jj : Fin 88) :
     t 0 jj = s 0 jj + mulCompanionSum A x (expandFam zc0) (expandFam zc1) jj ⟨i, hi⟩ := by
-  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, x2, -, -, -, x10, x11, x12, x14, -, -, x16, x17, x19, -, -, -,
-    -, -, -, -, -, x21, x22, -, -, -, -, -, -, -, -, x24, x25, -, hin, x27, xout⟩ := h
+  obtain ⟨w, ⟨-, -, -, -, -, -, -, -, -, -, x2, -, -, -, x10, x11, x12, x14, -, -, x16, x17, x19, -, -, -, -, -, -, -, -, x21⟩, x22, -, -, -, -, -, -, -, -, x24, x25, -, hin, x27, xout⟩ := h
   have hdiv : Int.fdiv (Int.ofNat i) 44 = 0 := by
     rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
     simp only [Int.ofNat_eq_natCast]
@@ -228,7 +227,7 @@ theorem mulLoop0 {model : HashModel} {tape : SampleTape} {path : List Nat}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {zc0 zc1 : Fin 15488 → ExactMatrix PQ N 1 1} {x : Fin 4} {final : ExactMatrix Q N 1 88}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 88) ↦
-      Stage_online_eval.sequential_generatedRoot_185 Backend.backend model tape (path ++ [185, i])
+      Stage_online_eval.sequential_generatedRoot_395 Backend.backend model tape (path ++ [395, i])
         params i (current, (zc0, (((x : Nat) : Int), (zc1, (A0, (A1, ())))))) next)
       (Int.toNat 44) 0 final) (jj : Fin 88) :
     final 0 jj = ∑ a, mulCompanionSum A x (expandFam zc0) (expandFam zc1) jj a := by
@@ -245,7 +244,7 @@ set_option maxHeartbeats 4000000 in
 theorem coefLoop0 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {final : ExactMatrix Q N 1 1}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 1) ↦
-      Stage_online_eval.sequential_generatedRoot_190 Backend.backend model tape (path ++ [190, i])
+      Stage_online_eval.sequential_generatedRoot_400 Backend.backend model tape (path ++ [400, i])
         params i (current, (tables, ())) next) (Int.toNat 128) 0 final) :
     final = ∑ j : Fin 128, coefTermC tables 384 1 j (by norm_num) := by
   have hcount : Int.toNat 128 = 128 := rfl
@@ -268,11 +267,11 @@ theorem coefLoop0 {model : HashModel} {tape : SampleTape} {path : List Nat}
   exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]
 
 set_option maxHeartbeats 4000000 in
-/-- One iteration of the column action loop `sequential_generatedRoot_177`. -/
+/-- One iteration of the column action loop `sequential_generatedRoot_387`. -/
 theorem colStep23 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
     {s t : ExactMatrix Q N 1 88}
-    (hb : Stage_online_eval.sequential_generatedRoot_177 Backend.backend model tape path params i
+    (hb : Stage_online_eval.sequential_generatedRoot_387 Backend.backend model tape path params i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -289,12 +288,17 @@ theorem colStep23 {model : HashModel} {tape : SampleTape} {path : List Nat}
   refine ⟨?_, ⟨w7, hrun, x8⟩⟩
   simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
 
+/-! ## The internal branches of the first LUT depth (root parallel loop 56)
+
+Each lane `b < 15` builds its branch's companion row (loops 58 and 58_22), switches the imported key
+`T_b` (loops 22 and 47), and weights its row by the branch's coefficient (loop 74). -/
+
 set_option maxHeartbeats 4000000 in
-/-- One iteration of the column action loop `sequential_parallel_generatedRoot_212_49`. -/
-theorem colStep65_49 {model : HashModel} {tape : SampleTape} {path : List Nat}
+/-- One iteration of the column action loop `sequential_parallel_generatedRoot_415_47`. -/
+theorem colStep56_47 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
     {s t : ExactMatrix Q N 1 88}
-    (hb : Stage_online_eval.sequential_parallel_generatedRoot_212_49 Backend.backend model tape path params i0 i
+    (hb : Stage_online_eval.sequential_parallel_generatedRoot_415_47 Backend.backend model tape path params i0 i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -315,10 +319,10 @@ set_option maxHeartbeats 4000000 in
 /-- One iteration of the three-row column action loop of an internal branch of step `0`: the
 helper row and the two public helper-key rows, each times the digits of one column of the
 branch's switched key. -/
-theorem colStep65_24 {model : HashModel} {tape : SampleTape} {path : List Nat}
+theorem colStep56_22 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {i0 : Nat} {x y z top bot : ExactMatrix Q N 1 88} {i : Nat}
     (hi : i < 88) {s t : ExactMatrix Q N 1 88 × ExactMatrix Q N 1 88 × ExactMatrix Q N 1 88 × Unit}
-    (hb : Stage_online_eval.sequential_parallel_generatedRoot_212_24 Backend.backend model tape path
+    (hb : Stage_online_eval.sequential_parallel_generatedRoot_415_22 Backend.backend model tape path
       params i0 i (s.1, (s.2.1, (s.2.2.1, (x, (top, (bot, (y, (z, ())))))))) t) :
     (t.1 = s.1 + (x * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
       t.2.1 = s.2.1 + (y * rhsDigits top bot ⟨i, hi⟩) 0 0 •
@@ -339,454 +343,12 @@ theorem colStep65_24 {model : HashModel} {tape : SampleTape} {path : List Nat}
   refine ⟨⟨?_, ?_, ?_⟩, ⟨w7, hrun, x8⟩⟩ <;>
     simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
 
-set_option maxHeartbeats 8000000 in
-/-- One iteration `j` of the inner companion loop of the first LUT depth at pair `i` (branch
-`i / 44`, private digit row `i % 44`). -/
-theorem lutInner0_step {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params}
-    {U : Fin 2 → ExactMatrix Q N 44 1} {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1}
-    {i j : Nat} (hi : i < 968) (hj : j < 88) {s t : MulBlock}
-    (hs : s.2.1 = expand (zc0 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ ⟨j, hj⟩)) ∧
-      s.2.2.1 = expand (zc1 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ ⟨j, hj⟩)))
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_211_24 Backend.backend model tape path
-      params i j (s.1, s.2.1, s.2.2.1, U 0, U 1, zc0, zc1, ()) t) :
-    t.1 = s.1 + (expand (zc0 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ ⟨j, hj⟩)) * U 0 +
-        expand (zc1 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ ⟨j, hj⟩)) * U 1) 0 0 •
-          unitRow ((j : Nat) : Int) ∧
-      t.2.1 = expand (zc0 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩
-        ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩)) ∧
-      t.2.2.1 = expand (zc1 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩
-        ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩)) := by
-  obtain ⟨w9, w14, w15, w16, w18, w20, w21, w23, -, -, -, -, -, -, -, -, x9, -, -, -, -, -, -, -,
-    x14, x15, x16, x18, -, -, x20, x21, x23, xout⟩ := h
-  have hmem : MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) switchMembers = ((i / 44 : Nat) : Int) := by
-    rw [show Int.fdiv (Int.ofNat i) 44 = Int.ofNat (i / 44) by
-      rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]; simp only [Int.ofNat_eq_natCast]; omega]
-    exact switchMembers_eq _ (by omega)
-  have hnext : 88 * Int.fmod (Int.ofNat i) 44 + Int.fmod (1 + Int.ofNat j) 88 +
-      3872 * MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) switchMembers =
-      Int.ofNat (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩
-        ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩) := by
-    rw [hmem]
-    simp only [lutIndex, Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 44 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 88 by norm_num), Int.ofNat_eq_natCast]
-    omega
-  rw [hnext] at x14 x20
-  obtain ⟨_, hw14⟩ := familyGet_eq x14
-  obtain ⟨_, hw20⟩ := familyGet_eq x20
-  have hw18 := expand_read x15 x16 x18
-  have hw23 := expand_read x15 x21 x23
-  have hw9 := unitRow_window (c := ((j : Nat) : Int)) (by simp only [Int.ofNat_eq_natCast]; omega) x9
-  subst hw14 hw20
-  subst xout hw9 hw18 hw23
-  obtain ⟨hs0, hs1⟩ := hs
-  refine ⟨?_, rfl, rfl⟩
-  simp only [hs0, hs1, matrixAdd, matrixMul, matrixMulScalarLeft_eq]
-
-set_option maxHeartbeats 8000000 in
-/-- The inner companion loop of the first LUT depth at pair `i` ends with the companion row of
-branch `i / 44` and private digit row `i % 44`, column by column. -/
-theorem lutInner0 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44)
-    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {i : Nat} (hi : i < 968) {final : MulBlock}
-    (h : MxxIR.IterRuns (fun (j : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_211_24 Backend.backend model tape
-        (path ++ [24, j]) params i j
-        (current.1, (current.2.1, (current.2.2.1,
-          (keyDigits (routedKey (kSw (i / 44)) (kSw_odd ⟨i / 44, by omega⟩) A) ⟨44 + i % 44, by omega⟩ 0,
-          (keyDigits (routedKey (kSw (i / 44)) (kSw_odd ⟨i / 44, by omega⟩) A) ⟨44 + i % 44, by omega⟩ 1,
-          (zc0, (zc1, ()))))))) next) (Int.toNat 88)
-      (0, (expand (zc0 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ 0)),
-        (expand (zc1 (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ 0)), ()))) final)
-    (jj : Fin 88) :
-    final.1 0 jj = lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨i / 44, by omega⟩ jj
-      ⟨i % 44, by omega⟩ := by
-  let z0 := expandFam zc0
-  let z1 := expandFam zc1
-  let b : Fin 22 := ⟨i / 44, by omega⟩
-  let a : Fin 44 := ⟨i % 44, by omega⟩
-  let Inv : Nat → MulBlock → Prop := fun j s ↦
-    s.2.1 = z0 (lutIndex b a ⟨j % 88, Nat.mod_lt _ (by norm_num)⟩) ∧
-      s.2.2.1 = z1 (lutIndex b a ⟨j % 88, Nat.mod_lt _ (by norm_num)⟩)
-  have hInv0 : Inv 0 (0, (expand (zc0 (lutIndex b a 0)), (expand (zc1 (lutIndex b a 0)), ()))) :=
-    ⟨congrArg z0 (by simp [lutIndex]), congrArg z1 (by simp [lutIndex])⟩
-  have hstep : ∀ j (s t : MulBlock) (hj : j < 88), Inv j s →
-      Stage_online_eval.sequential_sequential_generatedRoot_211_24 Backend.backend model tape
-        (path ++ [24, j]) params i j
-        (s.1, (s.2.1, (s.2.2.1,
-          (keyDigits (routedKey (kSw (i / 44)) (kSw_odd b) A) ⟨44 + i % 44, by omega⟩ 0,
-          (keyDigits (routedKey (kSw (i / 44)) (kSw_odd b) A) ⟨44 + i % 44, by omega⟩ 1,
-          (zc0, (zc1, ()))))))) t →
-      (∀ w, t.1 0 w = s.1 0 w + lutCompanionSum A z0 z1 b ⟨j, hj⟩ a *
-          (unitRow ((j : Nat) : Int) : ExactMatrix Q N 1 88) 0 w) ∧ Inv (j + 1) t := by
-    intro j s t hj hq hb
-    have hq' : s.2.1 = expand (zc0 (lutIndex b a ⟨j, hj⟩)) ∧
-        s.2.2.1 = expand (zc1 (lutIndex b a ⟨j, hj⟩)) := by
-      obtain ⟨h0, h1⟩ := hq
-      exact ⟨h0.trans (congrArg z0 (by simp [lutIndex, Nat.mod_eq_of_lt hj])),
-        h1.trans (congrArg z1 (by simp [lutIndex, Nat.mod_eq_of_lt hj]))⟩
-    obtain ⟨h0, h1, h2⟩ := lutInner0_step hi hj hq' hb
-    refine ⟨fun w ↦ ?_, h1, h2⟩
-    rw [h0]
-    rfl
-  have hk := IterRuns.accumulate_entries (fun s : MulBlock ↦ s.1)
-    (fun w (j : Fin 88) ↦ lutCompanionSum A z0 z1 b j a *
-      (unitRow ((j : Nat) : Int) : ExactMatrix Q N 1 88) 0 w)
-    Inv hInv0 (fun j s t hj hq hb ↦ hstep j s t hj hq hb) h jj
-  rw [hk, sum_unitRow_mul (fun j ↦ lutCompanionSum A z0 z1 b j a) jj]
-  simp [z0, z1, b, a]
-
-set_option maxHeartbeats 16000000 in
-/-- One iteration `i` of the companion loop of the first LUT depth decomposes the routed key column
-`44 + i % 44` of branch `i / 44` once and adds, at the columns of that branch, its companion row. -/
-theorem lutLoop0_step {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params}
-    {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
-    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
-    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {i : Nat} (hi : i < 968)
-    {s t : ExactMatrix Q N 1 1936}
-    (h : Stage_online_eval.sequential_generatedRoot_211 Backend.backend model tape path
-      params i (s, zc0, zc1, A0, A1, ()) t) (p : Fin 1936) :
-    t 0 p = s 0 p + (if (p : Nat) / 88 = i / 44 then
-      lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨i / 44, by omega⟩
-        ⟨(p : Nat) % 88, by omega⟩ ⟨i % 44, by omega⟩ else 0) := by
-  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, x2, -, -, -, -, -, -, x6, x7, x8, x10, -, -, x12, x13, x15,
-    -, -, -, -, -, -, -, -, x17, -, -, -, x18, x19, -, -, -, -, -, -, -, -, x21, -, -, -, x22, x23, -,
-    hin, x25, xout⟩ := h
-  have hb : Int.fdiv (Int.ofNat i) 44 = Int.ofNat (i / 44) := by
-    rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]; simp only [Int.ofNat_eq_natCast]; omega
-  have hrow : Int.fmod (Int.ofNat i) 44 = ((i % 44 : Nat) : Int) := by
-    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hmem := switchMembers_eq (i / 44) (by omega)
-  have hfirst : 88 * Int.fmod (Int.ofNat i) 44 +
-      3872 * MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) switchMembers =
-      Int.ofNat (lutIndex ⟨i / 44, by omega⟩ ⟨i % 44, by omega⟩ 0) := by
-    rw [hb, hmem, hrow]
-    simp only [lutIndex, Int.ofNat_eq_natCast, Fin.val_zero]
-    omega
-  have hcol : (44 : Int) + Int.fmod (Int.ofNat i) 44 = ((44 + i % 44 : Nat) : Int) := by
-    rw [hrow]; push_cast; ring
-  have hcol1 : (45 : Int) + Int.fmod (Int.ofNat i) 44 = 1 + ((44 + i % 44 : Nat) : Int) := by
-    rw [hrow]; push_cast; ring
-  rw [hfirst] at x6 x12
-  rw [hb] at x2 x18 x22
-  rw [hcol, hcol1] at x17 x21
-  have hw2 := unitRow_window (c := ((i / 44 : Nat) : Int)) (by simp only [Int.ofNat_eq_natCast]; omega) x2
-  obtain ⟨_, hw6⟩ := familyGet_eq x6
-  obtain ⟨_, hw12⟩ := familyGet_eq x12
-  have hw10 := expand_read x7 x8 x10
-  have hw15 := expand_read x7 x13 x15
-  rw [hw6] at hw10
-  rw [hw12] at hw15
-  have hentry : ∀ {r : Fin 2} {Ar : ExactMatrix Q N 1 88} {x y : ExactMatrix Q N 1 1}
-      {u : ExactMatrix Q N 44 1}, concatColumns (A r 0) (A r 1) Ar →
-      sliceMatrix Ar 0 1 ((44 + i % 44 : Nat) : Int) (1 + ((44 + i % 44 : Nat) : Int)) x →
-      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat (i / 44)) switchList) x y →
-      gadgetDecomposeRuns Backend.backend 65536 44 y u →
-      u = keyDigits (routedKey (kSw (i / 44)) (kSw_odd ⟨i / 44, by omega⟩) A)
-        ⟨44 + i % 44, by omega⟩ r := by
-    intro r Ar x y u hAr hx hy hu
-    obtain ⟨_, hx0⟩ := sliceMatrix_column hx
-    rw [concatColumns_entry hAr, pair_eta] at hx0
-    obtain ⟨_, hy0⟩ := ringAutomorphismRuns_eq hQ hN hy
-    have hye : y = fun _ _ ↦ joinedEntry (routedKey (kSw (i / 44)) (kSw_odd ⟨i / 44, by omega⟩) A r)
-        ⟨44 + i % 44, by omega⟩ := by
-      funext c d
-      rw [hy0]
-      dsimp only
-      rw [Subsingleton.elim c 0, Subsingleton.elim d 0, hx0]
-      show _ = joinedEntry (fun j ↦ substituteMatrix (kSw (i / 44)) (kSw_odd ⟨i / 44, by omega⟩)
-        (A r j)) _
-      rw [joinedEntry_substitute]
-      rfl
-    rw [hye] at hu
-    exact entryDigits_eq hu
-  have hw19 := hentry hA0 x17 x18 x19
-  have hw23 := hentry hA1 x21 x22 x23
-  rw [hw19, hw23, hw10, hw15] at hin
-  have hblock := lutInner0 (model := model) (tape := tape) (path := path) A hi hin
-  rw [hw2] at x25
-  subst xout
-  simp only [matrixAdd, Matrix.add_apply]
-  rw [tensorRuns_unitRow x25 p]
-  split_ifs with hpi
-  · have e := hblock ⟨(p : Nat) % 88, by omega⟩
-    dsimp only at e
-    rw [e]
-  · rfl
-
-set_option maxHeartbeats 16000000 in
-/-- The companion loop of the first LUT depth ends with the companion row of every branch,
-position by position. -/
-theorem lutLoop0 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params}
-    {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
-    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
-    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {final : ExactMatrix Q N 1 1936}
-    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 1936) ↦
-      Stage_online_eval.sequential_generatedRoot_211 Backend.backend model tape (path ++ [211, i])
-        params i (current, (zc0, (zc1, (A0, (A1, ()))))) next) (Int.toNat 968) 0 final)
-    (p : Fin 1936) :
-    final 0 p = ∑ a, lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨(p : Nat) / 88, by omega⟩
-      ⟨(p : Nat) % 88, by omega⟩ a := by
-  have hcount : Int.toNat 968 = 22 * 44 := rfl
-  rw [hcount] at h
-  have hk := IterRuns.accumulate_entries (fun s : ExactMatrix Q N 1 1936 ↦ s)
-    (fun (w : Fin 1936) (i : Fin (22 * 44)) ↦ if (i : Nat) / 44 = (w : Nat) / 88 then
-      lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨(w : Nat) / 88, by omega⟩
-        ⟨(w : Nat) % 88, by omega⟩ ⟨(i : Nat) % 44, by omega⟩ else 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨fun w ↦ by
-      dsimp only
-      rw [lutLoop0_step hA0 hA1 hi hb w]
-      congr 1
-      split_ifs with h1 h2 h2
-      · congr 2
-      · exact absurd h1.symm h2
-      · exact absurd h2.symm h1
-      · rfl, trivial⟩) h p
-  rw [hk]
-  simpa using sum_branch_entry (B := 22) (A := 44)
-    (fun a ↦ lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨(p : Nat) / 88, by omega⟩
-      ⟨(p : Nat) % 88, by omega⟩ a) ⟨(p : Nat) / 88, by omega⟩
-
-set_option maxHeartbeats 64000000 in
-/-- Internal branch `b` of the first LUT depth: the helper action `h_k Dec(T_k)`, the switch
-`σ_k(c) Dec(C_k)` of the switching ciphertext `C_k` (rows `σ_k(H⁰_{k⁻¹})` and
-`σ_k(H¹_{k⁻¹}) - σ_k(h_{k⁻¹})`), and the companion row `E_b`, per component; and the key
-`H_k Dec(T_k)` of the branch. -/
-theorem internalBranch0 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {b : Nat} (hb : b < 15)
-    {hf0 hf1 : Fin 37 → ExactMatrix Q N 1 44} {T0 T1 : ExactMatrix Q N 1 11176} {key : ByteArray}
-    {c0 c1 : ExactMatrix Q N 1 44} {E : ExactMatrix Q N 1 1936}
-    {outputs : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 ×
-      ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
-    (h : Stage_online_eval.parallel_generatedRoot_212 Backend.backend model tape path params b
-      (hf0, hf1, T0, T1, key, c0, c1, E, ()) outputs) :
-    let k := kSw b
-    let hk : Odd k := kSw_odd ⟨b, by omega⟩
-    let Tb0 := rowBlock T0 b (by omega)
-    let Tb1 := rowBlock T1 b (by omega)
-    let hrow : Fin 2 → ExactMatrix Q N 1 44 := ![hf0 ⟨b, by omega⟩, hf1 ⟨b, by omega⟩]
-    let hinv : Fin 2 → ExactMatrix Q N 1 44 := ![hf0 ⟨36 - b, by omega⟩, hf1 ⟨36 - b, by omega⟩]
-    let top : Fin 2 → ExactMatrix Q N 1 44 := fun j ↦
-      substituteMatrix k hk (helperKey model key (kInv b) 0 j)
-    let bot : Fin 2 → ExactMatrix Q N 1 44 := fun j ↦
-      substituteMatrix k hk (helperKey model key (kInv b) 1 j) - substituteMatrix k hk (hinv j)
-    let σc : Fin 2 → ExactMatrix Q N 1 44 := ![substituteMatrix k hk c0, substituteMatrix k hk c1]
-    let Eb := rowBlock E b (by omega)
-    (∀ (j : Fin 2) (l : Fin 44), ∃ D' : ExactMatrix Q N (44 + 44) 1,
-      gadgetDecomposeRuns Backend.backend 65536 44 (pairColumn (halves Tb0 j 0 l) (halves Tb1 j 0 l)) D' ∧
-        compactCenteredRebaseRuns 32768 D' (fun a _ ↦ actionDigits Tb0 Tb1 j a l)) ∧
-    (∀ (j : Fin 2) (l : Fin 44), ∃ D' : ExactMatrix Q N (44 + 44) 1,
-      gadgetDecomposeRuns Backend.backend 65536 44 (pairColumn (top j 0 l) (bot j 0 l)) D' ∧
-        compactCenteredRebaseRuns 32768 D' (fun a _ ↦ actionDigits (joinRow top) (joinRow bot) j a l)) ∧
-    (∀ j : Fin 2, ![outputs.1, outputs.2.1] j = pairMul hrow (actionDigits Tb0 Tb1 j) +
-      (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Eb j)) ∧
-    (∀ r j : Fin 2, ![![outputs.2.2.1, outputs.2.2.2.1], ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1]] r j =
-      pairMul (helperKey model key k r) (actionDigits Tb0 Tb1 j)) := by
-  intro k hk Tb0 Tb1 hrow hinv top bot σc Eb
-  obtain ⟨w, hbody⟩ := h
-  let ctx : Stage_online_eval.parallel_generatedRoot_212.Ctx Backend.backend model tape path params b :=
-    ⟨(hf0, hf1, T0, T1, key, c0, c1, E, ()), w⟩
-  have F := Stage_online_eval.parallel_generatedRoot_212.facts ctx hbody
-  -- The helper of `k`.
-  have hw2 : Stage_online_eval.parallel_generatedRoot_212.w_2_0 ctx = Int.ofNat b :=
-    switchMembers_eq b (by omega)
-  have h3 := F.c0.h3_0
-  have h5 := F.c0.h5_0
-  rw [hw2] at h3 h5
-  obtain ⟨_, hw3⟩ := familyGet_eq h3
-  obtain ⟨_, hw5⟩ := familyGet_eq h5
-  have hw6 : Stage_online_eval.parallel_generatedRoot_212.w_6_0 ctx = joinRow hrow := by
-    have h6 := F.c0.h6_0
-    rw [hw3, hw5] at h6
-    exact concat_joinRow (r := hrow) h6
-  -- The key `T_k` of the branch, block `b` of the imported branch keys.
-  have hw8 : Stage_online_eval.parallel_generatedRoot_212.w_8_0 ctx = Tb0 :=
-    sliceMatrix_window (88 * b) F.c0.h8_0 (by simp only [Int.ofNat_eq_natCast]; push_cast; ring) _
-  have hw13 : Stage_online_eval.parallel_generatedRoot_212.w_13_0 ctx = Tb1 :=
-    sliceMatrix_window (88 * b) F.c1.h13_0 (by simp only [Int.ofNat_eq_natCast]; push_cast; ring) _
-  have hw11 : Stage_online_eval.parallel_generatedRoot_212.w_11_0 ctx = Tb0 := by
-    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
-    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
-    have h11 := F.c0.h11_0
-    rw [h9, h10, hw8] at h11
-    exact (concat_joinRow (r := halves Tb0) h11).trans (joinRow_halves Tb0)
-  have hw16 : Stage_online_eval.parallel_generatedRoot_212.w_16_0 ctx = Tb1 := by
-    have h14 := sliceMatrix_window 0 F.c1.h14_0 (by simp) (by omega)
-    have h15 := sliceMatrix_window 44 F.c1.h15_0 (by simp) (by omega)
-    have h16 := F.c1.h16_0
-    rw [h14, h15, hw13] at h16
-    exact (concat_joinRow (r := halves Tb1) h16).trans (joinRow_halves Tb1)
-  -- The helper key `H_k`.
-  have hkc := kSw_cast b (by omega)
-  have hH : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
-      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
-        .u64Le (MxxIR.selectInt (Int.ofNat b) switchList), .bytes componentBytes, .u64Le (c : Int)]
-        key y → y = helperKey model key k ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
-    intro c hc y hy
-    rw [← hkc] at hy
-    exact helperKey_read hc hy
-  have hw20 : Stage_online_eval.parallel_generatedRoot_212.w_20_0 ctx = joinRow (helperKey model key k 0) := by
-    have h20 := F.c1.h20_0
-    rw [hH (c := 0) (by norm_num) F.c1.h18_0, hH (c := 1) (by norm_num) F.c1.h19_0] at h20
-    exact concat_joinRow (r := helperKey model key k 0) h20
-  have hw23 : Stage_online_eval.parallel_generatedRoot_212.w_23_0 ctx = joinRow (helperKey model key k 1) := by
-    have h23 := F.c2.h23_0
-    rw [hH (c := 2) (by norm_num) F.c1.h21_0, hH (c := 3) (by norm_num) F.c2.h22_0] at h23
-    exact concat_joinRow (r := helperKey model key k 1) h23
-  -- The helper action and the key of the branch.
-  have h24 := F.c2.h24_2
-  rw [hw6, hw11, hw16, hw20, hw23] at h24
-  have hcount : Int.toNat 88 = 88 := rfl
-  rw [hcount] at h24
-  have hact := colAction (r := 3)
-    (fun r (s : ExactMatrix Q N 1 88 × ExactMatrix Q N 1 88 × ExactMatrix Q N 1 88 × Unit) ↦
-      ![s.1, s.2.1, s.2.2.1] r)
-    (rows := ![joinRow hrow, joinRow (helperKey model key k 0), joinRow (helperKey model key k 1)])
-    (fun r ↦ by fin_cases r <;> rfl)
-    (fun i s t hi hb ↦ by
-      obtain ⟨⟨e0, e1, e2⟩, hrun⟩ := colStep65_24 hi hb
-      refine ⟨fun r ↦ ?_, hrun⟩
-      fin_cases r
-      · exact e0
-      · exact e1
-      · exact e2) h24
-  -- The routed state rows.
-  have hw28 := routing_kSw (by omega) F.c2.h28_0
-  have hw30 := routing_kSw (by omega) F.c2.h30_0
-  have hw31 : Stage_online_eval.parallel_generatedRoot_212.w_31_0 ctx = joinRow σc := by
-    have h31 := F.c2.h31_0
-    rw [hw28, hw30] at h31
-    exact concat_joinRow (r := σc) h31
-  -- The switching ciphertext `C_k` from the helper key of `k⁻¹` and its helper.
-  have hkic := kInv_cast b (by omega)
-  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
-      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
-        .u64Le (MxxIR.selectInt (Int.ofNat b) switchInvList), .bytes componentBytes, .u64Le (c : Int)]
-        key y → y = helperKey model key (kInv b) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
-    intro c hc y hy
-    rw [← hkic] at hy
-    exact helperKey_read hc hy
-  have hw36 : Stage_online_eval.parallel_generatedRoot_212.w_36_0 ctx = joinRow top := by
-    have h36 := F.c2.h36_0
-    rw [routing_kSw (by omega) F.c2.h33_0, routing_kSw (by omega) F.c2.h35_0,
-      hHi (c := 0) (by norm_num) F.c2.h32_0, hHi (c := 1) (by norm_num) F.c2.h34_0] at h36
-    exact concat_joinRow (r := top) h36
-  have hw39 : Stage_online_eval.parallel_generatedRoot_212.w_39_0 ctx = Int.ofNat (36 - b) :=
-    switchInvMembers_eq b (by omega)
-  have h40 := F.c3.h40_0
-  have h45 := F.c3.h45_0
-  rw [hw39] at h40 h45
-  obtain ⟨_, hw40⟩ := familyGet_eq h40
-  obtain ⟨_, hw45⟩ := familyGet_eq h45
-  have hw48 : Stage_online_eval.parallel_generatedRoot_212.w_48_0 ctx = joinRow bot := by
-    have h48 := F.c3.h48_0
-    have hw42 : Stage_online_eval.parallel_generatedRoot_212.w_42_0 ctx =
-        matrixSub (Stage_online_eval.parallel_generatedRoot_212.w_38_0 ctx)
-          (Stage_online_eval.parallel_generatedRoot_212.w_41_0 ctx) := rfl
-    have hw47 : Stage_online_eval.parallel_generatedRoot_212.w_47_0 ctx =
-        matrixSub (Stage_online_eval.parallel_generatedRoot_212.w_44_0 ctx)
-          (Stage_online_eval.parallel_generatedRoot_212.w_46_0 ctx) := rfl
-    rw [hw42, hw47, routing_kSw (by omega) F.c3.h38_0, routing_kSw (by omega) F.c3.h44_0,
-      routing_kSw (by omega) F.c3.h41_0, routing_kSw (by omega) F.c3.h46_0,
-      hHi (c := 2) (by norm_num) F.c3.h37_0, hHi (c := 3) (by norm_num) F.c3.h43_0, hw40, hw45] at h48
-    exact concat_joinRow (r := bot) h48
-  -- The switch.
-  have h49 := F.c3.h49_0
-  rw [hw31, hw36, hw48] at h49
-  rw [hcount] at h49
-  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s) (rows := ![joinRow σc])
-    (fun _ ↦ rfl)
-    (fun i s t hi hb ↦ by
-      obtain ⟨e, hrun⟩ := colStep65_49 hi hb
-      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h49
-  -- Component by component.
-  have hsplit := fun (r : Fin 3) ↦ colActionSplit (c := ![joinRow hrow, joinRow (helperKey model key k 0),
-      joinRow (helperKey model key k 1)] r) (row := ![hrow, helperKey model key k 0, helperKey model key k 1] r)
-    (by fin_cases r <;> exact concatColumns_joinRow _) (tk := halves Tb0) (bk := halves Tb1)
-    (entry_halves Tb0) (entry_halves Tb1)
-    (acc := ![Stage_online_eval.parallel_generatedRoot_212.w_24_0 ctx,
-      Stage_online_eval.parallel_generatedRoot_212.w_24_1 ctx,
-      Stage_online_eval.parallel_generatedRoot_212.w_24_2 ctx] r)
-    (fun jj ↦ ⟨by fin_cases r <;> exact (hact jj).1 _, (hact jj).2⟩)
-  have hswitch := colActionSplit (c := joinRow σc) (row := σc) (concatColumns_joinRow σc)
-    (tk := top) (bk := bot) (fun _ ↦ rfl) (fun _ ↦ rfl)
-    (acc := Stage_online_eval.parallel_generatedRoot_212.w_49_0 ctx)
-    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
-  -- The companion block.
-  have hw52 : Stage_online_eval.parallel_generatedRoot_212.w_52_0 ctx = Eb :=
-    sliceMatrix_window (88 * b) F.c4.h52_0 (by simp only [Int.ofNat_eq_natCast]; push_cast; ring) _
-  have hw53 : Stage_online_eval.parallel_generatedRoot_212.w_53_0 ctx = halves Eb 0 := by
-    rw [sliceMatrix_window 0 F.c4.h53_0 (by simp) (by omega), hw52]; rfl
-  have hw58 : Stage_online_eval.parallel_generatedRoot_212.w_58_0 ctx = halves Eb 1 := by
-    rw [sliceMatrix_window 44 F.c5.h58_0 (by simp) (by omega), hw52]; rfl
-  have hhalf : ∀ {x y : ExactMatrix Q N 1 44} {z : ExactMatrix Q N 1 88} (j : Fin 2) (start : Nat),
-      start = 44 * j → sliceMatrix z 0 1 (start : Int) (start + 44 : Nat) x →
-      rowWindow 44 (44 * j) (by omega) z = y → x = y := by
-    intro x y z j start hs hx hz
-    subst hs
-    rw [sliceMatrix_window (44 * j) hx (by simp) (by omega)]
-    exact hz
-  refine ⟨(hsplit 0).2, hswitch.2, fun j ↦ ?_, fun r j ↦ ?_⟩
-  · rw [F.c6.hout]
-    have h25 := sliceMatrix_window 0 F.c2.h25_0 (by simp) (by omega)
-    have h50 := sliceMatrix_window 0 F.c4.h50_0 (by simp) (by omega)
-    have h56 := sliceMatrix_window 44 F.c4.h56_0 (by simp) (by omega)
-    have h57 := sliceMatrix_window 44 F.c4.h57_0 (by simp) (by omega)
-    have e0 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-        (Stage_online_eval.parallel_generatedRoot_212.w_24_0 ctx) = pairMul hrow (actionDigits Tb0 Tb1 j) :=
-      (hsplit 0).1
-    have es : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-        (Stage_online_eval.parallel_generatedRoot_212.w_49_0 ctx) =
-          pairMul σc (actionDigits (joinRow top) (joinRow bot) j) := hswitch.1
-    fin_cases j
-    · show matrixAdd (Stage_online_eval.parallel_generatedRoot_212.w_25_0 ctx)
-          (matrixAdd (Stage_online_eval.parallel_generatedRoot_212.w_50_0 ctx)
-            (Stage_online_eval.parallel_generatedRoot_212.w_53_0 ctx)) = _
-      have a0 := e0 0
-      have b0 := es 0
-      simp only [Fin.val_zero] at a0 b0
-      rw [h25, h50, hw53, a0, b0]
-      rfl
-    · show matrixAdd (Stage_online_eval.parallel_generatedRoot_212.w_56_0 ctx)
-          (matrixAdd (Stage_online_eval.parallel_generatedRoot_212.w_57_0 ctx)
-            (Stage_online_eval.parallel_generatedRoot_212.w_58_0 ctx)) = _
-      have a1 := e0 1
-      have b1 := es 1
-      simp only [Fin.val_one] at a1 b1
-      rw [h56, h57, hw58, a1, b1]
-      rfl
-  · rw [F.c6.hout]
-    have h61 := sliceMatrix_window 0 F.c5.h61_0 (by simp) (by omega)
-    have h62 := sliceMatrix_window 44 F.c5.h62_0 (by simp) (by omega)
-    have h63 := sliceMatrix_window 0 F.c5.h63_0 (by simp) (by omega)
-    have h64 := sliceMatrix_window 44 F.c6.h64_0 (by simp) (by omega)
-    have e1 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-        (Stage_online_eval.parallel_generatedRoot_212.w_24_1 ctx) =
-          pairMul (helperKey model key k 0) (actionDigits Tb0 Tb1 j) := (hsplit 1).1
-    have e2 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-        (Stage_online_eval.parallel_generatedRoot_212.w_24_2 ctx) =
-          pairMul (helperKey model key k 1) (actionDigits Tb0 Tb1 j) := (hsplit 2).1
-    have a10 := e1 0
-    have a11 := e1 1
-    have a20 := e2 0
-    have a21 := e2 1
-    simp only [Fin.val_zero, Fin.val_one] at a10 a11 a20 a21
-    fin_cases r <;> fin_cases j
-    · exact h61.trans a10
-    · exact h62.trans a11
-    · exact h63.trans a20
-    · exact h64.trans a21
-
 set_option maxHeartbeats 4000000 in
 /-- One iteration of the coefficient loop of internal branch `b` of step `0`. -/
-theorem coefStep66_7 {model : HashModel} {tape : SampleTape} {path : List Nat}
+theorem coefStep56_74 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b i : Nat} (_hb : b < 22)
     (hi : i < 128) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_213_7 Backend.backend model tape path
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_415_70 Backend.backend model tape path
       params b i (s, (tables, ())) t) :
     t = s + coefTermC tables 384 (kSw b) ⟨i, hi⟩ (by norm_num) := by
   obtain ⟨w5, w13, -, -, x5, -, -, x13, xout⟩ := h
@@ -797,382 +359,29 @@ theorem coefStep66_7 {model : HashModel} {tape : SampleTape} {path : List Nat}
   congr 2
   rw [hw5]
 
-set_option maxHeartbeats 16000000 in
-/-- One iteration `b` of the sum over the internal branches of step `0` adds each switched row times
-the branch's scalar action; the key blocks pass through. -/
-theorem sumStep66 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {b : Nat} (hb : b < 15)
-    {rows0 rows1 : Fin 15 → ExactMatrix Q N 1 44} {tables : Fin 512 → Int} {s t : SumState}
-    (h : Stage_online_eval.sequential_generatedRoot_213 Backend.backend model tape path params b
-      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (s.2.2.2.2.2.1, (rows0, (tables,
-        (rows1, ()))))))))) t) :
-    t = (s.1 + rows0 ⟨b, hb⟩ * scalarV (branchCoefC tables 384 (kSw b) (by norm_num)),
-      (s.2.1 + rows1 ⟨b, hb⟩ * scalarV (branchCoefC tables 384 (kSw b) (by norm_num)),
-        s.2.2) ) := by
-  obtain ⟨w, -, -, x3, -, hin, x9, x11, -, -, x16, xout⟩ := h
-  have hcount : Int.toNat 128 = 128 := rfl
-  rw [hcount] at hin
-  have hcoef := coefAccumC (by norm_num) (fun i s t hi hb' ↦ coefStep66_7 (b := b) (by omega) hi hb') hin
-  obtain ⟨_, hw3⟩ := familyGet_eq x3
-  obtain ⟨_, hw16⟩ := familyGet_eq x16
-  have hV := scalarV_eq x9 (coef := branchCoefC tables 384 (kSw b) (by norm_num)) (by
-    have : w.w_7_0 = branchCoefC tables 384 (kSw b) (by norm_num) := hcoef
-    rw [← this]
-    exact x11)
-  subst xout
-  simp only [hw3, hw16, hV, matrixAdd, matrixMul]
-
-set_option maxHeartbeats 16000000 in
-/-- The sum over the internal branches of step `0`. -/
-theorem sumLoop66 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {rows0 rows1 : Fin 15 → ExactMatrix Q N 1 44}
-    {tables : Fin 512 → Int} {init final : SumState}
-    (h : MxxIR.IterRuns (fun (i : Nat) (current next : SumState) ↦
-      Stage_online_eval.sequential_generatedRoot_213 Backend.backend model tape (path ++ [213, i]) params i
-        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1,
-          (current.2.2.2.2.2.1, (rows0, (tables, (rows1, ()))))))))) next) (Int.toNat 15) init final) :
-    final = (init.1 + ∑ b : Fin 15, rows0 b * scalarV (branchCoefC tables 384 (kSw b) (by norm_num)),
-      (init.2.1 + ∑ b : Fin 15, rows1 b * scalarV (branchCoefC tables 384 (kSw b) (by norm_num)),
-        init.2.2)) := by
-  have hcount : Int.toNat 15 = 15 := rfl
-  rw [hcount] at h
-  have h0 := IterRuns.accumulate (fun s : SumState ↦ s.1)
-    (fun i ↦ if hi : i < 15 then rows0 ⟨i, hi⟩ * scalarV (branchCoefC tables 384 (kSw i) (by norm_num))
-      else 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by simp only [sumStep66 hi hb, dif_pos hi], trivial⟩) h
-  have h1 := IterRuns.accumulate (fun s : SumState ↦ s.2.1)
-    (fun i ↦ if hi : i < 15 then rows1 ⟨i, hi⟩ * scalarV (branchCoefC tables 384 (kSw i) (by norm_num))
-      else 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by simp only [sumStep66 hi hb, dif_pos hi], trivial⟩) h
-  have h2 := IterRuns.accumulate (fun s : SumState ↦ s.2.2) (fun _ ↦ 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by simp only [sumStep66 hi hb, add_zero], trivial⟩) h
-  have hfin : ∀ (f : Fin 15 → ExactMatrix Q N 1 44),
-      (∑ i ∈ Finset.range 15, if hi : i < 15 then f ⟨i, hi⟩ else 0) = ∑ b : Fin 15, f b := by
-    intro f
-    rw [← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 15 then f ⟨i, hi⟩ else 0)]
-    exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]
-  obtain ⟨e0, -⟩ := h0
-  obtain ⟨e1, -⟩ := h1
-  obtain ⟨e2, -⟩ := h2
-  rw [hfin (fun b ↦ rows0 b * scalarV (branchCoefC tables 384 (kSw b) (by norm_num)))] at e0
-  rw [hfin (fun b ↦ rows1 b * scalarV (branchCoefC tables 384 (kSw b) (by norm_num)))] at e1
-  simp only [Finset.sum_const_zero, add_zero] at e2
-  exact Prod.ext e0 (Prod.ext e1 e2)
-
-set_option maxHeartbeats 4000000 in
-/-- One iteration of the column action loop `sequential_sequential_generatedRoot_214_18`. -/
-theorem colStep67_18 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {i0 : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
-    {s t : ExactMatrix Q N 1 88}
-    (hb : Stage_online_eval.sequential_sequential_generatedRoot_214_18 Backend.backend model tape path params i0 i
-      (s, (c, (top, (bot, ())))) t) :
-    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
-      ColumnRuns top bot ⟨i, hi⟩ := by
-  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
-    -, -, -, -, -, -, x11, xout⟩ := hb
-  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
-  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
-  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
-  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
-  rw [concatRows_pairColumn x6, hw3, hw5] at x7
-  have hrun := x7
-  have hw8 := columnDigits_eq x7 x8
-  subst xout hw8 hw11
-  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
-  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
-
-set_option maxHeartbeats 4000000 in
-/-- One iteration of the column action loop `sequential_sequential_generatedRoot_214_44`. -/
-theorem colStep67_44 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {i0 : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
-    {s t : ExactMatrix Q N 1 88}
-    (hb : Stage_online_eval.sequential_sequential_generatedRoot_214_44 Backend.backend model tape path params i0 i
-      (s, (c, (top, (bot, ())))) t) :
-    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
-      ColumnRuns top bot ⟨i, hi⟩ := by
-  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
-    -, -, -, -, -, -, x11, xout⟩ := hb
-  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
-  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
-  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
-  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
-  rw [concatRows_pairColumn x6, hw3, hw5] at x7
-  have hrun := x7
-  have hw8 := columnDigits_eq x7 x8
-  subst xout hw8 hw11
-  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
-  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
-
-set_option maxHeartbeats 4000000 in
-/-- One iteration of the coefficient loop of first-depth leaf `15 + b` of step `0`. -/
-theorem coefStep67_54 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b i : Nat}
-    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_214_54 Backend.backend model tape path
-      params b i (s, (tables, ())) t) :
-    t = s + coefTermC tables 384 (kSw (15 + b)) ⟨i, hi⟩ (by norm_num) := by
-  obtain ⟨w5, w13, -, -, x5, -, -, x13, xout⟩ := h
-  have hsel : (15 + Int.ofNat b) = Int.ofNat (15 + b) := by simp only [Int.ofNat_eq_natCast]; push_cast; ring
-  rw [hsel] at x13
-  obtain ⟨_, hw5⟩ := familyGet_eq x5
-  obtain ⟨-, -, -, hw13⟩ := x13
-  subst xout
-  simp only [coefTermC, hw13]
-  congr 2
-  rw [hw5]
-
-set_option maxHeartbeats 64000000 in
-/-- One iteration `i` of the sum over the first-depth leaves of step `0`: leaf `b = 15 + i` adds each
-component of its row times its scalar action; the key blocks pass through. -/
-theorem leafStep67 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {i : Nat} (hi : i < 7) (d : BranchData)
-    {tables : Fin 512 → Int} {s t : SumState}
-    (h : Stage_online_eval.sequential_generatedRoot_214 Backend.backend model tape path params i
-      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (s.2.2.2.2.2.1, (d.hf0, (d.hf1, (d.T0, (d.T1,
-        (d.c0, (d.c1, (d.key, (d.E, (tables, ()))))))))))))))) t) :
-    d.Runs model (15 + i) (by omega) ∧
-      t = (s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)),
-        (s.2.1 + d.row model (15 + i) (by omega) 1 *
-          scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)), s.2.2)) := by
-  have hb : 15 + i < 22 := by omega
-  obtain ⟨w, hbody⟩ := h
-  let ctx : Stage_online_eval.sequential_generatedRoot_214.Ctx Backend.backend model tape path params i :=
-    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, d.hf0, d.hf1, d.T0, d.T1, d.c0, d.c1,
-      d.key, d.E, tables, ()), w⟩
-  have F := Stage_online_eval.sequential_generatedRoot_214.facts ctx hbody
-  have hsel : (15 + Int.ofNat i) = Int.ofNat (15 + i) := by
-    simp only [Int.ofNat_eq_natCast]; push_cast; ring
-  -- The helper of `k`.
-  have hw3 : Stage_online_eval.sequential_generatedRoot_214.w_3_0 ctx = Int.ofNat (15 + i) := by
-    show MxxIR.selectInt (15 + Int.ofNat i) switchMembers = _
-    rw [hsel]
-    exact switchMembers_eq _ hb
-  have h4 := F.c0.h4_0
-  have h6 := F.c0.h6_0
-  rw [hw3] at h4 h6
-  obtain ⟨_, hw4⟩ := familyGet_eq h4
-  obtain ⟨_, hw6⟩ := familyGet_eq h6
-  have hw7 : Stage_online_eval.sequential_generatedRoot_214.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
-    have h7 := F.c0.h7_0
-    rw [hw4, hw6] at h7
-    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
-  -- The key `T_k`.
-  have hoff : (1320 : Int) + 88 * Int.ofNat i = ((88 * (15 + i) : Nat) : Int) := by
-    simp only [Int.ofNat_eq_natCast]; push_cast; ring
-  have hw9 : Stage_online_eval.sequential_generatedRoot_214.w_9_0 ctx = d.Tb0 (15 + i) hb := by
-    rw [sliceMatrix_window (88 * (15 + i)) F.c0.h9_0 hoff (by omega)]; rfl
-  have hw14 : Stage_online_eval.sequential_generatedRoot_214.w_14_0 ctx = d.Tb1 (15 + i) hb := by
-    rw [sliceMatrix_window (88 * (15 + i)) F.c1.h14_0 hoff (by omega)]; rfl
-  have hw12 : Stage_online_eval.sequential_generatedRoot_214.w_12_0 ctx = d.Tb0 (15 + i) hb := by
-    have h10 := sliceMatrix_window 0 F.c0.h10_0 (by simp) (by omega)
-    have h11 := sliceMatrix_window 44 F.c0.h11_0 (by simp) (by omega)
-    have h12 := F.c0.h12_0
-    rw [h10, h11, hw9] at h12
-    exact (concat_joinRow (r := halves _) h12).trans (joinRow_halves _)
-  have hw17 : Stage_online_eval.sequential_generatedRoot_214.w_17_0 ctx = d.Tb1 (15 + i) hb := by
-    have h15 := sliceMatrix_window 0 F.c1.h15_0 (by simp) (by omega)
-    have h16 := sliceMatrix_window 44 F.c1.h16_0 (by simp) (by omega)
-    have h17 := F.c1.h17_0
-    rw [h15, h16, hw14] at h17
-    exact (concat_joinRow (r := halves _) h17).trans (joinRow_halves _)
-  -- The helper action.
-  have hcount : Int.toNat 88 = 88 := rfl
-  have h18 := F.c1.h18_0
-  rw [hw7, hw12, hw17, hcount] at h18
-  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
-    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
-    (fun i' s t hi' hb' ↦ by
-      obtain ⟨e, hrun⟩ := colStep67_18 hi' hb'
-      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h18
-  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
-    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
-    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_generatedRoot_214.w_18_0 ctx)
-    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
-  -- The routed state rows.
-  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
-      ringAutomorphismRuns (MxxIR.selectInt (15 + Int.ofNat i) switchList) x y →
-      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
-    intro x y hxy
-    rw [hsel] at hxy
-    exact routing_kSw hb hxy
-  have hw25 : Stage_online_eval.sequential_generatedRoot_214.w_25_0 ctx = joinRow (d.σc (15 + i) hb) := by
-    have h25 := F.c2.h25_0
-    rw [hroute F.c2.h22_0, hroute F.c2.h24_0] at h25
-    exact concat_joinRow (r := d.σc (15 + i) hb) h25
-  -- The switching ciphertext `C_k`.
-  have hkic := kInv_cast (15 + i) hb
-  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
-      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
-        .u64Le (MxxIR.selectInt (15 + Int.ofNat i) switchInvList), .bytes componentBytes, .u64Le (c : Int)]
-        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
-    intro c hc y hy
-    rw [hsel, ← hkic] at hy
-    exact helperKey_read hc hy
-  have hw31 : Stage_online_eval.sequential_generatedRoot_214.w_31_0 ctx = joinRow (d.top model (15 + i) hb) := by
-    have h31 := F.c2.h31_0
-    rw [hroute F.c2.h28_0, hroute F.c2.h30_0, hHi (c := 0) (by norm_num) F.c2.h27_0,
-      hHi (c := 1) (by norm_num) F.c2.h29_0] at h31
-    exact concat_joinRow (r := d.top model (15 + i) hb) h31
-  have hw34 : Stage_online_eval.sequential_generatedRoot_214.w_34_0 ctx = Int.ofNat (36 - (15 + i)) := by
-    show MxxIR.selectInt (15 + Int.ofNat i) switchInvMembers = _
-    rw [hsel]
-    exact switchInvMembers_eq _ hb
-  have h35 := F.c2.h35_0
-  have h40 := F.c3.h40_0
-  rw [hw34] at h35 h40
-  obtain ⟨_, hw35⟩ := familyGet_eq h35
-  obtain ⟨_, hw40⟩ := familyGet_eq h40
-  have hw43 : Stage_online_eval.sequential_generatedRoot_214.w_43_0 ctx = joinRow (d.bot model (15 + i) hb) := by
-    have h43 := F.c3.h43_0
-    have hw37 : Stage_online_eval.sequential_generatedRoot_214.w_37_0 ctx =
-        matrixSub (Stage_online_eval.sequential_generatedRoot_214.w_33_0 ctx)
-          (Stage_online_eval.sequential_generatedRoot_214.w_36_0 ctx) := rfl
-    have hw42 : Stage_online_eval.sequential_generatedRoot_214.w_42_0 ctx =
-        matrixSub (Stage_online_eval.sequential_generatedRoot_214.w_39_0 ctx)
-          (Stage_online_eval.sequential_generatedRoot_214.w_41_0 ctx) := rfl
-    rw [hw37, hw42, hroute F.c2.h33_0, hroute F.c3.h39_0, hroute F.c2.h36_0, hroute F.c3.h41_0,
-      hHi (c := 2) (by norm_num) F.c2.h32_0, hHi (c := 3) (by norm_num) F.c3.h38_0, hw35, hw40] at h43
-    exact concat_joinRow (r := d.bot model (15 + i) hb) h43
-  -- The switch.
-  have h44 := F.c3.h44_0
-  rw [hw25, hw31, hw43, hcount] at h44
-  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
-    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
-    (fun i' s t hi' hb' ↦ by
-      obtain ⟨e, hrun⟩ := colStep67_44 hi' hb'
-      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h44
-  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
-    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
-    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_generatedRoot_214.w_44_0 ctx)
-    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
-  -- The companion block.
-  have hw47 : Stage_online_eval.sequential_generatedRoot_214.w_47_0 ctx = d.Eb (15 + i) hb := by
-    rw [sliceMatrix_window (88 * (15 + i)) F.c3.h47_0 hoff (by omega)]; rfl
-  -- The coefficient and the scalar action.
-  have h54 := F.c4.h54_0
-  have hc128 : Int.toNat 128 = 128 := rfl
-  rw [hc128] at h54
-  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ coefStep67_54 hi' hb') h54
-  have hV := scalarV_eq F.c4.h56_0 (coef := branchCoefC tables 384 (kSw (15 + i)) (by norm_num)) (by
-    have h58 := F.c4.h58_0
-    have : Stage_online_eval.sequential_generatedRoot_214.w_54_0 ctx =
-        branchCoefC tables 384 (kSw (15 + i)) (by norm_num) := hcoef
-    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
-      (Stage_online_eval.sequential_generatedRoot_214.w_54_0 ctx))
-        (Stage_online_eval.sequential_generatedRoot_214.w_56_0 ctx)) _ at h58
-    rw [this] at h58
-    exact h58)
-  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_⟩
-  rw [F.c4.hout]
-  have e0 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-      (Stage_online_eval.sequential_generatedRoot_214.w_18_0 ctx) =
-        pairMul (d.hrow (15 + i) hb) (actionDigits (d.Tb0 (15 + i) hb) (d.Tb1 (15 + i) hb) j) := hhelp.1
-  have es : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-      (Stage_online_eval.sequential_generatedRoot_214.w_44_0 ctx) =
-        pairMul (d.σc (15 + i) hb)
-          (actionDigits (joinRow (d.top model (15 + i) hb)) (joinRow (d.bot model (15 + i) hb)) j) := hswitch.1
-  have a0 := e0 0
-  have a1 := e0 1
-  have b0 := es 0
-  have b1 := es 1
-  simp only [Fin.val_zero, Fin.val_one] at a0 a1 b0 b1
-  have h19 := sliceMatrix_window 0 F.c1.h19_0 (by simp) (by omega)
-  have h45 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
-  have h48 := sliceMatrix_window 0 F.c4.h48_0 (by simp) (by omega)
-  have h62 := sliceMatrix_window 44 F.c4.h62_0 (by simp) (by omega)
-  have h63 := sliceMatrix_window 44 F.c4.h63_0 (by simp) (by omega)
-  have h64 := sliceMatrix_window 44 F.c4.h64_0 (by simp) (by omega)
-  rw [hw47] at h48 h64
-  show (matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_generatedRoot_214.w_19_0 ctx)
-      (matrixAdd (Stage_online_eval.sequential_generatedRoot_214.w_45_0 ctx)
-        (Stage_online_eval.sequential_generatedRoot_214.w_48_0 ctx)))
-      (Stage_online_eval.sequential_generatedRoot_214.w_58_0 ctx)),
-    (matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_generatedRoot_214.w_62_0 ctx)
-      (matrixAdd (Stage_online_eval.sequential_generatedRoot_214.w_63_0 ctx)
-        (Stage_online_eval.sequential_generatedRoot_214.w_64_0 ctx)))
-      (Stage_online_eval.sequential_generatedRoot_214.w_58_0 ctx)), s.2.2)) = _
-  rw [h19, h45, h48, h62, h63, h64, a0, a1, b0, b1, hV]
-  rfl
-
-set_option maxHeartbeats 16000000 in
-/-- The sum over the first-depth leaves `b = 15 + i` of step `0`: every leaf runs its keys and adds
-its rows times its scalar action. -/
-theorem leafLoop67 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} (d : BranchData) {tables : Fin 512 → Int} {init final : SumState}
-    (h : MxxIR.IterRuns (fun (i : Nat) (current next : SumState) ↦
-      Stage_online_eval.sequential_generatedRoot_214 Backend.backend model tape (path ++ [214, i]) params i
-        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1,
-          (current.2.2.2.2.2.1, (d.hf0, (d.hf1, (d.T0, (d.T1, (d.c0, (d.c1, (d.key, (d.E,
-            (tables, ()))))))))))))))) next) (Int.toNat 7) init final) :
-    (∀ i (hi : i < 7), d.Runs model (15 + i) (by omega)) ∧
-      final = (init.1 + ∑ i : Fin 7, d.row model (15 + i) (by omega) 0 *
-          scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)),
-        (init.2.1 + ∑ i : Fin 7, d.row model (15 + i) (by omega) 1 *
-          scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)), init.2.2)) := by
-  have hcount : Int.toNat 7 = 7 := rfl
-  rw [hcount] at h
-  let f : Fin 2 → Nat → ExactMatrix Q N 1 44 := fun j i ↦
-    if hi : i < 7 then d.row model (15 + i) (by omega) j *
-      scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)) else 0
-  have h0 := IterRuns.accumulate (fun s : SumState ↦ s.1) (f 0)
-    (fun k _ ↦ ∀ i (hi : i < 7), i < k → d.Runs model (15 + i) (by omega)) (fun _ _ hk ↦ absurd hk (by omega))
-    (fun i s t hi hq hb ↦ by
-      obtain ⟨hrun, ht⟩ := leafStep67 hi d hb
-      refine ⟨by rw [ht]; simp only [f, dif_pos hi], fun j hj7 hj ↦ ?_⟩
-      rcases Nat.lt_succ_iff_lt_or_eq.mp hj with hj | rfl
-      · exact hq j hj7 hj
-      · exact hrun) h
-  have h1 := IterRuns.accumulate (fun s : SumState ↦ s.2.1) (f 1) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by rw [(leafStep67 hi d hb).2]; simp only [f, dif_pos hi], trivial⟩) h
-  have h2 := IterRuns.accumulate (fun s : SumState ↦ s.2.2) (fun _ ↦ 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by rw [(leafStep67 hi d hb).2, add_zero], trivial⟩) h
-  have hfin : ∀ (g : Fin 7 → ExactMatrix Q N 1 44),
-      (∑ i ∈ Finset.range 7, if hi : i < 7 then g ⟨i, hi⟩ else 0) = ∑ b : Fin 7, g b := by
-    intro g
-    rw [← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 7 then g ⟨i, hi⟩ else 0)]
-    exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]
-  obtain ⟨e0, hruns⟩ := h0
-  obtain ⟨e1, -⟩ := h1
-  obtain ⟨e2, -⟩ := h2
-  refine ⟨fun i hi ↦ hruns i hi hi, ?_⟩
-  rw [hfin (fun i ↦ d.row model (15 + i) (by omega) 0 *
-    scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)))] at e0
-  rw [hfin (fun i ↦ d.row model (15 + i) (by omega) 1 *
-    scalarV (branchCoefC tables 384 (kSw (15 + i)) (by norm_num)))] at e1
-  simp only [Finset.sum_const_zero, add_zero] at e2
-  exact Prod.ext e0 (Prod.ext e1 e2)
-
 set_option maxHeartbeats 8000000 in
-/-- One iteration `j` of the inner companion loop of the second LUT depth at pair `i` (branch
-`i / 44`, private digit row `i % 44`). -/
-theorem lutInner2_step {model : HashModel} {tape : SampleTape} {path : List Nat}
+/-- One iteration `j` of the inner companion loop of internal branch `b` at private digit row `a`. -/
+theorem lutInner56_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params}
     {U : Fin 2 → ExactMatrix Q N 44 1} {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1}
-    {i j : Nat} (hi : i < 4620) (hj : j < 88) {s t : MulBlock}
-    (hs : s.2.1 = expand (zc0 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ ⟨j, hj⟩)) ∧
-      s.2.2.1 = expand (zc1 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ ⟨j, hj⟩)))
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_216_34 Backend.backend model tape path
-      params i j (s.1, s.2.1, s.2.2.1, U 0, U 1, zc0, zc1, ()) t) :
-    t.1 = s.1 + (expand (zc0 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ ⟨j, hj⟩)) * U 0 +
-        expand (zc1 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ ⟨j, hj⟩)) * U 1) 0 0 •
+    {b a j : Nat} (hb : b < 22) (ha : a < 44) (hj : j < 88) {s t : MulBlock}
+    (hs : s.2.1 = expand (zc0 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)) ∧
+      s.2.2.1 = expand (zc1 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)))
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+      path params b a j (s.1, (s.2.1, (s.2.2.1, (U 0, (U 1, (zc0, (zc1, ()))))))) t) :
+    t.1 = s.1 + (expand (zc0 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)) * U 0 +
+        expand (zc1 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨j, hj⟩)) * U 1) 0 0 •
           unitRow ((j : Nat) : Int) ∧
-      t.2.1 = expand (zc0 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩
-        ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩)) ∧
-      t.2.2.1 = expand (zc1 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩
-        ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩)) := by
-  obtain ⟨w9, w14, w15, w16, w18, w20, w21, w23, -, -, -, -, -, -, -, -, x9, -, -, -, -, -, -, -,
+      t.2.1 = expand (zc0 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩)) ∧
+      t.2.2.1 = expand (zc1 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩)) := by
+  obtain ⟨w9, w14, w15, w16, w18, w20, w21, w23, -, -, -, -, -, -, -, -, x9, -, -, -, -, -,
     x14, x15, x16, x18, -, -, x20, x21, x23, xout⟩ := h
-  have hmem : MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) memberList2 = ((15 + i / 44 / 15 : Nat) : Int) := by
-    rw [show Int.fdiv (Int.ofNat i) 44 = Int.ofNat (i / 44) by
-      rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]; simp only [Int.ofNat_eq_natCast]; omega]
-    exact memberList2_eq _ (by omega)
-  have hnext : 88 * Int.fmod (Int.ofNat i) 44 + Int.fmod (1 + Int.ofNat j) 88 +
-      3872 * MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) memberList2 =
-      Int.ofNat (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩
-        ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩) := by
-    rw [hmem]
-    simp only [lutIndex, member2, Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 44 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 88 by norm_num), Int.ofNat_eq_natCast]
+  have hnext : 88 * Int.ofNat a + Int.fmod (1 + Int.ofNat j) 88 +
+      3872 * MxxIR.selectInt (Int.ofNat b) switchMembers =
+      Int.ofNat (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ ⟨(j + 1) % 88, Nat.mod_lt _ (by norm_num)⟩) := by
+    rw [switchMembers_eq b hb]
+    simp only [lutIndex, Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 88 by norm_num),
+      Int.ofNat_eq_natCast]
     omega
   rw [hnext] at x14 x20
   obtain ⟨_, hw14⟩ := familyGet_eq x14
@@ -1187,221 +396,471 @@ theorem lutInner2_step {model : HashModel} {tape : SampleTape} {path : List Nat}
   simp only [hs0, hs1, matrixAdd, matrixMul, matrixMulScalarLeft_eq]
 
 set_option maxHeartbeats 8000000 in
-/-- The inner companion loop of the second LUT depth at pair `i` ends with the companion row of
-branch `i / 44` and private digit row `i % 44`, column by column. -/
-theorem lutInner2 {model : HashModel} {tape : SampleTape} {path : List Nat}
+/-- The inner companion loop of internal branch `b` at private digit row `a` ends with that digit
+row's companion row, column by column. -/
+theorem lutInner56 {model : HashModel} {tape : SampleTape} {path : List Nat}
     {params : Stage_online_eval.Params} (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44)
-    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {i : Nat} (hi : i < 4620) {final : MulBlock}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {b a : Nat} (hb : b < 22) (ha : a < 44) {start : ExactMatrix Q N 1 88} {final : MulBlock}
     (h : MxxIR.IterRuns (fun (j : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_216_34 Backend.backend model tape
-        (path ++ [34, j]) params i j
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+        (path ++ [21, j]) params b a j
         (current.1, (current.2.1, (current.2.2.1,
-          (keyDigits (routedKey (kSw (member2 (i / 44) (by omega))) (kSw_odd (member2 (i / 44) (by omega))) A)
-            ⟨44 + i % 44, by omega⟩ 0,
-          (keyDigits (routedKey (kSw (member2 (i / 44) (by omega))) (kSw_odd (member2 (i / 44) (by omega))) A)
-            ⟨44 + i % 44, by omega⟩ 1,
+          (keyDigits (routedKey (kSw b) (kSw_odd ⟨b, hb⟩) A) ⟨44 + a, by omega⟩ 0,
+          (keyDigits (routedKey (kSw b) (kSw_odd ⟨b, hb⟩) A) ⟨44 + a, by omega⟩ 1,
           (zc0, (zc1, ()))))))) next) (Int.toNat 88)
-      (0, (expand (zc0 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ 0)),
-        (expand (zc1 (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ 0)), ()))) final)
+      (start, (expand (zc0 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ 0)),
+        (expand (zc1 (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ 0)), ()))) final)
     (jj : Fin 88) :
-    final.1 0 jj = lutCompanionSum A (expandFam zc0) (expandFam zc1) (member2 (i / 44) (by omega)) jj
-      ⟨i % 44, by omega⟩ := by
+    final.1 0 jj = start 0 jj + lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨b, hb⟩ jj ⟨a, ha⟩ := by
   let z0 := expandFam zc0
   let z1 := expandFam zc1
-  let b : Fin 22 := member2 (i / 44) (by omega)
-  let a : Fin 44 := ⟨i % 44, by omega⟩
+  let bb : Fin 22 := ⟨b, hb⟩
+  let aa : Fin 44 := ⟨a, ha⟩
   let Inv : Nat → MulBlock → Prop := fun j s ↦
-    s.2.1 = z0 (lutIndex b a ⟨j % 88, Nat.mod_lt _ (by norm_num)⟩) ∧
-      s.2.2.1 = z1 (lutIndex b a ⟨j % 88, Nat.mod_lt _ (by norm_num)⟩)
-  have hInv0 : Inv 0 (0, (expand (zc0 (lutIndex b a 0)), (expand (zc1 (lutIndex b a 0)), ()))) :=
+    s.2.1 = z0 (lutIndex bb aa ⟨j % 88, Nat.mod_lt _ (by norm_num)⟩) ∧
+      s.2.2.1 = z1 (lutIndex bb aa ⟨j % 88, Nat.mod_lt _ (by norm_num)⟩)
+  have hInv0 : Inv 0 (start, (expand (zc0 (lutIndex bb aa 0)), (expand (zc1 (lutIndex bb aa 0)), ()))) :=
     ⟨congrArg z0 (by simp [lutIndex]), congrArg z1 (by simp [lutIndex])⟩
   have hstep : ∀ j (s t : MulBlock) (hj : j < 88), Inv j s →
-      Stage_online_eval.sequential_sequential_generatedRoot_216_34 Backend.backend model tape
-        (path ++ [34, j]) params i j
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+        (path ++ [21, j]) params b a j
         (s.1, (s.2.1, (s.2.2.1,
-          (keyDigits (routedKey (kSw b) (kSw_odd b) A) ⟨44 + i % 44, by omega⟩ 0,
-          (keyDigits (routedKey (kSw b) (kSw_odd b) A) ⟨44 + i % 44, by omega⟩ 1,
+          (keyDigits (routedKey (kSw b) (kSw_odd bb) A) ⟨44 + a, by omega⟩ 0,
+          (keyDigits (routedKey (kSw b) (kSw_odd bb) A) ⟨44 + a, by omega⟩ 1,
           (zc0, (zc1, ()))))))) t →
-      (∀ w, t.1 0 w = s.1 0 w + lutCompanionSum A z0 z1 b ⟨j, hj⟩ a *
+      (∀ w, t.1 0 w = s.1 0 w + lutCompanionSum A z0 z1 bb ⟨j, hj⟩ aa *
           (unitRow ((j : Nat) : Int) : ExactMatrix Q N 1 88) 0 w) ∧ Inv (j + 1) t := by
-    intro j s t hj hq hb
-    have hq' : s.2.1 = expand (zc0 (lutIndex b a ⟨j, hj⟩)) ∧
-        s.2.2.1 = expand (zc1 (lutIndex b a ⟨j, hj⟩)) := by
+    intro j s t hj hq hbody
+    have hq' : s.2.1 = expand (zc0 (lutIndex bb aa ⟨j, hj⟩)) ∧
+        s.2.2.1 = expand (zc1 (lutIndex bb aa ⟨j, hj⟩)) := by
       obtain ⟨h0, h1⟩ := hq
       exact ⟨h0.trans (congrArg z0 (by simp [lutIndex, Nat.mod_eq_of_lt hj])),
         h1.trans (congrArg z1 (by simp [lutIndex, Nat.mod_eq_of_lt hj]))⟩
-    obtain ⟨h0, h1, h2⟩ := lutInner2_step hi hj hq' hb
+    obtain ⟨h0, h1, h2⟩ := lutInner56_step hb ha hj hq' hbody
     refine ⟨fun w ↦ ?_, h1, h2⟩
     rw [h0]
     rfl
   have hk := IterRuns.accumulate_entries (fun s : MulBlock ↦ s.1)
-    (fun w (j : Fin 88) ↦ lutCompanionSum A z0 z1 b j a *
+    (fun w (j : Fin 88) ↦ lutCompanionSum A z0 z1 bb j aa *
       (unitRow ((j : Nat) : Int) : ExactMatrix Q N 1 88) 0 w)
-    Inv hInv0 (fun j s t hj hq hb ↦ hstep j s t hj hq hb) h jj
-  rw [hk, sum_unitRow_mul (fun j ↦ lutCompanionSum A z0 z1 b j a) jj]
-  simp [z0, z1, b, a]
+    Inv hInv0 (fun j s t hj hq hbody ↦ hstep j s t hj hq hbody) h jj
+  rw [hk, sum_unitRow_mul (fun j ↦ lutCompanionSum A z0 z1 bb j aa) jj]
 
 set_option maxHeartbeats 16000000 in
-/-- One iteration `i` of the companion loop of the second LUT depth decomposes the routed key column
-`44 + i % 44` of branch `i / 44` once and adds, at the columns of that branch, its companion row. -/
-theorem lutLoop2_step {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {K00 K01 K10 K11 : Fin 15 → ExactMatrix Q N 1 44}
-    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {i : Nat} (hi : i < 4620)
-    {s t : ExactMatrix Q N 1 9240}
-    (h : Stage_online_eval.sequential_generatedRoot_216 Backend.backend model tape path
-      params i (s, zc0, zc1, K00, K01, K10, K11, ()) t) (p : Fin 9240) :
-    t 0 p = s 0 p + (if (p : Nat) / 88 = i / 44 then
-      lutCompanionSum (parentKeys K00 K01 K10 K11 ⟨i / 44 % 15, by omega⟩) (expandFam zc0)
-        (expandFam zc1) (member2 (i / 44) (by omega)) ⟨(p : Nat) % 88, by omega⟩ ⟨i % 44, by omega⟩
-      else 0) := by
-  obtain ⟨w, hbody⟩ := h
-  let ctx : Stage_online_eval.sequential_generatedRoot_216.Ctx Backend.backend model tape path params i :=
-    ⟨(s, zc0, zc1, K00, K01, K10, K11, ()), w⟩
-  have F := Stage_online_eval.sequential_generatedRoot_216.facts ctx hbody
-  let A := parentKeys K00 K01 K10 K11 ⟨i / 44 % 15, by omega⟩
-  have hb : Int.fdiv (Int.ofNat i) 44 = Int.ofNat (i / 44) := by
-    rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]; simp only [Int.ofNat_eq_natCast]; omega
-  have hrow : Int.fmod (Int.ofNat i) 44 = ((i % 44 : Nat) : Int) := by
-    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
+/-- One iteration `a` of the companion loop of internal branch `b` decomposes the routed key column
+`44 + a` once and adds that digit row's companion row. -/
+theorem lutLoop56_step {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params}
+    {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {b a : Nat} (hb : b < 22) (ha : a < 44)
+    {s t : ExactMatrix Q N 1 88}
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape path
+      params b a (s, (zc0, (zc1, (A0, (A1, ()))))) t) (p : Fin 88) :
+    t 0 p = s 0 p + lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨b, hb⟩ p ⟨a, ha⟩ := by
+  obtain ⟨w, ⟨-, -, -, -, x3, x4, x5, x7, -, -, x9, x10, x12, -, -, -, -, -, -, x14, -, -, x15, x16,
+    -, -, -, -, -, -, x18, -⟩, -, x19, x20, -, hin, xout⟩ := h
+  have hfirst : 88 * Int.ofNat a + 3872 * MxxIR.selectInt (Int.ofNat b) switchMembers =
+      Int.ofNat (lutIndex ⟨b, hb⟩ ⟨a, ha⟩ 0) := by
+    rw [switchMembers_eq b hb]
+    simp only [lutIndex, Int.ofNat_eq_natCast, Fin.val_zero]
     omega
-  have hmem := memberList2_eq (i / 44) (by omega)
-  have hpar := parentList2_eq (i / 44) (by omega)
-  have hsw := switchList2_eq (i / 44) (by omega)
-  have hfirst : Stage_online_eval.sequential_generatedRoot_216.w_5_0 ctx =
-      Int.ofNat (lutIndex (member2 (i / 44) (by omega)) ⟨i % 44, by omega⟩ 0) := by
-    show 88 * Int.fmod (Int.ofNat i) 44 + 3872 * MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) memberList2 = _
-    rw [hb, hmem, hrow]
-    simp only [lutIndex, member2, Int.ofNat_eq_natCast, Fin.val_zero]
-    omega
-  have hw17 : Stage_online_eval.sequential_generatedRoot_216.w_17_0 ctx = Int.ofNat (i / 44 % 15) := by
-    show MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) parentList2 = _
-    rw [hb, hpar]
-  have hw26 : Stage_online_eval.sequential_generatedRoot_216.w_26_0 ctx = Int.ofNat (i / 44 % 15) := by
-    show MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) parentList2 = _
-    rw [hb, hpar]
-  have hcol : (44 : Int) + Int.fmod (Int.ofNat i) 44 = ((44 + i % 44 : Nat) : Int) := by
-    rw [hrow]; push_cast; ring
-  have hcol1 : (45 : Int) + Int.fmod (Int.ofNat i) 44 = 1 + ((44 + i % 44 : Nat) : Int) := by
-    rw [hrow]; push_cast; ring
-  have x6 := F.c0.h6_0
-  have x12 := F.c0.h12_0
-  rw [hfirst] at x6 x12
-  obtain ⟨_, hw6⟩ := familyGet_eq x6
-  obtain ⟨_, hw12⟩ := familyGet_eq x12
-  have hw10 := expand_read F.c0.h7_0 F.c0.h8_0 F.c0.h10_0
-  have hw15 := expand_read F.c0.h7_0 F.c0.h13_0 F.c0.h15_0
-  rw [hw6] at hw10
-  rw [hw12] at hw15
-  have x2 := F.c0.h2_0
-  rw [hb] at x2
-  have hw2 := unitRow_window (c := ((i / 44 : Nat) : Int)) (by simp only [Int.ofNat_eq_natCast]; omega) x2
-  -- The keys of the parent.
-  have x18 := F.c0.h18_0
-  have x20 := F.c1.h20_0
-  have x27 := F.c1.h27_0
-  have x29 := F.c1.h29_0
-  rw [hw17] at x18 x20
-  rw [hw26] at x27 x29
-  obtain ⟨_, hw18⟩ := familyGet_eq x18
-  obtain ⟨_, hw20⟩ := familyGet_eq x20
-  obtain ⟨_, hw27⟩ := familyGet_eq x27
-  obtain ⟨_, hw29⟩ := familyGet_eq x29
-  have hA0 : concatColumns (A 0 0) (A 0 1) (Stage_online_eval.sequential_generatedRoot_216.w_21_0 ctx) := by
-    have h21 := F.c1.h21_0
-    rw [hw18, hw20] at h21
-    exact h21
-  have hA1 : concatColumns (A 1 0) (A 1 1) (Stage_online_eval.sequential_generatedRoot_216.w_30_0 ctx) := by
-    have h30 := F.c1.h30_0
-    rw [hw27, hw29] at h30
-    exact h30
+  have hcol : (44 : Int) + Int.ofNat a = ((44 + a : Nat) : Int) := by
+    simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  have hcol1 : (45 : Int) + Int.ofNat a = 1 + ((44 + a : Nat) : Int) := by
+    simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hfirst] at x3 x9
+  rw [hcol, hcol1] at x14 x18
+  obtain ⟨_, hw3⟩ := familyGet_eq x3
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  have hw7 := expand_read x4 x5 x7
+  have hw12 := expand_read x4 x10 x12
+  rw [hw3] at hw7
+  rw [hw9] at hw12
   have hentry : ∀ {r : Fin 2} {Ar : ExactMatrix Q N 1 88} {x y : ExactMatrix Q N 1 1}
       {u : ExactMatrix Q N 44 1}, concatColumns (A r 0) (A r 1) Ar →
-      sliceMatrix Ar 0 1 (44 + Int.fmod (Int.ofNat i) 44) (45 + Int.fmod (Int.ofNat i) 44) x →
-      ringAutomorphismRuns (MxxIR.selectInt (Int.fdiv (Int.ofNat i) 44) switchList2) x y →
+      sliceMatrix Ar 0 1 ((44 + a : Nat) : Int) (1 + ((44 + a : Nat) : Int)) x →
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat b) switchList) x y →
       gadgetDecomposeRuns Backend.backend 65536 44 y u →
-      u = keyDigits (routedKey (kSw (member2 (i / 44) (by omega))) (kSw_odd (member2 (i / 44) (by omega))) A)
-        ⟨44 + i % 44, by omega⟩ r := by
+      u = keyDigits (routedKey (kSw b) (kSw_odd ⟨b, hb⟩) A) ⟨44 + a, by omega⟩ r := by
     intro r Ar x y u hAr hx hy hu
-    rw [hcol, hcol1] at hx
-    rw [hb, hsw] at hy
     obtain ⟨_, hx0⟩ := sliceMatrix_column hx
     rw [concatColumns_entry hAr, pair_eta] at hx0
     obtain ⟨_, hy0⟩ := ringAutomorphismRuns_eq hQ hN hy
-    have hye : y = fun _ _ ↦ joinedEntry (routedKey (kSw (member2 (i / 44) (by omega)))
-        (kSw_odd (member2 (i / 44) (by omega))) A r) ⟨44 + i % 44, by omega⟩ := by
+    have hye : y = fun _ _ ↦ joinedEntry (routedKey (kSw b) (kSw_odd ⟨b, hb⟩) A r)
+        ⟨44 + a, by omega⟩ := by
       funext c d
       rw [hy0]
       dsimp only
       rw [Subsingleton.elim c 0, Subsingleton.elim d 0, hx0]
-      show _ = joinedEntry (fun j ↦ substituteMatrix (kSw (member2 (i / 44) (by omega)))
-        (kSw_odd (member2 (i / 44) (by omega))) (A r j)) _
+      show _ = joinedEntry (fun j ↦ substituteMatrix (kSw b) (kSw_odd ⟨b, hb⟩) (A r j)) _
       rw [joinedEntry_substitute]
       rfl
     rw [hye] at hu
     exact entryDigits_eq hu
-  have hw24 := hentry hA0 F.c1.h22_0 F.c1.h23_0 F.c1.h24_0
-  have hw33 := hentry hA1 F.c2.h31_0 F.c2.h32_0 F.c2.h33_0
-  have hin := F.c2.h34_2
-  rw [hw24, hw33] at hin
-  change MxxIR.IterRuns _ _ (0, (Stage_online_eval.sequential_generatedRoot_216.w_10_0 ctx,
-    (Stage_online_eval.sequential_generatedRoot_216.w_15_0 ctx, ()))) _ at hin
-  rw [hw10, hw15] at hin
-  have hblock := lutInner2 (model := model) (tape := tape) (path := path) A hi hin
-  have x35 := F.c2.h35_0
-  rw [hw2] at x35
-  rw [F.c2.hout]
-  show matrixAdd s (Stage_online_eval.sequential_generatedRoot_216.w_35_0 ctx) 0 p = _
-  simp only [matrixAdd, Matrix.add_apply]
-  rw [tensorRuns_unitRow x35 p]
-  split_ifs with hpi
-  · have e := hblock ⟨(p : Nat) % 88, by omega⟩
-    dsimp only at e
-    rw [e]
-    rfl
-  · rfl
+  have hw16 := hentry hA0 x14 x15 x16
+  have hw20 := hentry hA1 x18 x19 x20
+  rw [hw16, hw20, hw7, hw12] at hin
+  have hblock := lutInner56 (model := model) (tape := tape) (path := path) A hb ha hin p
+  subst xout
+  exact hblock
 
 set_option maxHeartbeats 16000000 in
-/-- The companion loop of the second LUT depth ends with the companion row of every branch,
-position by position. -/
-theorem lutLoop2 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {K00 K01 K10 K11 : Fin 15 → ExactMatrix Q N 1 44}
-    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {final : ExactMatrix Q N 1 9240}
-    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 9240) ↦
-      Stage_online_eval.sequential_generatedRoot_216 Backend.backend model tape (path ++ [216, i])
-        params i (current, (zc0, (zc1, (K00, (K01, (K10, (K11, ()))))))) next) (Int.toNat 4620) 0 final)
-    (p : Fin 9240) :
-    final 0 p = ∑ a, lutCompanionSum (parentKeys K00 K01 K10 K11 ⟨(p : Nat) / 88 % 15, by omega⟩)
-      (expandFam zc0) (expandFam zc1) (member2 ((p : Nat) / 88) (by omega))
-      ⟨(p : Nat) % 88, by omega⟩ a := by
-  have hcount : Int.toNat 4620 = 105 * 44 := rfl
+/-- The companion loop of internal branch `b` ends with the branch's companion row. -/
+theorem lutLoop56 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params}
+    {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {b : Nat} (hb : b < 22) {final : ExactMatrix Q N 1 88}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 88) ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape (path ++ [54, i])
+        params b i (current, (zc0, (zc1, (A0, (A1, ()))))) next) (Int.toNat 44) 0 final)
+    (p : Fin 88) :
+    final 0 p = ∑ a, lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨b, hb⟩ p a := by
+  have hcount : Int.toNat 44 = 44 := rfl
   rw [hcount] at h
-  have hk := IterRuns.accumulate_entries (fun s : ExactMatrix Q N 1 9240 ↦ s)
-    (fun (w : Fin 9240) (i : Fin (105 * 44)) ↦ if (i : Nat) / 44 = (w : Nat) / 88 then
-      lutCompanionSum (parentKeys K00 K01 K10 K11 ⟨(w : Nat) / 88 % 15, by omega⟩) (expandFam zc0)
-        (expandFam zc1) (member2 ((w : Nat) / 88) (by omega))
-        ⟨(w : Nat) % 88, by omega⟩ ⟨(i : Nat) % 44, by omega⟩ else 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨fun w ↦ by
+  have hk := IterRuns.accumulate (fun s : ExactMatrix Q N 1 88 ↦ s 0 p)
+    (fun i ↦ if hi : i < 44 then lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨b, hb⟩ p ⟨i, hi⟩
+      else 0) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hbody ↦ ⟨by
       dsimp only
-      rw [lutLoop2_step hi hb w]
-      congr 1
-      split_ifs with h1 h2 h2
-      · congr 2; simp only [h1]
-      · exact absurd h1.symm h2
-      · exact absurd h2.symm h1
-      · rfl, trivial⟩) h p
-  rw [hk]
-  simpa using sum_branch_entry (B := 105) (A := 44)
-    (fun a ↦ lutCompanionSum (parentKeys K00 K01 K10 K11 ⟨(p : Nat) / 88 % 15, by omega⟩)
-      (expandFam zc0) (expandFam zc1) (member2 ((p : Nat) / 88) (by omega))
-      ⟨(p : Nat) % 88, by omega⟩ a) ⟨(p : Nat) / 88, by omega⟩
+      rw [lutLoop56_step hA0 hA1 hb hi hbody p, dif_pos hi], trivial⟩) h
+  obtain ⟨e, -⟩ := hk
+  dsimp only at e
+  rw [e]
+  simp only [Matrix.zero_apply, zero_add]
+  rw [← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 44 then
+    lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨b, hb⟩ p ⟨i, hi⟩ else 0)]
+  exact Finset.sum_congr rfl fun a _ ↦ by simp [a.isLt]
+
+set_option maxHeartbeats 64000000 in
+/-- Internal branch `b` of the first LUT depth (one lane of the root parallel loop 56): the helper
+action `h_k Dec(T_b)`, the switch `σ_k(c) Dec(C_k)` of the switching ciphertext `C_k` (rows
+`σ_k(H⁰_{k⁻¹})` and `σ_k(H¹_{k⁻¹}) - σ_k(h_{k⁻¹})`), and the branch's own companion row `E_b`, per
+component; the key `H_k Dec(T_b)` of the branch; and the row weighted by the branch coefficient. -/
+theorem internalBranch56 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {b : Nat} (hb : b < 15)
+    {hf0 hf1 : Fin 37 → ExactMatrix Q N 1 44} {Tb0 Tb1 : ExactMatrix Q N 1 88} {key : ByteArray}
+    {c0 c1 : ExactMatrix Q N 1 44} {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1}
+    {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 44} {A0 A1 : ExactMatrix Q N 1 88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
+    {tables : Fin 512 → Int}
+    {outputs : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 ×
+      ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 ×
+      ExactMatrix Q N 1 44 × Unit}
+    (h : Stage_online_eval.parallel_generatedRoot_415 Backend.backend model tape path params b
+      (hf0, hf1, Tb0, Tb1, key, c0, c1, zc0, zc1, A0, A1, tables, ()) outputs) :
+    let k := kSw b
+    let hk : Odd k := kSw_odd ⟨b, by omega⟩
+    let hrow : Fin 2 → ExactMatrix Q N 1 44 := ![hf0 ⟨b, by omega⟩, hf1 ⟨b, by omega⟩]
+    let hinv : Fin 2 → ExactMatrix Q N 1 44 := ![hf0 ⟨36 - b, by omega⟩, hf1 ⟨36 - b, by omega⟩]
+    let top : Fin 2 → ExactMatrix Q N 1 44 := fun j ↦
+      substituteMatrix k hk (helperKey model key (kInv b) 0 j)
+    let bot : Fin 2 → ExactMatrix Q N 1 44 := fun j ↦
+      substituteMatrix k hk (helperKey model key (kInv b) 1 j) - substituteMatrix k hk (hinv j)
+    let σc : Fin 2 → ExactMatrix Q N 1 44 := ![substituteMatrix k hk c0, substituteMatrix k hk c1]
+    let Eb : ExactMatrix Q N 1 88 := fun _ p ↦
+      ∑ a, lutCompanionSum A (expandFam zc0) (expandFam zc1) ⟨b, by omega⟩ p a
+    (∀ (j : Fin 2) (l : Fin 44), ∃ D' : ExactMatrix Q N (44 + 44) 1,
+      gadgetDecomposeRuns Backend.backend 65536 44 (pairColumn (halves Tb0 j 0 l) (halves Tb1 j 0 l)) D' ∧
+        compactCenteredRebaseRuns 32768 D' (fun a _ ↦ actionDigits Tb0 Tb1 j a l)) ∧
+    (∀ (j : Fin 2) (l : Fin 44), ∃ D' : ExactMatrix Q N (44 + 44) 1,
+      gadgetDecomposeRuns Backend.backend 65536 44 (pairColumn (top j 0 l) (bot j 0 l)) D' ∧
+        compactCenteredRebaseRuns 32768 D' (fun a _ ↦ actionDigits (joinRow top) (joinRow bot) j a l)) ∧
+    (∀ j : Fin 2, ![outputs.1, outputs.2.1] j = pairMul hrow (actionDigits Tb0 Tb1 j) +
+      (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Eb j)) ∧
+    (∀ r j : Fin 2, ![![outputs.2.2.1, outputs.2.2.2.1], ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1]] r j =
+      pairMul (helperKey model key k r) (actionDigits Tb0 Tb1 j)) ∧
+    (∀ j : Fin 2, ![outputs.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.1] j =
+      ![outputs.1, outputs.2.1] j * scalarV (branchCoefC tables 384 k (by norm_num))) := by
+  intro k hk hrow hinv top bot σc Eb
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.parallel_generatedRoot_415.Ctx Backend.backend model tape path params b :=
+    ⟨(hf0, hf1, Tb0, Tb1, key, c0, c1, zc0, zc1, A0, A1, tables, ()), w⟩
+  have F := Stage_online_eval.parallel_generatedRoot_415.facts ctx hbody
+  -- The helper of `k`.
+  have hw2 : Stage_online_eval.parallel_generatedRoot_415.w_2_0 ctx = Int.ofNat b :=
+    switchMembers_eq b (by omega)
+  have h3 := F.c0.h3_0
+  have h5 := F.c0.h5_0
+  rw [hw2] at h3 h5
+  obtain ⟨_, hw3⟩ := familyGet_eq h3
+  obtain ⟨_, hw5⟩ := familyGet_eq h5
+  have hw6 : Stage_online_eval.parallel_generatedRoot_415.w_6_0 ctx = joinRow hrow := by
+    have h6 := F.c0.h6_0
+    rw [hw3, hw5] at h6
+    exact concat_joinRow (r := hrow) h6
+  -- The imported key `T_b` of the branch, rejoined from its halves.
+  have hw10 : Stage_online_eval.parallel_generatedRoot_415.w_10_0 ctx = Tb0 := by
+    have h8 := sliceMatrix_window 0 F.c0.h8_0 (by simp) (by omega)
+    have h9 := sliceMatrix_window 44 F.c0.h9_0 (by simp) (by omega)
+    have h10 := F.c0.h10_0
+    rw [h8, h9] at h10
+    exact (concat_joinRow (r := halves Tb0) h10).trans (joinRow_halves Tb0)
+  have hw14 : Stage_online_eval.parallel_generatedRoot_415.w_14_0 ctx = Tb1 := by
+    have h12 := sliceMatrix_window 0 F.c0.h12_0 (by simp) (by omega)
+    have h13 := sliceMatrix_window 44 F.c1.h13_0 (by simp) (by omega)
+    have h14 := F.c1.h14_0
+    rw [h12, h13] at h14
+    exact (concat_joinRow (r := halves Tb1) h14).trans (joinRow_halves Tb1)
+  -- The helper key `H_k`.
+  have hkc := kSw_cast b (by omega)
+  have hH : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat b) switchList), .bytes componentBytes, .u64Le (c : Int)]
+        key y → y = helperKey model key k ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [← hkc] at hy
+    exact helperKey_read hc hy
+  have hw18 : Stage_online_eval.parallel_generatedRoot_415.w_18_0 ctx = joinRow (helperKey model key k 0) := by
+    have h18 := F.c1.h18_0
+    rw [hH (c := 0) (by norm_num) F.c1.h16_0, hH (c := 1) (by norm_num) F.c1.h17_0] at h18
+    exact concat_joinRow (r := helperKey model key k 0) h18
+  have hw21 : Stage_online_eval.parallel_generatedRoot_415.w_21_0 ctx = joinRow (helperKey model key k 1) := by
+    have h21 := F.c1.h21_0
+    rw [hH (c := 2) (by norm_num) F.c1.h19_0, hH (c := 3) (by norm_num) F.c1.h20_0] at h21
+    exact concat_joinRow (r := helperKey model key k 1) h21
+  -- The helper action and the key of the branch.
+  have h22 := F.c1.h22_2
+  rw [hw6, hw10, hw14, hw18, hw21] at h22
+  have hcount : Int.toNat 88 = 88 := rfl
+  rw [hcount] at h22
+  have hact := colAction (r := 3)
+    (fun r (s : ExactMatrix Q N 1 88 × ExactMatrix Q N 1 88 × ExactMatrix Q N 1 88 × Unit) ↦
+      ![s.1, s.2.1, s.2.2.1] r)
+    (rows := ![joinRow hrow, joinRow (helperKey model key k 0), joinRow (helperKey model key k 1)])
+    (fun r ↦ by fin_cases r <;> rfl)
+    (fun i s t hi hb ↦ by
+      obtain ⟨⟨e0, e1, e2⟩, hrun⟩ := colStep56_22 hi hb
+      refine ⟨fun r ↦ ?_, hrun⟩
+      fin_cases r
+      · exact e0
+      · exact e1
+      · exact e2) h22
+  -- The routed state rows.
+  have hw26 := routing_kSw (by omega) F.c2.h26_0
+  have hw28 := routing_kSw (by omega) F.c2.h28_0
+  have hw29 : Stage_online_eval.parallel_generatedRoot_415.w_29_0 ctx = joinRow σc := by
+    have h29 := F.c2.h29_0
+    rw [hw26, hw28] at h29
+    exact concat_joinRow (r := σc) h29
+  -- The switching ciphertext `C_k` from the helper key of `k⁻¹` and its helper.
+  have hkic := kInv_cast b (by omega)
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat b) switchInvList), .bytes componentBytes, .u64Le (c : Int)]
+        key y → y = helperKey model key (kInv b) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [← hkic] at hy
+    exact helperKey_read hc hy
+  have hw34 : Stage_online_eval.parallel_generatedRoot_415.w_34_0 ctx = joinRow top := by
+    have h34 := F.c2.h34_0
+    rw [routing_kSw (by omega) F.c2.h31_0, routing_kSw (by omega) F.c2.h33_0,
+      hHi (c := 0) (by norm_num) F.c2.h30_0, hHi (c := 1) (by norm_num) F.c2.h32_0] at h34
+    exact concat_joinRow (r := top) h34
+  have hw37 : Stage_online_eval.parallel_generatedRoot_415.w_37_0 ctx = Int.ofNat (36 - b) :=
+    switchInvMembers_eq b (by omega)
+  have h38 := F.c2.h38_0
+  have h43 := F.c3.h43_0
+  rw [hw37] at h38 h43
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  obtain ⟨_, hw43⟩ := familyGet_eq h43
+  have hw46 : Stage_online_eval.parallel_generatedRoot_415.w_46_0 ctx = joinRow bot := by
+    have h46 := F.c3.h46_0
+    have hw40 : Stage_online_eval.parallel_generatedRoot_415.w_40_0 ctx =
+        matrixSub (Stage_online_eval.parallel_generatedRoot_415.w_36_0 ctx)
+          (Stage_online_eval.parallel_generatedRoot_415.w_39_0 ctx) := rfl
+    have hw45 : Stage_online_eval.parallel_generatedRoot_415.w_45_0 ctx =
+        matrixSub (Stage_online_eval.parallel_generatedRoot_415.w_42_0 ctx)
+          (Stage_online_eval.parallel_generatedRoot_415.w_44_0 ctx) := rfl
+    rw [hw40, hw45, routing_kSw (by omega) F.c2.h36_0, routing_kSw (by omega) F.c3.h42_0,
+      routing_kSw (by omega) F.c2.h39_0, routing_kSw (by omega) F.c3.h44_0,
+      hHi (c := 2) (by norm_num) F.c2.h35_0, hHi (c := 3) (by norm_num) F.c3.h41_0, hw38, hw43] at h46
+    exact concat_joinRow (r := bot) h46
+  -- The switch.
+  have h47 := F.c3.h47_0
+  rw [hw29, hw34, hw46, hcount] at h47
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s) (rows := ![joinRow σc])
+    (fun _ ↦ rfl)
+    (fun i s t hi hb ↦ by
+      obtain ⟨e, hrun⟩ := colStep56_47 hi hb
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h47
+  -- Component by component.
+  have hsplit := fun (r : Fin 3) ↦ colActionSplit (c := ![joinRow hrow, joinRow (helperKey model key k 0),
+      joinRow (helperKey model key k 1)] r) (row := ![hrow, helperKey model key k 0, helperKey model key k 1] r)
+    (by fin_cases r <;> exact concatColumns_joinRow _) (tk := halves Tb0) (bk := halves Tb1)
+    (entry_halves Tb0) (entry_halves Tb1)
+    (acc := ![Stage_online_eval.parallel_generatedRoot_415.w_22_0 ctx,
+      Stage_online_eval.parallel_generatedRoot_415.w_22_1 ctx,
+      Stage_online_eval.parallel_generatedRoot_415.w_22_2 ctx] r)
+    (fun jj ↦ ⟨by fin_cases r <;> exact (hact jj).1 _, (hact jj).2⟩)
+  have hswitch := colActionSplit (c := joinRow σc) (row := σc) (concatColumns_joinRow σc)
+    (tk := top) (bk := bot) (fun _ ↦ rfl) (fun _ ↦ rfl)
+    (acc := Stage_online_eval.parallel_generatedRoot_415.w_47_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  -- The companion row of the branch.
+  have h58 := F.c3.h54_0
+  have hcount44 : Int.toNat 44 = 44 := rfl
+  have hw58 : Stage_online_eval.parallel_generatedRoot_415.w_54_0 ctx = Eb := by
+    funext c p
+    rw [Subsingleton.elim c 0]
+    exact lutLoop56 hA0 hA1 (by omega) h58 p
+  have hw59 : Stage_online_eval.parallel_generatedRoot_415.w_55_0 ctx = halves Eb 0 := by
+    rw [sliceMatrix_window 0 F.c3.h55_0 (by simp) (by omega), hw58]; rfl
+  have hw64 : Stage_online_eval.parallel_generatedRoot_415.w_60_0 ctx = halves Eb 1 := by
+    rw [sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega), hw58]; rfl
+  -- The coefficient of the branch.
+  have h74 := F.c5.h70_0
+  have hcount128 : Int.toNat 128 = 128 := rfl
+  rw [hcount128] at h74
+  have hcoef := coefAccumC (by norm_num) (fun i s t hi hb' ↦ coefStep56_74 (b := b) (by omega) hi hb') h74
+  have hV : Stage_online_eval.parallel_generatedRoot_415.w_74_0 ctx =
+      scalarV (branchCoefC tables 384 k (by norm_num)) := by
+    refine scalarV_eq F.c5.h72_0 ?_
+    have h78 := F.c5.h74_0
+    have hw77 : Stage_online_eval.parallel_generatedRoot_415.w_73_0 ctx =
+        matrixMulScalarLeft (matrixMulScalarLeft winvPoly (branchCoefC tables 384 k (by norm_num)))
+          (Stage_online_eval.parallel_generatedRoot_415.w_72_0 ctx) := by
+      show matrixMulScalarLeft (matrixMulScalarLeft _ (Stage_online_eval.parallel_generatedRoot_415.w_70_0 ctx)) _ = _
+      rw [hcoef]
+      rfl
+    rw [hw77] at h78
+    exact h78
+  -- The rows.
+  have hrows : ∀ j : Fin 2, ![Stage_online_eval.parallel_generatedRoot_415.w_57_0 ctx,
+      Stage_online_eval.parallel_generatedRoot_415.w_62_0 ctx] j = pairMul hrow (actionDigits Tb0 Tb1 j) +
+        (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Eb j) := by
+    intro j
+    have h23 := sliceMatrix_window 0 F.c1.h23_0 (by simp) (by omega)
+    have h48 := sliceMatrix_window 0 F.c3.h48_0 (by simp) (by omega)
+    have h62 := sliceMatrix_window 44 F.c4.h58_0 (by simp) (by omega)
+    have h63 := sliceMatrix_window 44 F.c4.h59_0 (by simp) (by omega)
+    have e0 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
+        (Stage_online_eval.parallel_generatedRoot_415.w_22_0 ctx) = pairMul hrow (actionDigits Tb0 Tb1 j) :=
+      (hsplit 0).1
+    have es : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
+        (Stage_online_eval.parallel_generatedRoot_415.w_47_0 ctx) =
+          pairMul σc (actionDigits (joinRow top) (joinRow bot) j) := hswitch.1
+    fin_cases j
+    · show matrixAdd (Stage_online_eval.parallel_generatedRoot_415.w_23_0 ctx)
+          (matrixAdd (Stage_online_eval.parallel_generatedRoot_415.w_48_0 ctx)
+            (Stage_online_eval.parallel_generatedRoot_415.w_55_0 ctx)) = _
+      have a0 := e0 0
+      have b0 := es 0
+      simp only [Fin.val_zero] at a0 b0
+      rw [h23, h48, hw59, a0, b0]
+      rfl
+    · show matrixAdd (Stage_online_eval.parallel_generatedRoot_415.w_58_0 ctx)
+          (matrixAdd (Stage_online_eval.parallel_generatedRoot_415.w_59_0 ctx)
+            (Stage_online_eval.parallel_generatedRoot_415.w_60_0 ctx)) = _
+      have a1 := e0 1
+      have b1 := es 1
+      simp only [Fin.val_one] at a1 b1
+      rw [h62, h63, hw64, a1, b1]
+      rfl
+  refine ⟨(hsplit 0).2, hswitch.2, fun j ↦ ?_, fun r j ↦ ?_, fun j ↦ ?_⟩
+  · rw [F.c5.hout]
+    exact hrows j
+  · rw [F.c5.hout]
+    have h67 := sliceMatrix_window 0 F.c4.h63_0 (by simp) (by omega)
+    have h68 := sliceMatrix_window 44 F.c5.h64_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 0 F.c5.h65_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c5.h66_0 (by simp) (by omega)
+    have e1 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
+        (Stage_online_eval.parallel_generatedRoot_415.w_22_1 ctx) =
+          pairMul (helperKey model key k 0) (actionDigits Tb0 Tb1 j) := (hsplit 1).1
+    have e2 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
+        (Stage_online_eval.parallel_generatedRoot_415.w_22_2 ctx) =
+          pairMul (helperKey model key k 1) (actionDigits Tb0 Tb1 j) := (hsplit 2).1
+    have a10 := e1 0
+    have a11 := e1 1
+    have a20 := e2 0
+    have a21 := e2 1
+    simp only [Fin.val_zero, Fin.val_one] at a10 a11 a20 a21
+    fin_cases r <;> fin_cases j
+    · exact h67.trans a10
+    · exact h68.trans a11
+    · exact h69.trans a20
+    · exact h70.trans a21
+  · rw [F.c5.hout]
+    fin_cases j
+    · show matrixMul (Stage_online_eval.parallel_generatedRoot_415.w_57_0 ctx)
+          (Stage_online_eval.parallel_generatedRoot_415.w_74_0 ctx) = _
+      rw [hV]
+      rfl
+    · show matrixMul (Stage_online_eval.parallel_generatedRoot_415.w_62_0 ctx)
+          (Stage_online_eval.parallel_generatedRoot_415.w_74_0 ctx) = _
+      rw [hV]
+      rfl
 
 set_option maxHeartbeats 4000000 in
-/-- One iteration of the column action loop `sequential_sequential_generatedRoot_217_18`. -/
-theorem colStep70_18 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {i0 : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+/-- One iteration `i` of the sum over the weighted rows of the internal branches adds member
+`i + 2` of each component. -/
+theorem sumStep63 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i : Nat} {f0 f1 : Fin 15 → ExactMatrix Q N 1 44}
+    {s t : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : Stage_online_eval.sequential_generatedRoot_422 Backend.backend model tape path params i
+      (s.1, (s.2.1, (f0, (f1, ())))) t) :
+    ∃ hi : i + 2 < 15, t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) := by
+  obtain ⟨w5, w9, -, -, x5, -, -, x9, xout⟩ := h
+  have hidx : Int.ofNat i + 2 = Int.ofNat (i + 2) := by simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at x5 x9
+  obtain ⟨hi, hw5⟩ := familyGet_eq x5
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  subst xout hw5 hw9
+  exact ⟨hi, rfl⟩
+
+set_option maxHeartbeats 16000000 in
+/-- The sum over the weighted rows of the internal branches: from members `0` and `1` of each
+component, the loop adds the other thirteen. -/
+theorem sumLoop63 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {f0 f1 : Fin 15 → ExactMatrix Q N 1 44}
+    {final : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) ↦
+      Stage_online_eval.sequential_generatedRoot_422 Backend.backend model tape (path ++ [422, i]) params i
+        (current.1, (current.2.1, (f0, (f1, ())))) next) (Int.toNat 13)
+      (f0 0 + f0 1, (f1 0 + f1 1, ())) final) :
+    final = (∑ b, f0 b, (∑ b, f1 b, ())) := by
+  have hcount : Int.toNat 13 = 13 := rfl
+  rw [hcount] at h
+  have step : ∀ (proj : (ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) → ExactMatrix Q N 1 44)
+      (f : Fin 15 → ExactMatrix Q N 1 44),
+      (∀ i s t (hi : i + 2 < 15), t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) →
+        proj t = proj s + f ⟨i + 2, hi⟩) →
+      proj final = proj (f0 0 + f0 1, (f1 0 + f1 1, ())) +
+        ∑ i ∈ Finset.range 13, (if hi : i + 2 < 15 then f ⟨i + 2, hi⟩ else 0) := by
+    intro proj f hp
+    have hk := IterRuns.accumulate proj (fun i ↦ if hi : i + 2 < 15 then f ⟨i + 2, hi⟩ else 0)
+      (fun _ _ ↦ True) trivial (fun i s t _ _ hbody ↦ ⟨by
+        obtain ⟨hi, ht⟩ := sumStep63 hbody
+        rw [hp i s t hi ht]
+        simp only [dif_pos hi], trivial⟩) h
+    exact hk.1
+  have hsum : ∀ f : Fin 15 → ExactMatrix Q N 1 44,
+      f 0 + f 1 + ∑ i ∈ Finset.range 13, (if hi : i + 2 < 15 then f ⟨i + 2, hi⟩ else 0) = ∑ b, f b := by
+    intro f
+    rw [Fin.sum_univ_succ, Fin.sum_univ_succ, ← Fin.sum_univ_eq_sum_range, add_assoc]
+    congr 2
+  have e0 := step (fun s ↦ s.1) f0 (fun i s t hi ht ↦ by rw [ht])
+  have e1 := step (fun s ↦ s.2.1) f1 (fun i s t hi ht ↦ by rw [ht])
+  dsimp only at e0 e1
+  rw [hsum] at e0 e1
+  exact Prod.ext e0 (Prod.ext e1 rfl)
+
+/-! ## The first-depth leaves (root sequential loop 71)
+
+Leaf `i < 7` is branch `15 + i`. Each iteration reads the next leaf's imported key `T` one iteration
+ahead, and adds its row weighted by its coefficient to the running sums. -/
+
+/-! ## Member-group slot bodies -/
+
+namespace Group0
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol0_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
     {s t : ExactMatrix Q N 1 88}
-    (hb : Stage_online_eval.sequential_sequential_generatedRoot_217_18 Backend.backend model tape path params i0 i
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_43_16 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1419,11 +878,10 @@ theorem colStep70_18 {model : HashModel} {tape : SampleTape} {path : List Nat}
   simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
 
 set_option maxHeartbeats 4000000 in
-/-- One iteration of the column action loop `sequential_sequential_generatedRoot_217_47`. -/
-theorem colStep70_47 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {i0 : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+theorem slotCol0_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
     {s t : ExactMatrix Q N 1 88}
-    (hb : Stage_online_eval.sequential_sequential_generatedRoot_217_47 Backend.backend model tape path params i0 i
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_43_42 Backend.backend model tape path params i0 tick i
       (s, (c, (top, (bot, ())))) t) :
     t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
       ColumnRuns top bot ⟨i, hi⟩ := by
@@ -1441,15 +899,16 @@ theorem colStep70_47 {model : HashModel} {tape : SampleTape} {path : List Nat}
   simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
 
 set_option maxHeartbeats 4000000 in
-/-- One iteration of the coefficient loop `sequential_sequential_generatedRoot_217_57` of second-depth
-leaf `b`. -/
-theorem coefStep70_57 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b i : Nat}
+theorem slotCoef0 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
     (hi : i < 128) {s t : ExactMatrix Q N 1 1}
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_217_57 Backend.backend model tape path
-      params b i (s, (tables, ())) t) :
-    t = s + coefTermC tables 384 (kLeaf2 b) ⟨i, hi⟩ (by norm_num) := by
-  obtain ⟨w5, w13, -, -, x5, -, -, x13, xout⟩ := h
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_43_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 0 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [15, 16, 17, 18, 19, 20, 21]) switchList = Int.ofNat (kSlot 0 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
   obtain ⟨_, hw5⟩ := familyGet_eq x5
   obtain ⟨-, -, -, hw13⟩ := x13
   subst xout
@@ -1458,227 +917,6485 @@ theorem coefStep70_57 {model : HashModel} {tape : SampleTape} {path : List Nat}
   rw [hw5]
 
 set_option maxHeartbeats 64000000 in
-/-- One iteration `l` of the sum over the second-depth leaves of step `0`. -/
-theorem leafStep70 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} {l : Nat} (hl : l < 105) (d : Leaf2Data)
-    {tables : Fin 512 → Int} {s t : SumState}
-    (h : Stage_online_eval.sequential_generatedRoot_217 Backend.backend model tape path params l
-      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (s.2.2.2.2.2.1, (d.hf0, (d.hf1, (d.T0, (d.T1,
-        (d.c0, (d.c1, (d.key, (d.E, (tables, ()))))))))))))))) t) :
-    d.Runs model l hl ∧
-      t = (s.1 + d.row model l hl 0 * scalarV (branchCoefC tables 384 (kLeaf2 l) (by norm_num)),
-        (s.2.1 + d.row model l hl 1 * scalarV (branchCoefC tables 384 (kLeaf2 l) (by norm_num)), s.2.2)) := by
-  have hm : 15 + l / 15 < 22 := by omega
+theorem slotFinish0 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_432_43 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 0 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 0 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
   obtain ⟨w, hbody⟩ := h
-  let ctx : Stage_online_eval.sequential_generatedRoot_217.Ctx Backend.backend model tape path params l :=
-    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, d.hf0, d.hf1, d.T0, d.T1, d.c0, d.c1,
-      d.key, d.E, tables, ()), w⟩
-  have F := Stage_online_eval.sequential_generatedRoot_217.facts ctx hbody
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_432_43.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_432_43.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
   -- The helper of `k`.
-  have hw3 : Stage_online_eval.sequential_generatedRoot_217.w_3_0 ctx = Int.ofNat (15 + l / 15) := by
-    show MxxIR.selectInt (Int.ofNat l) memberList2 = _
-    exact memberList2_eq _ hl
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
   have h4 := F.c0.h4_0
   have h6 := F.c0.h6_0
   rw [hw3] at h4 h6
   obtain ⟨_, hw4⟩ := familyGet_eq h4
   obtain ⟨_, hw6⟩ := familyGet_eq h6
-  have hw7 : Stage_online_eval.sequential_generatedRoot_217.w_7_0 ctx = joinRow (d.hrow l hl) := by
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
     have h7 := F.c0.h7_0
     rw [hw4, hw6] at h7
-    exact concat_joinRow (r := d.hrow l hl) h7
-  -- The key `T`.
-  have hoff : (1936 : Int) + 88 * Int.ofNat l = ((88 * (22 + l) : Nat) : Int) := by
-    simp only [Int.ofNat_eq_natCast]; push_cast; ring
-  have hw9 : Stage_online_eval.sequential_generatedRoot_217.w_9_0 ctx = d.Tb0 l hl := by
-    rw [sliceMatrix_window (88 * (22 + l)) F.c0.h9_0 hoff (by omega)]; rfl
-  have hw14 : Stage_online_eval.sequential_generatedRoot_217.w_14_0 ctx = d.Tb1 l hl := by
-    rw [sliceMatrix_window (88 * (22 + l)) F.c1.h14_0 hoff (by omega)]; rfl
-  have hw12 : Stage_online_eval.sequential_generatedRoot_217.w_12_0 ctx = d.Tb0 l hl := by
-    have h10 := sliceMatrix_window 0 F.c0.h10_0 (by simp) (by omega)
-    have h11 := sliceMatrix_window 44 F.c0.h11_0 (by simp) (by omega)
-    have h12 := F.c0.h12_0
-    rw [h10, h11, hw9] at h12
-    exact (concat_joinRow (r := halves _) h12).trans (joinRow_halves _)
-  have hw17 : Stage_online_eval.sequential_generatedRoot_217.w_17_0 ctx = d.Tb1 l hl := by
-    have h15 := sliceMatrix_window 0 F.c1.h15_0 (by simp) (by omega)
-    have h16 := sliceMatrix_window 44 F.c1.h16_0 (by simp) (by omega)
-    have h17 := F.c1.h17_0
-    rw [h15, h16, hw14] at h17
-    exact (concat_joinRow (r := halves _) h17).trans (joinRow_halves _)
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
   -- The helper action.
   have hcount : Int.toNat 88 = 88 := rfl
-  have h18 := F.c1.h18_0
-  rw [hw7, hw12, hw17, hcount] at h18
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
   have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
-    (rows := ![joinRow (d.hrow l hl)]) (fun _ ↦ rfl)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
     (fun i' s t hi' hb' ↦ by
-      obtain ⟨e, hrun⟩ := colStep70_18 hi' hb'
-      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h18
-  have hhelp := colActionSplit (c := joinRow (d.hrow l hl)) (row := d.hrow l hl)
-    (concatColumns_joinRow _) (tk := halves (d.Tb0 l hl)) (bk := halves (d.Tb1 l hl))
-    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_generatedRoot_217.w_18_0 ctx)
+      obtain ⟨e, hrun⟩ := slotCol0_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_16_0 ctx)
     (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
-  -- The routed state rows of the parent.
+  -- The routed state rows.
   have hroute : ∀ {x y : ExactMatrix Q N 1 44},
-      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat l) switchList2) x y →
-      y = substituteMatrix (kSw (15 + l / 15)) (kSw_odd (member2 l hl)) x := by
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
     intro x y hxy
-    rw [switchList2_eq l hl] at hxy
-    exact routing_kSw hm hxy
-  have hw22 : Stage_online_eval.sequential_generatedRoot_217.w_22_0 ctx = Int.ofNat (l % 15) := by
-    show MxxIR.selectInt (Int.ofNat l) parentList2 = _
-    exact parentList2_eq _ hl
-  have h23 := F.c2.h23_0
-  have h26 := F.c2.h26_0
-  rw [hw22] at h23 h26
-  obtain ⟨_, hw23⟩ := familyGet_eq h23
-  obtain ⟨_, hw26⟩ := familyGet_eq h26
-  have hw28 : Stage_online_eval.sequential_generatedRoot_217.w_28_0 ctx = joinRow (d.σc l hl) := by
-    have h28 := F.c2.h28_0
-    rw [hroute F.c2.h24_0, hroute F.c2.h27_0, hw23, hw26] at h28
-    exact concat_joinRow (r := d.σc l hl) h28
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
   -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
   have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
       hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
-        .u64Le (MxxIR.selectInt (Int.ofNat l) invList2), .bytes componentBytes, .u64Le (c : Int)]
-        d.key y → y = helperKey model d.key (kInv (15 + l / 15)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
     intro c hc y hy
-    rw [invList2_eq l hl] at hy
+    rw [leafInvSwitchSelect i hi] at hy
     exact helperKey_read hc hy
-  have hw34 : Stage_online_eval.sequential_generatedRoot_217.w_34_0 ctx = joinRow (d.top model l hl) := by
-    have h34 := F.c2.h34_0
-    rw [hroute F.c2.h31_0, hroute F.c2.h33_0, hHi (c := 0) (by norm_num) F.c2.h30_0,
-      hHi (c := 1) (by norm_num) F.c2.h32_0] at h34
-    exact concat_joinRow (r := d.top model l hl) h34
-  have hw37 : Stage_online_eval.sequential_generatedRoot_217.w_37_0 ctx = Int.ofNat (36 - (15 + l / 15)) := by
-    show MxxIR.selectInt (Int.ofNat l) invMembers2 = _
-    exact invMembers2_eq _ hl
-  have h38 := F.c3.h38_0
-  have h43 := F.c3.h43_0
-  rw [hw37] at h38 h43
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
   obtain ⟨_, hw38⟩ := familyGet_eq h38
-  obtain ⟨_, hw43⟩ := familyGet_eq h43
-  have hw46 : Stage_online_eval.sequential_generatedRoot_217.w_46_0 ctx = joinRow (d.bot model l hl) := by
-    have h46 := F.c3.h46_0
-    have hw40 : Stage_online_eval.sequential_generatedRoot_217.w_40_0 ctx =
-        matrixSub (Stage_online_eval.sequential_generatedRoot_217.w_36_0 ctx)
-          (Stage_online_eval.sequential_generatedRoot_217.w_39_0 ctx) := rfl
-    have hw45 : Stage_online_eval.sequential_generatedRoot_217.w_45_0 ctx =
-        matrixSub (Stage_online_eval.sequential_generatedRoot_217.w_42_0 ctx)
-          (Stage_online_eval.sequential_generatedRoot_217.w_44_0 ctx) := rfl
-    rw [hw40, hw45, hroute F.c2.h36_0, hroute F.c3.h42_0, hroute F.c3.h39_0, hroute F.c3.h44_0,
-      hHi (c := 2) (by norm_num) F.c2.h35_0, hHi (c := 3) (by norm_num) F.c3.h41_0, hw38, hw43] at h46
-    exact concat_joinRow (r := d.bot model l hl) h46
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
   -- The switch.
-  have h47 := F.c3.h47_0
-  rw [hw28, hw34, hw46, hcount] at h47
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
   have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
-    (rows := ![joinRow (d.σc l hl)]) (fun _ ↦ rfl)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
     (fun i' s t hi' hb' ↦ by
-      obtain ⟨e, hrun⟩ := colStep70_47 hi' hb'
-      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h47
-  have hswitch := colActionSplit (c := joinRow (d.σc l hl)) (row := d.σc l hl)
-    (concatColumns_joinRow _) (tk := d.top model l hl) (bk := d.bot model l hl)
-    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_generatedRoot_217.w_47_0 ctx)
+      obtain ⟨e, hrun⟩ := slotCol0_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_42_0 ctx)
     (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
-  -- The companion block.
-  have hw50 : Stage_online_eval.sequential_generatedRoot_217.w_50_0 ctx = d.Eb l hl := by
-    rw [sliceMatrix_window (88 * l) F.c4.h50_0 (by simp only [Int.ofNat_eq_natCast]; push_cast; ring)
-      (by omega)]; rfl
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
   -- The coefficient and the scalar action.
-  have h57 := F.c4.h57_0
+  have h60 := F.c3.h51_0
   have hc128 : Int.toNat 128 = 128 := rfl
-  rw [hc128] at h57
-  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ coefStep70_57 hi' hb') h57
-  have hV := scalarV_eq F.c4.h59_0 (coef := branchCoefC tables 384 (kLeaf2 l) (by norm_num)) (by
-    have h61 := F.c4.h61_0
-    have : Stage_online_eval.sequential_generatedRoot_217.w_57_0 ctx =
-        branchCoefC tables 384 (kLeaf2 l) (by norm_num) := hcoef
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef0 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 0 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 0 i) (by norm_num) := hcoef
     change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
-      (Stage_online_eval.sequential_generatedRoot_217.w_57_0 ctx))
-        (Stage_online_eval.sequential_generatedRoot_217.w_59_0 ctx)) _ at h61
-    rw [this] at h61
-    exact h61)
-  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_⟩
-  rw [F.c5.hout]
-  have e0 : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-      (Stage_online_eval.sequential_generatedRoot_217.w_18_0 ctx) =
-        pairMul (d.hrow l hl) (actionDigits (d.Tb0 l hl) (d.Tb1 l hl) j) := hhelp.1
-  have es : ∀ j : Fin 2, rowWindow 44 (44 * j) (by omega)
-      (Stage_online_eval.sequential_generatedRoot_217.w_47_0 ctx) =
-        pairMul (d.σc l hl)
-          (actionDigits (joinRow (d.top model l hl)) (joinRow (d.bot model l hl)) j) := hswitch.1
-  have a0 := e0 0
-  have a1 := e0 1
-  have b0 := es 0
-  have b1 := es 1
-  simp only [Fin.val_zero, Fin.val_one] at a0 a1 b0 b1
-  have h19 := sliceMatrix_window 0 F.c1.h19_0 (by simp) (by omega)
-  have h48 := sliceMatrix_window 0 F.c3.h48_0 (by simp) (by omega)
-  have h51 := sliceMatrix_window 0 F.c4.h51_0 (by simp) (by omega)
-  have h65 := sliceMatrix_window 44 F.c4.h65_0 (by simp) (by omega)
-  have h66 := sliceMatrix_window 44 F.c4.h66_0 (by simp) (by omega)
-  have h67 := sliceMatrix_window 44 F.c5.h67_0 (by simp) (by omega)
-  rw [hw50] at h51 h67
-  show (matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_generatedRoot_217.w_19_0 ctx)
-      (matrixAdd (Stage_online_eval.sequential_generatedRoot_217.w_48_0 ctx)
-        (Stage_online_eval.sequential_generatedRoot_217.w_51_0 ctx)))
-      (Stage_online_eval.sequential_generatedRoot_217.w_61_0 ctx)),
-    (matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_generatedRoot_217.w_65_0 ctx)
-      (matrixAdd (Stage_online_eval.sequential_generatedRoot_217.w_66_0 ctx)
-        (Stage_online_eval.sequential_generatedRoot_217.w_67_0 ctx)))
-      (Stage_online_eval.sequential_generatedRoot_217.w_61_0 ctx)), s.2.2)) = _
-  rw [h19, h48, h51, h65, h66, h67, a0, a1, b0, b1, hV]
-  rfl
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_43.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
 
-set_option maxRecDepth 100000 in
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol1_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_50_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol1_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_50_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef1 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_50_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 1 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [0, 15, 30, 45, 60, 75, 90]) coefList2 = Int.ofNat (kSlot 1 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish1 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_432_50 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 1 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 1 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_432_50.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_432_50.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol1_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol1_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef1 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 1 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 1 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_50.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol2_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_55_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol2_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_55_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef2 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_55_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 2 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [1, 16, 31, 46, 61, 76, 91]) coefList2 = Int.ofNat (kSlot 2 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish2 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_432_55 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 2 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 2 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_432_55.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_432_55.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol2_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol2_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef2 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 2 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 2 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_55.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol3_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_60_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol3_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_60_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef3 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_60_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 3 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [2, 17, 32, 47, 62, 77, 92]) coefList2 = Int.ofNat (kSlot 3 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish3 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_432_60 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 3 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 3 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_432_60.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_432_60.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol3_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol3_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef3 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 3 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 3 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_432_60.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+set_option maxHeartbeats 4000000 in
+/-- One iteration `i` of the sum over the weighted rows of the member lanes adds member
+`i + 2` of each component. -/
+theorem memberSumStep {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i : Nat} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {s t : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : Stage_online_eval.sequential_generatedRoot_439 Backend.backend model tape path params i
+      (s.1, (s.2.1, (f0, (f1, ())))) t) :
+    ∃ hi : i + 2 < 7, t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) := by
+  obtain ⟨w5, w9, -, -, x5, -, -, x9, xout⟩ := h
+  have hidx : Int.ofNat i + 2 = Int.ofNat (i + 2) := by simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at x5 x9
+  obtain ⟨hi, hw5⟩ := familyGet_eq x5
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  subst xout hw5 hw9
+  exact ⟨hi, rfl⟩
+
 set_option maxHeartbeats 16000000 in
-/-- The sum over the second-depth leaves of step `0`: every leaf runs its keys and adds its rows
-times its scalar action. -/
-theorem leafLoop70 {model : HashModel} {tape : SampleTape} {path : List Nat}
-    {params : Stage_online_eval.Params} (d : Leaf2Data) {tables : Fin 512 → Int} {init final : SumState}
-    (h : MxxIR.IterRuns (fun (i : Nat) (current next : SumState) ↦
-      Stage_online_eval.sequential_generatedRoot_217 Backend.backend model tape (path ++ [217, i]) params i
-        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1,
-          (current.2.2.2.2.2.1, (d.hf0, (d.hf1, (d.T0, (d.T1, (d.c0, (d.c1, (d.key, (d.E,
-            (tables, ()))))))))))))))) next) (Int.toNat 105) init final) :
-    (∀ i (hi : i < 105), d.Runs model i (by omega)) ∧
-      final = (init.1 + ∑ i : Fin 105, d.row model i (by omega) 0 *
-          scalarV (branchCoefC tables 384 (kLeaf2 i) (by norm_num)),
-        (init.2.1 + ∑ i : Fin 105, d.row model i (by omega) 1 *
-          scalarV (branchCoefC tables 384 (kLeaf2 i) (by norm_num)), init.2.2)) := by
-  have hcount : Int.toNat 105 = 105 := rfl
+/-- The sum over the weighted rows of the member lanes: from members `0` and `1` of each
+component, the loop adds the other five. -/
+theorem memberSumLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {final : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) ↦
+      Stage_online_eval.sequential_generatedRoot_439 Backend.backend model tape (path ++ [439, i]) params i
+        (current.1, (current.2.1, (f0, (f1, ())))) next) (Int.toNat 5)
+      (f0 0 + f0 1, (f1 0 + f1 1, ())) final) :
+    final = (∑ b, f0 b, (∑ b, f1 b, ())) := by
+  have hcount : Int.toNat 5 = 5 := rfl
   rw [hcount] at h
-  let f : Fin 2 → Nat → ExactMatrix Q N 1 44 := fun j i ↦
-    if hi : i < 105 then d.row model i (by omega) j *
-      scalarV (branchCoefC tables 384 (kLeaf2 i) (by norm_num)) else 0
-  have h0 := IterRuns.accumulate (fun s : SumState ↦ s.1) (f 0)
-    (fun k _ ↦ ∀ i (hi : i < 105), i < k → d.Runs model i (by omega)) (fun _ _ hk ↦ absurd hk (by omega))
-    (fun i s t hi hq hb ↦ by
-      obtain ⟨hrun, ht⟩ := leafStep70 hi d hb
-      refine ⟨by rw [ht]; simp only [f, dif_pos hi], fun j hj7 hj ↦ ?_⟩
-      rcases Nat.lt_succ_iff_lt_or_eq.mp hj with hj | rfl
-      · exact hq j hj7 hj
-      · exact hrun) h
-  have h1 := IterRuns.accumulate (fun s : SumState ↦ s.2.1) (f 1) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by rw [(leafStep70 hi d hb).2]; simp only [f, dif_pos hi], trivial⟩) h
-  have h2 := IterRuns.accumulate (fun s : SumState ↦ s.2.2) (fun _ ↦ 0) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨by rw [(leafStep70 hi d hb).2, add_zero], trivial⟩) h
-  have hfin : ∀ (g : Fin 105 → ExactMatrix Q N 1 44),
-      (∑ i ∈ Finset.range 105, if hi : i < 105 then g ⟨i, hi⟩ else 0) = ∑ b : Fin 105, g b := by
-    intro g
-    rw [← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 105 then g ⟨i, hi⟩ else 0)]
-    exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]
-  obtain ⟨e0, hruns⟩ := h0
-  obtain ⟨e1, -⟩ := h1
-  obtain ⟨e2, -⟩ := h2
-  refine ⟨fun i hi ↦ hruns i hi hi, ?_⟩
-  rw [hfin (fun i ↦ d.row model i (by omega) 0 *
-    scalarV (branchCoefC tables 384 (kLeaf2 i) (by norm_num)))] at e0
-  rw [hfin (fun i ↦ d.row model i (by omega) 1 *
-    scalarV (branchCoefC tables 384 (kLeaf2 i) (by norm_num)))] at e1
-  simp only [Finset.sum_const_zero, add_zero] at e2
-  exact Prod.ext e0 (Prod.ext e1 e2)
+  have step : ∀ (proj : (ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) → ExactMatrix Q N 1 44)
+      (f : Fin 7 → ExactMatrix Q N 1 44),
+      (∀ i s t (hi : i + 2 < 7), t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) →
+        proj t = proj s + f ⟨i + 2, hi⟩) →
+      proj final = proj (f0 0 + f0 1, (f1 0 + f1 1, ())) +
+        ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) := by
+    intro proj f hp
+    have hk := IterRuns.accumulate proj (fun i ↦ if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0)
+      (fun _ _ ↦ True) trivial (fun i s t _ _ hbody ↦ ⟨by
+        obtain ⟨hi, ht⟩ := memberSumStep hbody
+        rw [hp i s t hi ht]
+        simp only [dif_pos hi], trivial⟩) h
+    exact hk.1
+  have hsum : ∀ f : Fin 7 → ExactMatrix Q N 1 44,
+      f 0 + f 1 + ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) = ∑ b, f b := by
+    intro f
+    rw [Fin.sum_univ_succ, Fin.sum_univ_succ, ← Fin.sum_univ_eq_sum_range, add_assoc]
+    congr 2
+  have e0 := step (fun s ↦ s.1) f0 (fun i s t hi ht ↦ by rw [ht])
+  have e1 := step (fun s ↦ s.2.1) f1 (fun i s t hi ht ↦ by rw [ht])
+  dsimp only at e0 e1
+  rw [hsum] at e0 e1
+  exact Prod.ext e0 (Prod.ext e1 rfl)
+
+
+
+abbrev Mat88 := ExactMatrix Q N 1 88
+abbrev Mat44 := ExactMatrix Q N 1 44
+abbrev Rows4 := Mat88 × Mat88 × Mat88 × Mat88 × Unit
+abbrev SharedBlock := Mat88 × Mat88 × Mat88 × Mat88 × Mat44 × Mat44 × Unit
+noncomputable abbrev rows4 (s : Rows4) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockRows (s : SharedBlock) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockProjection (s : SharedBlock) (slot : Fin 4) : MulBlock :=
+  (blockRows s slot, s.2.2.2.2.1, s.2.2.2.2.2.1, ())
+noncomputable abbrev sharedInnerInputs (s : SharedBlock) (U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, U 0 0, U 0 1, U 1 0, U 1 1, U 2 0, U 2 1, U 3 0, U 3 1, zc0, zc1, ())
+noncomputable abbrev sharedOuterInputs (s : Rows4) (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1)
+    (Ar : Fin 4 → Fin 2 → Mat88) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, zc0, zc1, Ar 0 0, Ar 0 1, Ar 1 0, Ar 1 1, Ar 2 0, Ar 2 1, Ar 3 0, Ar 3 1, ())
+
+theorem iterProject {State Target : Type} {body : Nat → State → State → Prop}
+    {targetBody : Nat → Target → Target → Prop} (project : State → Target)
+    (hstep : ∀ i s t, body i s t → targetBody i (project s) (project t))
+    {count : Nat} {s t : State} (h : MxxIR.IterRuns body count s t) :
+    MxxIR.IterRuns targetBody count (project s) (project t) := by
+  induction h with
+  | zero => exact .zero _
+  | step previous run ih => exact .step ih (hstep _ _ _ run)
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 7)
+    {U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_39_48 Backend.backend
+      model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+      targetPath params (15 + member) a j
+      ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
+        U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
+  have hbranch : 15 + member < 22 := by omega
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  obtain ⟨w9, w38, w39, w40, w42, w44, w45, w47,
+    h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, h9, h10, h11, h12, x38, x39,
+    x40, x42, h13, h14, x44, x45, x47, xout⟩ := h
+  rw [leafMemberSelect member hm] at h11 h12 x38 h13 h14 x44
+  rw [xout]
+  fin_cases slot <;>
+    refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
+    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21.constraints_0]
+  all_goals simp only [switchMembers_eq (15 + member) hbranch]
+  all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
+    h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
+
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a : Nat} (hm : member < 7)
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {Ar : Fin 4 → Fin 2 → Mat88}
+    {s t : Rows4}
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_432_39 Backend.backend model tape path params member a
+      (sharedOuterInputs s zc0 zc1 Ar) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape targetPath
+      params (15 + member) a (rows4 s slot, zc0, zc1, Ar slot 0, Ar slot 1, ()) (rows4 t slot) := by
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  have h00 : (0 : Nat) ≤ 0 := by omega
+  have h01 : (0 : Nat) < 1 := by omega
+  have h11 : (1 : Nat) ≤ 1 := by omega
+  have ha0 : 0 ≤ 44 + Int.ofNat a := by simp only [Int.ofNat_eq_natCast]; omega
+  have ha1 : 44 + Int.ofNat a < 45 + Int.ofNat a := by omega
+  have h88 : (0 : Nat) ≤ 88 := by omega
+  obtain ⟨w, hb⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_432_39.Ctx Backend.backend model tape path params member a :=
+    ⟨sharedOuterInputs s zc0 zc1 Ar, w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_432_39.facts ctx hb
+  have ha88 : 45 + Int.ofNat a ≤ 88 := F.c0.t18
+  let digits : Fin 4 → Fin 2 → ExactMatrix Q N 44 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_47_0 ctx]]
+  have hin := F.c3.h48_5
+  change MxxIR.IterRuns (fun j current next ↦
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_39_48 Backend.backend model tape
+      (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
+  have projected := iterProject (State := SharedBlock) (Target := MulBlock)
+    (body := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_432_39_48 Backend.backend model tape
+        (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
+    (fun current ↦ blockProjection current slot)
+    (targetBody := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+        (targetPath ++ [21, j]) params (15 + member) a j
+        (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
+    (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) hin
+  have hmember : MxxIR.selectInt (Int.ofNat (15 + member)) switchMembers =
+      MxxIR.selectInt (Int.ofNat member) [15, 16, 17, 18, 19, 20, 21] := by
+    rw [switchMembers_eq (15 + member) (by omega), leafMemberSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  have hswitch : MxxIR.selectInt (Int.ofNat (15 + member)) switchList =
+      MxxIR.selectInt (Int.ofNat member) leafSwitches := by
+    rw [← kSw_cast (15 + member) (by omega), leafSwitchSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  rw [F.c3.hout]
+  fin_cases slot
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_17_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_18_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_19_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_21_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_22_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_23_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_0 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h17_0,
+      hm0,
+      hm22,
+      F.c0.h18_0,
+      F.c0.h19_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h21_0,
+      hm0⟩,
+      hm22,
+      F.c1.h22_0,
+      F.c1.h23_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_25_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_26_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_27_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_29_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_30_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_31_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_1 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h25_0,
+      hm0,
+      hm22,
+      F.c1.h26_0,
+      F.c1.h27_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h29_0,
+      hm0⟩,
+      hm22,
+      F.c1.h30_0,
+      F.c1.h31_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_33_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_34_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_35_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_37_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_38_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_39_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_2 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h33_0,
+      hm0,
+      hm22,
+      F.c2.h34_0,
+      F.c2.h35_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h37_0,
+      hm0⟩,
+      hm22,
+      F.c2.h38_0,
+      F.c2.h39_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_41_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_42_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_43_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_45_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_46_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_47_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_3 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_432_39.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h41_0,
+      hm0,
+      hm22,
+      F.c2.h42_0,
+      F.c2.h43_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c3.h45_0,
+      hm0⟩,
+      hm22,
+      F.c3.h46_0,
+      F.c3.h47_0,
+      h88,
+      projected,
+      rfl⟩
+
+theorem iterOne {State : Type} {body : Nat → State → State → Prop} {s t : State}
+    (h : MxxIR.IterRuns body (Int.toNat 1) s t) : body 0 s t := by
+  obtain ⟨current, previous, run⟩ := MxxIR.IterRuns.step_of_succ (count := 0) h
+  cases previous
+  exact run
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem sharedLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (slot : Fin 4) {A : Fin 2 → Fin 2 → Mat44} {Ar : Fin 4 → Fin 2 → Mat88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) (Ar slot 0))
+    (hA1 : concatColumns (A 1 0) (A 1 1) (Ar slot 1))
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {final : Rows4}
+    (h : MxxIR.IterRuns (fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_432_39 Backend.backend model tape
+        (path ++ [39, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+      (Int.toNat 44) (0, 0, 0, 0, ()) final) :
+    rows4 final slot = lutCompRow A (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩ := by
+  have hb : 15 + member < 22 := by omega
+  have initial : rows4 ((0, 0, 0, 0, ()) : Rows4) slot = 0 := by fin_cases slot <;> rfl
+  have projected := iterProject (State := Rows4) (Target := Mat88)
+    (body := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_432_39 Backend.backend model tape
+        (path ++ [39, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+    (fun current ↦ rows4 current slot)
+    (targetBody := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape
+        (path ++ [54, a]) params (15 + member) a
+        (current, zc0, zc1, Ar slot 0, Ar slot 1, ()) next)
+    (fun a current next run ↦ sharedOuter_project (Ar := Ar) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) h
+  dsimp only at projected
+  rw [initial] at projected
+  apply Matrix.ext
+  intro row col
+  rw [Subsingleton.elim row 0]
+  exact lutLoop56 hA0 hA1 hb projected col
+
+theorem forall4 {pred : Fin 4 → Prop}
+    (h0 : pred 0)
+    (h1 : pred 1)
+    (h2 : pred 2)
+    (h3 : pred 3)
+    : ∀ slot, pred slot := by
+  intro slot
+  fin_cases slot
+  · exact h0
+  · exact h1
+  · exact h2
+  · exact h3
+
+theorem sum4 {Value : Type} [AddCommMonoid Value] (term : Fin 4 → Value) :
+    ∑ slot, term slot = ((((0 + term 0) + term 1) + term 2) + term 3) := by
+  simp only [Fin.sum_univ_succ, Fin.sum_univ_zero]
+  abel
+
+noncomputable abbrev memberInputs (first : BranchData) (second : Leaf2Data)
+    (T0 T1 : Fin 16 → Fin 7 → Mat88) (member : Fin 7)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) (M0 M1 : Mat88)
+    (K00 K01 K10 K11 : Fin 15 → Mat44) (tables : Fin 512 → Int) :=
+  (T0 0 member, T1 0 member, first.hf0, first.hf1, first.c0, first.c1, first.key, zc0, zc1, M0, M1, K00, K01, K10, K11, tables, T0 1, T1 1, second.c0, second.c1, T0 2, T1 2, T0 3, T1 3, T0 0, T1 0, ())
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem memberLane {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (first : BranchData) (second : Leaf2Data)
+    (hf0 : second.hf0 = first.hf0) (hf1 : second.hf1 = first.hf1) (hkey : second.key = first.key)
+    {T0 T1 : Fin 16 → Fin 7 → Mat88}
+    (hT0 : ∀ slot, (leafSlotData first second slot).TL0 = T0 slot)
+    (hT1 : ∀ slot, (leafSlotData first second slot).TL1 = T1 slot)
+    {M : Fin 2 → Fin 2 → Mat44} {M0 M1 : Mat88}
+    (hM0 : concatColumns (M 0 0) (M 0 1) M0) (hM1 : concatColumns (M 1 0) (M 1 1) M1)
+    {K00 K01 K10 K11 : Fin 15 → Mat44}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {tables : Fin 512 → Int}
+    (hE : ∀ slot : Fin 16, (leafSlotData first second slot).Eb (15 + member) (by omega) =
+      lutCompRow (Fin.cases M (parentKeys K00 K01 K10 K11) slot)
+        (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩)
+    {final : Mat44 × Mat44 × Unit}
+    (h : Stage_online_eval.parallel_generatedRoot_432 Backend.backend model tape path params member
+      (memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables) final) :
+    (∀ slot : Fin 4, (leafSlotData first second (chunkSlot 0 slot)).Runs model
+      (15 + member) (by omega)) ∧
+      (∀ port : Fin 2, ![final.1, final.2.1] port =
+        ∑ slot : Fin 4, memberTerm model first second
+          (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩
+          (chunkSlot 0 slot) port) := by
+  have hb : 15 + member < 22 := by omega
+  have select0 := slotParentSelect (⟨0, by decide⟩ : Fin 15) member hm
+  have select1 := slotParentSelect (⟨1, by decide⟩ : Fin 15) member hm
+  have select2 := slotParentSelect (⟨2, by decide⟩ : Fin 15) member hm
+  obtain ⟨w, body⟩ := h
+  let ctx : Stage_online_eval.parallel_generatedRoot_432.Ctx Backend.backend model tape path params member :=
+    ⟨memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables, w⟩
+  have F := Stage_online_eval.parallel_generatedRoot_432.facts ctx body
+  have read16 := F.c0.h16_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 0))) parentList2) _ at read16
+  rw [select0] at read16
+  have eq16 := (familyGet_eq read16).2
+  have read18 := F.c0.h18_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 0))) parentList2) _ at read18
+  rw [select0] at read18
+  have eq18 := (familyGet_eq read18).2
+  have read21 := F.c0.h21_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 0))) parentList2) _ at read21
+  rw [select0] at read21
+  have eq21 := (familyGet_eq read21).2
+  have read23 := F.c0.h23_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 0))) parentList2) _ at read23
+  rw [select0] at read23
+  have eq23 := (familyGet_eq read23).2
+  have join19 := F.c0.h19_0
+  rw [eq16, eq18] at join19
+  have join24 := F.c0.h24_0
+  rw [eq21, eq23] at join24
+  have read26 := F.c0.h26_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 1))) parentList2) _ at read26
+  rw [select1] at read26
+  have eq26 := (familyGet_eq read26).2
+  have read27 := F.c0.h27_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 1))) parentList2) _ at read27
+  rw [select1] at read27
+  have eq27 := (familyGet_eq read27).2
+  have read29 := F.c0.h29_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 1))) parentList2) _ at read29
+  rw [select1] at read29
+  have eq29 := (familyGet_eq read29).2
+  have read30 := F.c1.h30_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 1))) parentList2) _ at read30
+  rw [select1] at read30
+  have eq30 := (familyGet_eq read30).2
+  have join28 := F.c0.h28_0
+  rw [eq26, eq27] at join28
+  have join31 := F.c1.h31_0
+  rw [eq29, eq30] at join31
+  have read33 := F.c1.h33_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 2))) parentList2) _ at read33
+  rw [select2] at read33
+  have eq33 := (familyGet_eq read33).2
+  have read34 := F.c1.h34_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 2))) parentList2) _ at read34
+  rw [select2] at read34
+  have eq34 := (familyGet_eq read34).2
+  have read36 := F.c1.h36_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 2))) parentList2) _ at read36
+  rw [select2] at read36
+  have eq36 := (familyGet_eq read36).2
+  have read37 := F.c1.h37_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 2))) parentList2) _ at read37
+  rw [select2] at read37
+  have eq37 := (familyGet_eq read37).2
+  have join35 := F.c1.h35_0
+  rw [eq33, eq34] at join35
+  have join38 := F.c1.h38_0
+  rw [eq36, eq37] at join38
+  let joined : Fin 4 → Fin 2 → Mat88 := ![![M0, M1], ![Stage_online_eval.parallel_generatedRoot_432.w_19_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_24_0 ctx], ![Stage_online_eval.parallel_generatedRoot_432.w_28_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_31_0 ctx], ![Stage_online_eval.parallel_generatedRoot_432.w_35_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_38_0 ctx]]
+  have companions := F.c1.h39_3
+  change MxxIR.IterRuns (fun a current next ↦
+    Stage_online_eval.sequential_parallel_generatedRoot_432_39 Backend.backend model tape
+      (path ++ [39, a]) params member a (sharedOuterInputs current zc0 zc1 joined) next) _ _ _ at companions
+  have companion0 : Stage_online_eval.parallel_generatedRoot_432.w_39_0 ctx =
+      (leafSlotData first second 0).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 0).symm
+    exact sharedLoop hm 0 (A := M) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) hM0 hM1 companions
+  have companion1 : Stage_online_eval.parallel_generatedRoot_432.w_39_1 ctx =
+      (leafSlotData first second 1).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 1).symm
+    exact sharedLoop hm 1 (A := parentKeys K00 K01 K10 K11 (⟨0, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join19 join24 companions
+  have companion2 : Stage_online_eval.parallel_generatedRoot_432.w_39_2 ctx =
+      (leafSlotData first second 2).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 2).symm
+    exact sharedLoop hm 2 (A := parentKeys K00 K01 K10 K11 (⟨1, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join28 join31 companions
+  have companion3 : Stage_online_eval.parallel_generatedRoot_432.w_39_3 ctx =
+      (leafSlotData first second 3).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 3).symm
+    exact sharedLoop hm 3 (A := parentKeys K00 K01 K10 K11 (⟨2, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join35 join38 companions
+  have run0 := iterOne F.c1.h43_3
+  have slot0 := slotFinish0 hm (first) (s := (0, 0, T0 0 ⟨member, hm⟩, T1 0 ⟨member, hm⟩, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_432.w_43_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_43_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_43_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_43_3 ctx, ())) companion0 ⟨congrFun (hT0 0).symm ⟨member, hm⟩, congrFun (hT1 0).symm ⟨member, hm⟩⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run0)
+  have read45 := F.c1.h45_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 0))) parentList2) _ at read45
+  rw [select0] at read45
+  have eq45 := (familyGet_eq read45).2
+  have read47 := F.c1.h47_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 0))) parentList2) _ at read47
+  rw [select0] at read47
+  have eq47 := (familyGet_eq read47).2
+  have run1 := iterOne F.c2.h50_3
+  rw [eq45, eq47] at run1
+  have slot1 := slotFinish1 hm (second.memberBranch (⟨0, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_432.w_43_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_43_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_43_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_43_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_432.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_50_3 ctx, ())) companion1 ⟨(slot0.2.2.2.1).trans (congrFun (hT0 1).symm ⟨member, hm⟩), (slot0.2.2.2.2).trans (congrFun (hT1 1).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run1)
+  have read51 := F.c2.h51_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 1))) parentList2) _ at read51
+  rw [select1] at read51
+  have eq51 := (familyGet_eq read51).2
+  have read52 := F.c2.h52_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 1))) parentList2) _ at read52
+  rw [select1] at read52
+  have eq52 := (familyGet_eq read52).2
+  have run2 := iterOne F.c2.h55_3
+  rw [eq51, eq52] at run2
+  have slot2 := slotFinish2 hm (second.memberBranch (⟨1, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_432.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_50_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_432.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_55_3 ctx, ())) companion2 ⟨(slot1.2.2.2.1).trans (congrFun (hT0 2).symm ⟨member, hm⟩), (slot1.2.2.2.2).trans (congrFun (hT1 2).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run2)
+  have read56 := F.c2.h56_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 2))) parentList2) _ at read56
+  rw [select2] at read56
+  have eq56 := (familyGet_eq read56).2
+  have read57 := F.c2.h57_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 2))) parentList2) _ at read57
+  rw [select2] at read57
+  have eq57 := (familyGet_eq read57).2
+  have run3 := iterOne F.c2.h60_3
+  rw [eq56, eq57] at run3
+  have slot3 := slotFinish3 hm (second.memberBranch (⟨2, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_432.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_55_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_432.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_432.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_432.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_432.w_60_3 ctx, ())) companion3 ⟨(slot2.2.2.2.1).trans (congrFun (hT0 3).symm ⟨member, hm⟩), (slot2.2.2.2.2).trans (congrFun (hT1 3).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run3)
+  dsimp only at slot0 slot1 slot2 slot3
+  refine ⟨forall4 (pred := fun slot ↦ (leafSlotData first second (chunkSlot 0 slot)).Runs model (15 + member) hb) slot0.1 slot1.1 slot2.1 slot3.1, ?_⟩
+  intro port
+  fin_cases port
+  · rw [F.c2.hout]
+    change Stage_online_eval.parallel_generatedRoot_432.w_60_0 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 0 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 1 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 2 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 3 0
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot3.2.1, slot2.2.1, slot1.2.1, slot0.2.1]
+    rfl
+  · rw [F.c2.hout]
+    change Stage_online_eval.parallel_generatedRoot_432.w_60_1 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 0 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 1 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 2 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 3 1
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot3.2.2.1, slot2.2.2.1, slot1.2.2.1, slot0.2.2.1]
+    rfl
+
+end Group0
+
+namespace Group1
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol4_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_50_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol4_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_50_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef4 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_50_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 4 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [3, 18, 33, 48, 63, 78, 93]) coefList2 = Int.ofNat (kSlot 4 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish4 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_449_50 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 4 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 4 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_449_50.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_449_50.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol4_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol4_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef4 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 4 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 4 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_50.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol5_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_55_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol5_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_55_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef5 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_55_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 5 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [4, 19, 34, 49, 64, 79, 94]) coefList2 = Int.ofNat (kSlot 5 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish5 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_449_55 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 5 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 5 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_449_55.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_449_55.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol5_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol5_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef5 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 5 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 5 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_55.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol6_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_60_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol6_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_60_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef6 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_60_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 6 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [5, 20, 35, 50, 65, 80, 95]) coefList2 = Int.ofNat (kSlot 6 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish6 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_449_60 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 6 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 6 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_449_60.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_449_60.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol6_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol6_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef6 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 6 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 6 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_60.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol7_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_65_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol7_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_65_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef7 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_65_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 7 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [6, 21, 36, 51, 66, 81, 96]) coefList2 = Int.ofNat (kSlot 7 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish7 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_449_65 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 7 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 7 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_449_65.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_449_65.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol7_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol7_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef7 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 7 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 7 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_449_65.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+set_option maxHeartbeats 4000000 in
+/-- One iteration `i` of the sum over the weighted rows of the member lanes adds member
+`i + 2` of each component. -/
+theorem memberSumStep {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i : Nat} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {s t : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : Stage_online_eval.sequential_generatedRoot_456 Backend.backend model tape path params i
+      (s.1, (s.2.1, (f0, (f1, ())))) t) :
+    ∃ hi : i + 2 < 7, t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) := by
+  obtain ⟨w5, w9, -, -, x5, -, -, x9, xout⟩ := h
+  have hidx : Int.ofNat i + 2 = Int.ofNat (i + 2) := by simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at x5 x9
+  obtain ⟨hi, hw5⟩ := familyGet_eq x5
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  subst xout hw5 hw9
+  exact ⟨hi, rfl⟩
+
+set_option maxHeartbeats 16000000 in
+/-- The sum over the weighted rows of the member lanes: from members `0` and `1` of each
+component, the loop adds the other five. -/
+theorem memberSumLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {final : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) ↦
+      Stage_online_eval.sequential_generatedRoot_456 Backend.backend model tape (path ++ [456, i]) params i
+        (current.1, (current.2.1, (f0, (f1, ())))) next) (Int.toNat 5)
+      (f0 0 + f0 1, (f1 0 + f1 1, ())) final) :
+    final = (∑ b, f0 b, (∑ b, f1 b, ())) := by
+  have hcount : Int.toNat 5 = 5 := rfl
+  rw [hcount] at h
+  have step : ∀ (proj : (ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) → ExactMatrix Q N 1 44)
+      (f : Fin 7 → ExactMatrix Q N 1 44),
+      (∀ i s t (hi : i + 2 < 7), t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) →
+        proj t = proj s + f ⟨i + 2, hi⟩) →
+      proj final = proj (f0 0 + f0 1, (f1 0 + f1 1, ())) +
+        ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) := by
+    intro proj f hp
+    have hk := IterRuns.accumulate proj (fun i ↦ if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0)
+      (fun _ _ ↦ True) trivial (fun i s t _ _ hbody ↦ ⟨by
+        obtain ⟨hi, ht⟩ := memberSumStep hbody
+        rw [hp i s t hi ht]
+        simp only [dif_pos hi], trivial⟩) h
+    exact hk.1
+  have hsum : ∀ f : Fin 7 → ExactMatrix Q N 1 44,
+      f 0 + f 1 + ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) = ∑ b, f b := by
+    intro f
+    rw [Fin.sum_univ_succ, Fin.sum_univ_succ, ← Fin.sum_univ_eq_sum_range, add_assoc]
+    congr 2
+  have e0 := step (fun s ↦ s.1) f0 (fun i s t hi ht ↦ by rw [ht])
+  have e1 := step (fun s ↦ s.2.1) f1 (fun i s t hi ht ↦ by rw [ht])
+  dsimp only at e0 e1
+  rw [hsum] at e0 e1
+  exact Prod.ext e0 (Prod.ext e1 rfl)
+
+
+
+abbrev Mat88 := ExactMatrix Q N 1 88
+abbrev Mat44 := ExactMatrix Q N 1 44
+abbrev Rows4 := Mat88 × Mat88 × Mat88 × Mat88 × Unit
+abbrev SharedBlock := Mat88 × Mat88 × Mat88 × Mat88 × Mat44 × Mat44 × Unit
+noncomputable abbrev rows4 (s : Rows4) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockRows (s : SharedBlock) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockProjection (s : SharedBlock) (slot : Fin 4) : MulBlock :=
+  (blockRows s slot, s.2.2.2.2.1, s.2.2.2.2.2.1, ())
+noncomputable abbrev sharedInnerInputs (s : SharedBlock) (U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, U 0 0, U 0 1, U 1 0, U 1 1, U 2 0, U 2 1, U 3 0, U 3 1, zc0, zc1, ())
+noncomputable abbrev sharedOuterInputs (s : Rows4) (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1)
+    (Ar : Fin 4 → Fin 2 → Mat88) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, zc0, zc1, Ar 0 0, Ar 0 1, Ar 1 0, Ar 1 1, Ar 2 0, Ar 2 1, Ar 3 0, Ar 3 1, ())
+
+theorem iterProject {State Target : Type} {body : Nat → State → State → Prop}
+    {targetBody : Nat → Target → Target → Prop} (project : State → Target)
+    (hstep : ∀ i s t, body i s t → targetBody i (project s) (project t))
+    {count : Nat} {s t : State} (h : MxxIR.IterRuns body count s t) :
+    MxxIR.IterRuns targetBody count (project s) (project t) := by
+  induction h with
+  | zero => exact .zero _
+  | step previous run ih => exact .step ih (hstep _ _ _ run)
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 7)
+    {U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_46_48 Backend.backend
+      model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+      targetPath params (15 + member) a j
+      ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
+        U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
+  have hbranch : 15 + member < 22 := by omega
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  obtain ⟨w9, w38, w39, w40, w42, w44, w45, w47,
+    h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, h9, h10, h11, h12, x38, x39,
+    x40, x42, h13, h14, x44, x45, x47, xout⟩ := h
+  rw [leafMemberSelect member hm] at h11 h12 x38 h13 h14 x44
+  rw [xout]
+  fin_cases slot <;>
+    refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
+    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21.constraints_0]
+  all_goals simp only [switchMembers_eq (15 + member) hbranch]
+  all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
+    h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
+
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a : Nat} (hm : member < 7)
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {Ar : Fin 4 → Fin 2 → Mat88}
+    {s t : Rows4}
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_449_46 Backend.backend model tape path params member a
+      (sharedOuterInputs s zc0 zc1 Ar) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape targetPath
+      params (15 + member) a (rows4 s slot, zc0, zc1, Ar slot 0, Ar slot 1, ()) (rows4 t slot) := by
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  have h00 : (0 : Nat) ≤ 0 := by omega
+  have h01 : (0 : Nat) < 1 := by omega
+  have h11 : (1 : Nat) ≤ 1 := by omega
+  have ha0 : 0 ≤ 44 + Int.ofNat a := by simp only [Int.ofNat_eq_natCast]; omega
+  have ha1 : 44 + Int.ofNat a < 45 + Int.ofNat a := by omega
+  have h88 : (0 : Nat) ≤ 88 := by omega
+  obtain ⟨w, hb⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_449_46.Ctx Backend.backend model tape path params member a :=
+    ⟨sharedOuterInputs s zc0 zc1 Ar, w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_449_46.facts ctx hb
+  have ha88 : 45 + Int.ofNat a ≤ 88 := F.c0.t18
+  let digits : Fin 4 → Fin 2 → ExactMatrix Q N 44 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_47_0 ctx]]
+  have hin := F.c3.h48_5
+  change MxxIR.IterRuns (fun j current next ↦
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_46_48 Backend.backend model tape
+      (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
+  have projected := iterProject (State := SharedBlock) (Target := MulBlock)
+    (body := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_449_46_48 Backend.backend model tape
+        (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
+    (fun current ↦ blockProjection current slot)
+    (targetBody := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+        (targetPath ++ [21, j]) params (15 + member) a j
+        (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
+    (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) hin
+  have hmember : MxxIR.selectInt (Int.ofNat (15 + member)) switchMembers =
+      MxxIR.selectInt (Int.ofNat member) [15, 16, 17, 18, 19, 20, 21] := by
+    rw [switchMembers_eq (15 + member) (by omega), leafMemberSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  have hswitch : MxxIR.selectInt (Int.ofNat (15 + member)) switchList =
+      MxxIR.selectInt (Int.ofNat member) leafSwitches := by
+    rw [← kSw_cast (15 + member) (by omega), leafSwitchSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  rw [F.c3.hout]
+  fin_cases slot
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_17_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_18_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_19_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_21_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_22_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_23_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_0 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h17_0,
+      hm0,
+      hm22,
+      F.c0.h18_0,
+      F.c0.h19_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h21_0,
+      hm0⟩,
+      hm22,
+      F.c1.h22_0,
+      F.c1.h23_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_25_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_26_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_27_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_29_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_30_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_31_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_1 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h25_0,
+      hm0,
+      hm22,
+      F.c1.h26_0,
+      F.c1.h27_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h29_0,
+      hm0⟩,
+      hm22,
+      F.c1.h30_0,
+      F.c1.h31_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_33_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_34_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_35_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_37_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_38_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_39_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_2 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h33_0,
+      hm0,
+      hm22,
+      F.c2.h34_0,
+      F.c2.h35_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h37_0,
+      hm0⟩,
+      hm22,
+      F.c2.h38_0,
+      F.c2.h39_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_41_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_42_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_43_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_45_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_46_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_47_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_3 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_449_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h41_0,
+      hm0,
+      hm22,
+      F.c2.h42_0,
+      F.c2.h43_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c3.h45_0,
+      hm0⟩,
+      hm22,
+      F.c3.h46_0,
+      F.c3.h47_0,
+      h88,
+      projected,
+      rfl⟩
+
+theorem iterOne {State : Type} {body : Nat → State → State → Prop} {s t : State}
+    (h : MxxIR.IterRuns body (Int.toNat 1) s t) : body 0 s t := by
+  obtain ⟨current, previous, run⟩ := MxxIR.IterRuns.step_of_succ (count := 0) h
+  cases previous
+  exact run
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem sharedLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (slot : Fin 4) {A : Fin 2 → Fin 2 → Mat44} {Ar : Fin 4 → Fin 2 → Mat88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) (Ar slot 0))
+    (hA1 : concatColumns (A 1 0) (A 1 1) (Ar slot 1))
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {final : Rows4}
+    (h : MxxIR.IterRuns (fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_449_46 Backend.backend model tape
+        (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+      (Int.toNat 44) (0, 0, 0, 0, ()) final) :
+    rows4 final slot = lutCompRow A (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩ := by
+  have hb : 15 + member < 22 := by omega
+  have initial : rows4 ((0, 0, 0, 0, ()) : Rows4) slot = 0 := by fin_cases slot <;> rfl
+  have projected := iterProject (State := Rows4) (Target := Mat88)
+    (body := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_449_46 Backend.backend model tape
+        (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+    (fun current ↦ rows4 current slot)
+    (targetBody := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape
+        (path ++ [54, a]) params (15 + member) a
+        (current, zc0, zc1, Ar slot 0, Ar slot 1, ()) next)
+    (fun a current next run ↦ sharedOuter_project (Ar := Ar) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) h
+  dsimp only at projected
+  rw [initial] at projected
+  apply Matrix.ext
+  intro row col
+  rw [Subsingleton.elim row 0]
+  exact lutLoop56 hA0 hA1 hb projected col
+
+theorem forall4 {pred : Fin 4 → Prop}
+    (h0 : pred 0)
+    (h1 : pred 1)
+    (h2 : pred 2)
+    (h3 : pred 3)
+    : ∀ slot, pred slot := by
+  intro slot
+  fin_cases slot
+  · exact h0
+  · exact h1
+  · exact h2
+  · exact h3
+
+theorem sum4 {Value : Type} [AddCommMonoid Value] (term : Fin 4 → Value) :
+    ∑ slot, term slot = ((((0 + term 0) + term 1) + term 2) + term 3) := by
+  simp only [Fin.sum_univ_succ, Fin.sum_univ_zero]
+  abel
+
+noncomputable abbrev memberInputs (first : BranchData) (second : Leaf2Data)
+    (T0 T1 : Fin 16 → Fin 7 → Mat88) (member : Fin 7)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) (_M0 _M1 : Mat88)
+    (K00 K01 K10 K11 : Fin 15 → Mat44) (tables : Fin 512 → Int) :=
+  (T0 4 member, T1 4 member, first.hf0, first.hf1, second.c0, second.c1, first.key, zc0, zc1, K00, K01, K10, K11, tables, T0 5, T1 5, T0 6, T1 6, T0 7, T1 7, T0 4, T1 4, ())
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem memberLane {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (first : BranchData) (second : Leaf2Data)
+    (hf0 : second.hf0 = first.hf0) (hf1 : second.hf1 = first.hf1) (hkey : second.key = first.key)
+    {T0 T1 : Fin 16 → Fin 7 → Mat88}
+    (hT0 : ∀ slot, (leafSlotData first second slot).TL0 = T0 slot)
+    (hT1 : ∀ slot, (leafSlotData first second slot).TL1 = T1 slot)
+    {M : Fin 2 → Fin 2 → Mat44} {M0 M1 : Mat88}
+    (_hM0 : concatColumns (M 0 0) (M 0 1) M0) (_hM1 : concatColumns (M 1 0) (M 1 1) M1)
+    {K00 K01 K10 K11 : Fin 15 → Mat44}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {tables : Fin 512 → Int}
+    (hE : ∀ slot : Fin 16, (leafSlotData first second slot).Eb (15 + member) (by omega) =
+      lutCompRow (Fin.cases M (parentKeys K00 K01 K10 K11) slot)
+        (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩)
+    {final : Mat44 × Mat44 × Unit}
+    (h : Stage_online_eval.parallel_generatedRoot_449 Backend.backend model tape path params member
+      (memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables) final) :
+    (∀ slot : Fin 4, (leafSlotData first second (chunkSlot 1 slot)).Runs model
+      (15 + member) (by omega)) ∧
+      (∀ port : Fin 2, ![final.1, final.2.1] port =
+        ∑ slot : Fin 4, memberTerm model first second
+          (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩
+          (chunkSlot 1 slot) port) := by
+  have hb : 15 + member < 22 := by omega
+  have select3 := slotParentSelect (⟨3, by decide⟩ : Fin 15) member hm
+  have select4 := slotParentSelect (⟨4, by decide⟩ : Fin 15) member hm
+  have select5 := slotParentSelect (⟨5, by decide⟩ : Fin 15) member hm
+  have select6 := slotParentSelect (⟨6, by decide⟩ : Fin 15) member hm
+  obtain ⟨w, body⟩ := h
+  let ctx : Stage_online_eval.parallel_generatedRoot_449.Ctx Backend.backend model tape path params member :=
+    ⟨memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables, w⟩
+  have F := Stage_online_eval.parallel_generatedRoot_449.facts ctx body
+  have read16 := F.c0.h16_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 3))) parentList2) _ at read16
+  rw [select3] at read16
+  have eq16 := (familyGet_eq read16).2
+  have read18 := F.c0.h18_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 3))) parentList2) _ at read18
+  rw [select3] at read18
+  have eq18 := (familyGet_eq read18).2
+  have read21 := F.c0.h21_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 3))) parentList2) _ at read21
+  rw [select3] at read21
+  have eq21 := (familyGet_eq read21).2
+  have read23 := F.c0.h23_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 3))) parentList2) _ at read23
+  rw [select3] at read23
+  have eq23 := (familyGet_eq read23).2
+  have join19 := F.c0.h19_0
+  rw [eq16, eq18] at join19
+  have join24 := F.c0.h24_0
+  rw [eq21, eq23] at join24
+  have read26 := F.c0.h26_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 4))) parentList2) _ at read26
+  rw [select4] at read26
+  have eq26 := (familyGet_eq read26).2
+  have read27 := F.c1.h27_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 4))) parentList2) _ at read27
+  rw [select4] at read27
+  have eq27 := (familyGet_eq read27).2
+  have read29 := F.c1.h29_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 4))) parentList2) _ at read29
+  rw [select4] at read29
+  have eq29 := (familyGet_eq read29).2
+  have read30 := F.c1.h30_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 4))) parentList2) _ at read30
+  rw [select4] at read30
+  have eq30 := (familyGet_eq read30).2
+  have join28 := F.c1.h28_0
+  rw [eq26, eq27] at join28
+  have join31 := F.c1.h31_0
+  rw [eq29, eq30] at join31
+  have read33 := F.c1.h33_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 5))) parentList2) _ at read33
+  rw [select5] at read33
+  have eq33 := (familyGet_eq read33).2
+  have read34 := F.c1.h34_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 5))) parentList2) _ at read34
+  rw [select5] at read34
+  have eq34 := (familyGet_eq read34).2
+  have read36 := F.c1.h36_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 5))) parentList2) _ at read36
+  rw [select5] at read36
+  have eq36 := (familyGet_eq read36).2
+  have read37 := F.c1.h37_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 5))) parentList2) _ at read37
+  rw [select5] at read37
+  have eq37 := (familyGet_eq read37).2
+  have join35 := F.c1.h35_0
+  rw [eq33, eq34] at join35
+  have join38 := F.c1.h38_0
+  rw [eq36, eq37] at join38
+  have read40 := F.c2.h40_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 6))) parentList2) _ at read40
+  rw [select6] at read40
+  have eq40 := (familyGet_eq read40).2
+  have read41 := F.c2.h41_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 6))) parentList2) _ at read41
+  rw [select6] at read41
+  have eq41 := (familyGet_eq read41).2
+  have read43 := F.c2.h43_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 6))) parentList2) _ at read43
+  rw [select6] at read43
+  have eq43 := (familyGet_eq read43).2
+  have read44 := F.c2.h44_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 6))) parentList2) _ at read44
+  rw [select6] at read44
+  have eq44 := (familyGet_eq read44).2
+  have join42 := F.c2.h42_0
+  rw [eq40, eq41] at join42
+  have join45 := F.c2.h45_0
+  rw [eq43, eq44] at join45
+  let joined : Fin 4 → Fin 2 → Mat88 := ![![Stage_online_eval.parallel_generatedRoot_449.w_19_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_24_0 ctx], ![Stage_online_eval.parallel_generatedRoot_449.w_28_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_31_0 ctx], ![Stage_online_eval.parallel_generatedRoot_449.w_35_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_38_0 ctx], ![Stage_online_eval.parallel_generatedRoot_449.w_42_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_45_0 ctx]]
+  have companions := F.c2.h46_3
+  change MxxIR.IterRuns (fun a current next ↦
+    Stage_online_eval.sequential_parallel_generatedRoot_449_46 Backend.backend model tape
+      (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 joined) next) _ _ _ at companions
+  have companion4 : Stage_online_eval.parallel_generatedRoot_449.w_46_0 ctx =
+      (leafSlotData first second 4).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 4).symm
+    exact sharedLoop hm 0 (A := parentKeys K00 K01 K10 K11 (⟨3, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join19 join24 companions
+  have companion5 : Stage_online_eval.parallel_generatedRoot_449.w_46_1 ctx =
+      (leafSlotData first second 5).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 5).symm
+    exact sharedLoop hm 1 (A := parentKeys K00 K01 K10 K11 (⟨4, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join28 join31 companions
+  have companion6 : Stage_online_eval.parallel_generatedRoot_449.w_46_2 ctx =
+      (leafSlotData first second 6).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 6).symm
+    exact sharedLoop hm 2 (A := parentKeys K00 K01 K10 K11 (⟨5, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join35 join38 companions
+  have companion7 : Stage_online_eval.parallel_generatedRoot_449.w_46_3 ctx =
+      (leafSlotData first second 7).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 7).symm
+    exact sharedLoop hm 3 (A := parentKeys K00 K01 K10 K11 (⟨6, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join42 join45 companions
+  have read8 := F.c0.h8_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 3))) parentList2) _ at read8
+  rw [select3] at read8
+  have eq8 := (familyGet_eq read8).2
+  have read10 := F.c0.h10_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 3))) parentList2) _ at read10
+  rw [select3] at read10
+  have eq10 := (familyGet_eq read10).2
+  have run4 := iterOne F.c2.h50_3
+  rw [eq8, eq10] at run4
+  have slot4 := slotFinish4 hm (second.memberBranch (⟨3, by decide⟩ : Fin 15)) (s := (0, 0, T0 4 ⟨member, hm⟩, T1 4 ⟨member, hm⟩, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_449.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_50_3 ctx, ())) companion4 ⟨congrFun (hT0 4).symm ⟨member, hm⟩, congrFun (hT1 4).symm ⟨member, hm⟩⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run4)
+  have read51 := F.c2.h51_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 4))) parentList2) _ at read51
+  rw [select4] at read51
+  have eq51 := (familyGet_eq read51).2
+  have read52 := F.c2.h52_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 4))) parentList2) _ at read52
+  rw [select4] at read52
+  have eq52 := (familyGet_eq read52).2
+  have run5 := iterOne F.c2.h55_3
+  rw [eq51, eq52] at run5
+  have slot5 := slotFinish5 hm (second.memberBranch (⟨4, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_449.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_50_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_449.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_55_3 ctx, ())) companion5 ⟨(slot4.2.2.2.1).trans (congrFun (hT0 5).symm ⟨member, hm⟩), (slot4.2.2.2.2).trans (congrFun (hT1 5).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run5)
+  have read56 := F.c2.h56_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 5))) parentList2) _ at read56
+  rw [select5] at read56
+  have eq56 := (familyGet_eq read56).2
+  have read57 := F.c2.h57_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 5))) parentList2) _ at read57
+  rw [select5] at read57
+  have eq57 := (familyGet_eq read57).2
+  have run6 := iterOne F.c3.h60_3
+  rw [eq56, eq57] at run6
+  have slot6 := slotFinish6 hm (second.memberBranch (⟨5, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_449.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_55_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_449.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_60_3 ctx, ())) companion6 ⟨(slot5.2.2.2.1).trans (congrFun (hT0 6).symm ⟨member, hm⟩), (slot5.2.2.2.2).trans (congrFun (hT1 6).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run6)
+  have read61 := F.c3.h61_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 6))) parentList2) _ at read61
+  rw [select6] at read61
+  have eq61 := (familyGet_eq read61).2
+  have read62 := F.c3.h62_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 6))) parentList2) _ at read62
+  rw [select6] at read62
+  have eq62 := (familyGet_eq read62).2
+  have run7 := iterOne F.c3.h65_3
+  rw [eq61, eq62] at run7
+  have slot7 := slotFinish7 hm (second.memberBranch (⟨6, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_449.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_60_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_449.w_65_0 ctx, Stage_online_eval.parallel_generatedRoot_449.w_65_1 ctx, Stage_online_eval.parallel_generatedRoot_449.w_65_2 ctx, Stage_online_eval.parallel_generatedRoot_449.w_65_3 ctx, ())) companion7 ⟨(slot6.2.2.2.1).trans (congrFun (hT0 7).symm ⟨member, hm⟩), (slot6.2.2.2.2).trans (congrFun (hT1 7).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run7)
+  dsimp only at slot4 slot5 slot6 slot7
+  refine ⟨forall4 (pred := fun slot ↦ (leafSlotData first second (chunkSlot 1 slot)).Runs model (15 + member) hb) slot4.1 slot5.1 slot6.1 slot7.1, ?_⟩
+  intro port
+  fin_cases port
+  · rw [F.c3.hout]
+    change Stage_online_eval.parallel_generatedRoot_449.w_65_0 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 4 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 5 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 6 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 7 0
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot7.2.1, slot6.2.1, slot5.2.1, slot4.2.1]
+    rfl
+  · rw [F.c3.hout]
+    change Stage_online_eval.parallel_generatedRoot_449.w_65_1 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 4 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 5 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 6 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 7 1
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot7.2.2.1, slot6.2.2.1, slot5.2.2.1, slot4.2.2.1]
+    rfl
+
+end Group1
+
+namespace Group2
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol8_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_50_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol8_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_50_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef8 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_50_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 8 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [7, 22, 37, 52, 67, 82, 97]) coefList2 = Int.ofNat (kSlot 8 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish8 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_466_50 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 8 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 8 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_466_50.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_466_50.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol8_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol8_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef8 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 8 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 8 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_50.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol9_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_55_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol9_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_55_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef9 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_55_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 9 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [8, 23, 38, 53, 68, 83, 98]) coefList2 = Int.ofNat (kSlot 9 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish9 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_466_55 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 9 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 9 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_466_55.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_466_55.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol9_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol9_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef9 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 9 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 9 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_55.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol10_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_60_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol10_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_60_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef10 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_60_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 10 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [9, 24, 39, 54, 69, 84, 99]) coefList2 = Int.ofNat (kSlot 10 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish10 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_466_60 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 10 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 10 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_466_60.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_466_60.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol10_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol10_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef10 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 10 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 10 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_60.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol11_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_65_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol11_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_65_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef11 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_65_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 11 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [10, 25, 40, 55, 70, 85, 100]) coefList2 = Int.ofNat (kSlot 11 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish11 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_466_65 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 11 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 11 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_466_65.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_466_65.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol11_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol11_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef11 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 11 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 11 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_466_65.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+set_option maxHeartbeats 4000000 in
+/-- One iteration `i` of the sum over the weighted rows of the member lanes adds member
+`i + 2` of each component. -/
+theorem memberSumStep {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i : Nat} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {s t : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : Stage_online_eval.sequential_generatedRoot_473 Backend.backend model tape path params i
+      (s.1, (s.2.1, (f0, (f1, ())))) t) :
+    ∃ hi : i + 2 < 7, t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) := by
+  obtain ⟨w5, w9, -, -, x5, -, -, x9, xout⟩ := h
+  have hidx : Int.ofNat i + 2 = Int.ofNat (i + 2) := by simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at x5 x9
+  obtain ⟨hi, hw5⟩ := familyGet_eq x5
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  subst xout hw5 hw9
+  exact ⟨hi, rfl⟩
+
+set_option maxHeartbeats 16000000 in
+/-- The sum over the weighted rows of the member lanes: from members `0` and `1` of each
+component, the loop adds the other five. -/
+theorem memberSumLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {final : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) ↦
+      Stage_online_eval.sequential_generatedRoot_473 Backend.backend model tape (path ++ [473, i]) params i
+        (current.1, (current.2.1, (f0, (f1, ())))) next) (Int.toNat 5)
+      (f0 0 + f0 1, (f1 0 + f1 1, ())) final) :
+    final = (∑ b, f0 b, (∑ b, f1 b, ())) := by
+  have hcount : Int.toNat 5 = 5 := rfl
+  rw [hcount] at h
+  have step : ∀ (proj : (ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) → ExactMatrix Q N 1 44)
+      (f : Fin 7 → ExactMatrix Q N 1 44),
+      (∀ i s t (hi : i + 2 < 7), t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) →
+        proj t = proj s + f ⟨i + 2, hi⟩) →
+      proj final = proj (f0 0 + f0 1, (f1 0 + f1 1, ())) +
+        ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) := by
+    intro proj f hp
+    have hk := IterRuns.accumulate proj (fun i ↦ if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0)
+      (fun _ _ ↦ True) trivial (fun i s t _ _ hbody ↦ ⟨by
+        obtain ⟨hi, ht⟩ := memberSumStep hbody
+        rw [hp i s t hi ht]
+        simp only [dif_pos hi], trivial⟩) h
+    exact hk.1
+  have hsum : ∀ f : Fin 7 → ExactMatrix Q N 1 44,
+      f 0 + f 1 + ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) = ∑ b, f b := by
+    intro f
+    rw [Fin.sum_univ_succ, Fin.sum_univ_succ, ← Fin.sum_univ_eq_sum_range, add_assoc]
+    congr 2
+  have e0 := step (fun s ↦ s.1) f0 (fun i s t hi ht ↦ by rw [ht])
+  have e1 := step (fun s ↦ s.2.1) f1 (fun i s t hi ht ↦ by rw [ht])
+  dsimp only at e0 e1
+  rw [hsum] at e0 e1
+  exact Prod.ext e0 (Prod.ext e1 rfl)
+
+
+
+abbrev Mat88 := ExactMatrix Q N 1 88
+abbrev Mat44 := ExactMatrix Q N 1 44
+abbrev Rows4 := Mat88 × Mat88 × Mat88 × Mat88 × Unit
+abbrev SharedBlock := Mat88 × Mat88 × Mat88 × Mat88 × Mat44 × Mat44 × Unit
+noncomputable abbrev rows4 (s : Rows4) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockRows (s : SharedBlock) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockProjection (s : SharedBlock) (slot : Fin 4) : MulBlock :=
+  (blockRows s slot, s.2.2.2.2.1, s.2.2.2.2.2.1, ())
+noncomputable abbrev sharedInnerInputs (s : SharedBlock) (U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, U 0 0, U 0 1, U 1 0, U 1 1, U 2 0, U 2 1, U 3 0, U 3 1, zc0, zc1, ())
+noncomputable abbrev sharedOuterInputs (s : Rows4) (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1)
+    (Ar : Fin 4 → Fin 2 → Mat88) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, zc0, zc1, Ar 0 0, Ar 0 1, Ar 1 0, Ar 1 1, Ar 2 0, Ar 2 1, Ar 3 0, Ar 3 1, ())
+
+theorem iterProject {State Target : Type} {body : Nat → State → State → Prop}
+    {targetBody : Nat → Target → Target → Prop} (project : State → Target)
+    (hstep : ∀ i s t, body i s t → targetBody i (project s) (project t))
+    {count : Nat} {s t : State} (h : MxxIR.IterRuns body count s t) :
+    MxxIR.IterRuns targetBody count (project s) (project t) := by
+  induction h with
+  | zero => exact .zero _
+  | step previous run ih => exact .step ih (hstep _ _ _ run)
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 7)
+    {U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_46_48 Backend.backend
+      model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+      targetPath params (15 + member) a j
+      ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
+        U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
+  have hbranch : 15 + member < 22 := by omega
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  obtain ⟨w9, w38, w39, w40, w42, w44, w45, w47,
+    h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, h9, h10, h11, h12, x38, x39,
+    x40, x42, h13, h14, x44, x45, x47, xout⟩ := h
+  rw [leafMemberSelect member hm] at h11 h12 x38 h13 h14 x44
+  rw [xout]
+  fin_cases slot <;>
+    refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
+    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21.constraints_0]
+  all_goals simp only [switchMembers_eq (15 + member) hbranch]
+  all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
+    h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
+
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a : Nat} (hm : member < 7)
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {Ar : Fin 4 → Fin 2 → Mat88}
+    {s t : Rows4}
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_466_46 Backend.backend model tape path params member a
+      (sharedOuterInputs s zc0 zc1 Ar) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape targetPath
+      params (15 + member) a (rows4 s slot, zc0, zc1, Ar slot 0, Ar slot 1, ()) (rows4 t slot) := by
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  have h00 : (0 : Nat) ≤ 0 := by omega
+  have h01 : (0 : Nat) < 1 := by omega
+  have h11 : (1 : Nat) ≤ 1 := by omega
+  have ha0 : 0 ≤ 44 + Int.ofNat a := by simp only [Int.ofNat_eq_natCast]; omega
+  have ha1 : 44 + Int.ofNat a < 45 + Int.ofNat a := by omega
+  have h88 : (0 : Nat) ≤ 88 := by omega
+  obtain ⟨w, hb⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_466_46.Ctx Backend.backend model tape path params member a :=
+    ⟨sharedOuterInputs s zc0 zc1 Ar, w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_466_46.facts ctx hb
+  have ha88 : 45 + Int.ofNat a ≤ 88 := F.c0.t18
+  let digits : Fin 4 → Fin 2 → ExactMatrix Q N 44 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_47_0 ctx]]
+  have hin := F.c3.h48_5
+  change MxxIR.IterRuns (fun j current next ↦
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_46_48 Backend.backend model tape
+      (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
+  have projected := iterProject (State := SharedBlock) (Target := MulBlock)
+    (body := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_466_46_48 Backend.backend model tape
+        (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
+    (fun current ↦ blockProjection current slot)
+    (targetBody := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+        (targetPath ++ [21, j]) params (15 + member) a j
+        (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
+    (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) hin
+  have hmember : MxxIR.selectInt (Int.ofNat (15 + member)) switchMembers =
+      MxxIR.selectInt (Int.ofNat member) [15, 16, 17, 18, 19, 20, 21] := by
+    rw [switchMembers_eq (15 + member) (by omega), leafMemberSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  have hswitch : MxxIR.selectInt (Int.ofNat (15 + member)) switchList =
+      MxxIR.selectInt (Int.ofNat member) leafSwitches := by
+    rw [← kSw_cast (15 + member) (by omega), leafSwitchSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  rw [F.c3.hout]
+  fin_cases slot
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_17_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_18_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_19_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_21_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_22_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_23_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_0 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h17_0,
+      hm0,
+      hm22,
+      F.c0.h18_0,
+      F.c0.h19_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h21_0,
+      hm0⟩,
+      hm22,
+      F.c1.h22_0,
+      F.c1.h23_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_25_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_26_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_27_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_29_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_30_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_31_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_1 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h25_0,
+      hm0,
+      hm22,
+      F.c1.h26_0,
+      F.c1.h27_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h29_0,
+      hm0⟩,
+      hm22,
+      F.c1.h30_0,
+      F.c1.h31_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_33_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_34_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_35_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_37_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_38_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_39_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_2 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h33_0,
+      hm0,
+      hm22,
+      F.c2.h34_0,
+      F.c2.h35_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h37_0,
+      hm0⟩,
+      hm22,
+      F.c2.h38_0,
+      F.c2.h39_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_41_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_42_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_43_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_45_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_46_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_47_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_3 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_466_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h41_0,
+      hm0,
+      hm22,
+      F.c2.h42_0,
+      F.c2.h43_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c3.h45_0,
+      hm0⟩,
+      hm22,
+      F.c3.h46_0,
+      F.c3.h47_0,
+      h88,
+      projected,
+      rfl⟩
+
+theorem iterOne {State : Type} {body : Nat → State → State → Prop} {s t : State}
+    (h : MxxIR.IterRuns body (Int.toNat 1) s t) : body 0 s t := by
+  obtain ⟨current, previous, run⟩ := MxxIR.IterRuns.step_of_succ (count := 0) h
+  cases previous
+  exact run
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem sharedLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (slot : Fin 4) {A : Fin 2 → Fin 2 → Mat44} {Ar : Fin 4 → Fin 2 → Mat88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) (Ar slot 0))
+    (hA1 : concatColumns (A 1 0) (A 1 1) (Ar slot 1))
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {final : Rows4}
+    (h : MxxIR.IterRuns (fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_466_46 Backend.backend model tape
+        (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+      (Int.toNat 44) (0, 0, 0, 0, ()) final) :
+    rows4 final slot = lutCompRow A (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩ := by
+  have hb : 15 + member < 22 := by omega
+  have initial : rows4 ((0, 0, 0, 0, ()) : Rows4) slot = 0 := by fin_cases slot <;> rfl
+  have projected := iterProject (State := Rows4) (Target := Mat88)
+    (body := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_466_46 Backend.backend model tape
+        (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+    (fun current ↦ rows4 current slot)
+    (targetBody := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape
+        (path ++ [54, a]) params (15 + member) a
+        (current, zc0, zc1, Ar slot 0, Ar slot 1, ()) next)
+    (fun a current next run ↦ sharedOuter_project (Ar := Ar) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) h
+  dsimp only at projected
+  rw [initial] at projected
+  apply Matrix.ext
+  intro row col
+  rw [Subsingleton.elim row 0]
+  exact lutLoop56 hA0 hA1 hb projected col
+
+theorem forall4 {pred : Fin 4 → Prop}
+    (h0 : pred 0)
+    (h1 : pred 1)
+    (h2 : pred 2)
+    (h3 : pred 3)
+    : ∀ slot, pred slot := by
+  intro slot
+  fin_cases slot
+  · exact h0
+  · exact h1
+  · exact h2
+  · exact h3
+
+theorem sum4 {Value : Type} [AddCommMonoid Value] (term : Fin 4 → Value) :
+    ∑ slot, term slot = ((((0 + term 0) + term 1) + term 2) + term 3) := by
+  simp only [Fin.sum_univ_succ, Fin.sum_univ_zero]
+  abel
+
+noncomputable abbrev memberInputs (first : BranchData) (second : Leaf2Data)
+    (T0 T1 : Fin 16 → Fin 7 → Mat88) (member : Fin 7)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) (_M0 _M1 : Mat88)
+    (K00 K01 K10 K11 : Fin 15 → Mat44) (tables : Fin 512 → Int) :=
+  (T0 8 member, T1 8 member, first.hf0, first.hf1, second.c0, second.c1, first.key, zc0, zc1, K00, K01, K10, K11, tables, T0 9, T1 9, T0 10, T1 10, T0 11, T1 11, T0 8, T1 8, ())
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem memberLane {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (first : BranchData) (second : Leaf2Data)
+    (hf0 : second.hf0 = first.hf0) (hf1 : second.hf1 = first.hf1) (hkey : second.key = first.key)
+    {T0 T1 : Fin 16 → Fin 7 → Mat88}
+    (hT0 : ∀ slot, (leafSlotData first second slot).TL0 = T0 slot)
+    (hT1 : ∀ slot, (leafSlotData first second slot).TL1 = T1 slot)
+    {M : Fin 2 → Fin 2 → Mat44} {M0 M1 : Mat88}
+    (_hM0 : concatColumns (M 0 0) (M 0 1) M0) (_hM1 : concatColumns (M 1 0) (M 1 1) M1)
+    {K00 K01 K10 K11 : Fin 15 → Mat44}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {tables : Fin 512 → Int}
+    (hE : ∀ slot : Fin 16, (leafSlotData first second slot).Eb (15 + member) (by omega) =
+      lutCompRow (Fin.cases M (parentKeys K00 K01 K10 K11) slot)
+        (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩)
+    {final : Mat44 × Mat44 × Unit}
+    (h : Stage_online_eval.parallel_generatedRoot_466 Backend.backend model tape path params member
+      (memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables) final) :
+    (∀ slot : Fin 4, (leafSlotData first second (chunkSlot 2 slot)).Runs model
+      (15 + member) (by omega)) ∧
+      (∀ port : Fin 2, ![final.1, final.2.1] port =
+        ∑ slot : Fin 4, memberTerm model first second
+          (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩
+          (chunkSlot 2 slot) port) := by
+  have hb : 15 + member < 22 := by omega
+  have select7 := slotParentSelect (⟨7, by decide⟩ : Fin 15) member hm
+  have select8 := slotParentSelect (⟨8, by decide⟩ : Fin 15) member hm
+  have select9 := slotParentSelect (⟨9, by decide⟩ : Fin 15) member hm
+  have select10 := slotParentSelect (⟨10, by decide⟩ : Fin 15) member hm
+  obtain ⟨w, body⟩ := h
+  let ctx : Stage_online_eval.parallel_generatedRoot_466.Ctx Backend.backend model tape path params member :=
+    ⟨memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables, w⟩
+  have F := Stage_online_eval.parallel_generatedRoot_466.facts ctx body
+  have read16 := F.c0.h16_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 7))) parentList2) _ at read16
+  rw [select7] at read16
+  have eq16 := (familyGet_eq read16).2
+  have read18 := F.c0.h18_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 7))) parentList2) _ at read18
+  rw [select7] at read18
+  have eq18 := (familyGet_eq read18).2
+  have read21 := F.c0.h21_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 7))) parentList2) _ at read21
+  rw [select7] at read21
+  have eq21 := (familyGet_eq read21).2
+  have read23 := F.c0.h23_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 7))) parentList2) _ at read23
+  rw [select7] at read23
+  have eq23 := (familyGet_eq read23).2
+  have join19 := F.c0.h19_0
+  rw [eq16, eq18] at join19
+  have join24 := F.c0.h24_0
+  rw [eq21, eq23] at join24
+  have read26 := F.c0.h26_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 8))) parentList2) _ at read26
+  rw [select8] at read26
+  have eq26 := (familyGet_eq read26).2
+  have read27 := F.c1.h27_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 8))) parentList2) _ at read27
+  rw [select8] at read27
+  have eq27 := (familyGet_eq read27).2
+  have read29 := F.c1.h29_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 8))) parentList2) _ at read29
+  rw [select8] at read29
+  have eq29 := (familyGet_eq read29).2
+  have read30 := F.c1.h30_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 8))) parentList2) _ at read30
+  rw [select8] at read30
+  have eq30 := (familyGet_eq read30).2
+  have join28 := F.c1.h28_0
+  rw [eq26, eq27] at join28
+  have join31 := F.c1.h31_0
+  rw [eq29, eq30] at join31
+  have read33 := F.c1.h33_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 9))) parentList2) _ at read33
+  rw [select9] at read33
+  have eq33 := (familyGet_eq read33).2
+  have read34 := F.c1.h34_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 9))) parentList2) _ at read34
+  rw [select9] at read34
+  have eq34 := (familyGet_eq read34).2
+  have read36 := F.c1.h36_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 9))) parentList2) _ at read36
+  rw [select9] at read36
+  have eq36 := (familyGet_eq read36).2
+  have read37 := F.c1.h37_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 9))) parentList2) _ at read37
+  rw [select9] at read37
+  have eq37 := (familyGet_eq read37).2
+  have join35 := F.c1.h35_0
+  rw [eq33, eq34] at join35
+  have join38 := F.c1.h38_0
+  rw [eq36, eq37] at join38
+  have read40 := F.c2.h40_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 10))) parentList2) _ at read40
+  rw [select10] at read40
+  have eq40 := (familyGet_eq read40).2
+  have read41 := F.c2.h41_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 10))) parentList2) _ at read41
+  rw [select10] at read41
+  have eq41 := (familyGet_eq read41).2
+  have read43 := F.c2.h43_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 10))) parentList2) _ at read43
+  rw [select10] at read43
+  have eq43 := (familyGet_eq read43).2
+  have read44 := F.c2.h44_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 10))) parentList2) _ at read44
+  rw [select10] at read44
+  have eq44 := (familyGet_eq read44).2
+  have join42 := F.c2.h42_0
+  rw [eq40, eq41] at join42
+  have join45 := F.c2.h45_0
+  rw [eq43, eq44] at join45
+  let joined : Fin 4 → Fin 2 → Mat88 := ![![Stage_online_eval.parallel_generatedRoot_466.w_19_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_24_0 ctx], ![Stage_online_eval.parallel_generatedRoot_466.w_28_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_31_0 ctx], ![Stage_online_eval.parallel_generatedRoot_466.w_35_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_38_0 ctx], ![Stage_online_eval.parallel_generatedRoot_466.w_42_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_45_0 ctx]]
+  have companions := F.c2.h46_3
+  change MxxIR.IterRuns (fun a current next ↦
+    Stage_online_eval.sequential_parallel_generatedRoot_466_46 Backend.backend model tape
+      (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 joined) next) _ _ _ at companions
+  have companion8 : Stage_online_eval.parallel_generatedRoot_466.w_46_0 ctx =
+      (leafSlotData first second 8).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 8).symm
+    exact sharedLoop hm 0 (A := parentKeys K00 K01 K10 K11 (⟨7, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join19 join24 companions
+  have companion9 : Stage_online_eval.parallel_generatedRoot_466.w_46_1 ctx =
+      (leafSlotData first second 9).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 9).symm
+    exact sharedLoop hm 1 (A := parentKeys K00 K01 K10 K11 (⟨8, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join28 join31 companions
+  have companion10 : Stage_online_eval.parallel_generatedRoot_466.w_46_2 ctx =
+      (leafSlotData first second 10).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 10).symm
+    exact sharedLoop hm 2 (A := parentKeys K00 K01 K10 K11 (⟨9, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join35 join38 companions
+  have companion11 : Stage_online_eval.parallel_generatedRoot_466.w_46_3 ctx =
+      (leafSlotData first second 11).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 11).symm
+    exact sharedLoop hm 3 (A := parentKeys K00 K01 K10 K11 (⟨10, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join42 join45 companions
+  have read8 := F.c0.h8_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 7))) parentList2) _ at read8
+  rw [select7] at read8
+  have eq8 := (familyGet_eq read8).2
+  have read10 := F.c0.h10_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 7))) parentList2) _ at read10
+  rw [select7] at read10
+  have eq10 := (familyGet_eq read10).2
+  have run8 := iterOne F.c2.h50_3
+  rw [eq8, eq10] at run8
+  have slot8 := slotFinish8 hm (second.memberBranch (⟨7, by decide⟩ : Fin 15)) (s := (0, 0, T0 8 ⟨member, hm⟩, T1 8 ⟨member, hm⟩, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_466.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_50_3 ctx, ())) companion8 ⟨congrFun (hT0 8).symm ⟨member, hm⟩, congrFun (hT1 8).symm ⟨member, hm⟩⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run8)
+  have read51 := F.c2.h51_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 8))) parentList2) _ at read51
+  rw [select8] at read51
+  have eq51 := (familyGet_eq read51).2
+  have read52 := F.c2.h52_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 8))) parentList2) _ at read52
+  rw [select8] at read52
+  have eq52 := (familyGet_eq read52).2
+  have run9 := iterOne F.c2.h55_3
+  rw [eq51, eq52] at run9
+  have slot9 := slotFinish9 hm (second.memberBranch (⟨8, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_466.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_50_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_466.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_55_3 ctx, ())) companion9 ⟨(slot8.2.2.2.1).trans (congrFun (hT0 9).symm ⟨member, hm⟩), (slot8.2.2.2.2).trans (congrFun (hT1 9).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run9)
+  have read56 := F.c2.h56_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 9))) parentList2) _ at read56
+  rw [select9] at read56
+  have eq56 := (familyGet_eq read56).2
+  have read57 := F.c2.h57_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 9))) parentList2) _ at read57
+  rw [select9] at read57
+  have eq57 := (familyGet_eq read57).2
+  have run10 := iterOne F.c3.h60_3
+  rw [eq56, eq57] at run10
+  have slot10 := slotFinish10 hm (second.memberBranch (⟨9, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_466.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_55_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_466.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_60_3 ctx, ())) companion10 ⟨(slot9.2.2.2.1).trans (congrFun (hT0 10).symm ⟨member, hm⟩), (slot9.2.2.2.2).trans (congrFun (hT1 10).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run10)
+  have read61 := F.c3.h61_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 10))) parentList2) _ at read61
+  rw [select10] at read61
+  have eq61 := (familyGet_eq read61).2
+  have read62 := F.c3.h62_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 10))) parentList2) _ at read62
+  rw [select10] at read62
+  have eq62 := (familyGet_eq read62).2
+  have run11 := iterOne F.c3.h65_3
+  rw [eq61, eq62] at run11
+  have slot11 := slotFinish11 hm (second.memberBranch (⟨10, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_466.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_60_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_466.w_65_0 ctx, Stage_online_eval.parallel_generatedRoot_466.w_65_1 ctx, Stage_online_eval.parallel_generatedRoot_466.w_65_2 ctx, Stage_online_eval.parallel_generatedRoot_466.w_65_3 ctx, ())) companion11 ⟨(slot10.2.2.2.1).trans (congrFun (hT0 11).symm ⟨member, hm⟩), (slot10.2.2.2.2).trans (congrFun (hT1 11).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run11)
+  dsimp only at slot8 slot9 slot10 slot11
+  refine ⟨forall4 (pred := fun slot ↦ (leafSlotData first second (chunkSlot 2 slot)).Runs model (15 + member) hb) slot8.1 slot9.1 slot10.1 slot11.1, ?_⟩
+  intro port
+  fin_cases port
+  · rw [F.c3.hout]
+    change Stage_online_eval.parallel_generatedRoot_466.w_65_0 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 8 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 9 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 10 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 11 0
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot11.2.1, slot10.2.1, slot9.2.1, slot8.2.1]
+    rfl
+  · rw [F.c3.hout]
+    change Stage_online_eval.parallel_generatedRoot_466.w_65_1 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 8 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 9 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 10 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 11 1
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot11.2.2.1, slot10.2.2.1, slot9.2.2.1, slot8.2.2.1]
+    rfl
+
+end Group2
+
+namespace Group3
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol12_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_50_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol12_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_50_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef12 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_50_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 12 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [11, 26, 41, 56, 71, 86, 101]) coefList2 = Int.ofNat (kSlot 12 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish12 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_483_50 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 12 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 12 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_483_50.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_483_50.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol12_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol12_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef12 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 12 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 12 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_50.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol13_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_55_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol13_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_55_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef13 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_55_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 13 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [12, 27, 42, 57, 72, 87, 102]) coefList2 = Int.ofNat (kSlot 13 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish13 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_483_55 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 13 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 13 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_483_55.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_483_55.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol13_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol13_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef13 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 13 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 13 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_55.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol14_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_60_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol14_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_60_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef14 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_60_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 14 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [13, 28, 43, 58, 73, 88, 103]) coefList2 = Int.ofNat (kSlot 14 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish14 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_483_60 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 14 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 14 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_483_60.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_483_60.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol14_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol14_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef14 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 14 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 14 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_60.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol15_16 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_65_16 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCol15_42 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i0 tick : Nat} {c top bot : ExactMatrix Q N 1 88} {i : Nat} (hi : i < 88)
+    {s t : ExactMatrix Q N 1 88}
+    (hb : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_65_42 Backend.backend model tape path params i0 tick i
+      (s, (c, (top, (bot, ())))) t) :
+    t = s + (c * rhsDigits top bot ⟨i, hi⟩) 0 0 • (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 88) ∧
+      ColumnRuns top bot ⟨i, hi⟩ := by
+  obtain ⟨w3, w5, w6, w7, w8, w11, -, -, -, -, -, -, x3, -, -, -, -, -, -, x5, x6, x7, x8, -, -,
+    -, -, -, -, -, -, x11, xout⟩ := hb
+  have hw11 := unitRow_window (c := Int.ofNat i) (by omega) x11
+  obtain ⟨_, hw3⟩ := sliceMatrix_column x3
+  obtain ⟨_, hw5⟩ := sliceMatrix_column x5
+  simp only [Int.ofNat_eq_natCast, Int.toNat_natCast] at hw3 hw5 hw11
+  rw [concatRows_pairColumn x6, hw3, hw5] at x7
+  have hrun := x7
+  have hw8 := columnDigits_eq x7 x8
+  subst xout hw8 hw11
+  refine ⟨?_, ⟨w7, hrun, x8⟩⟩
+  simp only [matrixAdd, matrixMulScalarLeft_eq, matrixMul]
+
+set_option maxHeartbeats 4000000 in
+theorem slotCoef15 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {tables : Fin 512 → Int} {b tick i : Nat} (hb : b < 7)
+    (hi : i < 128) {s t : ExactMatrix Q N 1 1}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_65_51 Backend.backend model tape path
+      params b tick i (s, (tables, ())) t) :
+    t = s + coefTermC tables 384 (kSlot 15 b) ⟨i, hi⟩ (by norm_num) := by
+  obtain ⟨w5, w13, -, -, x5, -, -, -, -, x13, xout⟩ := h
+  have hsel : MxxIR.selectInt (MxxIR.selectInt (Int.ofNat b) [14, 29, 44, 59, 74, 89, 104]) coefList2 = Int.ofNat (kSlot 15 b) := by
+    interval_cases b <;> rfl
+  rw [hsel] at x13
+  obtain ⟨_, hw5⟩ := familyGet_eq x5
+  obtain ⟨-, -, -, hw13⟩ := x13
+  subst xout
+  simp only [coefTermC, hw13]
+  congr 2
+  rw [hw5]
+
+set_option maxHeartbeats 64000000 in
+theorem slotFinish15 {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i tick : Nat} (hi : i < 7) (d : BranchData)
+    {E : ExactMatrix Q N 1 88} (hE : E = d.Eb (15 + i) (by omega))
+    {next0 next1 : Fin 7 → ExactMatrix Q N 1 88}
+    {tables : Fin 512 → Int} {s t : LeafState}
+    (hT : s.2.2.1 = d.TL0 ⟨i, hi⟩ ∧ s.2.2.2.1 = d.TL1 ⟨i, hi⟩)
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_483_65 Backend.backend model tape path params i tick
+      (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (d.hf0, (d.hf1, (d.c0, (d.c1, (d.key, (E, (tables, (next0, (next1, ()))))))))))))) t) :
+    d.Runs model (15 + i) (by omega) ∧
+      t.1 = s.1 + d.row model (15 + i) (by omega) 0 * scalarV (branchCoefC tables 384 (kSlot 15 i) (by norm_num)) ∧
+      t.2.1 = s.2.1 + d.row model (15 + i) (by omega) 1 *
+        scalarV (branchCoefC tables 384 (kSlot 15 i) (by norm_num)) ∧
+      t.2.2.1 = next0 ⟨i, hi⟩ ∧
+      t.2.2.2.1 = next1 ⟨i, hi⟩ := by
+  have hb : 15 + i < 22 := by omega
+  obtain ⟨w, hbody⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_483_65.Ctx Backend.backend model tape path params i tick :=
+    ⟨(s.1, s.2.1, s.2.2.1, s.2.2.2.1, d.hf0, d.hf1, d.c0, d.c1, d.key, E, tables, next0, next1, ()), w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_483_65.facts ctx hbody
+  have hsel := leafSwitchSelect i hi
+  obtain ⟨hT0, hT1⟩ := hT
+  have eT0 : s.2.2.1 = d.Tb0 (15 + i) hb := hT0.trans (d.Tb0_leaf hi).symm
+  have eT1 : s.2.2.2.1 = d.Tb1 (15 + i) hb := hT1.trans (d.Tb1_leaf hi).symm
+  -- The helper of `k`.
+  have hw3 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_3_0 ctx = Int.ofNat (15 + i) := leafMemberSelect i hi
+  have h4 := F.c0.h4_0
+  have h6 := F.c0.h6_0
+  rw [hw3] at h4 h6
+  obtain ⟨_, hw4⟩ := familyGet_eq h4
+  obtain ⟨_, hw6⟩ := familyGet_eq h6
+  have hw7 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_7_0 ctx = joinRow (d.hrow (15 + i) hb) := by
+    have h7 := F.c0.h7_0
+    rw [hw4, hw6] at h7
+    exact concat_joinRow (r := d.hrow (15 + i) hb) h7
+  -- The key `T`, rejoined from its halves.
+  have hw11 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_11_0 ctx = d.Tb0 (15 + i) hb := by
+    have h9 := sliceMatrix_window 0 F.c0.h9_0 (by simp) (by omega)
+    have h10 := sliceMatrix_window 44 F.c0.h10_0 (by simp) (by omega)
+    have h11 := F.c0.h11_0
+    rw [h9, h10] at h11
+    rw [(concat_joinRow (r := halves _) h11).trans (joinRow_halves _)]
+    exact eT0
+  have hw15 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_15_0 ctx = d.Tb1 (15 + i) hb := by
+    have h13 := sliceMatrix_window 0 F.c0.h13_0 (by simp) (by omega)
+    have h14 := sliceMatrix_window 44 F.c1.h14_0 (by simp) (by omega)
+    have h15 := F.c1.h15_0
+    rw [h13, h14] at h15
+    rw [(concat_joinRow (r := halves _) h15).trans (joinRow_halves _)]
+    exact eT1
+  -- The helper action.
+  have hcount : Int.toNat 88 = 88 := rfl
+  have h16 := F.c1.h16_0
+  rw [hw7, hw11, hw15, hcount] at h16
+  have hact := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.hrow (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol15_16 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h16
+  have hhelp := colActionSplit (c := joinRow (d.hrow (15 + i) hb)) (row := d.hrow (15 + i) hb)
+    (concatColumns_joinRow _) (tk := halves (d.Tb0 (15 + i) hb)) (bk := halves (d.Tb1 (15 + i) hb))
+    (entry_halves _) (entry_halves _) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_16_0 ctx)
+    (fun jj ↦ ⟨(hact jj).1 0, (hact jj).2⟩)
+  -- The routed state rows.
+  have hroute : ∀ {x y : ExactMatrix Q N 1 44},
+      ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat i) leafSwitches) x y →
+      y = substituteMatrix (kSw (15 + i)) (kSw_odd ⟨15 + i, hb⟩) x := by
+    intro x y hxy
+    rw [hsel] at hxy
+    rw [Int.ofNat_eq_natCast, kSw_cast (15 + i) hb] at hxy
+    exact routing_kSw hb hxy
+  have hw23 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_23_0 ctx = joinRow (d.σc (15 + i) hb) := by
+    have h23 := F.c1.h23_0
+    rw [hroute F.c1.h20_0, hroute F.c1.h22_0] at h23
+    exact concat_joinRow (r := d.σc (15 + i) hb) h23
+  -- The switching ciphertext `C_k`.
+  have hkic := kInv_cast (15 + i) hb
+  have hHi : ∀ {c : Nat} (hc : c < 4) {y : ExactMatrix Q N 1 44},
+      hashSample model dynamicPrefix [.bytes schemaBytes, .bytes helperKeyBytes,
+        .u64Le (MxxIR.selectInt (Int.ofNat i) leafInvSwitches), .bytes componentBytes, .u64Le (c : Int)]
+        d.key y → y = helperKey model d.key (kInv (15 + i)) ⟨c / 2, by omega⟩ ⟨c % 2, by omega⟩ := by
+    intro c hc y hy
+    rw [leafInvSwitchSelect i hi] at hy
+    exact helperKey_read hc hy
+  have hw29 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_29_0 ctx = joinRow (d.top model (15 + i) hb) := by
+    have h29 := F.c2.h29_0
+    rw [hroute F.c1.h26_0, hroute F.c2.h28_0, hHi (c := 0) (by norm_num) F.c1.h25_0,
+      hHi (c := 1) (by norm_num) F.c1.h27_0] at h29
+    exact concat_joinRow (r := d.top model (15 + i) hb) h29
+  have hw32 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_32_0 ctx = Int.ofNat (36 - (15 + i)) := leafInvMemberSelect i hi
+  have h33 := F.c2.h33_0
+  have h38 := F.c2.h38_0
+  rw [hw32] at h33 h38
+  obtain ⟨_, hw33⟩ := familyGet_eq h33
+  obtain ⟨_, hw38⟩ := familyGet_eq h38
+  have hw41 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_41_0 ctx = joinRow (d.bot model (15 + i) hb) := by
+    have h41 := F.c2.h41_0
+    have hw35 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_35_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_31_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_34_0 ctx) := rfl
+    have hw40 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_40_0 ctx =
+        matrixSub (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_37_0 ctx)
+          (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_39_0 ctx) := rfl
+    rw [hw35, hw40, hroute F.c2.h31_0, hroute F.c2.h37_0, hroute F.c2.h34_0, hroute F.c2.h39_0,
+      hHi (c := 2) (by norm_num) F.c2.h30_0, hHi (c := 3) (by norm_num) F.c2.h36_0, hw33, hw38] at h41
+    exact concat_joinRow (r := d.bot model (15 + i) hb) h41
+  -- The switch.
+  have h42 := F.c3.h42_0
+  rw [hw23, hw29, hw41, hcount] at h42
+  have hsw := colAction (r := 1) (fun _ (s : ExactMatrix Q N 1 88) ↦ s)
+    (rows := ![joinRow (d.σc (15 + i) hb)]) (fun _ ↦ rfl)
+    (fun i' s t hi' hb' ↦ by
+      obtain ⟨e, hrun⟩ := slotCol15_42 hi' hb'
+      exact ⟨fun r ↦ by fin_cases r; exact e, hrun⟩) h42
+  have hswitch := colActionSplit (c := joinRow (d.σc (15 + i) hb)) (row := d.σc (15 + i) hb)
+    (concatColumns_joinRow _) (tk := d.top model (15 + i) hb) (bk := d.bot model (15 + i) hb)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (acc := Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_42_0 ctx)
+    (fun jj ↦ ⟨(hsw jj).1 0, (hsw jj).2⟩)
+  have hw53 : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_44_0 ctx =
+      d.Eb (15 + i) hb := hE
+  -- The coefficient and the scalar action.
+  have h60 := F.c3.h51_0
+  have hc128 : Int.toNat 128 = 128 := rfl
+  rw [hc128] at h60
+  have hcoef := coefAccumC (by norm_num) (fun i' s t hi' hb' ↦ slotCoef15 hi hi' hb') h60
+  have hV := scalarV_eq F.c3.h53_0 (coef := branchCoefC tables 384 (kSlot 15 i) (by norm_num)) (by
+    have h64 := F.c3.h55_0
+    have : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_51_0 ctx =
+        branchCoefC tables 384 (kSlot 15 i) (by norm_num) := hcoef
+    change gadgetDecomposeRuns _ _ _ (matrixMulScalarLeft (matrixMulScalarLeft winvPoly
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_51_0 ctx))
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_53_0 ctx)) _ at h64
+    rw [this] at h64
+    exact h64)
+  -- The next leaf's key.
+  have hnext : Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_67_0 ctx =
+      Int.ofNat i := rfl
+  have h77 := F.c4.h68_0
+  have h79 := F.c4.h70_0
+  rw [hnext] at h77 h79
+  obtain ⟨_, hw77⟩ := familyGet_eq h77
+  obtain ⟨_, hw79⟩ := familyGet_eq h79
+  refine ⟨⟨hhelp.2, hswitch.2⟩, ?_, ?_, ?_, ?_⟩
+  · rw [F.c4.hout]
+    have a0 := hhelp.1 0
+    have b0 := hswitch.1 0
+    simp only [Fin.val_zero] at a0 b0
+    have h17 := sliceMatrix_window 0 F.c1.h17_0 (by simp) (by omega)
+    have h43 := sliceMatrix_window 0 F.c3.h43_0 (by simp) (by omega)
+    have h54 := sliceMatrix_window 0 F.c3.h45_0 (by simp) (by omega)
+    rw [hw53] at h54
+    show matrixAdd s.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_17_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_43_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_45_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_55_0 ctx)) = _
+    rw [h17, h43, h54, a0, b0, hV]
+    rfl
+  · rw [F.c4.hout]
+    have a1 := hhelp.1 1
+    have b1 := hswitch.1 1
+    simp only [Fin.val_one] at a1 b1
+    have h68 := sliceMatrix_window 44 F.c3.h59_0 (by simp) (by omega)
+    have h69 := sliceMatrix_window 44 F.c4.h60_0 (by simp) (by omega)
+    have h70 := sliceMatrix_window 44 F.c4.h61_0 (by simp) (by omega)
+    rw [hw53] at h70
+    show matrixAdd s.2.1 (matrixMul (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_59_0 ctx)
+      (matrixAdd (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_60_0 ctx)
+        (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_61_0 ctx)))
+      (Stage_online_eval.sequential_parallel_generatedRoot_483_65.w_55_0 ctx)) = _
+    rw [h68, h69, h70, a1, b1, hV]
+    rfl
+  · rw [F.c4.hout]
+    exact hw77
+  · rw [F.c4.hout]
+    exact hw79
+
+set_option maxHeartbeats 4000000 in
+/-- One iteration `i` of the sum over the weighted rows of the member lanes adds member
+`i + 2` of each component. -/
+theorem memberSumStep {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {i : Nat} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {s t : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : Stage_online_eval.sequential_generatedRoot_490 Backend.backend model tape path params i
+      (s.1, (s.2.1, (f0, (f1, ())))) t) :
+    ∃ hi : i + 2 < 7, t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) := by
+  obtain ⟨w5, w9, -, -, x5, -, -, x9, xout⟩ := h
+  have hidx : Int.ofNat i + 2 = Int.ofNat (i + 2) := by simp only [Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at x5 x9
+  obtain ⟨hi, hw5⟩ := familyGet_eq x5
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  subst xout hw5 hw9
+  exact ⟨hi, rfl⟩
+
+set_option maxHeartbeats 16000000 in
+/-- The sum over the weighted rows of the member lanes: from members `0` and `1` of each
+component, the loop adds the other five. -/
+theorem memberSumLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {f0 f1 : Fin 7 → ExactMatrix Q N 1 44}
+    {final : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) ↦
+      Stage_online_eval.sequential_generatedRoot_490 Backend.backend model tape (path ++ [490, i]) params i
+        (current.1, (current.2.1, (f0, (f1, ())))) next) (Int.toNat 5)
+      (f0 0 + f0 1, (f1 0 + f1 1, ())) final) :
+    final = (∑ b, f0 b, (∑ b, f1 b, ())) := by
+  have hcount : Int.toNat 5 = 5 := rfl
+  rw [hcount] at h
+  have step : ∀ (proj : (ExactMatrix Q N 1 44 × ExactMatrix Q N 1 44 × Unit) → ExactMatrix Q N 1 44)
+      (f : Fin 7 → ExactMatrix Q N 1 44),
+      (∀ i s t (hi : i + 2 < 7), t = (s.1 + f0 ⟨i + 2, hi⟩, (s.2.1 + f1 ⟨i + 2, hi⟩, ())) →
+        proj t = proj s + f ⟨i + 2, hi⟩) →
+      proj final = proj (f0 0 + f0 1, (f1 0 + f1 1, ())) +
+        ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) := by
+    intro proj f hp
+    have hk := IterRuns.accumulate proj (fun i ↦ if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0)
+      (fun _ _ ↦ True) trivial (fun i s t _ _ hbody ↦ ⟨by
+        obtain ⟨hi, ht⟩ := memberSumStep hbody
+        rw [hp i s t hi ht]
+        simp only [dif_pos hi], trivial⟩) h
+    exact hk.1
+  have hsum : ∀ f : Fin 7 → ExactMatrix Q N 1 44,
+      f 0 + f 1 + ∑ i ∈ Finset.range 5, (if hi : i + 2 < 7 then f ⟨i + 2, hi⟩ else 0) = ∑ b, f b := by
+    intro f
+    rw [Fin.sum_univ_succ, Fin.sum_univ_succ, ← Fin.sum_univ_eq_sum_range, add_assoc]
+    congr 2
+  have e0 := step (fun s ↦ s.1) f0 (fun i s t hi ht ↦ by rw [ht])
+  have e1 := step (fun s ↦ s.2.1) f1 (fun i s t hi ht ↦ by rw [ht])
+  dsimp only at e0 e1
+  rw [hsum] at e0 e1
+  exact Prod.ext e0 (Prod.ext e1 rfl)
+
+
+
+abbrev Mat88 := ExactMatrix Q N 1 88
+abbrev Mat44 := ExactMatrix Q N 1 44
+abbrev Rows4 := Mat88 × Mat88 × Mat88 × Mat88 × Unit
+abbrev SharedBlock := Mat88 × Mat88 × Mat88 × Mat88 × Mat44 × Mat44 × Unit
+noncomputable abbrev rows4 (s : Rows4) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockRows (s : SharedBlock) : Fin 4 → Mat88 := ![s.1, s.2.1, s.2.2.1, s.2.2.2.1]
+noncomputable abbrev blockProjection (s : SharedBlock) (slot : Fin 4) : MulBlock :=
+  (blockRows s slot, s.2.2.2.2.1, s.2.2.2.2.2.1, ())
+noncomputable abbrev sharedInnerInputs (s : SharedBlock) (U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, s.2.2.2.2.2.1, U 0 0, U 0 1, U 1 0, U 1 1, U 2 0, U 2 1, U 3 0, U 3 1, zc0, zc1, ())
+noncomputable abbrev sharedOuterInputs (s : Rows4) (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1)
+    (Ar : Fin 4 → Fin 2 → Mat88) :=
+  (s.1, s.2.1, s.2.2.1, s.2.2.2.1, zc0, zc1, Ar 0 0, Ar 0 1, Ar 1 0, Ar 1 1, Ar 2 0, Ar 2 1, Ar 3 0, Ar 3 1, ())
+
+theorem iterProject {State Target : Type} {body : Nat → State → State → Prop}
+    {targetBody : Nat → Target → Target → Prop} (project : State → Target)
+    (hstep : ∀ i s t, body i s t → targetBody i (project s) (project t))
+    {count : Nat} {s t : State} (h : MxxIR.IterRuns body count s t) :
+    MxxIR.IterRuns targetBody count (project s) (project t) := by
+  induction h with
+  | zero => exact .zero _
+  | step previous run ih => exact .step ih (hstep _ _ _ run)
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedInner_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a j : Nat} (hm : member < 7)
+    {U : Fin 4 → Fin 2 → ExactMatrix Q N 44 1}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {s t : SharedBlock}
+    (h : Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_46_48 Backend.backend
+      model tape path params member a j (sharedInnerInputs s U zc0 zc1) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+      targetPath params (15 + member) a j
+      ((blockProjection s slot).1, (blockProjection s slot).2.1, (blockProjection s slot).2.2.1,
+        U slot 0, U slot 1, zc0, zc1, ()) (blockProjection t slot) := by
+  have hbranch : 15 + member < 22 := by omega
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  obtain ⟨w9, w38, w39, w40, w42, w44, w45, w47,
+    h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, h9, h10, h11, h12, x38, x39,
+    x40, x42, h13, h14, x44, x45, x47, xout⟩ := h
+  rw [leafMemberSelect member hm] at h11 h12 x38 h13 h14 x44
+  rw [xout]
+  fin_cases slot <;>
+    refine ⟨w9, w38, w39, w40, w42, w44, w45, w47, ?_⟩ <;>
+    dsimp only [Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21.constraints_0]
+  all_goals simp only [switchMembers_eq (15 + member) hbranch]
+  all_goals exact ⟨h0, h1, h2, h3, h4, h5, h6, h7, x9, h8, hm0, hm22,
+    h11, h12, x38, x39, x40, x42, h13, h14, x44, x45, x47, rfl⟩
+
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 64000000 in
+theorem sharedOuter_project {model : HashModel} {tape : SampleTape} {path targetPath : List Nat}
+    {params : Stage_online_eval.Params} {member a : Nat} (hm : member < 7)
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {Ar : Fin 4 → Fin 2 → Mat88}
+    {s t : Rows4}
+    (h : Stage_online_eval.sequential_parallel_generatedRoot_483_46 Backend.backend model tape path params member a
+      (sharedOuterInputs s zc0 zc1 Ar) t) (slot : Fin 4) :
+    Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape targetPath
+      params (15 + member) a (rows4 s slot, zc0, zc1, Ar slot 0, Ar slot 1, ()) (rows4 t slot) := by
+  have hm0 : 0 ≤ Int.ofNat (15 + member) := by simp only [Int.ofNat_eq_natCast]; omega
+  have hm22 : Int.ofNat (15 + member) < 22 := by simp only [Int.ofNat_eq_natCast]; omega
+  have h00 : (0 : Nat) ≤ 0 := by omega
+  have h01 : (0 : Nat) < 1 := by omega
+  have h11 : (1 : Nat) ≤ 1 := by omega
+  have ha0 : 0 ≤ 44 + Int.ofNat a := by simp only [Int.ofNat_eq_natCast]; omega
+  have ha1 : 44 + Int.ofNat a < 45 + Int.ofNat a := by omega
+  have h88 : (0 : Nat) ≤ 88 := by omega
+  obtain ⟨w, hb⟩ := h
+  let ctx : Stage_online_eval.sequential_parallel_generatedRoot_483_46.Ctx Backend.backend model tape path params member a :=
+    ⟨sharedOuterInputs s zc0 zc1 Ar, w⟩
+  have F := Stage_online_eval.sequential_parallel_generatedRoot_483_46.facts ctx hb
+  have ha88 : 45 + Int.ofNat a ≤ 88 := F.c0.t18
+  let digits : Fin 4 → Fin 2 → ExactMatrix Q N 44 1 := ![![Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_19_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_23_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_27_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_31_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_35_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_39_0 ctx], ![Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_43_0 ctx, Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_47_0 ctx]]
+  have hin := F.c3.h48_5
+  change MxxIR.IterRuns (fun j current next ↦
+    Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_46_48 Backend.backend model tape
+      (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next) _ _ _ at hin
+  have projected := iterProject (State := SharedBlock) (Target := MulBlock)
+    (body := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_483_46_48 Backend.backend model tape
+        (path ++ [48, j]) params member a j (sharedInnerInputs current digits zc0 zc1) next)
+    (fun current ↦ blockProjection current slot)
+    (targetBody := fun j current next ↦
+      Stage_online_eval.sequential_sequential_parallel_generatedRoot_415_54_21 Backend.backend model tape
+        (targetPath ++ [21, j]) params (15 + member) a j
+        (current.1, current.2.1, current.2.2.1, digits slot 0, digits slot 1, zc0, zc1, ()) next)
+    (fun j current next run ↦ sharedInner_project (U := digits) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) hin
+  have hmember : MxxIR.selectInt (Int.ofNat (15 + member)) switchMembers =
+      MxxIR.selectInt (Int.ofNat member) [15, 16, 17, 18, 19, 20, 21] := by
+    rw [switchMembers_eq (15 + member) (by omega), leafMemberSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  have hswitch : MxxIR.selectInt (Int.ofNat (15 + member)) switchList =
+      MxxIR.selectInt (Int.ofNat member) leafSwitches := by
+    rw [← kSw_cast (15 + member) (by omega), leafSwitchSelect member hm]
+    simp only [Int.ofNat_eq_natCast]
+  rw [F.c3.hout]
+  fin_cases slot
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_17_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_18_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_19_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_21_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_22_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_23_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_0 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h17_0,
+      hm0,
+      hm22,
+      F.c0.h18_0,
+      F.c0.h19_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c0.h21_0,
+      hm0⟩,
+      hm22,
+      F.c1.h22_0,
+      F.c1.h23_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_25_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_26_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_27_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_29_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_30_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_31_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_1 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h25_0,
+      hm0,
+      hm22,
+      F.c1.h26_0,
+      F.c1.h27_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h29_0,
+      hm0⟩,
+      hm22,
+      F.c1.h30_0,
+      F.c1.h31_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_33_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_34_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_35_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_37_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_38_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_39_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_2 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c1.h33_0,
+      hm0,
+      hm22,
+      F.c2.h34_0,
+      F.c2.h35_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h37_0,
+      hm0⟩,
+      hm22,
+      F.c2.h38_0,
+      F.c2.h39_0,
+      h88,
+      projected,
+      rfl⟩
+  · refine ⟨({
+        w_3_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_6_0 ctx,
+        w_4_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_7_0 ctx,
+        w_5_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_8_0 ctx,
+        w_7_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_10_0 ctx,
+        w_9_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_12_0 ctx,
+        w_10_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_13_0 ctx,
+        w_12_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_15_0 ctx,
+        w_14_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_41_0 ctx,
+        w_15_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_42_0 ctx,
+        w_16_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_43_0 ctx,
+        w_18_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_45_0 ctx,
+        w_19_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_46_0 ctx,
+        w_20_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_47_0 ctx,
+        w_21_0 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_3 ctx,
+        w_21_1 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_4 ctx,
+        w_21_2 := Stage_online_eval.sequential_parallel_generatedRoot_483_46.w_48_5 ctx } : Stage_online_eval.sequential_parallel_generatedRoot_415_54.Witness), ?_⟩
+    dsimp only [Stage_online_eval.sequential_parallel_generatedRoot_415_54.body,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_0,
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54.constraints_1]
+    rw [hmember, hswitch]
+    exact ⟨⟨hm0,
+      hm22,
+      F.c0.h5_0,
+      F.c0.h5_0_1,
+      F.c0.h6_0,
+      F.c0.h7_0,
+      F.c0.h8_0,
+      F.c0.h10_0,
+      F.c0.h5_0_2,
+      F.c0.h5_0_3,
+      F.c0.h12_0,
+      F.c0.h13_0,
+      F.c0.h15_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c2.h41_0,
+      hm0,
+      hm22,
+      F.c2.h42_0,
+      F.c2.h43_0,
+      h00,
+      h01,
+      h11,
+      ha0,
+      ha1,
+      ha88,
+      F.c3.h45_0,
+      hm0⟩,
+      hm22,
+      F.c3.h46_0,
+      F.c3.h47_0,
+      h88,
+      projected,
+      rfl⟩
+
+theorem iterOne {State : Type} {body : Nat → State → State → Prop} {s t : State}
+    (h : MxxIR.IterRuns body (Int.toNat 1) s t) : body 0 s t := by
+  obtain ⟨current, previous, run⟩ := MxxIR.IterRuns.step_of_succ (count := 0) h
+  cases previous
+  exact run
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem sharedLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (slot : Fin 4) {A : Fin 2 → Fin 2 → Mat44} {Ar : Fin 4 → Fin 2 → Mat88}
+    (hA0 : concatColumns (A 0 0) (A 0 1) (Ar slot 0))
+    (hA1 : concatColumns (A 1 0) (A 1 1) (Ar slot 1))
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {final : Rows4}
+    (h : MxxIR.IterRuns (fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_483_46 Backend.backend model tape
+        (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+      (Int.toNat 44) (0, 0, 0, 0, ()) final) :
+    rows4 final slot = lutCompRow A (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩ := by
+  have hb : 15 + member < 22 := by omega
+  have initial : rows4 ((0, 0, 0, 0, ()) : Rows4) slot = 0 := by fin_cases slot <;> rfl
+  have projected := iterProject (State := Rows4) (Target := Mat88)
+    (body := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_483_46 Backend.backend model tape
+        (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 Ar) next)
+    (fun current ↦ rows4 current slot)
+    (targetBody := fun a current next ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_415_54 Backend.backend model tape
+        (path ++ [54, a]) params (15 + member) a
+        (current, zc0, zc1, Ar slot 0, Ar slot 1, ()) next)
+    (fun a current next run ↦ sharedOuter_project (Ar := Ar) (s := current) (t := next)
+      (zc0 := zc0) (zc1 := zc1) hm run slot) h
+  dsimp only at projected
+  rw [initial] at projected
+  apply Matrix.ext
+  intro row col
+  rw [Subsingleton.elim row 0]
+  exact lutLoop56 hA0 hA1 hb projected col
+
+theorem forall4 {pred : Fin 4 → Prop}
+    (h0 : pred 0)
+    (h1 : pred 1)
+    (h2 : pred 2)
+    (h3 : pred 3)
+    : ∀ slot, pred slot := by
+  intro slot
+  fin_cases slot
+  · exact h0
+  · exact h1
+  · exact h2
+  · exact h3
+
+theorem sum4 {Value : Type} [AddCommMonoid Value] (term : Fin 4 → Value) :
+    ∑ slot, term slot = ((((0 + term 0) + term 1) + term 2) + term 3) := by
+  simp only [Fin.sum_univ_succ, Fin.sum_univ_zero]
+  abel
+
+noncomputable abbrev memberInputs (first : BranchData) (second : Leaf2Data)
+    (T0 T1 : Fin 16 → Fin 7 → Mat88) (member : Fin 7)
+    (zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1) (_M0 _M1 : Mat88)
+    (K00 K01 K10 K11 : Fin 15 → Mat44) (tables : Fin 512 → Int) :=
+  (T0 12 member, T1 12 member, first.hf0, first.hf1, second.c0, second.c1, first.key, zc0, zc1, K00, K01, K10, K11, tables, T0 13, T1 13, T0 14, T1 14, T0 15, T1 15, T0 12, T1 12, ())
+
+set_option maxRecDepth 200000 in
+set_option maxHeartbeats 8000000 in
+theorem memberLane {model : HashModel} {tape : SampleTape} {path : List Nat}
+    {params : Stage_online_eval.Params} {member : Nat} (hm : member < 7)
+    (first : BranchData) (second : Leaf2Data)
+    (hf0 : second.hf0 = first.hf0) (hf1 : second.hf1 = first.hf1) (hkey : second.key = first.key)
+    {T0 T1 : Fin 16 → Fin 7 → Mat88}
+    (hT0 : ∀ slot, (leafSlotData first second slot).TL0 = T0 slot)
+    (hT1 : ∀ slot, (leafSlotData first second slot).TL1 = T1 slot)
+    {M : Fin 2 → Fin 2 → Mat44} {M0 M1 : Mat88}
+    (_hM0 : concatColumns (M 0 0) (M 0 1) M0) (_hM1 : concatColumns (M 1 0) (M 1 1) M1)
+    {K00 K01 K10 K11 : Fin 15 → Mat44}
+    {zc0 zc1 : Fin 85184 → ExactMatrix PQ N 1 1} {tables : Fin 512 → Int}
+    (hE : ∀ slot : Fin 16, (leafSlotData first second slot).Eb (15 + member) (by omega) =
+      lutCompRow (Fin.cases M (parentKeys K00 K01 K10 K11) slot)
+        (expandFam zc0) (expandFam zc1) ⟨15 + member, by omega⟩)
+    {final : Mat44 × Mat44 × Unit}
+    (h : Stage_online_eval.parallel_generatedRoot_483 Backend.backend model tape path params member
+      (memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables) final) :
+    (∀ slot : Fin 4, (leafSlotData first second (chunkSlot 3 slot)).Runs model
+      (15 + member) (by omega)) ∧
+      (∀ port : Fin 2, ![final.1, final.2.1] port =
+        ∑ slot : Fin 4, memberTerm model first second
+          (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩
+          (chunkSlot 3 slot) port) := by
+  have hb : 15 + member < 22 := by omega
+  have select11 := slotParentSelect (⟨11, by decide⟩ : Fin 15) member hm
+  have select12 := slotParentSelect (⟨12, by decide⟩ : Fin 15) member hm
+  have select13 := slotParentSelect (⟨13, by decide⟩ : Fin 15) member hm
+  have select14 := slotParentSelect (⟨14, by decide⟩ : Fin 15) member hm
+  obtain ⟨w, body⟩ := h
+  let ctx : Stage_online_eval.parallel_generatedRoot_483.Ctx Backend.backend model tape path params member :=
+    ⟨memberInputs first second T0 T1 ⟨member, hm⟩ zc0 zc1 M0 M1 K00 K01 K10 K11 tables, w⟩
+  have F := Stage_online_eval.parallel_generatedRoot_483.facts ctx body
+  have read16 := F.c0.h16_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 11))) parentList2) _ at read16
+  rw [select11] at read16
+  have eq16 := (familyGet_eq read16).2
+  have read18 := F.c0.h18_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 11))) parentList2) _ at read18
+  rw [select11] at read18
+  have eq18 := (familyGet_eq read18).2
+  have read21 := F.c0.h21_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 11))) parentList2) _ at read21
+  rw [select11] at read21
+  have eq21 := (familyGet_eq read21).2
+  have read23 := F.c0.h23_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 11))) parentList2) _ at read23
+  rw [select11] at read23
+  have eq23 := (familyGet_eq read23).2
+  have join19 := F.c0.h19_0
+  rw [eq16, eq18] at join19
+  have join24 := F.c0.h24_0
+  rw [eq21, eq23] at join24
+  have read26 := F.c0.h26_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 12))) parentList2) _ at read26
+  rw [select12] at read26
+  have eq26 := (familyGet_eq read26).2
+  have read27 := F.c1.h27_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 12))) parentList2) _ at read27
+  rw [select12] at read27
+  have eq27 := (familyGet_eq read27).2
+  have read29 := F.c1.h29_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 12))) parentList2) _ at read29
+  rw [select12] at read29
+  have eq29 := (familyGet_eq read29).2
+  have read30 := F.c1.h30_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 12))) parentList2) _ at read30
+  rw [select12] at read30
+  have eq30 := (familyGet_eq read30).2
+  have join28 := F.c1.h28_0
+  rw [eq26, eq27] at join28
+  have join31 := F.c1.h31_0
+  rw [eq29, eq30] at join31
+  have read33 := F.c1.h33_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 13))) parentList2) _ at read33
+  rw [select13] at read33
+  have eq33 := (familyGet_eq read33).2
+  have read34 := F.c1.h34_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 13))) parentList2) _ at read34
+  rw [select13] at read34
+  have eq34 := (familyGet_eq read34).2
+  have read36 := F.c1.h36_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 13))) parentList2) _ at read36
+  rw [select13] at read36
+  have eq36 := (familyGet_eq read36).2
+  have read37 := F.c1.h37_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 13))) parentList2) _ at read37
+  rw [select13] at read37
+  have eq37 := (familyGet_eq read37).2
+  have join35 := F.c1.h35_0
+  rw [eq33, eq34] at join35
+  have join38 := F.c1.h38_0
+  rw [eq36, eq37] at join38
+  have read40 := F.c2.h40_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 14))) parentList2) _ at read40
+  rw [select14] at read40
+  have eq40 := (familyGet_eq read40).2
+  have read41 := F.c2.h41_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 14))) parentList2) _ at read41
+  rw [select14] at read41
+  have eq41 := (familyGet_eq read41).2
+  have read43 := F.c2.h43_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 14))) parentList2) _ at read43
+  rw [select14] at read43
+  have eq43 := (familyGet_eq read43).2
+  have read44 := F.c2.h44_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 14))) parentList2) _ at read44
+  rw [select14] at read44
+  have eq44 := (familyGet_eq read44).2
+  have join42 := F.c2.h42_0
+  rw [eq40, eq41] at join42
+  have join45 := F.c2.h45_0
+  rw [eq43, eq44] at join45
+  let joined : Fin 4 → Fin 2 → Mat88 := ![![Stage_online_eval.parallel_generatedRoot_483.w_19_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_24_0 ctx], ![Stage_online_eval.parallel_generatedRoot_483.w_28_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_31_0 ctx], ![Stage_online_eval.parallel_generatedRoot_483.w_35_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_38_0 ctx], ![Stage_online_eval.parallel_generatedRoot_483.w_42_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_45_0 ctx]]
+  have companions := F.c2.h46_3
+  change MxxIR.IterRuns (fun a current next ↦
+    Stage_online_eval.sequential_parallel_generatedRoot_483_46 Backend.backend model tape
+      (path ++ [46, a]) params member a (sharedOuterInputs current zc0 zc1 joined) next) _ _ _ at companions
+  have companion12 : Stage_online_eval.parallel_generatedRoot_483.w_46_0 ctx =
+      (leafSlotData first second 12).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 12).symm
+    exact sharedLoop hm 0 (A := parentKeys K00 K01 K10 K11 (⟨11, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join19 join24 companions
+  have companion13 : Stage_online_eval.parallel_generatedRoot_483.w_46_1 ctx =
+      (leafSlotData first second 13).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 13).symm
+    exact sharedLoop hm 1 (A := parentKeys K00 K01 K10 K11 (⟨12, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join28 join31 companions
+  have companion14 : Stage_online_eval.parallel_generatedRoot_483.w_46_2 ctx =
+      (leafSlotData first second 14).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 14).symm
+    exact sharedLoop hm 2 (A := parentKeys K00 K01 K10 K11 (⟨13, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join35 join38 companions
+  have companion15 : Stage_online_eval.parallel_generatedRoot_483.w_46_3 ctx =
+      (leafSlotData first second 15).Eb (15 + member) hb := by
+    apply Eq.trans ?_ (hE 15).symm
+    exact sharedLoop hm 3 (A := parentKeys K00 K01 K10 K11 (⟨14, by decide⟩ : Fin 15)) (Ar := joined)
+      (zc0 := zc0) (zc1 := zc1) join42 join45 companions
+  have read8 := F.c0.h8_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 11))) parentList2) _ at read8
+  rw [select11] at read8
+  have eq8 := (familyGet_eq read8).2
+  have read10 := F.c0.h10_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 11))) parentList2) _ at read10
+  rw [select11] at read10
+  have eq10 := (familyGet_eq read10).2
+  have run12 := iterOne F.c2.h50_3
+  rw [eq8, eq10] at run12
+  have slot12 := slotFinish12 hm (second.memberBranch (⟨11, by decide⟩ : Fin 15)) (s := (0, 0, T0 12 ⟨member, hm⟩, T1 12 ⟨member, hm⟩, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_483.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_50_3 ctx, ())) companion12 ⟨congrFun (hT0 12).symm ⟨member, hm⟩, congrFun (hT1 12).symm ⟨member, hm⟩⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run12)
+  have read51 := F.c2.h51_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 12))) parentList2) _ at read51
+  rw [select12] at read51
+  have eq51 := (familyGet_eq read51).2
+  have read52 := F.c2.h52_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 12))) parentList2) _ at read52
+  rw [select12] at read52
+  have eq52 := (familyGet_eq read52).2
+  have run13 := iterOne F.c2.h55_3
+  rw [eq51, eq52] at run13
+  have slot13 := slotFinish13 hm (second.memberBranch (⟨12, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_483.w_50_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_50_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_50_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_50_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_483.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_55_3 ctx, ())) companion13 ⟨(slot12.2.2.2.1).trans (congrFun (hT0 13).symm ⟨member, hm⟩), (slot12.2.2.2.2).trans (congrFun (hT1 13).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run13)
+  have read56 := F.c2.h56_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 13))) parentList2) _ at read56
+  rw [select13] at read56
+  have eq56 := (familyGet_eq read56).2
+  have read57 := F.c2.h57_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 13))) parentList2) _ at read57
+  rw [select13] at read57
+  have eq57 := (familyGet_eq read57).2
+  have run14 := iterOne F.c3.h60_3
+  rw [eq56, eq57] at run14
+  have slot14 := slotFinish14 hm (second.memberBranch (⟨13, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_483.w_55_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_55_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_55_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_55_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_483.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_60_3 ctx, ())) companion14 ⟨(slot13.2.2.2.1).trans (congrFun (hT0 14).symm ⟨member, hm⟩), (slot13.2.2.2.2).trans (congrFun (hT1 14).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run14)
+  have read61 := F.c3.h61_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 14))) parentList2) _ at read61
+  rw [select14] at read61
+  have eq61 := (familyGet_eq read61).2
+  have read62 := F.c3.h62_0
+  change familyGetDynamic _ (MxxIR.selectInt (MxxIR.selectInt (Int.ofNat member)
+    (List.ofFn fun lane : Fin 7 ↦ Int.ofNat (15 * lane + 14))) parentList2) _ at read62
+  rw [select14] at read62
+  have eq62 := (familyGet_eq read62).2
+  have run15 := iterOne F.c3.h65_3
+  rw [eq61, eq62] at run15
+  have slot15 := slotFinish15 hm (second.memberBranch (⟨14, by decide⟩ : Fin 15)) (s := (Stage_online_eval.parallel_generatedRoot_483.w_60_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_60_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_60_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_60_3 ctx, ()))
+    (t := (Stage_online_eval.parallel_generatedRoot_483.w_65_0 ctx, Stage_online_eval.parallel_generatedRoot_483.w_65_1 ctx, Stage_online_eval.parallel_generatedRoot_483.w_65_2 ctx, Stage_online_eval.parallel_generatedRoot_483.w_65_3 ctx, ())) companion15 ⟨(slot14.2.2.2.1).trans (congrFun (hT0 15).symm ⟨member, hm⟩), (slot14.2.2.2.2).trans (congrFun (hT1 15).symm ⟨member, hm⟩)⟩
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run15)
+  dsimp only at slot12 slot13 slot14 slot15
+  refine ⟨forall4 (pred := fun slot ↦ (leafSlotData first second (chunkSlot 3 slot)).Runs model (15 + member) hb) slot12.1 slot13.1 slot14.1 slot15.1, ?_⟩
+  intro port
+  fin_cases port
+  · rw [F.c3.hout]
+    change Stage_online_eval.parallel_generatedRoot_483.w_65_0 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 12 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 13 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 14 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 15 0
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot15.2.1, slot14.2.1, slot13.2.1, slot12.2.1]
+    rfl
+  · rw [F.c3.hout]
+    change Stage_online_eval.parallel_generatedRoot_483.w_65_1 ctx = _
+    rw [sum4]
+    change _ = 0 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 12 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 13 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 14 1 + memberTerm model first second (fun index ↦ branchCoefC tables 384 index (by norm_num)) ⟨member, hm⟩ 15 1
+    dsimp only [memberTerm, leafSlotData, Fin.cases_zero, Fin.cases_succ]
+    rw [slot15.2.2.1, slot14.2.2.1, slot13.2.2.1, slot12.2.2.1]
+    rfl
+
+end Group3
 
 end PeProof.Step3

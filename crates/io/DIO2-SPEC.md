@@ -1031,3 +1031,13 @@ member zero when forming `S_0`; its carried `StepRowsValue` is unchanged. This u
 the ordinary backend's streamed publication path instead of retaining large
 scalar matrix returns throughout obfuscation. It introduces no iO-specific
 concurrency policy: the generic GPU planner still chooses lane and column widths.
+
+### Member hash tags
+
+Root input members, input ciphertext members and RHS ciphertext members use the
+existing signed, length-prefixed integer hash component. The DSL emits Integer
+for compile-time expressions and Operand for runtime values; both serialize the
+same bytes. Production smudge member indices exceed 64 bits. Instance/domain
+components retain their existing U64Le representation. This changes member-tag
+bytes, so previously generated hash-derived artifacts must be regenerated. It
+does not change sampler distributions, arithmetic, or the noise recurrence.

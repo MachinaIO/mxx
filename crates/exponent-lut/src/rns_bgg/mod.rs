@@ -505,11 +505,13 @@ impl RnsBggRoot {
     }
 
     /// The root tag of an input's root object `tag`, or of its member `member`.
+    /// Member indices use the same length-prefixed integer encoding in static
+    /// and runtime tags, including indices wider than 64 bits.
     pub fn input_tag(tag: &str, member: Option<mxx_dsl::Int>) -> mxx_dsl::HashTag {
         let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/root-input/{tag}").into_bytes());
         if let Some(member) = member {
             tag.push("member");
-            tag.push_u64_le(member);
+            tag.push_integer(member);
         }
         tag
     }

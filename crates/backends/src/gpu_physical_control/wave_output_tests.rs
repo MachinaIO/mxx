@@ -86,12 +86,36 @@ fn assert_matches_cpu(
 #[ignore = "requires a CUDA GPU"]
 #[serial_test::serial(gpu_context)]
 fn test_gpu_direct_parallel_hash_capture_matches_root() {
+    parallel_hash_capture_matches_root(None);
+}
+
+/// Production member indices exceed u64; static and device loop tags must agree.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial(gpu_context)]
+fn test_gpu_direct_parallel_wide_integer_hash_capture_matches_root() {
+    parallel_hash_capture_matches_root(Some(BigInt::from(1u8) << 70usize));
+}
+
+/// Zero has a one-byte magnitude in the host BigInt tag encoding.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial(gpu_context)]
+fn test_gpu_direct_parallel_zero_integer_hash_capture_matches_root() {
+    parallel_hash_capture_matches_root(Some(BigInt::from(0)));
+}
+
+fn parallel_hash_capture_matches_root(offset: Option<BigInt>) {
     let (_, gpu, ring) = parameters();
     let columns = crate::env::test_streamed_columns();
     let key = ring.bytes_input("hash-key", 32);
     let hash = |member: Int| {
         let mut tag = mxx_dsl::HashTag::from(b"nested-hash-capture".as_slice());
-        tag.push_u64_le(member);
+        if let Some(offset) = &offset {
+            tag.push_integer(member.add(Int::constant(offset.clone())));
+        } else {
+            tag.push_u64_le(member);
+        }
         ring.hash_matrix(key.clone(), tag, (1, columns))
     };
     let nested = parallel(2usize, |member| {

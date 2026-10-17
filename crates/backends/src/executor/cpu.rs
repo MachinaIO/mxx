@@ -2961,6 +2961,49 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wide_integer_hash_tag_matches_static_integer() {
+        use mxx_dsl::{HashTag, IntType};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = ring(&parameters);
+        let value = (BigInt::from(1u8) << 70usize) + BigInt::from(rand::random::<u64>());
+        let context = DslContext::new("cpu-u64-le-operand");
+        let row = context.input::<Int>("row", IntType).unwrap();
+        let key = ring.bytes_input("key", 32);
+        let sample = |index: Int| {
+            let mut tag = HashTag::from(b"u64-le:".as_slice());
+            tag.push_integer(index);
+            ring.hash_matrix(key.clone(), tag, (1, 2))
+        };
+        let graph = context
+            .output("static", sample(Int::constant(value.clone())))
+            .unwrap()
+            .output("runtime", sample(row))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let key_bytes: [u8; 32] = rand::random();
+        let mut run = |row: BigInt| {
+            execute(
+                &graph,
+                &mut backend,
+                BTreeMap::from([
+                    ("row".to_owned(), RuntimeValue::Int(row)),
+                    ("key".to_owned(), RuntimeValue::Bytes(key_bytes.to_vec().into())),
+                ]),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+        };
+        let result = run(BigInt::from(value)).unwrap();
+        assert_eq!(matrix_output(&result, "static"), matrix_output(&result, "runtime"));
+    }
+
+    #[test]
     fn parallel_preimages_use_one_cpu_batch() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = ring(&parameters);

@@ -1347,6 +1347,19 @@ impl HashTag {
         Ok(())
     }
 
+    /// Append a signed, length-prefixed integer component. Compile-time and runtime
+    /// values use identical bytes, including indices wider than 64 bits. This is
+    /// the existing Integer/Operand encoding, distinct from `push_u64_le`.
+    pub fn push_integer(&mut self, index: Int) {
+        match index.compile_expression() {
+            Some(expression) => self.components.push(HashTagComponent::Integer(expression)),
+            None => {
+                self.components.push(HashTagComponent::Operand(self.dynamic.len() + 1));
+                self.dynamic.push(index.value);
+            }
+        }
+    }
+
     /// Append `index` as a `u64` little-endian component (`[3]` and eight bytes).
     ///
     /// An index known when the graph is built (a constant, parameter, or loop-index expression)

@@ -208,7 +208,9 @@ namespace
                 const uint64_t highest = words ? scratch[words - 1] : 0;
                 size_t high_bytes = 0;
                 for (uint64_t remaining = highest; remaining; remaining >>= 8) ++high_bytes;
-                const size_t magnitude_bytes = words ? (words - 1) * 8 + high_bytes : 0;
+                // Match BigInt::to_bytes_be: zero has one zero magnitude byte.
+                // hash_operand_magnitude initializes scratch[0] even for zero.
+                const size_t magnitude_bytes = words ? (words - 1) * 8 + high_bytes : 1;
                 if (magnitude_bytes > tag_capacity - cursor ||
                     tag_capacity - cursor - magnitude_bytes < 10) goto invalid;
                 tag[cursor++] = 1;

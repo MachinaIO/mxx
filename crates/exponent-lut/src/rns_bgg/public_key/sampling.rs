@@ -61,7 +61,7 @@ pub(in crate::rns_bgg) fn lut_public_matrix(
     Ok(matrix_from_hash(&ring, key, tag, columns))
 }
 
-/// The member enters the tag as a `u64` component in every stage: a member
+/// The member enters the tag as a length-prefixed integer in every stage: a member
 /// index known when the graph is built (a constant or a loop-index
 /// expression) is static, and a runtime one (a table entry) is a hash
 /// argument hashing the same bytes, so every reader of a member derives the
@@ -70,7 +70,7 @@ fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::H
     let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/input/{wire:?}/{level}").into_bytes());
     if let Some(member) = member {
         tag.push("member");
-        tag.push_u64_le(member);
+        tag.push_integer(member);
     }
     tag
 }
@@ -84,7 +84,8 @@ fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::H
 /// rows of two that did would differ by their plaintext difference times the
 /// secret, revealing whether the plaintexts differ.
 /// `member` may be a runtime integer selected from a Program-data family; both
-/// runtime and compile-time members use the same little-endian `u64` tag component.
+/// runtime and compile-time members use the same signed, length-prefixed integer tag.
+/// This also supports the production sampler indices wider than 64 bits.
 pub(crate) fn rhs_top(
     parameters: &RnsBggParameters,
     program: crate::program::ExponentLutProgramId,
@@ -106,7 +107,7 @@ pub(crate) fn rhs_top(
     crate::rns_bgg::push_digest(&mut tag, program.as_bytes());
     if let Some(member) = member {
         tag.push("member");
-        tag.push_u64_le(member);
+        tag.push_integer(member);
     }
     parameters.push_hash_domain(&mut tag);
     let component = |index: u64| {

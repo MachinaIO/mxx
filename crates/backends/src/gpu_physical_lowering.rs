@@ -31,7 +31,9 @@
 //!   operation. A root output that is a whole scratch matrix is returned in place.
 //! - **Preimage retries.** Each preimage column tile is a device loop that derives a per-attempt
 //!   seed, samples a candidate, and checks its cutoff, until acceptance or the frozen attempt bound
-//!   (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`); exhaustion is a device status error.
+//!   (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`); exhaustion is a device status error. Ordered tiles of
+//!   equal width share native P1, GQ and cutoff workspaces on each device. Covariance refresh
+//!   follows the preceding retry loop; separate parallel lanes retain independent resources.
 //! - **Graph scratch admission.** CUDA keeps the reservation of a Graph upload that runs out of
 //!   memory, so before uploading any region `admit_graph_scratch` compares the scheduled scratch
 //!   peak with the free memory and rejects the candidate if it does not fit. After each candidate,
@@ -3865,6 +3867,32 @@ pub(super) fn matrix_row_slice(
     Ok(view)
 }
 
+/// An evaluation view for an in-place NTT of disposable coefficient scratch.
+/// The caller must order the transform after all coefficient readers and before
+/// any evaluation reader; both values deliberately refer to the same bytes.
+fn matrix_evaluation_alias(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+) -> Result<PhysicalValueId, String> {
+    let mut physical = ctx.values[source.0 as usize].clone();
+    if physical.encodings.as_ref() != [PhysicalEncoding::FullCoeff] ||
+        !matches!(physical.ty, ConcreteWireType::Matrix(_))
+    {
+        return Err("GPU evaluation alias requires full coefficient matrix scratch".into());
+    }
+    physical.encodings = Box::new([PhysicalEncoding::FullEval]);
+    let owner = ctx
+        .owners
+        .get(&source)
+        .ok_or("GPU evaluation alias owner is absent")?
+        .with_physical_view(Arc::new(physical.clone()))
+        .map_err(str::to_owned)?;
+    let id = value_id(ctx.values.len())?;
+    ctx.values.push(physical);
+    ctx.owners.insert(id, Arc::new(owner));
+    Ok(id)
+}
+
 /// A compact publication addresses the full owner base and uses the semantic
 /// column origin to scatter a packed tile into that owner. Unlike a full
 /// matrix subview, its byte offset must not advance by the column stride.
@@ -6386,9 +6414,12 @@ pub(super) fn lower_preimage_sample_node(
         ctx.device = home;
         remote.insert(device, (copies, block_output, *block));
     }
-    // One cutoff staging allocation per device and tile width. Tiles sharing it
-    // are ordered below; C controls their width and W controls independent lanes.
-    let mut cutoff_tiles = BTreeMap::<(i32, usize), (u32, Option<u32>)>::new();
+    // One set of native workspaces per device and tile width. Tiles sharing
+    // these buffers are already ordered for cutoff staging. Keep that ordering
+    // through covariance refresh too, so a later tile cannot overwrite P1 state
+    // while the preceding retry body reads it. C controls tile width; W controls
+    // independent lanes, whose resources remain separate.
+    let mut workspace_tiles = BTreeMap::<(i32, usize), (u32, Option<u32>)>::new();
     for &(tile_device, tile_start, tile_width) in &tiles {
         let target_source = target;
         let target = matrix_view(ctx, target_source, 0, d, tile_start, tile_width)?;
@@ -6428,10 +6459,12 @@ pub(super) fn lower_preimage_sample_node(
             .ok()
             .and_then(|value| value.checked_mul(3))
             .ok_or("GPU preimage resource ID overflows")?;
-        let p1_resource = resource_base;
-        let gq_resource = resource_base + 1;
-        let (cutoff_resource, previous_cutoff) =
-            *cutoff_tiles.entry((tile_device, t)).or_insert((resource_base + 2, None));
+        let (shared_resource_base, previous_tile) =
+            *workspace_tiles.entry((tile_device, t)).or_insert((resource_base, None));
+        // Statistical precomputation retains its independent workspace.
+        let p1_resource = if statistical.is_some() { resource_base } else { shared_resource_base };
+        let gq_resource = shared_resource_base + 1;
+        let cutoff_resource = shared_resource_base + 2;
         // The statistical sampler reads the trapdoor's precomputation on the tile's device.
         let (p1_workspace, precomputation) = match statistical {
             Some(_) => (
@@ -6473,6 +6506,7 @@ pub(super) fn lower_preimage_sample_node(
             let predecessors = covariance
                 .iter()
                 .flat_map(|id| all_predecessors(ctx.producer, *id))
+                .chain(previous_tile)
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             Some(push_preimage_op(
@@ -6525,20 +6559,35 @@ pub(super) fn lower_preimage_sample_node(
             let mut child =
                 retry_body_context(ctx, &mut body, &mut body_producer, &mut body_converted);
             let mut reusable_p2 = None;
+            let perturb_eval =
+                allocate_scratch_matrix(&mut child, &output_matrix, PhysicalEncoding::FullEval)?;
             let perturb_coeff = match statistical {
                 None => {
                     let p2_seed =
                         derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 0)?;
-                    let (p2_coeff, p2_eval) = emit_fresh_matrix_sample_parts(
+                    // Sample p2 directly into the perturbation's trailing rows.
+                    // After the public product, this same view can hold z: all
+                    // subsequent perturbation readers use perturb_eval. The final
+                    // inverse NTT overwrites the coefficient owner only after z
+                    // has been transformed and used by the correction.
+                    let perturb_coeff = allocate_scratch_matrix(
                         &mut child,
-                        scope_id,
-                        node_id,
-                        3,
-                        &shape(dk, t),
-                        Some(dgg_stddev),
-                        Some(p2_seed),
+                        &output_matrix,
+                        PhysicalEncoding::FullCoeff,
                     )?;
-                    reusable_p2 = Some((p2_coeff, p2_eval));
+                    let p2_coeff = matrix_row_slice(&mut child, perturb_coeff, 2 * d, dk)?;
+                    // P1 consumes this temporary transform before the complete
+                    // perturbation transform replaces the evaluation owner.
+                    let p2_eval = matrix_row_slice(&mut child, perturb_eval, 2 * d, dk)?;
+                    let p2_sample =
+                        emit_matrix_sample(&mut child, p2_seed, p2_coeff, Some(dgg_stddev))?;
+                    emit_matrix_operation(
+                        &mut child,
+                        GpuImplementation::ntt(false),
+                        &[p2_coeff],
+                        p2_eval,
+                    )?;
+                    reusable_p2 = Some(p2_coeff);
                     let tp2_eval = allocate_scratch_matrix(
                         &mut child,
                         &shape(2 * d, t),
@@ -6600,30 +6649,18 @@ pub(super) fn lower_preimage_sample_node(
                     child
                         .producer
                         .insert(p1_coeff, vec![(ColumnRange { start: 0, end: t }, p1_index)]);
-                    let perturb_coeff = allocate_scratch_matrix(
-                        &mut child,
-                        &output_matrix,
-                        PhysicalEncoding::FullCoeff,
-                    )?;
                     let p1_dest = matrix_view(&mut child, perturb_coeff, 0, 2 * d, 0, t)?;
-                    let p2_dest = matrix_view(&mut child, perturb_coeff, 2 * d, dk, 0, t)?;
                     let p1_copy = emit_matrix_operation(
                         &mut child,
                         GpuImplementation::matrix_copy_view(),
                         &[p1_coeff],
                         p1_dest,
                     )?;
-                    let p2_copy = emit_matrix_operation(
-                        &mut child,
-                        GpuImplementation::matrix_copy_view(),
-                        &[p2_coeff],
-                        p2_dest,
-                    )?;
                     child.producer.insert(
                         perturb_coeff,
                         vec![
                             (ColumnRange { start: 0, end: t }, p1_copy),
-                            (ColumnRange { start: 0, end: t }, p2_copy),
+                            (ColumnRange { start: 0, end: t }, p2_sample),
                         ],
                     );
                     perturb_coeff
@@ -6676,8 +6713,6 @@ pub(super) fn lower_preimage_sample_node(
                     perturb_coeff
                 }
             };
-            let perturb_eval =
-                allocate_scratch_matrix(&mut child, &output_matrix, PhysicalEncoding::FullEval)?;
             emit_matrix_operation(
                 &mut child,
                 GpuImplementation::ntt(false),
@@ -6709,9 +6744,9 @@ pub(super) fn lower_preimage_sample_node(
                 residual_coeff,
             )?;
             // The perturbation has consumed p2 through the public product and
-            // residual. Its two buffers can hold z without overlapping readers.
+            // residual. Its coefficient tail can hold z without overlapping readers.
             let z_coeff = match reusable_p2 {
-                Some((coefficient, _)) => coefficient,
+                Some(coefficient) => coefficient,
                 None => {
                     allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullCoeff)?
                 }
@@ -6744,7 +6779,10 @@ pub(super) fn lower_preimage_sample_node(
             )?;
             child.producer.insert(z_coeff, vec![(ColumnRange { start: 0, end: t }, gq_index)]);
             let z_eval = match reusable_p2 {
-                Some((_, evaluation)) => evaluation,
+                // z is disposable after its forward transform. Reinterpret
+                // the coefficient tail for an in-place NTT, then consume it in
+                // the correction before the final inverse overwrites the owner.
+                Some(coefficient) => matrix_evaluation_alias(&mut child, coefficient)?,
                 None => {
                     allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullEval)?
                 }
@@ -6968,7 +7006,7 @@ pub(super) fn lower_preimage_sample_node(
         // source window: the loop must follow that copy.
         predecessors.extend(all_predecessors(ctx.producer, target_local));
         predecessors.extend(refresh);
-        predecessors.extend(previous_cutoff);
+        predecessors.extend(previous_tile);
         predecessors.push(output_initializers[&tile_owner]);
         if let Some(precomputation) = precomputation {
             predecessors.extend(all_predecessors(ctx.producer, precomputation));
@@ -6976,7 +7014,7 @@ pub(super) fn lower_preimage_sample_node(
         predecessors.sort_unstable();
         predecessors.dedup();
         let loop_op = emit_retry_loop(ctx, &controls, predecessors.into_boxed_slice(), body)?;
-        cutoff_tiles.insert((tile_device, t), (cutoff_resource, Some(loop_op)));
+        workspace_tiles.insert((tile_device, t), (shared_resource_base, Some(loop_op)));
         ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: t }, loop_op)]);
         ctx.producer
             .entry(tile_owner)
@@ -10216,8 +10254,9 @@ mod tests {
         let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 2_000_000);
         // A uniform target: a zero one is solved by a zero column, which hides
         // a tile published at another tile's columns.
-        let target = ring.uniform_residue((1, 2));
-        let preimage = trapdoor.sample_preimage(target.clone(), (digits + 2, 2));
+        let columns = crate::env::test_streamed_columns();
+        let target = ring.uniform_residue((1, columns));
+        let preimage = trapdoor.sample_preimage(target.clone(), (digits + 2, columns));
         let validated = DslContext::new("direct-preimage-tiled")
             .output("public", trapdoor.public_matrix())
             .unwrap()
@@ -10235,7 +10274,7 @@ mod tests {
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], devices.clone())).unwrap();
         let mut plan =
             runtime.plan_with_fixed_columns_for_test(validated, &BTreeMap::new(), 1).unwrap();
-        assert_eq!(plan.physical_frame_for_test().preimage_replays.len(), 2);
+        assert_eq!(plan.physical_frame_for_test().preimage_replays.len(), columns);
         let mut store = MemoryArtifactStore::default();
         let first = runtime
             .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
@@ -10267,9 +10306,31 @@ mod tests {
                     crate::gpu_execution_plan::GpuNativePrimitive::LoopWhile
             })
             .collect::<Vec<_>>();
-        assert_eq!(retries.len(), 2);
+        assert_eq!(retries.len(), columns);
         let tile_devices = retries.iter().map(|retry| retry.device).collect::<BTreeSet<_>>();
-        assert_eq!(tile_devices.len(), devices.len().min(2));
+        assert_eq!(tile_devices.len(), devices.len().min(columns));
+        // Native workspaces scale with active devices/tile widths, not the
+        // number of output columns. Covariance refresh must wait for the prior
+        // tile's entire retry loop before overwriting the shared P1 state.
+        let mut resources = BTreeMap::new();
+        let mut previous_retry = BTreeMap::new();
+        for (index, op) in frame.program.operations.iter().enumerate() {
+            let primitive =
+                frame.program.implementations.resolve(op.implementation).unwrap().primitive;
+            if primitive == crate::gpu_execution_plan::GpuNativePrimitive::P1CovarianceRefresh {
+                let KernelArg::U32(resource) = op.arguments[0] else { panic!("P1 resource") };
+                if let Some(previous) = resources.insert(op.device, resource) {
+                    assert_eq!(previous, resource, "same-device tiles share native P1 state");
+                    assert!(
+                        op.predecessors.contains(&previous_retry[&op.device]),
+                        "refresh waits for previous tile readers"
+                    );
+                }
+            } else if primitive == crate::gpu_execution_plan::GpuNativePrimitive::LoopWhile {
+                previous_retry.insert(op.device, index as u32);
+            }
+        }
+        assert_eq!(resources.len(), tile_devices.len());
         // Each tile's retry values are Graph-owned scratch freed when its
         // loop ends, so every tile is checked through its published column.
         for (column, retry) in retries.iter().enumerate() {

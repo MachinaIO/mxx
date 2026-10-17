@@ -118,12 +118,13 @@ impl Evaluator<'_> {
         let (plan, function) = (&obfuscation.plan, &obfuscation.function);
         let production = obfuscation.production.production().clone();
         let initial = DslContext::new("dio2-evaluate")
-            .artifact_input::<super::step::StepRowsValue>(
+            .artifact_input::<super::step::InitialRowsValue>(
                 production,
                 INITIAL_OUTPUT,
-                StepRows::schema(plan, &self.ring()),
+                StepRows::initial_schema(plan, &self.ring()),
                 ArtifactAvailability::Transferred,
             )?;
+        let initial = StepRows::from_initial(initial).into_value();
         let labels =
             mxx_dsl::int_family_input(LABELS_INPUT, plan.label_rows * (plan.label_width + 1));
         let steps = function.stream_length();

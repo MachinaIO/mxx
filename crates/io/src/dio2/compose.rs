@@ -526,10 +526,19 @@ impl Compose<'_, Key> {
             RootObject::Public,
             Some(Int::constant(plan.label_rows)),
         )?;
-        let targets = self.targets(next, label_chunk, leaf, one)?;
         let failure = Failure::default();
         let primes = plan.primes;
         let keys = mxx_dsl::parallel(plan.blocks() * primes, |member| {
+            // The scalar target families and padded anchor belong to this lane:
+            // their last readers precede its preimage sampler. Keeping them outside
+            // the loop would retain their storage throughout every invocation.
+            // Lane/column concurrency remains the generic backend's W/C choice.
+            let targets = failure.keep(self.targets(
+                next,
+                (label_chunk.0, label_chunk.1.clone()),
+                leaf.clone(),
+                one.clone(),
+            ))?;
             let part = failure.keep(self.part(&member.clone().div(primes), next, &targets))?;
             let decoded = failure.keep(self.decoded(&part, &member.rem(primes), &targets))?;
             Ok(consume(key_rows(decoded)))

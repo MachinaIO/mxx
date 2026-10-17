@@ -162,7 +162,73 @@ fn inspect(graph: &ValidatedGraph, stage: &str) {
         }
     }
     println!("{stage} root_integer_input_bytes={total}");
+    if std::env::var_os("MXX_IO_DIO2_ESTIMATE_LIVENESS").is_some() {
+        inspect_sampler_liveness(graph, stage);
+    }
 }
+/// List logical live matrices at each sampler and its enclosing loop call sites.
+/// This deliberately does not sum them into a VRAM estimate: parent/child inputs,
+/// views and packed families can alias, and backend scratch is not represented here.
+fn inspect_sampler_liveness(graph: &ValidatedGraph, stage: &str) {
+    use mxx_ir_core::{graph::FrozenGraphScopeId, node::NodeKind, types::ConcreteWireType};
+    for (scope_id, scope) in graph.source.scopes() {
+        for (index, node) in scope.nodes().iter().enumerate() {
+            if !matches!(node.kind(), NodeKind::PreimageSample { .. }) {
+                continue;
+            }
+            println!("{stage} sampler_scope={scope_id:?} sampler_node={index}");
+            let mut current = scope_id;
+            let mut position = index;
+            loop {
+                let validated = &graph.scopes[current];
+                let source = graph.source.scope(current).unwrap();
+                for (wire, ty) in &validated.wire_types {
+                    if wire.node.0 as usize >= position ||
+                        (!validated.liveness.retained.contains(wire) &&
+                            validated
+                                .liveness
+                                .last_use
+                                .get(wire)
+                                .is_none_or(|last| *last < position))
+                    {
+                        continue;
+                    }
+                    // Families are reported by member shape, never multiplied by their
+                    // symbolic cardinality: streamed families need not be resident.
+                    let (element, members) = match ty {
+                        ConcreteWireType::IndexedFamily { element, count } => {
+                            (element.as_ref(), Some(*count))
+                        }
+                        _ => (ty, None),
+                    };
+                    if let Some(matrix) = element.matrix_type() {
+                        let bytes = matrix.rows as u128 *
+                            matrix.columns as u128 *
+                            u128::from(matrix.ring.ring_dimension()) *
+                            matrix.ring.crt_depth() as u128 *
+                            8;
+                        println!(
+                            "{stage} sampler_live scope={current:?} call={position} wire={wire:?} producer={:?} rows={} columns={} full_member_bytes={bytes} family_members={members:?} artifact_input={}",
+                            std::mem::discriminant(source.node(wire.node).unwrap().kind()),
+                            matrix.rows,
+                            matrix.columns,
+                            validated.artifact_inputs.contains_key(wire)
+                        );
+                    }
+                }
+                match current {
+                    FrozenGraphScopeId::ParallelBody { parent, owner } |
+                    FrozenGraphScopeId::SequentialBody { parent, owner } => {
+                        current = parent;
+                        position = owner.0 as usize;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
 impl StageExecution<MemoryArtifactStore> for RecordGraphs {
     fn produce(
         &mut self,

@@ -507,6 +507,51 @@ struct ScopeSealer {
 impl ScopeSealer {
     fn value(&mut self, value: &ValueHandle) -> Result<ValueHandle, FreezeError> {
         if value.construction_scope() != self.scope {
+            // A deterministic public hash needs only its small key/tag inputs in
+            // each lane. Carrying the full matrix through a parallel loop keeps
+            // it resident across every nested operation, including large samplers.
+            // Only fixed-shape matrix values qualify: a parameter-sized packed
+            // family must not be resampled in full for each selected member.
+            // Preserve the exact hash metadata and reject non-ancestor values as
+            // usual; fresh samplers must never be rematerialized this way.
+            if matches!(self.policy, CapturePolicy::Lexical { parallel_index: Some(_) }) &&
+                value.construction_scope().is_ancestor_of(&self.scope) &&
+                matches!(value.node.kind(), NodeKind::HashSample { .. }) &&
+                matches!(value.wire_type(), WireType::Matrix(matrix)
+                    if matches!(matrix.rows, crate::IntExpr::Const(_)) &&
+                        matches!(matrix.columns, crate::IntExpr::Const(_)))
+            {
+                let identity = value.node.identity();
+                if let Some(node) = self.nodes.get(&identity) {
+                    return node
+                        .output(value.port.0)
+                        .ok_or(FreezeError::InvalidPort { port: value.port.0 });
+                }
+                // Seal the inputs directly. Recursing through a temporary node
+                // would memoize its pointer identity after the temporary dies;
+                // allocator reuse could then conflate distinct hash domains.
+                let arguments = value
+                    .node
+                    .arguments()
+                    .iter()
+                    .map(|argument| self.value(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut local = NodeHandle::new_in_scope(
+                    self.scope.clone(),
+                    value.node.kind().clone(),
+                    arguments,
+                    value.node.output_types().to_vec(),
+                    value.node.source_location().cloned(),
+                    None,
+                );
+                Arc::get_mut(&mut local.0).expect("new node").benchmark_role =
+                    value.node.benchmark_role();
+                let output = local
+                    .output(value.port.0)
+                    .ok_or(FreezeError::InvalidPort { port: value.port.0 })?;
+                self.nodes.insert(identity, local);
+                return Ok(output);
+            }
             return self.capture(value, LoopInputMode::Broadcast);
         }
         let identity = value.node.identity();

@@ -179,6 +179,123 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    fn parallel_hash_captures_keep_tags_but_not_resident_matrices() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let sample = ring.hash_matrix(key.clone(), b"public-key".as_slice(), (1, 4));
+        let other = ring.hash_matrix(key, b"another-key".as_slice(), (1, 4));
+        let fresh = ring.uniform_residue((1, 4));
+        let outputs =
+            parallel(3, |_| Ok((sample.clone(), sample.clone(), fresh.clone(), other.clone())))
+                .unwrap();
+        let built =
+            DslContext::new("hash-captures").output("result", outputs).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let root = built.graph.root_scope();
+        assert!(!root.nodes().iter().any(|n| matches!(n.kind(), NodeKind::HashSample { .. })));
+        assert_eq!(
+            root.nodes()
+                .iter()
+                .filter(|n| matches!(n.kind(), NodeKind::UniformResidueSample { .. }))
+                .count(),
+            1
+        );
+        let body = built
+            .graph
+            .scopes()
+            .values()
+            .find(|scope| {
+                matches!(scope.id(), mxx_ir_core::graph::FrozenGraphScopeId::ParallelBody { .. })
+            })
+            .unwrap();
+        let hashes = body
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind(), NodeKind::HashSample { .. }))
+            .collect::<Vec<_>>();
+        let tags = hashes
+            .iter()
+            .map(|hash| {
+                let NodeKind::HashSample { tag_prefix, .. } = hash.kind() else { unreachable!() };
+                tag_prefix.as_slice()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hashes.len(), 2, "distinct hashes remain distinct; repeated reads share one");
+        assert_eq!(
+            tags,
+            [b"public-key".as_slice(), b"another-key".as_slice()].into_iter().collect()
+        );
+        assert_eq!(body.outputs()[0], body.outputs()[1]);
+    }
+
+    #[test]
+    fn parallel_distinct_hash_captures_preserve_every_domain() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let samples = (0u64..32)
+            .map(|tag| ring.hash_matrix(key.clone(), tag.to_le_bytes().to_vec(), (1, 4)))
+            .collect::<Vec<_>>();
+        let outputs = parallel(3, |_| Family::pack(samples.clone())).unwrap();
+        let built = DslContext::new("distinct-hash-domains")
+            .output("result", outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let tags = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter_map(|node| match node.kind() {
+                NodeKind::HashSample { tag_prefix, .. } => Some(tag_prefix.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tags, (0u64..32).map(|tag| tag.to_le_bytes().to_vec()).collect());
+    }
+
+    #[test]
+    fn parallel_hash_capture_does_not_resample_a_parameter_sized_packed_matrix() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let sample = ring.hash_matrix(
+            ring.bytes_input("key", 32),
+            b"packed".as_slice(),
+            (IntExpr::constant(1), IntExpr::Var("width".to_owned())),
+        );
+        let outputs = parallel(3, |_| Ok(sample.clone())).unwrap();
+        let built = DslContext::new("packed-hash-capture")
+            .int_parameter("width")
+            .output("result", outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+                .count(),
+            1
+        );
+        for scope in built
+            .graph
+            .scopes()
+            .values()
+            .filter(|scope| !matches!(scope.id(), mxx_ir_core::graph::FrozenGraphScopeId::Root))
+        {
+            assert!(
+                !scope
+                    .nodes()
+                    .iter()
+                    .any(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            );
+        }
+    }
+
+    #[test]
     fn escaped_binder_cannot_be_rebound_through_bit_or_hash_metadata() {
         let escaped = RefCell::new(None);
         parallel(1, |i| {

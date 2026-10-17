@@ -935,7 +935,14 @@ Choices the implementation makes within the specification:
   member copies, workspaces, and other live values. The backend sampler publishes tiles
   directly into the returned compact preimage, initializes that deferred output at its first
   graph use so earlier scratch can be reused, reuses perturbation temporaries after their
-  last read, and orders tiles sharing a cutoff staging allocation. W and C still determine
+  last read, and orders tiles sharing a cutoff staging allocation. The computational
+  sampler writes `p2` directly into the perturbation's coefficient tail, reuses that tail for
+  `z` after the public product, and overwrites it with the final inverse NTT only after the
+  correction has consumed `z`. Its evaluation tail holds the initial `p2` transform;
+  `z` later uses an in-place evaluation alias of the coefficient tail. Ordered equal-width
+  tiles share P1/GQ workspaces and cutoff staging on each device. Covariance refresh
+  waits for the previous tile's complete retry loop before overwriting shared state.
+  W and C still determine
   independent lanes and tile width; this introduces no DIO2-specific concurrency setting.
   Wave input placeholders preserve overlapping storage views of each native owner, so CRT
   limbs and shared trapdoor leaves do not allocate separate copies of the buffer tail.
@@ -958,6 +965,12 @@ Choices the implementation makes within the specification:
   the wave width and chunk size from measurements and its memory budget; DIO2 has no separate
   concurrency controller. Step carries and accumulating reductions remain `iterate` loops.
   `W=1` is a capacity-diagnostic setting, not an application concurrency limit.
+  The decoded-key lane constructs its scalar target families and padded anchor locally,
+  allowing their storage to end before preimage sampling. Generic graph sealing
+  rematerializes fixed-shape deterministic public hash matrices inside parallel bodies,
+  preserving their key and exact tag metadata; fresh samplers and parameter-sized packed
+  hash matrices remain captures. This avoids keeping those full public matrices across
+  nested samplers without introducing DIO2-specific scheduling.
 - **Graph size.** Neither graph grows with the ring dimension, the number of primes, the label
   width, the smudge digits, the stream length or the number of chunks: every such count is a
   loop or family count (`graphs_do_not_grow_with_the_parameters` in
@@ -1009,3 +1022,12 @@ with six 60-bit primes and base `2^30` (twelve gadget digits). Its worst-case mo
 decoder error is 285 bits against 300 bits of spacing. Both streaming steps and all
 four evaluator inputs are retained. These are correctness-test parameters, not a
 production security configuration.
+
+### Initial material residency
+
+The initial private/state rows and anchor hint are singleton artifact families,
+produced by parallel loops just like the label/helper families. Evaluation selects
+member zero when forming `S_0`; its carried `StepRowsValue` is unchanged. This uses
+the ordinary backend's streamed publication path instead of retaining large
+scalar matrix returns throughout obfuscation. It introduces no iO-specific
+concurrency policy: the generic GPU planner still chooses lane and column widths.

@@ -1179,6 +1179,8 @@ pub(crate) fn prepare_compiled_gpu_program(
     let mut gq = BTreeMap::new();
     let mut cutoff = BTreeMap::new();
     let mut cutoff_shapes = BTreeMap::new();
+    let mut p1_shapes = BTreeMap::new();
+    let mut gq_shapes = BTreeMap::new();
     let mut resource_ids = BTreeSet::new();
     let mut crt_resource_ids = BTreeSet::new();
     let mut compact_pack_resource_ids = BTreeSet::new();
@@ -1736,8 +1738,8 @@ pub(crate) fn prepare_compiled_gpu_program(
                 else {
                     return Err(invalid("P1 refresh has invalid preparation arguments"));
                 };
-                if !resource_ids.insert(*resource_id) || *tile_columns == 0 {
-                    return Err(invalid("P1 workspace resource ID is duplicated or empty"));
+                if *tile_columns == 0 {
+                    return Err(invalid("P1 workspace is empty"));
                 }
                 let a_owner = owners.get(a_id).ok_or_else(|| invalid("P1 A owner is missing"))?;
                 let b_owner = owners.get(b_id).ok_or_else(|| invalid("P1 B owner is missing"))?;
@@ -1762,6 +1764,19 @@ pub(crate) fn prepare_compiled_gpu_program(
                         "P1 covariance preparation requires packed equal square views",
                     ));
                 }
+                // Reuse only identically shaped resources; lowering orders the
+                // entire previous tile before this covariance refresh.
+                let shape = (operation.device, a_ty.ring.clone(), a.rows, *tile_columns);
+                if let Some(previous) = p1_shapes.get(resource_id) {
+                    if previous != &shape {
+                        return Err(invalid("shared P1 resource has incompatible parameters"));
+                    }
+                    continue;
+                }
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("P1 resource ID is used by another resource kind"));
+                }
+                p1_shapes.insert(*resource_id, shape);
                 let params = backend
                     .parameters_on_physical_device(operation.device, &a_ty)
                     .map_err(|error| invalid(&error))?;
@@ -1839,9 +1854,6 @@ pub(crate) fn prepare_compiled_gpu_program(
                 else {
                     return Err(invalid("GQ sample has invalid preparation arguments"));
                 };
-                if !resource_ids.insert(*resource_id) {
-                    return Err(invalid("GQ workspace resource ID is duplicated"));
-                }
                 let source_owner =
                     owners.get(source_id).ok_or_else(|| invalid("GQ source owner is missing"))?;
                 let (source_ty, source, _) = compiled_raw_matrix_part(
@@ -1855,6 +1867,23 @@ pub(crate) fn prepare_compiled_gpu_program(
                 {
                     return Err(invalid("GQ source is not a packed tile on its selected device"));
                 }
+                let shape = (
+                    operation.device,
+                    source_ty.ring.clone(),
+                    source.rows,
+                    source.columns,
+                    *base_bits,
+                );
+                if let Some(previous) = gq_shapes.get(resource_id) {
+                    if previous != &shape {
+                        return Err(invalid("shared GQ resource has incompatible parameters"));
+                    }
+                    continue;
+                }
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("GQ resource ID is used by another resource kind"));
+                }
+                gq_shapes.insert(*resource_id, shape);
                 let params = backend
                     .parameters_on_physical_device(operation.device, &source_ty)
                     .map_err(|error| invalid(&error))?;

@@ -1,46 +1,69 @@
 # DIO2 implementation verification
 
-Source branch: `redesign/full`, base `1830090b9`. Logs are retained in the task scratchpad `redesign/e3/`.
-Toy correctness and the listed gates passed. Production capacity is not certified.
+Source branch: `redesign/full`, original base `1830090b9`. The previous accepted baseline is `7c2eefaf3`. Logs are retained in the task scratchpad `redesign/e3/`. The implementation is integrated into `codex/diamond-io2-roundtrip` in the chat worktree without a push.
 
-## Current implementation
+## Accepted toy GPU round trip
 
-- DIO2 exposes independent instance, target, component and preimage work as parallel loops. The generic backend chooses W/C; no application concurrency controller was added.
-- Deferred PRF/CBD/smudge members and block retargeting avoid parameter-sized resident families. Reductions and streaming steps remain sequential graph loops.
-- Backend fixes cover scalar families, streamed carries, nested parallel outputs, replica storage identity, singleton selections, covariance-only trapdoor conversion, shared trapdoor leaves and correct wave rebinding.
-- Preimage sampling publishes directly to deferred compact outputs, initialized at their first graph use. Computational perturbation temporaries are reused after their last reads. Ordered tiles share cutoff staging.
-- Wave placeholders retain overlapping views of each original allocation. Rebinding keeps the widest replacement range. The memory ledger counts the union of device ranges.
+The final RTX 4080 SUPER run passed all four clear-function equality assertions: `1 passed; 0 failed`, normal exit **0**. Framework duration was **1,679.23 seconds (27m59s)**; measured process wall time was 1,680.32 seconds. The 45-minute timeout did not fire.
 
-## Completed checks
+The toy retains two steps and all four evaluator inputs, with n=4, Q=P=4, six 60-bit primes and base 2^30 (12 gadget digits). Its worst-case modeled error is 285 bits against 300-bit spacing. The backend automatically chooses W/C; the test defaults to one I/O trial wave and honors an explicit environment override. No production application concurrency controller was added.
 
-- CPU workspace libraries: 1,017 tests passed, 21 ignored, 43 filtered. Round-trip names were excluded; no CPU DIO2 round trip was run.
-- Latest IO default unit tests: 22 passed, one ignored.
-- CPU/GPU workspace no-run and nightly formatting gates have passed on successive revisions; the final CPU compilation also passed after the latest GPU-only changes.
-- Before the latest memory fixes, 1,875 targeted GPU repetitions passed with no failures.
-- Latest computational, tiled and statistical sampler smoke checks: nine passed across identity, `0,0`, and `0,0,0` logical-device modes. The trapdoor regression now checks four columns, two replays, and placeholder R/E aliasing.
-- Allocation-range union unit regression passed, including overlap, nesting, adjacency and overflow.
-- Final required GPU repetition set: **2,790 executions passed, zero failures**, across identity, `0,0`, and `0,0,0`. Three regression filters each ran 300 times per mode; six smoke filters each ran five times per mode. Binary identities and results are recorded in `codex-vram-final-*`.
+| Stage | Seconds, including planning/trials |
+| --- | ---: |
+| Obfuscation | 404.175555581 |
+| Evaluate false, false | 317.829052693 |
+| Evaluate true, false | 319.691199763 |
+| Evaluate false, true | 317.317860902 |
+| Evaluate true, true | 319.577104527 |
 
-## Round trip
+Planned device payload peak was 4,642,348 bytes for obfuscation and 16,762,624 bytes for evaluation. The 561 NVML samples, taken every three seconds, recorded a **device-wide peak of 13,798 MiB**. This includes context/runtime allocations absent from the planned payload ledger and is not a precise instantaneous peak. Host peak RSS was 13,608,884 KiB.
 
-The superseded four-prime/base-15 toy completed obfuscation in 616.145268758 seconds and its first evaluator input in 425.14830615 seconds. That input matched the clear function. The run was stopped during the second input after 1,110.29 seconds because it lacked the latest memory fixes and projected total duration exceeded 30 minutes. This is not a complete round-trip pass.
+Evidence: `codex-initial-stream-final-toy.log`, `codex-initial-stream-final-toy-vram.csv`, `codex-initial-stream-final-source.patch`, `codex-initial-stream-final-binaries.sha256`, and `codex-initial-stream-final-validation.sh`. Frozen toy SHA-256: `f67d88c7ff0edadd7e45e6e1bb241151defd4c4761804e30f6ec3ab4be05f9c8`.
 
-The latest toy retains two steps and all four evaluator inputs, with n=4, Q=P=4, six 60-bit primes and base 2^30 (12 gadget digits). Its worst-case modeled error is 285 bits against 300-bit spacing. The final GPU run passed all four clear-function equality assertions on an RTX 4080 SUPER. The framework reports `1 passed; 0 failed`, 2,066.01 seconds (34m26s). Obfuscation took 558.953170327 seconds; evaluations took 379.614344808, 370.832055963, 385.516062951 and 370.512698793 seconds, respectively. These times include planning/trials. Planned peak: obfuscation 4,801,284 bytes, evaluation maximum 16,625,728 bytes. NVML device-wide sampled peak was 13,768 MiB; it includes runtime/graph/context allocations excluded from the planned payload ledger.
+The baseline took 2,066.01 seconds (34m26s); its separate logs remain in `codex-vram-final-*`. The latest full run is below 30 minutes without removing inputs or assertions. Earlier interrupted and failed runs are not acceptance evidence.
 
-The test process exited 0, confirmed by its kernel wait status in `codex-vram-final-test-exit.json`. Its original 30-minute GNU timeout was suspended and replaced with a cancellation-aware 45-minute watchdog to preserve all four inputs. The old wrapper subsequently reported 124 from its queued timer; this is distinct from the successful test process. The replacement watchdog exited 0. Raw logs, binary hashes and 3-second NVML samples are in `codex-vram-final-*`.
+## Validation gates
 
-The smaller parameters reduced the gadget width from 16 to 12, but the complete run still exceeds 30 minutes. No inputs or assertions were removed. The resident-family audit and graph-size invariance assertions both pass.
+- CPU workspace library tests after the generic hash fix: **1,020 passed, zero failed, 21 ignored, 43 filtered**. Round-trip names were excluded; no CPU DIO2 round trip was run.
+- Subsequent IO changes: **22 passed, zero failed, one ignored**, including noise, residency and graph-size invariance checks.
+- GPU regression repetitions: **5,475 passed, zero failures** across identity, `0,0`, and `0,0,0` logical-device modes. This includes 4,575 regression/smoke repetitions and 900 two-concurrent-lane sampler repetitions. Logical-device aliases are not multiple physical GPUs.
+- Nine native sampler/ownership smoke checks and both capacity diagnostics passed.
+- CPU/GPU workspace library no-run builds and the final toy harness build passed without warnings. Rust was formatted with `cargo +nightly fmt --all`.
 
-## Production capacity: measured subtotal, not whole-program certification
+Evidence: `codex-hash-identity-fixed-cpu-units.log`, `codex-initial-stream-final-io-units.log`, `codex-shared-hash-final-results.txt`, `codex-concurrent-workspace-results.txt`, and the corresponding scripts/logs. The 2,790 baseline GPU repetitions are separate from the 5,475 follow-up executions.
 
-The production-shape sampler diagnostic uses 27 60-bit primes, base 2^6, 270 gadget digits, two anchors and two refresh chunks selecting anchor `instance / 2`, with W=C=1. Only ring dimension is reduced from 65,536 to 128. Latest planned allocation ledger: **350,368,960 bytes** (`codex-deferred-preimage-production-capacity.log`).
+## Implementation and production-capacity limits
 
-Scaling by 512 gives 179,388,907,520 bytes. Conservatively adding one byte per coefficient for the production compact preimage (bound grows from 22 to 27 bits) and cutoff staging gives **189,050,486,784 bytes**. Two additional full rows would add 7,644,119,040 bytes, giving 196,694,605,824 bytes, but this allowance is not yet a proof of all DIO2 live values. CUDA context/driver graph metadata and artifact storage are outside the plan ledger. The whole-program 200 GB peak remains unverified.
+DIO2 exposes instance, target, component, initial-material and preimage work through parallel loops. The generic backend selects concurrency and tile widths. Deferred families and artifact streaming avoid keeping all members resident; reductions and state-carrying steps remain sequential. The following changes reduce sampler memory and root output lifetimes.
 
-The full production evaluation graph also reaches an existing u64 hash-tag index limit. The n=128 graph-only diagnostic constructs both graphs, but does not establish executable production parameters or practical host/artifact volume.
 
-## Remaining
+The computational sampler samples `p2` directly into the perturbation coefficient tail and uses the evaluation tail for its temporary transform. After the public product, `z` uses the coefficient tail and an in-place NTT alias; correction consumes it before the final inverse overwrites the owner. Equal-width ordered tiles share P1/GQ/cutoff resources, with an explicit previous-tile dependency on covariance refresh.
 
-Whole-program production peak remains unverified: the sampler-only estimate leaves about 11 GB, without a proved allowance for all additional live values and runtime overhead. Do not use this report as a production 200 GB acceptance certificate. Full production graph validation is also blocked by the existing u64 hash-tag index limit. The least-change decision is to retain the hash format rather than introduce an unvalidated cryptographic format redesign. No production end-to-end run or multiple-physical-GPU validation is claimed.
+Fixed-shape public hashes are rematerialized inside parallel bodies, and DIO2 constructs targets inside decoded-key lanes. Parameter-sized packed hashes remain captures. A regression in the first rematerialization implementation memoized dead temporary pointer identities, conflating distinct hash domains. A 32-domain graph test reproduced that failure; sealing arguments directly fixes it. The failed follow-up toy (`codex-p2-final-toy.log`, 1,261.21 seconds) is not acceptance evidence. A nested GPU hash oracle now compares two distinct domains, dynamic outer tags and two fresh input keys against root hashes.
 
-The implementation is based on `redesign/full`. After the successful toy, it is committed there and merged into a new `codex/diamond-io2-roundtrip` branch in the chat worktree; no push is performed.
+Initial private/state/hint outputs now use singleton parallel artifact families. Evaluation selects member zero into the unchanged carried state. The residency audit asserts that every initial output publishes from a parallel loop. This removes four full rows and the full-width hint from root return storage during refresh sampling. Both n=128 and the full n=65,536 obfuscation liveness diagnostics now retain only one scalar polynomial at the root, in addition to streamed families; the refresh caller retains eight full rows. The eliminated S_0 root-return payload is 22,988,980,224 production bytes. Logical aliases are not added as independent allocations.
+
+Native sampler smoke checks passed nine times across identity/double/triple logical-device modes. Two physical capacity diagnostics passed with n=128, 27x60-bit primes, base 2^6, two anchors and W=C=1:
+
+| Diagnostic | Planned bytes | n=65,536 projection, including compact-width correction |
+| --- | ---: | ---: |
+| Sampler | 301,778,112 | 164,171,972,608 |
+| Sampler plus eight retained caller rows | 361,508,216 | 194,753,785,856 |
+
+The projection multiplies by 512 and adds 9,661,579,264 bytes for the production preimage/cutoff width. The second diagnostic explicitly retains eight rows through sampling; it is a synthetic envelope, not a complete production plan. It excludes CUDA context/graph metadata and additional caller state. Whole-program 200 GB acceptance remains unverified.
+
+CPU workspace tests after the hash identity repair passed (1,020 passed, zero failed, 21 ignored, 43 filtered); the subsequent IO-only initial-material change passed all 22 IO unit tests (one ignored), including noise, graph-size invariance and residency assertions. The 4,575 updated GPU repetitions passed with zero failures across identity/double/triple logical-device modes. A two-concurrent-lane smoke and 900 repetitions (300 per mode) also passed, for 5,475 successful GPU repetitions in this follow-up. The final all-input toy passed; see the acceptance results above. Binary hashes and exact commands are retained in the task scratchpad.
+
+The toy now defaults to one I/O trial wave through the existing backend option,
+while honoring `MXX_GPU_IO_TRIAL_WAVES` overrides. The frozen acceptance binary
+used that same setting via the environment; the subsequent test-only default
+change does not change the exercised configuration or any production code. W/C
+selection, actual loop counts and the four equality assertions remain unchanged.
+
+## Remaining production limitation and design decision
+
+The **194,753,785,856-byte projection is a sampler-plus-eight-rows payload envelope, not a whole-program 200 GB certificate**. It excludes CUDA context/graph metadata and additional live state. The full n=65,536 obfuscation graph was constructed and its initial-output liveness inspected, but the full evaluation graph fails at the existing `little-endian hash tag must fit in u64` limit (nested scope node 445). The n=128 graph-only diagnostic constructs both graphs. Neither establishes practical production artifact volume or production end-to-end execution.
+
+Evidence: `codex-initial-stream-production-liveness.log`, `codex-initial-stream-liveness.log`, `codex-native-alias-capacity.log`, and `codex-native-alias-capacity_retained_rows.log`.
+
+The least-change decision is to preserve the existing hash transcript format instead of silently introducing an unvalidated wider cryptographic format. Whole-program production capacity remains unverified. No production end-to-end or multiple-physical-GPU acceptance is claimed.

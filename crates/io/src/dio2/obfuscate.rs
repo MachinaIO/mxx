@@ -28,7 +28,7 @@ use super::{
         LABELS_INPUT, OBFUSCATE_STAGE, STEP_DATA_INPUT, Y_INPUT, derive, record, selector_input,
         step_chain, step_root, table_input,
     },
-    step::{RootObject, StepPlan, StepRows},
+    step::{InitialRowsValue, RootObject, StepPlan},
 };
 use mxx_backends::{RuntimeValue, SessionStore};
 use mxx_dsl::{DslContext, Family, Int, Leaf, Mat, Trapdoor};
@@ -114,7 +114,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         };
         let secrets = obfuscator.secrets()?;
         let mut graph = DslContext::new("dio2-obfuscate")
-            .transferred_output(INITIAL_OUTPUT, obfuscator.initial(&secrets)?.into_value())?
+            .transferred_output(INITIAL_OUTPUT, obfuscator.initial(&secrets)?)?
             .transferred_output(ANCHORS_OUTPUT, secrets.anchors.public_matrices())?;
         let mut descriptors = Vec::new();
         for (kind, program) in kinds.iter().zip(&programs) {
@@ -283,7 +283,7 @@ impl Obfuscator<'_> {
     /// CBD(1) errors, the targets `(t_bar, 1)` (`ONEPRIV`), `mono(z_0) (t_bar, 1)` (state),
     /// `mono(a) s_0` (labels and `ONEPUB`) and `(sigma_k(s_bar_0), 1)` (helpers), and the hint
     /// `b_0 = s_0 B_0 + e`.
-    fn initial(&mut self, secrets: &Secrets) -> Result<StepRows, Dio2Error> {
+    fn initial(&mut self, secrets: &Secrets) -> Result<InitialRowsValue, Dio2Error> {
         let (plan, ring) = (self.plan, self.ring());
         let root = self.root.clone().with_domain(vec![Int::constant(0)]);
         let hash_key = root.hash_key_input();
@@ -312,9 +312,19 @@ impl Obfuscator<'_> {
                 (self.error(plan.columns), self.error(plan.columns)),
             )?)
         };
-        let private = encode(RootObject::Private, None, times(ring.identity(1), &t))?;
-        let state =
-            encode(RootObject::State, None, times(monomial(initial_state.mul(state_stride)), &t))?;
+        // Even singleton outputs use the backend's streamed family publication:
+        // retaining them as ordinary returns would keep S_0 alive during every
+        // large refresh preimage. There is no application concurrency controller.
+        let private = failure.finish(mxx_dsl::parallel(1usize, |_| {
+            failure.keep(encode(RootObject::Private, None, times(ring.identity(1), &t)))
+        }))?;
+        let state = failure.finish(mxx_dsl::parallel(1usize, |_| {
+            failure.keep(encode(
+                RootObject::State,
+                None,
+                times(monomial(initial_state.clone().mul(state_stride)), &t),
+            ))
+        }))?;
         let public = mxx_dsl::parallel(plan.label_rows + 1, |member| {
             let entry = labels.at(member.clone().rem(plan.label_rows).mul(plan.label_width + 1));
             let exponent = mxx_dsl::select(
@@ -344,12 +354,14 @@ impl Obfuscator<'_> {
         let (public, labels, helpers) =
             (failure.finish(public)?, failure.finish(label_rows)?, failure.finish(helpers)?);
         let anchor_columns = super::anchor_columns(plan.columns);
-        let hint = unmask_hint(
-            Mat::concat(ConcatAxis::Columns, vec![s.0.clone(), s.1.clone()]),
-            secrets.anchors.public_matrices().at(Int::constant(0)),
-            self.error(anchor_columns),
-        );
-        Ok(StepRows { private, state, public, labels, helpers, hint })
+        let hint = mxx_dsl::parallel(1usize, |_| {
+            Ok(unmask_hint(
+                Mat::concat(ConcatAxis::Columns, vec![s.0.clone(), s.1.clone()]),
+                secrets.anchors.public_matrices().at(Int::constant(0)),
+                self.error(anchor_columns),
+            ))
+        })?;
+        Ok((private, state, public, labels, helpers, hint))
     }
 
     /// The RHS plaintexts of the instance of step `step` on chunk `chunk`: the monomials

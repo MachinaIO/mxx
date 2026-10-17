@@ -80,6 +80,70 @@ fn assert_matches_cpu(
     }
 }
 
+/// Rematerializing a deterministic hash in a nested lane preserves its outer
+/// index tag and observes new key inputs on a replay of the same GPU plan.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial(gpu_context)]
+fn test_gpu_direct_parallel_hash_capture_matches_root() {
+    let (_, gpu, ring) = parameters();
+    let columns = crate::env::test_streamed_columns();
+    let key = ring.bytes_input("hash-key", 32);
+    let hash = |member: Int| {
+        let mut tag = mxx_dsl::HashTag::from(b"nested-hash-capture".as_slice());
+        tag.push_u64_le(member);
+        ring.hash_matrix(key.clone(), tag, (1, columns))
+    };
+    let nested = parallel(2usize, |member| {
+        let value = hash(member.clone());
+        let other = hash(member.add(10usize));
+        let lanes = parallel(3usize, |_| Ok(value.clone() + other.clone()))?;
+        Ok((lanes.at(0usize), lanes.at(1usize), lanes.at(2usize)))
+    })
+    .unwrap();
+    let mut graph = DslContext::new("nested-hash-capture");
+    for member in 0..2 {
+        graph = graph
+            .output(
+                format!("expected_{member}"),
+                hash(Int::constant(member)) + hash(Int::constant(member + 10)),
+            )
+            .unwrap();
+        let (a, b, c) = nested.at(member);
+        for (lane, value) in [a, b, c].into_iter().enumerate() {
+            graph = graph.output(format!("actual_{member}_{lane}"), value).unwrap();
+        }
+    }
+    let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
+    let inputs = || {
+        BTreeMap::from([(
+            "hash-key".to_owned(),
+            RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec().into()),
+        )])
+    };
+    let first = inputs();
+    let mut runtime = runtime(gpu);
+    let mut plan = runtime.plan_with_fixed_geometry_for_test(graph, &first, 1, 1).unwrap();
+    let mut store = MemoryArtifactStore::default();
+    for values in [first, inputs()] {
+        let result =
+            runtime.execute_with_artifacts(&mut plan, values, &mut store, rand::random()).unwrap();
+        for member in 0..2 {
+            let expected = runtime
+                .download_matrix_output(&result.output(&format!("expected_{member}")).unwrap())
+                .unwrap();
+            for lane in 0..3 {
+                let actual = runtime
+                    .download_matrix_output(
+                        &result.output(&format!("actual_{member}_{lane}")).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "member {member}, lane {lane}");
+            }
+        }
+    }
+}
+
 /// A parallel loop samples one trapdoor per member and another loop reads them by a computed
 /// member index: the family stays resident with its public matrices, later waves' trapdoors in
 /// the member arena, and every preimage satisfies `B K = target`.
@@ -87,6 +151,19 @@ fn assert_matches_cpu(
 #[ignore = "requires a CUDA GPU"]
 #[serial_test::serial(gpu_context)]
 fn test_gpu_direct_parallel_trapdoor_family_feeds_member_preimages() {
+    parallel_preimage_workspaces(1);
+}
+
+/// Sharing ordered tiles must never share native mutable workspace between
+/// concurrently active parallel lanes, even when logical devices alias one GPU.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial(gpu_context)]
+fn test_gpu_direct_parallel_preimage_workspace_independence() {
+    parallel_preimage_workspaces(2);
+}
+
+fn parallel_preimage_workspaces(width: usize) {
     let (cpu, gpu, ring) = parameters();
     let digits = cpu.modulus_digits();
     let columns = crate::env::test_streamed_columns();
@@ -127,7 +204,7 @@ fn test_gpu_direct_parallel_trapdoor_family_feeds_member_preimages() {
     let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
     let mut runtime = runtime(gpu);
     let mut plan =
-        runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+        runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), width, 1).unwrap();
     // R and E must share the stacked leaf's storage in both sampled and dynamically
     // selected trapdoors; otherwise a family keeps a second copy of its largest payload.
     let mut shared = 0;
@@ -769,6 +846,20 @@ fn test_gpu_direct_singleton_index_uses_candidate() {
 #[ignore = "requires a CUDA GPU"]
 #[serial_test::serial(gpu_context)]
 fn test_gpu_direct_preimage_capacity() {
+    preimage_capacity(0);
+}
+
+/// Include retained caller rows explicitly instead of assuming the sampler's
+/// allocation ledger covers them. This is a synthetic capacity envelope, not a
+/// complete DIO2 plan; its row count is overridable with MXX_TEST_STREAMED_MEMBERS.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial(gpu_context)]
+fn test_gpu_direct_preimage_capacity_retained_rows() {
+    preimage_capacity(crate::env::test_streamed_members());
+}
+
+fn preimage_capacity(live_rows: usize) {
     let (n, primes, bits, base_bits) = crate::env::test_capacity_parameters();
     let cpu = DCRTPolyParams::new(n, primes, bits, base_bits, None, None);
     let gpu = GpuDCRTPolyParams::new(cpu.ring_dimension(), cpu.moduli().to_vec(), base_bits, None);
@@ -791,27 +882,62 @@ fn test_gpu_direct_preimage_capacity() {
         Ok(ring.sample_trapdoor(2, 4, base, digits, BigInt::from(bound.clone())))
     })
     .unwrap();
+    let rows = (live_rows != 0)
+        .then(|| parallel(live_rows, |_| Ok(ring.uniform_residue((1, digits)))).unwrap());
     // Two refresh chunks of step zero: the production selector is instance / chunks.
     let preimages = parallel(2usize, |member| {
-        Ok(anchors
-            .at(member.div(2usize))
-            .sample_preimage(ring.uniform_residue((2, digits)), (2 * (digits + 2), digits)))
+        let target = match &rows {
+            Some(rows) => {
+                let row = rows.at(member.clone().rem(live_rows));
+                Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, vec![row.clone(), row])
+            }
+            None => ring.uniform_residue((2, digits)),
+        };
+        Ok(anchors.at(member.div(2usize)).sample_preimage(target, (2 * (digits + 2), digits)))
     })
     .unwrap();
-    let graph = DslContext::new("preimage-capacity")
+    let mut builder = DslContext::new("preimage-capacity")
         .cached_output("anchors", anchors.public_matrices())
         .unwrap()
         .cached_output("preimages", preimages)
-        .unwrap()
-        .build()
-        .unwrap()
-        .validate(&ParamEnv::default())
         .unwrap();
+    if let Some(rows) = rows {
+        builder = builder.output("retained_rows", rows).unwrap();
+    }
+    let graph = builder.build().unwrap().validate(&ParamEnv::default()).unwrap();
     let plan =
         runtime(gpu).plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
     eprintln!(
-        "capacity n={n} primes={primes} crt_bits={bits} base_bits={base_bits} digits={digits} bound_bits={} W=1 C=1 planned_device_bytes={:?}",
+        "capacity n={n} primes={primes} crt_bits={bits} base_bits={base_bits} digits={digits} bound_bits={} retained_rows={live_rows} W=1 C=1 planned_device_bytes={:?}",
         bound.bits(),
         plan.planned_device_bytes().unwrap()
     );
+    // Logical views can overlap: this ledger identifies large owners, not an
+    // additional peak estimate. Deferred graph scratch is reported separately
+    // by planned_device_bytes after physical compilation.
+    let mut allocations = BTreeMap::new();
+    for (id, owner) in plan
+        .frame()
+        .owners
+        .iter()
+        .chain(plan.frame().waves.iter().flat_map(|wave| wave.owner_bindings.iter()))
+    {
+        for (_, bound) in owner.storages() {
+            if crate::gpu_graph_memory::is_graph_managed(bound) {
+                continue;
+            }
+            let entry = allocations.entry((bound.device, bound.address)).or_insert((0, Vec::new()));
+            entry.0 = entry.0.max(bound.bytes);
+            entry.1.push(*id);
+        }
+    }
+    let mut allocations = allocations.into_iter().collect::<Vec<_>>();
+    allocations.sort_by_key(|(_, (bytes, _))| std::cmp::Reverse(*bytes));
+    for ((device, address), (bytes, values)) in allocations.into_iter().take(24) {
+        let count = values.len();
+        let examples = &values[..values.len().min(8)];
+        eprintln!(
+            "capacity allocation device={device} address={address} bytes={bytes} references={count} first_values={examples:?}"
+        );
+    }
 }

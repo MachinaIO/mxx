@@ -11,6 +11,9 @@
 //! Six 60-bit primes and base `2^30` need only twelve gadget digits. The worst-case
 //! decoder error is 285 bits against 300 bits of spacing; all four evaluator inputs
 //! and both streaming steps remain in the test.
+//! The toy defaults to one backend I/O trial wave (overridable with the existing
+//! `MXX_GPU_IO_TRIAL_WAVES` setting). This shortens planning only; W/C remain
+//! automatic and actual execution still covers every step and evaluator input.
 //!
 //! | Variable (`MXX_IO_DIO2_` prefix) | Default | Meaning |
 //! | --- | --- | --- |
@@ -87,13 +90,14 @@ fn test_gpu_dio2_round_trip() {
     let noise =
         mxx_io::dio2::noise::simulate_noise(&parameters, &function, None).expect("toy noise model");
     assert!(noise.iter().all(|bound| bound.fits()), "toy noise must fit every decoder");
-    let runtime = GpuRuntime::new(gpu_backend_on(
+    let mut runtime = GpuRuntime::new(gpu_backend_on(
         parameters.rings().unwrap().into_iter().map(|ring| {
             GpuDCRTPolyParams::new(ring.ring_dimension(), ring.to_crt().0, ring.base_bits(), None)
         }),
         detected_gpu_device_ids(),
     ))
     .expect("GPU runtime");
+    runtime.options_mut().io_trial_waves.get_or_insert(std::num::NonZeroUsize::MIN);
     let mut dio2 = Dio2::new(parameters, runtime, MemoryArtifactStore::default()).unwrap();
     let steps = function.stream_length();
     let y = (0..steps)

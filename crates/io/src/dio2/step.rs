@@ -132,6 +132,19 @@ pub struct StepRows {
 pub type StepRowsValue =
     (RnsBggRow, RnsBggRow, Family<RnsBggRow>, Family<RnsBggRow>, Family<RnsBggRow>, Mat);
 
+/// Initial material uses singleton families for private/state rows and the hint,
+/// so the ordinary backend can publish each member and release its GPU storage
+/// before generating refresh keys. Evaluation unwraps those singleton members;
+/// the carried `StepRowsValue` and its cryptographic meaning are unchanged.
+pub(crate) type InitialRowsValue = (
+    Family<RnsBggRow>,
+    Family<RnsBggRow>,
+    Family<RnsBggRow>,
+    Family<RnsBggRow>,
+    Family<RnsBggRow>,
+    Family<Mat>,
+);
+
 impl StepRows {
     pub fn into_value(self) -> StepRowsValue {
         (self.private, self.state, self.public, self.labels, self.helpers, self.hint)
@@ -139,6 +152,34 @@ impl StepRows {
 
     pub fn from_value((private, state, public, labels, helpers, hint): StepRowsValue) -> Self {
         Self { private, state, public, labels, helpers, hint }
+    }
+
+    pub(crate) fn from_initial(
+        (private, state, public, labels, helpers, hint): InitialRowsValue,
+    ) -> Self {
+        Self {
+            private: private.at(0usize),
+            state: state.at(0usize),
+            public,
+            labels,
+            helpers,
+            hint: hint.at(0usize),
+        }
+    }
+
+    pub(crate) fn initial_schema(
+        plan: &StepPlan,
+        ring: &mxx_dsl::Ring,
+    ) -> <InitialRowsValue as mxx_dsl::GraphValue>::Schema {
+        let (private, state, public, labels, helpers, hint) = Self::schema(plan, ring);
+        (
+            mxx_dsl::FamilyType { element: private, count: 1usize.into(), member_slot: None },
+            mxx_dsl::FamilyType { element: state, count: 1usize.into(), member_slot: None },
+            public,
+            labels,
+            helpers,
+            mxx_dsl::FamilyType { element: hint, count: 1usize.into(), member_slot: None },
+        )
     }
 
     /// The schema of a step input of `plan` on the root ring `ring`.

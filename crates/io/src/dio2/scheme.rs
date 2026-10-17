@@ -542,6 +542,38 @@ mod tests {
                 };
                 let obfuscation = dio2.obfuscate_with_hash_key(&input, [7; 32]).unwrap();
                 dio2.evaluate(&obfuscation, &vec![vec![false; eval_bits]; steps]).unwrap();
+                // Every S_0 field is published by a loop, including singleton
+                // private/state/hint fields. An ordinary matrix output would
+                // retain its allocation throughout refresh preimage generation.
+                let initial_graph = &dio2.execution.1[0];
+                let initial_outputs = initial_graph
+                    .source
+                    .outputs()
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(INITIAL_OUTPUT))
+                    .collect::<Vec<_>>();
+                assert_eq!(initial_outputs.len(), 11);
+                for (name, output) in initial_outputs {
+                    assert!(
+                        matches!(
+                            initial_graph.root_scope().wire_types.get(&output.value),
+                            Some(mxx_ir_core::types::ConcreteWireType::IndexedFamily { .. })
+                        ),
+                        "{name} must be an indexed artifact"
+                    );
+                    assert!(
+                        matches!(
+                            initial_graph
+                                .source
+                                .root_scope()
+                                .node(output.value.node)
+                                .unwrap()
+                                .kind(),
+                            mxx_ir_core::node::NodeKind::ParallelLoop(_)
+                        ),
+                        "{name} must publish directly from its parallel loop"
+                    );
+                }
                 let w0 = crate::dio2::step::StepPlan::new(&parameters, &function).unwrap().columns;
                 let audit = dio2
                     .execution

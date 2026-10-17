@@ -397,6 +397,24 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
 #[test]
 #[serial_test::serial]
 fn root_dynamic_integer_import_replays_mixed_signed_widths() {
+    integer_import_replays(false, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial]
+fn test_gpu_integer_family_bound_avoids_metadata_and_rejects_oversize() {
+    integer_import_replays(true, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial]
+fn test_gpu_integer_family_capture_loads_only_selected_member() {
+    integer_import_replays(true, true);
+}
+
+fn integer_import_replays(bounded: bool, captured: bool) {
     let cpu_params = DCRTPolyParams::new(8, 2, 20, 4, None, None);
     let gpu_params = GpuDCRTPolyParams::new(
         cpu_params.ring_dimension(),
@@ -429,7 +447,7 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     let producer = mxx_ir_core::validate(&producer, &ParamEnv::default()).unwrap();
     let values = [
         -(BigInt::from(1u8) << 80usize) + BigInt::from(7u8),
-        BigInt::from(42u8),
+        BigInt::from(128u16),
         (BigInt::from(1u8) << 127usize) + BigInt::from(3u8),
     ];
     let mut store = MemoryArtifactStore::default();
@@ -473,10 +491,85 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     )
     .output(0)
     .unwrap();
-    let selected =
-        NodeHandle::new(NodeKind::FamilyGetDynamic, vec![artifact, selector], vec![WireType::Int])
+    let selected = if captured {
+        use mxx_ir_core::{
+            graph::{SubgraphHandle, with_new_construction_scope},
+            node::{LoopInputMode, ParallelLoop},
+        };
+        let body = with_new_construction_scope(|scope| {
+            let family = NodeHandle::new(
+                NodeKind::Input {
+                    name: "captured-members".into(),
+                    wire_type: artifact.wire_type().clone(),
+                    artifact: Some(ArtifactInput {
+                        production_id: production.clone(),
+                        artifact_name: "members".into(),
+                        availability: ArtifactAvailability::Cached,
+                    }),
+                },
+                vec![],
+                vec![artifact.wire_type().clone()],
+            )
             .output(0)
             .unwrap();
+            let index = NodeHandle::new(
+                NodeKind::Input {
+                    name: "captured-selector".into(),
+                    wire_type: WireType::Int,
+                    artifact: None,
+                },
+                vec![],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            let selected = NodeHandle::new(
+                NodeKind::FamilyGetDynamic,
+                vec![family.clone(), index.clone()],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            // Consume the imported value in lane computation before returning it.
+            let selected = NodeHandle::new(
+                NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add),
+                vec![selected, index.clone()],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("selected-integer-body", scope, vec![family, index], vec![selected])
+                .unwrap()
+        });
+        let lanes = NodeHandle::parallel_loop(
+            body,
+            vec![artifact, selector],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: IntExpr::constant(1),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(1),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![LoopInputMode::Broadcast, LoopInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![lanes],
+            vec![WireType::Int],
+        )
+        .output(0)
+        .unwrap()
+    } else {
+        NodeHandle::new(NodeKind::FamilyGetDynamic, vec![artifact, selector], vec![WireType::Int])
+            .output(0)
+            .unwrap()
+    };
     let consumer = Graph::freeze(
         "selected-integer-consumer",
         vec![],
@@ -498,7 +591,19 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     let bind = |index: usize| {
         BTreeMap::from([("selector".into(), RuntimeValue::Int(BigInt::from(index)))])
     };
-    let mut plan = runtime.plan_with_store(consumer, &bind(2), &mut store).unwrap();
+    let family_key =
+        ArtifactKey { production: production.clone(), name: "members".into(), index: None };
+    if bounded {
+        runtime.options_mut().artifact_payload_size_bounds.insert(
+            family_key.clone(),
+            values.iter().map(|value| value.to_signed_bytes_le().len()).max().unwrap(),
+        );
+    }
+    let mut plan = if bounded {
+        runtime.plan(consumer.clone(), &bind(2)).unwrap()
+    } else {
+        runtime.plan_with_store(consumer.clone(), &bind(2), &mut store).unwrap()
+    };
     let keys = (0..3)
         .map(|index| ArtifactKey {
             production: production.clone(),
@@ -508,7 +613,10 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
         .collect::<Vec<_>>();
     // The planning I/O trial of this memory store reads the selected member
     // itself, since its type has no zero payload to emulate the load with.
-    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0, 0, 1]);
+    assert_eq!(
+        keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(),
+        [0, 0, usize::from(!bounded)]
+    );
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
@@ -521,12 +629,22 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
                     &result.output("selected").expect("selected output")
                 )
                 .unwrap(),
-            vec![values[index].clone()],
+            vec![values[index].clone() + BigInt::from(if captured { index } else { 0 })],
         );
         let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
         for member in 0..3 {
             assert_eq!(after[member] - before[member], usize::from(member == index));
         }
+    }
+    if bounded {
+        drop(plan);
+        runtime.options_mut().artifact_payload_size_bounds.insert(family_key, 1);
+        let mut narrow = runtime.plan(consumer, &bind(1)).unwrap();
+        let error = runtime
+            .execute_with_artifacts(&mut narrow, bind(1), &mut store, rand::random())
+            .err()
+            .expect("oversized import must fail");
+        assert!(error.to_string().contains("payload capacity"), "{error}");
     }
 }
 

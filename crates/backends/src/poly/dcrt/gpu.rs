@@ -6189,6 +6189,8 @@ pub enum GpuIntegerOperation {
     Equal,
     Less,
     LessEqual,
+    /// Two's-complement bit extraction, including sign extension beyond storage.
+    /// With a RHS, its nonnegative u64 value is the position; otherwise use `argument`.
     BitExtract,
     Select,
     CopyConstant,

@@ -3,6 +3,18 @@
 //! Reports the former helper-family payload and PRF input sizes. Helpers and large inputs
 //! are now consumed by member. This is not a measurement of a complete GPU plan's peak. Parameters
 //! use `MXX_IO_DIO2_ESTIMATE_*` overrides.
+//! With `--features gpu`, `MXX_IO_DIO2_ESTIMATE_GPU_PLAN=1` additionally builds a
+//! physical GPU plan using synthetic inputs with explicit ranges (full label
+//! modulus for labels, [0,1] for this example's Boolean data).
+//! Set `MXX_IO_DIO2_ESTIMATE_GRAPHS=1` and a reduced ring dimension (for example
+//! `MXX_IO_DIO2_ESTIMATE_N=128`) first: this mode allocates device memory and runs
+//! backend planning measurements, but performs no artifact-backed round trip.
+//! `MXX_GPU_MAX_PARALLEL_INSTANCES=1` constrains W through the generic backend;
+//! C remains automatic. Its ledger is not a full-production peak certificate.
+
+#[cfg(feature = "gpu")]
+#[path = "dio2_residency/gpu_capacity.rs"]
+mod gpu_capacity;
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{MemoryArtifactStore, RuntimeValue};
@@ -117,9 +129,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("MXX_IO_DIO2_ESTIMATE_GRAPHS").is_none() {
         return Ok(());
     }
+    let recorder = RecordGraphs {
+        #[cfg(feature = "gpu")]
+        parameters: parameters.clone(),
+    };
     let mut dio2 = mxx_io::dio2::Dio2::new(
         parameters,
-        RecordGraphs,
+        recorder,
         mxx_backends::MemoryArtifactStore::default(),
     )?
     .with_inputs_by_shape();
@@ -135,7 +151,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Record shapes only. This executor performs no cryptographic operations.
-struct RecordGraphs;
+struct RecordGraphs {
+    #[cfg(feature = "gpu")]
+    parameters: Dio2Parameters,
+}
+
+impl RecordGraphs {
+    fn record(
+        &self,
+        graph: &ValidatedGraph,
+        stage: &str,
+        inputs: &BTreeMap<String, RuntimeValue>,
+    ) -> Result<(), ApiError> {
+        inspect(graph, stage);
+        println!("{stage} bound_runtime_inputs={}", inputs.len());
+        #[cfg(feature = "gpu")]
+        if std::env::var_os("MXX_IO_DIO2_ESTIMATE_GPU_PLAN").is_some() {
+            gpu_capacity::plan(&self.parameters, graph, inputs).map_err(|message| {
+                ApiError::Scheme { source: Box::new(std::io::Error::other(message)) }
+            })?;
+        }
+        Ok(())
+    }
+}
 fn inspect(graph: &ValidatedGraph, stage: &str) {
     use mxx_ir_core::{
         node::NodeKind,
@@ -163,17 +201,27 @@ fn inspect(graph: &ValidatedGraph, stage: &str) {
     }
     println!("{stage} root_integer_input_bytes={total}");
     if std::env::var_os("MXX_IO_DIO2_ESTIMATE_LIVENESS").is_some() {
-        inspect_sampler_liveness(graph, stage);
+        inspect_preimage_liveness(graph, stage);
     }
 }
-/// List logical live matrices at each sampler and its enclosing loop call sites.
+/// List logical live matrices at each sampler or preimage material read and its
+/// enclosing loop call sites. This includes evaluation, which does not sample.
 /// This deliberately does not sum them into a VRAM estimate: parent/child inputs,
 /// views and packed families can alias, and backend scratch is not represented here.
-fn inspect_sampler_liveness(graph: &ValidatedGraph, stage: &str) {
+fn inspect_preimage_liveness(graph: &ValidatedGraph, stage: &str) {
     use mxx_ir_core::{graph::FrozenGraphScopeId, node::NodeKind, types::ConcreteWireType};
     for (scope_id, scope) in graph.source.scopes() {
         for (index, node) in scope.nodes().iter().enumerate() {
-            if !matches!(node.kind(), NodeKind::PreimageSample { .. }) {
+            let produces_preimage =
+                matches!(
+                    node.kind(),
+                    NodeKind::FamilyGetStatic { .. } |
+                        NodeKind::FamilyGetDynamic |
+                        NodeKind::Input { artifact: Some(_), .. }
+                ) && graph.scopes[scope_id].wire_types.iter().any(|(wire, ty)| {
+                    wire.node.0 as usize == index && matches!(ty, ConcreteWireType::Preimage { .. })
+                });
+            if !matches!(node.kind(), NodeKind::PreimageSample { .. }) && !produces_preimage {
                 continue;
             }
             println!("{stage} sampler_scope={scope_id:?} sampler_node={index}");
@@ -233,11 +281,11 @@ impl StageExecution<MemoryArtifactStore> for RecordGraphs {
     fn produce(
         &mut self,
         graph: ValidatedGraph,
-        _: BTreeMap<String, RuntimeValue>,
+        inputs: BTreeMap<String, RuntimeValue>,
         _: &mut MemoryArtifactStore,
         nonce: [u8; 32],
     ) -> Result<ProductionId, ApiError> {
-        inspect(&graph, "obfuscate");
+        self.record(&graph, "obfuscate", &inputs)?;
         Ok(mxx_ir_core::artifact::production_id(
             mxx_ir_core::encoding::spec_hash(&graph.source, &graph.bindings).unwrap(),
             nonce,
@@ -246,11 +294,11 @@ impl StageExecution<MemoryArtifactStore> for RecordGraphs {
     fn evaluate(
         &mut self,
         graph: ValidatedGraph,
-        _: BTreeMap<String, RuntimeValue>,
+        inputs: BTreeMap<String, RuntimeValue>,
         _: &mut MemoryArtifactStore,
         _: [u8; 32],
     ) -> Result<StageOutputs, ApiError> {
-        inspect(&graph, "evaluate");
+        self.record(&graph, "evaluate", &inputs)?;
         Ok(StageOutputs {
             outputs: graph
                 .source

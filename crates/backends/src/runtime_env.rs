@@ -13,6 +13,10 @@ pub struct GpuRuntimeOptions {
     /// Caller-guaranteed closed ranges for named Int inputs, including every
     /// member of an Int family. The plan rejects unknown or noninteger names.
     pub integer_input_ranges: BTreeMap<String, RangeInclusive<BigInt>>,
+    /// Caller-guaranteed maximum canonical payload bytes for Int/TypedBlob artifacts.
+    /// A key with no index covers every member of that family. This avoids enumerating
+    /// metadata for huge families. Imports reject payloads exceeding their capacity.
+    pub artifact_payload_size_bounds: BTreeMap<crate::artifact::ArtifactKey, usize>,
     /// Subgraphs the planner executes with their registered native kernel
     /// instead of their body; empty runs every subgraph from its body.
     pub subgraph_kernels: Vec<crate::gpu_subgraph_kernel::GpuSubgraphKernel>,
@@ -106,6 +110,7 @@ impl GpuRuntimeOptions {
             measurement_iterations,
             release_fence_interval,
             integer_input_ranges: BTreeMap::new(),
+            artifact_payload_size_bounds: BTreeMap::new(),
             subgraph_kernels: Vec::new(),
             profile_nodes,
             io_trial_waves,

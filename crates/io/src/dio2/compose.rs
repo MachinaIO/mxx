@@ -559,8 +559,9 @@ impl Compose<'_, Row> {
     /// its preimage `preimages.at(first + p |P| + k)`, recombined from the residues modulo the
     /// primes. Each root object's family of `S_(i+1)` is one loop over its members, each of
     /// which decodes the two parts of its target (spec §6.6), so no family of refreshed parts
-    /// is held. The label leaves are the label rows with their public payloads
-    /// `mono(stride a)`.
+    /// is held. Temporary target families are constructed inside each component lane, so
+    /// unused alternatives need not remain resident across every refreshed member. The
+    /// label leaves are the label rows with their public payloads `mono(stride a)`.
     pub fn next_rows(
         &self,
         next: &NextStep,
@@ -587,12 +588,17 @@ impl Compose<'_, Row> {
             plan.root_key(root, hash_key.clone(), RootObject::Public, Some(one_member))?,
             ring.identity(1),
         );
-        let targets = self.targets(next, (columns, chunk), leaf, one)?;
         let basis = self.chain.level(self.level())?.to_crt().0;
         let half = ring
             .all_coefficients((1, plan.columns), IntExpr::constant((&self.modulus()? + 1u8) / 2u8));
         // The refreshed row of part `index`: one loop over the primes.
         let refreshed = |index: Int| -> Result<Mat, Dio2Error> {
+            // Like decoded_keys, form the temporary target families inside the
+            // component lane. Their unused scalar/key alternatives then die
+            // before preimage import instead of spanning every refreshed member.
+            // The backend still chooses lane and column concurrency.
+            let targets =
+                self.targets(next, (columns, chunk.clone()), leaf.clone(), one.clone())?;
             let part = self.part(&index, next, &targets)?;
             let failure = Failure::default();
             let row = mxx_dsl::iterate(basis.len(), ring.zero((1, plan.columns)), |prime, sum| {
@@ -654,17 +660,22 @@ impl Compose<'_, Row> {
             failure.keep(target(member.add(first_helper)))
         });
         let helpers = failure.finish(helpers)?;
-        // The hint: the anchor blocks' parts side by side (one loop over them), cut to the
-        // hint's width.
+        // The hint's independent anchor parts use the same component-lane
+        // placement as the other targets. The generic backend can fuse their
+        // disjoint-column sum and choose W without retaining target alternatives
+        // across the sequential construction of every hint block.
         let first_anchor = first_helper + plan.automorphisms.len();
         let anchor_parts = 2 * self.anchor_blocks();
-        let hint = self.columns(anchor_parts, |part| {
-            Ok(vec![refreshed(Int::evaluate(IntExpr::Add(
-                Box::new(IntExpr::constant(2 * first_anchor)),
-                Box::new(part),
-            )))?])
-        })?;
-        let hint = hint.into_iter().next().expect("one entry").slice(
+        let hint_parts = mxx_dsl::parallel(anchor_parts, |part| {
+            let row = failure.keep(refreshed(part.clone().add(2 * first_anchor)))?;
+            Ok(place_in_column(row, anchor_parts, &part.expression()?))
+        });
+        let hint_parts = failure.finish(hint_parts)?;
+        let hint =
+            mxx_dsl::iterate(anchor_parts - 1, hint_parts.at(Int::constant(0)), |part, sum| {
+                Ok(sum + hint_parts.at(part.add(1usize)))
+            })?;
+        let hint = hint.slice(
             None,
             Some(super::carrier::block_columns(
                 IntExpr::constant(0),

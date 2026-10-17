@@ -52,6 +52,13 @@
 //! is frozen into a value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected
 //! report.
 //!
+//! Leaf parallel loops whose outputs are all streamed or summed reuse one full-wave template
+//! and at most one tail template when they have no resident Zip owners or alternating read-ahead
+//! buffers. Planning metadata then depends on W, not the total number of members. Replays retain
+//! distinct logical indices, hash seeds and export keys; I/O trials and cost estimates count all
+//! logical waves. The existing artifact-handle vector is populated after successful execution, not
+//! during planning.
+//!
 //! With `profile_nodes`, planning then lowers the selected candidate once more with a Graph region
 //! boundary at every graph node's operations and times it the same way. Every separate launch pays
 //! a fixed launch and join cost, estimated per region as the cost that makes its nodes' times sum
@@ -97,6 +104,7 @@
 //! | `profile_nodes` | `MXX_GPU_PROFILE_NODES` | false |
 //! | `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset (2 for a host or file store) |
 //! | `integer_input_ranges` | (set in code) | empty |
+//! | `artifact_payload_size_bounds` | (set in code) | empty |
 //! | `subgraph_kernels` | (set in code) | empty |
 //!
 //! Other settings are read from the environment by [`crate::env`]: `MXX_GPU_MEMORY_FRACTION` (the
@@ -133,10 +141,11 @@
 //! - Parallel-loop bodies cannot create their own artifact inputs. Nested loop counts and types
 //!   cannot depend on the enclosing index, and matrix-valued loop outputs must be homogeneous
 //!   matrix families.
-//! - Integer and typed-blob artifact inputs need `plan_with_store`, matrix exports need an
-//!   evaluation-form source, and raw transcoding does not support every wire type. An
-//!   integer-family artifact is imported whole, one member per slot, before its first consumer; its
-//!   planned range is the widest member payload.
+//! - Integer and typed-blob artifacts need payload metadata from `plan_with_store` or explicit
+//!   `artifact_payload_size_bounds`; imports enforce those bounds before upload. Families used only
+//!   through member selection, including descriptor-preserving loop captures, remain lazy. A
+//!   whole-family consumer still imports every integer member. Matrix exports need an
+//!   evaluation-form source, and raw transcoding does not support every wire type.
 //! - Trapdoors and preimages require the exact regular gadget layout, sigma, and shapes.
 //! - Integer matrix-vector products need one-word operands and operand and output ranges within
 //!   `int64`, and cannot run in a vectorized body.
@@ -351,12 +360,16 @@ struct WaveGroup {
     body_start: u32,
     body_end: u32,
     waves: Vec<usize>,
+    /// Template index, number of replays, and logical width of each replay.
+    runs: Vec<(usize, usize, usize)>,
+    wave_count: usize,
     controls: Vec<usize>,
 }
 
 #[derive(Clone)]
 struct ActiveWave {
     wave_index: usize,
+    start_index: usize,
     logical_path: Vec<u64>,
 }
 
@@ -405,12 +418,16 @@ fn wave_groups(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<WaveGro
                 wave.body_start != first.body_start ||
                 wave.body_end != first.body_end ||
                 wave.start_index != next ||
-                wave.active_lanes == 0
+                wave.active_lanes == 0 ||
+                wave.repetitions == 0
             {
                 return Err("GPU wave group has inconsistent frozen template metadata".into());
             }
-            next =
-                next.checked_add(wave.active_lanes).ok_or("GPU wave occurrence count overflows")?;
+            next = wave
+                .active_lanes
+                .checked_mul(wave.repetitions)
+                .and_then(|count| next.checked_add(count))
+                .ok_or("GPU wave occurrence count overflows")?;
         }
         let mut active = first.active_parent_occurrences.clone();
         active.sort_unstable();
@@ -425,6 +442,16 @@ fn wave_groups(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<WaveGro
             active_parent_occurrences: active,
             body_start: first.body_start,
             body_end: first.body_end,
+            runs: indices
+                .iter()
+                .map(|&index| {
+                    let wave = &frame.waves[index];
+                    (index, wave.repetitions, wave.active_lanes)
+                })
+                .collect(),
+            wave_count: indices.iter().try_fold(0usize, |total, &index| {
+                total.checked_add(frame.waves[index].repetitions).ok_or("GPU wave count overflows")
+            })?,
             waves: indices,
             controls: graph.regions[graph
                 .region_interval(first.body_start, first.body_end)
@@ -797,7 +824,7 @@ fn region_replay_counts(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Ve
                     } else {
                         1
                     };
-                    (group.waves.len() * invocations) as f64
+                    group.wave_count as f64 * invocations as f64
                 })
         })
         .collect())
@@ -2494,7 +2521,60 @@ impl GpuRuntime {
         let validated = graph.into_validated_graph().map_err(GpuPlanError::InvalidInput)?;
         let inputs = crate::backend::expand_composite_values(inputs.clone());
         let inputs = self.distinct_planning_inputs(inputs).map_err(GpuPlanError::InvalidInput)?;
-        self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), false, None)
+        let sizes = self.artifact_size_bounds(&validated)?;
+        self.plan_with_payload_sizes(validated, &inputs, &sizes, false, None)
+    }
+
+    /// Validate explicit bounds without enumerating family members.
+    fn artifact_size_bounds(
+        &self,
+        graph: &ValidatedGraph,
+    ) -> Result<BTreeMap<ArtifactKey, usize>, GpuPlanError> {
+        for (key, size) in &self.options.artifact_payload_size_bounds {
+            let known = graph.scopes.iter().any(|(scope_id, scope)| {
+                let source = graph.source.scope(scope_id).expect("validated scope");
+                scope.artifact_inputs.iter().any(|(wire, descriptor)| {
+                    let Some(node) = source.node(wire.node) else { return false };
+                    let mxx_ir_core::node::NodeKind::Input { artifact: Some(input), .. } =
+                        node.kind()
+                    else {
+                        return false
+                    };
+                    input.production_id == key.production &&
+                        input.artifact_name == key.name &&
+                        matches!(
+                            descriptor.artifact_type,
+                            ArtifactType::Int | ArtifactType::TypedBlob { .. }
+                        ) &&
+                        match (key.index, descriptor.family_count) {
+                            (None, _) => true,
+                            (Some(index), Some(count)) => (index as u128) < count,
+                            _ => false,
+                        }
+                })
+            });
+            if !known || *size == 0 || size.checked_mul(8).is_none() {
+                return Err(GpuPlanError::InvalidInput(format!(
+                    "invalid artifact payload-size bound for {}",
+                    key.name
+                )));
+            }
+            if key.index.is_some() &&
+                self.options
+                    .artifact_payload_size_bounds
+                    .get(&ArtifactKey {
+                        production: key.production.clone(),
+                        name: key.name.clone(),
+                        index: None,
+                    })
+                    .is_some_and(|family| size > family)
+            {
+                return Err(GpuPlanError::InvalidInput(
+                    "member payload bound exceeds family bound".into(),
+                ));
+            }
+        }
+        Ok(self.options.artifact_payload_size_bounds.clone())
     }
 
     /// Input rebinding redirects every plan value viewing an input's planning
@@ -2571,7 +2651,8 @@ impl GpuRuntime {
     }
 
     /// Query only artifact metadata before allocating a reusable frame.
-    /// Every possible member of an unbounded family contributes its size so
+    /// Caller-declared family payload bounds avoid per-member metadata queries.
+    /// Otherwise every possible member of an unbounded family contributes its size so
     /// a later selector can reuse one pointer-stable destination allocation.
     /// Payload bytes are still read only at the selected first consumer.
     pub fn plan_with_store<S: SessionStore + Send>(
@@ -2580,7 +2661,7 @@ impl GpuRuntime {
         inputs: &BTreeMap<String, RuntimeValue>,
         store: &mut S,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        let mut sizes = BTreeMap::new();
+        let mut sizes = self.artifact_size_bounds(&validated)?;
         for (scope_id, validated_scope) in &validated.scopes {
             let scope = validated.source.scope(scope_id).ok_or_else(|| {
                 GpuPlanError::InvalidInput("validated artifact scope is absent".into())
@@ -2601,6 +2682,13 @@ impl GpuRuntime {
                         "validated artifact descriptor has no input source".into(),
                     ));
                 };
+                if sizes.contains_key(&ArtifactKey {
+                    production: source.production_id.clone(),
+                    name: source.artifact_name.clone(),
+                    index: None,
+                }) {
+                    continue;
+                }
                 let members = host_family_count(descriptor.family_count.unwrap_or(1))
                     .map_err(GpuPlanError::InvalidInput)?;
                 for member in 0..members {
@@ -2609,6 +2697,9 @@ impl GpuRuntime {
                         name: source.artifact_name.clone(),
                         index: descriptor.family_count.map(|_| member),
                     };
+                    if sizes.contains_key(&key) {
+                        continue;
+                    }
                     let size = store.load_payload_size(&key, descriptor).map_err(|error| {
                         GpuPlanError::Resource(format!(
                             "artifact {} metadata size is unavailable: {error}",
@@ -3606,6 +3697,24 @@ impl GpuRuntime {
                 .and_modify(|previous| *previous = (*previous).max(count))
                 .or_insert(count);
         }
+        // Repeated templates cover more scratch members than their first keys.
+        for wave in &plan.frame.waves {
+            for &template in &wave.streamed_exports {
+                let site = &plan.frame.export_templates[template];
+                if site.scratch {
+                    let last = site.index.ok_or_else(|| {
+                        GpuRuntimeError::Artifact("scratch export has no member index".into())
+                    })? + (wave.repetitions - 1) *
+                        wave.active_lanes *
+                        wave.streamed_export_strides[&template] +
+                        1;
+                    scratch_families
+                        .entry(site.name.clone())
+                        .and_modify(|count| *count = (*count).max(last))
+                        .or_insert(last);
+                }
+            }
+        }
         let run_finished = Instant::now();
         let trial = self.io_trial.is_some();
         let observed = if observing {
@@ -3786,7 +3895,7 @@ impl GpuRuntime {
                         if lane >= wave.active_lanes {
                             None
                         } else {
-                            Some(Some(wave.start_index.checked_add(lane).ok_or_else(|| {
+                            Some(Some(parent.start_index.checked_add(lane).ok_or_else(|| {
                                 GpuRuntimeError::Execution(
                                     "nested wave parent occurrence overflows".into(),
                                 )
@@ -3979,7 +4088,7 @@ impl GpuRuntime {
             .io_trial
             .as_ref()
             .filter(|_| parent_occurrence.is_none())
-            .map_or(group.waves.len(), |trial| trial.waves.min(group.waves.len()));
+            .map_or(group.wave_count, |trial| trial.waves.min(group.wave_count));
         // Each wave's read-ahead members are read while the previous wave
         // runs, into the owner the wave before that one used.
         let mut indices = BTreeMap::new();
@@ -4008,12 +4117,16 @@ impl GpuRuntime {
         }
         // Each wave's `owner_bindings` hold its plan-owned output members, and
         // the family owner was packed from those same members at plan time.
-        for (ordinal, &wave_index) in group.waves.iter().enumerate().take(limit) {
+        let runs = group.runs.iter().flat_map(|&(index, repeats, width)| {
+            (0..repeats).map(move |repeat| (index, repeat * width))
+        });
+        for (ordinal, (wave_index, occurrence_offset)) in runs.enumerate().take(limit) {
             let wave_started = Instant::now();
             let wave = &plan.frame.waves[wave_index];
+            let start_index = wave.start_index + occurrence_offset;
             let mut logical_path = parent_path.to_vec();
             logical_path.push(
-                u64::try_from(wave.start_index).map_err(|_| {
+                u64::try_from(start_index).map_err(|_| {
                     GpuRuntimeError::Execution("wave occurrence exceeds u64".into())
                 })?,
             );
@@ -4063,11 +4176,11 @@ impl GpuRuntime {
                     .write()
                     .map_err(|_| GpuRuntimeError::Execution("carry state lock poisoned".into()))?
                     .parent_occurrences
-                    .insert(wave.loop_site, wave.start_index);
+                    .insert(wave.loop_site, start_index);
             }
             for (owner, occurrence) in &wave.export_occurrences {
                 owner
-                    .upload_u64(&[*occurrence])
+                    .upload_u64(&[*occurrence + occurrence_offset as u64])
                     .and_then(|()| owner.wait_until_ready())
                     .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
             }
@@ -4082,7 +4195,13 @@ impl GpuRuntime {
                 .copied()
                 .filter(|&index| !plan.frame.import_templates[index].read_ahead)
                 .collect::<Vec<_>>();
-            self.start_imports(plan, pump, in_place, Some(wave_index), &mut indices)?;
+            self.start_imports(
+                plan,
+                pump,
+                in_place,
+                Some((wave_index, occurrence_offset)),
+                &mut indices,
+            )?;
             self.run_region_range(
                 plan,
                 groups,
@@ -4090,7 +4209,7 @@ impl GpuRuntime {
                 execution_nonce,
                 group.body_start,
                 group.body_end,
-                Some(&ActiveWave { wave_index, logical_path }),
+                Some(&ActiveWave { wave_index, start_index, logical_path }),
                 Some(&imports),
                 pump,
                 None,
@@ -4152,7 +4271,9 @@ impl GpuRuntime {
                     };
                     let offset = parent_occurrence
                         .zip(site.parent_stride)
-                        .map_or(0, |(occurrence, stride)| occurrence * stride);
+                        .map_or(0, |(occurrence, stride)| occurrence * stride) +
+                        occurrence_offset *
+                            plan.frame.waves[wave_index].streamed_export_strides[&template];
                     pump.export_streamed(template, key, offset)
                         .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
                 }
@@ -4164,7 +4285,7 @@ impl GpuRuntime {
             if let Some(trial) = self.io_trial.as_mut().filter(|_| parent_occurrence.is_none()) {
                 trial.record(
                     group.body_start,
-                    group.waves.len(),
+                    group.wave_count,
                     wave_started.elapsed().as_secs_f64(),
                 );
             }
@@ -4253,13 +4374,32 @@ impl GpuRuntime {
         plan: &GpuExecutionPlan,
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
         templates: impl IntoIterator<Item = usize>,
-        wave: Option<usize>,
+        wave: Option<(usize, usize)>,
         indices: &mut BTreeMap<PhysicalValueId, Vec<BigInt>>,
     ) -> Result<(), GpuRuntimeError> {
         let frame = FrameGeneration::new(0, plan.completed_runs);
         for index in templates {
             let mut template = plan.frame.import_templates[index].clone();
             let mut key = template.key.clone();
+            if let Some((wave, offset)) = wave &&
+                plan.frame.waves[wave].indexed_imports.contains(&index)
+            {
+                if let Some((_, position)) = template.member.as_mut() {
+                    *position = position.checked_add(offset).ok_or_else(|| {
+                        GpuRuntimeError::Artifact("repeated Gather position overflows".into())
+                    })?;
+                } else if let Some(member) = key.index.as_mut() {
+                    *member = member.checked_add(offset).ok_or_else(|| {
+                        GpuRuntimeError::Artifact("repeated Zip index overflows".into())
+                    })?;
+                    if template.descriptor.family_count.is_none_or(|count| *member as u128 >= count)
+                    {
+                        return Err(GpuRuntimeError::Artifact(
+                            "repeated Zip index exceeds family".into(),
+                        ));
+                    }
+                }
+            }
             if let Some((slot, base)) = template.base {
                 if !indices.contains_key(&base) {
                     let publication = &plan.frame.slots[slot];
@@ -4349,7 +4489,9 @@ impl GpuRuntime {
                 template.staged = staged;
             }
             let destination = wave
-                .and_then(|wave| plan.frame.waves[wave].owner_bindings.get(&template.destination))
+                .and_then(|(wave, _)| {
+                    plan.frame.waves[wave].owner_bindings.get(&template.destination)
+                })
                 .or_else(|| plan.frame.owners.get(&template.destination))
                 .cloned();
             let pump = pump.as_deref_mut().ok_or_else(|| {
@@ -4384,7 +4526,7 @@ impl GpuRuntime {
             .copied()
             .filter(|&index| plan.frame.import_templates[index].read_ahead)
             .collect::<Vec<_>>();
-        self.start_imports(plan, pump, templates, Some(wave), indices)
+        self.start_imports(plan, pump, templates, Some((wave, 0)), indices)
     }
 
     /// Start iteration `iteration`'s host-selected imports of host-driven loop
@@ -4683,8 +4825,24 @@ fn planned_export_slots(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Nested parent lanes have distinct runtime member offsets even when their
+    // reusable templates start at the same index. Check fragment coverage per
+    // parent lane, while retaining duplicate detection within that lane.
+    let export_parents = frame
+        .waves
+        .iter()
+        .flat_map(|wave| {
+            wave.streamed_exports.iter().map(move |&index| (index, wave.parent_template))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut ranges = BTreeMap::<
-        (String, Option<usize>, bool, Option<(u32, mxx_ir_core::IntExpr)>),
+        (
+            String,
+            Option<usize>,
+            bool,
+            Option<(u32, mxx_ir_core::IntExpr)>,
+            Option<(GpuLoopSiteKey, usize)>,
+        ),
         Vec<(u64, u64, u64)>,
     >::new();
     for (index, slot) in &slots {
@@ -4693,11 +4851,17 @@ fn planned_export_slots(
             GpuRuntimeError::Artifact("planned export raw range overflows".into())
         })?;
         ranges
-            .entry((slot.key.name.clone(), slot.key.index, site.scratch, site.member_base.clone()))
+            .entry((
+                slot.key.name.clone(),
+                slot.key.index,
+                site.scratch,
+                site.member_base.clone(),
+                site.parent_stride.and_then(|_| export_parents.get(index).copied().flatten()),
+            ))
             .or_default()
             .push((slot.raw_offset, end, slot.export.raw_total_bytes));
     }
-    for ((name, index, _, _), fragments) in &mut ranges {
+    for ((name, index, _, _, _), fragments) in &mut ranges {
         fragments.sort_unstable();
         let total = fragments[0].2;
         let mut next = 0;
@@ -4728,18 +4892,33 @@ fn finalized_export_handles(
         let descriptor = manifest.artifacts.get(&site.name).ok_or_else(|| {
             GpuRuntimeError::Artifact(format!("missing manifest artifact {}", site.name))
         })?;
-        handles.entry(site.name.clone()).or_default().entry(site.index).or_insert_with(|| {
-            ArtifactHandle {
-                key: ArtifactKey {
-                    production: production.clone(),
-                    name: site.name.clone(),
-                    index: site.index,
-                },
-                artifact_type: site.artifact_type.clone(),
-                availability: site.availability,
-                layout: descriptor.layout.clone(),
+        // Finalization has checked every declared member. Preserve the public
+        // handles API even when planning retained only reusable wave templates.
+        let indexes: Box<dyn Iterator<Item = Option<usize>>> = if site.streamed {
+            if handles.contains_key(&site.name) {
+                continue;
             }
-        });
+            let count = descriptor.family_count.ok_or_else(|| {
+                GpuRuntimeError::Artifact("streamed export has no family count".into())
+            })?;
+            Box::new((0..host_family_count(count).map_err(GpuRuntimeError::Artifact)?).map(Some))
+        } else {
+            Box::new(std::iter::once(site.index))
+        };
+        for index in indexes {
+            handles.entry(site.name.clone()).or_default().entry(index).or_insert_with(|| {
+                ArtifactHandle {
+                    key: ArtifactKey {
+                        production: production.clone(),
+                        name: site.name.clone(),
+                        index,
+                    },
+                    artifact_type: site.artifact_type.clone(),
+                    availability: site.availability,
+                    layout: descriptor.layout.clone(),
+                }
+            });
+        }
     }
     Ok(handles.into_iter().map(|(name, indexed)| (name, indexed.into_values().collect())).collect())
 }

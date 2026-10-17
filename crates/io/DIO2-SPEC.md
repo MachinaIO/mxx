@@ -965,8 +965,14 @@ Choices the implementation makes within the specification:
   the wave width and chunk size from measurements and its memory budget; DIO2 has no separate
   concurrency controller. Step carries and accumulating reductions remain `iterate` loops.
   `W=1` is a capacity-diagnostic setting, not an application concurrency limit.
-  The decoded-key lane constructs its scalar target families and padded anchor locally,
-  allowing their storage to end before preimage sampling. Generic graph sealing
+  Both the decoded-key lane and the evaluator's refreshed-component lane construct their
+  scalar target families and padded anchor locally. Unused alternatives can end before
+  preimage sampling or import; only the chosen target and the shared decoder inputs remain
+  live across the prime reduction. This changes placement, not the arithmetic or noise
+  recurrence. The evaluator also computes the hint's independent anchor parts in a
+  parallel loop and combines their disjoint columns with the existing member-sum
+  reduction, so this path has the same lane-local target placement.
+  Generic graph sealing
   rematerializes fixed-shape deterministic public hash matrices inside parallel bodies,
   preserving their key and exact tag metadata; fresh samplers and parameter-sized packed
   hash matrices remain captures. This avoids keeping those full public matrices across

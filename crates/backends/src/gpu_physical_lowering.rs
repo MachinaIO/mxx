@@ -137,6 +137,7 @@ pub(crate) enum ImportDestination {
     Signed {
         owner: Arc<GpuSignedValues>,
         ty: ConcreteWireType,
+        payload_capacity: usize,
     },
     Bytes {
         owner: Arc<GpuDeviceBytes>,
@@ -1848,7 +1849,7 @@ pub(super) fn allocate_typed_import_destination(
             (physical, resident, ImportDestination::PlacedBounded { ty: ty.clone() })
         }
         ConcreteWireType::Int => {
-            let known_size = ctx.artifact_payload_sizes.get(key).copied();
+            let known_size = artifact_payload_size(ctx.artifact_payload_sizes, key);
             let payload_size = payload_capacity.or(known_size).ok_or_else(|| {
                 "GPU Int artifact requires plan_with_store for payload size".to_owned()
             })?;
@@ -1872,13 +1873,17 @@ pub(super) fn allocate_typed_import_destination(
                 &range,
                 storage,
             )?;
-            (physical, resident, ImportDestination::Signed { owner, ty: ty.clone() })
+            (
+                physical,
+                resident,
+                ImportDestination::Signed { owner, ty: ty.clone(), payload_capacity: payload_size },
+            )
         }
         ConcreteWireType::Bytes { .. } | ConcreteWireType::TypedBlob { .. } => {
             let capacity = match ty {
                 ConcreteWireType::Bytes { length } => *length,
                 ConcreteWireType::TypedBlob { .. } => {
-                    let known_size = ctx.artifact_payload_sizes.get(key).copied();
+                    let known_size = artifact_payload_size(ctx.artifact_payload_sizes, key);
                     let payload_size = payload_capacity.or(known_size).ok_or(
                         "GPU TypedBlob artifact requires plan_with_store for payload size",
                     )?;
@@ -1979,7 +1984,7 @@ pub(super) fn twin_import_destination(
                 compact_value_owner(ctx.backend, device, ty.clone(), storage)?;
             (physical, (ImportDestination::Bounded { owner, ty: ty.clone() }, resident))
         }
-        ImportDestination::Signed { ty, .. } => {
+        ImportDestination::Signed { ty, payload_capacity, .. } => {
             let range =
                 planned.integer_ranges.get(&0).ok_or("GPU Int import has no planned range")?;
             let (physical, resident, owner) = planned_integer_input(
@@ -1990,7 +1995,17 @@ pub(super) fn twin_import_destination(
                 range,
                 storage,
             )?;
-            (physical, (ImportDestination::Signed { owner, ty: ty.clone() }, resident))
+            (
+                physical,
+                (
+                    ImportDestination::Signed {
+                        owner,
+                        ty: ty.clone(),
+                        payload_capacity: *payload_capacity,
+                    },
+                    resident,
+                ),
+            )
         }
         ImportDestination::Bytes { length, .. } => {
             let params = ctx.backend.control_parameters_on_device(device)?;
@@ -3833,6 +3848,24 @@ fn matrix_view(
     ctx.values.push(view);
     ctx.owners.insert(id, owner);
     Ok(id)
+}
+
+/// Resolve member metadata, falling back to a caller-guaranteed family capacity.
+pub(crate) fn artifact_payload_size(
+    sizes: &BTreeMap<ArtifactKey, usize>,
+    key: &ArtifactKey,
+) -> Option<usize> {
+    sizes.get(key).copied().or_else(|| {
+        key.index.and_then(|_| {
+            sizes
+                .get(&ArtifactKey {
+                    production: key.production.clone(),
+                    name: key.name.clone(),
+                    index: None,
+                })
+                .copied()
+        })
+    })
 }
 
 /// A row slice with its own matrix shape, sharing the source allocation and writers.
@@ -7438,6 +7471,67 @@ pub(super) fn emit_artifact_export(
     Ok(())
 }
 
+/// Whether an artifact family is used only through member reads, including
+/// descriptor-preserving captures in nested control scopes. Capturing a family
+/// is not a request to materialize every member before entering the loop.
+fn artifact_family_is_selected(
+    graph: &mxx_ir_core::Graph,
+    scope_id: &FrozenGraphScopeId,
+    wire: WireRef,
+) -> bool {
+    let Some(scope) = graph.scope(scope_id) else { return false };
+    if scope.outputs().contains(&wire) {
+        return false;
+    }
+    for (index, consumer) in scope.nodes().iter().enumerate() {
+        let Some(arguments) = scope.arguments(consumer) else { return false };
+        for (position, argument) in arguments.iter().enumerate() {
+            if *argument != wire {
+                continue;
+            }
+            if position == 0 &&
+                matches!(
+                    consumer.kind(),
+                    NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
+                )
+            {
+                continue;
+            }
+            let capture = match consumer.kind() {
+                NodeKind::ParallelLoop(spec) => {
+                    spec.input_modes.get(position) == Some(&LoopInputMode::Broadcast)
+                }
+                NodeKind::SequentialLoop(spec) => position >= spec.carried_count,
+                NodeKind::SubgraphCall(_) => true,
+                _ => false,
+            };
+            if !capture {
+                return false;
+            }
+            let Some(child_id) = graph.child_scope_id(scope_id, NodeId(index as u64)) else {
+                return false;
+            };
+            let Some(child) = graph.scope(&child_id) else { return false };
+            let Some(input) = child.inputs().get(position) else { return false };
+            let source_artifact = scope.node(wire.node).and_then(|node| match node.kind() {
+                NodeKind::Input { artifact: Some(artifact), .. } => Some(artifact),
+                _ => None,
+            });
+            let child_artifact = child.node(input.node).and_then(|node| match node.kind() {
+                NodeKind::Input { artifact: Some(artifact), .. } => Some(artifact),
+                _ => None,
+            });
+            if source_artifact.is_none() ||
+                source_artifact != child_artifact ||
+                !artifact_family_is_selected(graph, &child_id, *input)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Allocate the physical frame during plan preparation. Every accepted node
 /// has a direct physical operation or bounded control lowering; other
 /// semantics fail preparation without a capture or host-compute fallback.
@@ -7499,15 +7593,7 @@ pub(crate) fn plan_physical_graph(
                 checked.wire_types.get(&wire) &&
                 element.as_ref() == &ConcreteWireType::Int &&
                 *count > 0 &&
-                (validated.source.outputs().values().any(|output| output.value == wire) ||
-                    scope.nodes().iter().any(|consumer| {
-                        scope.arguments(consumer).is_some_and(|arguments| {
-                            arguments.contains(&wire)
-                        }) && !matches!(
-                            consumer.kind(),
-                            NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
-                        )
-                    }))
+                !artifact_family_is_selected(&validated.source, &FrozenGraphScopeId::Root, wire)
             {
                 // An integer family read other than by member selection is one
                 // device value: every member is imported into its slot before
@@ -7523,9 +7609,10 @@ pub(crate) fn plan_physical_graph(
                     .collect::<Vec<_>>();
                 let mut payload_size = 1usize;
                 for key in &keys {
-                    let size = *artifact_payload_sizes.get(key).ok_or_else(|| {
-                        "GPU Int artifact requires plan_with_store for payload size".to_owned()
-                    })?;
+                    let size =
+                        artifact_payload_size(artifact_payload_sizes, key).ok_or_else(|| {
+                            "GPU Int artifact requires plan_with_store for payload size".to_owned()
+                        })?;
                     payload_size = payload_size.max(size);
                 }
                 let bits = payload_size.checked_mul(8).ok_or("GPU Int artifact width overflows")?;
@@ -7560,6 +7647,7 @@ pub(crate) fn plan_physical_graph(
                             upload_owner: ImportDestination::Signed {
                                 owner: Arc::new(native.member(index)),
                                 ty: ConcreteWireType::Int,
+                                payload_capacity: payload_size,
                             },
                             member: None,
                             read_ahead: false,
@@ -7797,7 +7885,11 @@ pub(crate) fn plan_physical_graph(
                         expected_type: ArtifactType::Int,
                         staged: false,
                         destination,
-                        upload_owner: ImportDestination::Signed { owner: native, ty: ty.clone() },
+                        upload_owner: ImportDestination::Signed {
+                            owner: native,
+                            ty: ty.clone(),
+                            payload_capacity: payload_size,
+                        },
                         member: None,
                         read_ahead: false,
                         carry: None,
@@ -8311,7 +8403,8 @@ pub(crate) fn plan_physical_graph(
                 node_id,
                 node,
                 &validated.bindings,
-            )?;
+            )
+            .map_err(|error| format!("GPU root node {node_id:?}: {error}"))?;
         }
         record_node_operations(&mut ctx, &FrozenGraphScopeId::Root, node_id, first_operation)?;
     }
@@ -8959,10 +9052,21 @@ pub(crate) fn plan_physical_graph(
                 })
                 .map(|import| &import.destination),
         )
+        // Carry initialization, reads and copy tails are explicit graph operations;
+        // they need liveness across their loop, not a plan-long dedicated allocation.
         .chain(external_io_loops.iter().flat_map(|body| {
-            body.carried_ids.iter().chain(body.imports.iter().map(|import| &import.destination))
+            body.imports
+                .iter()
+                .filter(|import| {
+                    !matches!(
+                        import.upload_owner,
+                        ImportDestination::Placed { .. } | ImportDestination::PlacedBounded { .. }
+                    )
+                })
+                .map(|import| &import.destination)
         }))
-        .chain(indexed_tables.iter().flat_map(|table| table.candidates.iter().map(|(id, _)| id)))
+        // Indexed copies' indirect candidate reads are tracked by scratch liveness;
+        // registered subgraph kernels also name their family operand explicitly.
         // A HashSample reads its tag operands through its plan's pointer table,
         // not as kernel arguments, so scratch liveness never sees those reads.
         .chain(hash_resources.values().flat_map(|spec| spec.operands.iter().map(|(id, _, _)| id)))

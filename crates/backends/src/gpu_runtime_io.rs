@@ -361,12 +361,13 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
         let scratch = scratch_key.is_some();
         if let Some(key) = scratch_key {
             slot.key = key;
-            if slot.raw_offset == 0 {
-                self.remove_staged(slot.frame, slot.key.clone(), 1)?;
-            }
         }
-        // A nested wave's member of its parent occurrence's block of a flattened family.
+        // Resolve both the repeated wave and nested parent's member before
+        // replacing a scratch artifact; the template's first member is reused.
         slot.key.index = slot.key.index.map(|index| index + member_offset);
+        if scratch && slot.raw_offset == 0 {
+            self.remove_staged(slot.frame, slot.key.clone(), 1)?;
+        }
         let handle = (slot.commit_to_session || scratch).then(|| ArtifactHandle {
             key: slot.key.clone(),
             artifact_type: slot.artifact_type.clone(),

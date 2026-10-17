@@ -244,7 +244,7 @@ unsafe fn upload_selected_payload(
         }
         (
             ArtifactType::Int,
-            ImportDestination::Signed { owner, ty },
+            ImportDestination::Signed { owner, ty, payload_capacity },
             ArtifactPayload::Bytes(bytes),
         ) if matches!(
             ty,
@@ -254,6 +254,9 @@ unsafe fn upload_selected_payload(
         {
             if owner.count() != 1 {
                 return Err("integer import destination is not one scalar".into());
+            }
+            if bytes.len() > *payload_capacity {
+                return Err("integer import exceeds its planned payload capacity".into());
             }
             let value = BigInt::from_signed_bytes_le(&bytes);
             if value.to_signed_bytes_le() != bytes {

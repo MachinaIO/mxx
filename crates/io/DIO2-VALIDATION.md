@@ -8,9 +8,9 @@ task scratchpad `redesign/e3/`. Production capacity remains under investigation.
 
 The RTX 4080 SUPER test passed all four clear-function equality assertions,
 `1 passed; 0 failed`, with normal exit **0**. Framework duration was
-**1,689.13 seconds (28m09s)**; process wall time was 1,690.24 seconds. The
-45-minute timeout did not fire. This acceptance includes wide member tags and
-the CUDA integer-zero encoding fix.
+**1,647.73 seconds (27m28s)**; process wall time was 1,648.94 seconds. The
+45-minute timeout did not fire. This acceptance includes the backend residency
+changes and evaluator target/hint lane placement described below.
 
 The toy retains two steps and all four inputs, n=4, Q=P=4, six 60-bit primes,
 base 2^30 and twelve gadget digits. Its modeled worst-case error is 285 bits
@@ -19,22 +19,31 @@ an explicit environment override. W/C selection remains automatic.
 
 | Stage | Seconds, including planning and trials |
 | --- | ---: |
-| Obfuscation | 407.892482285 |
-| Evaluate false, false | 328.696769251 |
-| Evaluate true, false | 317.56340612 |
-| Evaluate false, true | 318.055239685 |
-| Evaluate true, true | 316.271857182 |
+| Obfuscation | 404.169708261 |
+| Evaluate false, false | 310.665406875 |
+| Evaluate true, false | 310.291123144 |
+| Evaluate false, true | 313.693374122 |
+| Evaluate true, true | 308.2596357 |
 
-Planned device payload peak: obfuscation **4,645,036 bytes**, evaluation maximum
-**16,775,008 bytes**. The 564 NVML samples, at three-second intervals, recorded
-**13,798 MiB device-wide**. This includes runtime/context memory missing from the
-payload ledger, and is not an instantaneous peak measurement. Host peak RSS was
-13,611,352 KiB. No assertions or inputs were removed to stay below 30 minutes.
+Planned device payload peak: obfuscation **3,765,884 bytes**, evaluation maximum
+**5,853,044 bytes**. The 550 NVML samples, at three-second intervals, recorded
+**15,382,609,920 bytes (14,670 MiB) device-wide** across planning and execution.
+During execution after preparation, obfuscation peaked at **3,082,813,440 bytes**
+and evaluation at **6,197,084,160 bytes**. These device-wide readings include
+context/driver/cache memory outside the payload ledger; sampling can miss shorter
+peaks. Host peak RSS was 15,125,716 KiB.
 
-Evidence: `codex-zero-tag-fixed-toy.log`, `codex-zero-tag-fixed-toy-vram.csv`,
-`codex-zero-tag-fixed-source.patch`, `codex-zero-tag-fixed-binaries.sha256`, and
-`codex-zero-tag-fixed-validation.sh`. Frozen toy SHA-256:
-`f1acb1e8f797d3aa817fec5bc4754c72aa4e2a0fddab1c5e4503b8267087e845`.
+The prior accepted version took 1,689.13 seconds and planned up to 16,775,008
+evaluation payload bytes. The new payload is smaller, but the overall NVML
+planning peak increased from 13,798 to 14,670 MiB; payload reduction must not be
+reported as the same reduction in total VRAM. No assertions or inputs were
+removed, and the unchanged toy remains below 30 minutes.
+
+Evidence: `codex-hint-lanes-toy.log`, `codex-hint-lanes-toy-vram.csv`,
+`codex-hint-lanes-toy-phase-vram.json`, `codex-hint-lanes-source.patch`,
+`codex-hint-lanes-hashes.txt`, and `codex-hint-lanes-toy.sh`.
+Frozen toy SHA-256:
+`7646e2e3323a7e7ecf95d819504a7fa92675c8e35be7163880e5d97fd4b790e2`.
 
 ## Validation gates
 
@@ -119,16 +128,82 @@ not prove a physical peak in either direction.
 A full-graph physical planning experiment used synthetic ordinary inputs with
 explicit ranges: full label modulus for labels, [0,1] for this example's one-bit
 state/chunks and Boolean step data. The n=64 attempt was rejected because the
-production PRF does not fit that ring (`codex-full-plan-n64.log`). At n=128,
-planning was rejected because Int artifacts require payload-size metadata. The
-experiment was stopped after this structural failure (exit 143), rather than
-repeating it for every column width. No physical full-graph capacity was obtained.
-The existing `plan_with_store` path enumerates every member's size, so using it
-unchanged would not be practical for the production family counts. The diagnostic
-experiment remains in the task worktree/scratchpad and is not acceptance evidence.
+production PRF does not fit that ring. The n=128 experiment exposed backend
+metadata enumeration, expanded bit-position candidates, and scratch lifetime
+issues. Family-wide artifact payload bounds, lazy captures, repeated wave
+templates, direct device bit extraction, and scratch reuse now address those
+issues. Import payload bounds are checked again when the payload is loaded.
+
+This experiment is not a production execution or a capacity certificate. Its
+latest exploratory binary included a subsequently removed native-body scratch
+coalescing prototype. At W=1, C=135 its region pool occupied 4,188,727,296 bytes,
+but CUDA graph compilation still failed. The search was explicitly stopped
+(exit 143, 583.95 seconds). Do not extrapolate that failed candidate into an
+accepted production peak. Allocation-specific extrapolation and small component
+measurements take priority over further full-shape OOM searches.
 
 Sampler evidence: `codex-native-alias-capacity.log` and
 `codex-native-alias-capacity_retained_rows.log`. Full-plan diagnostic source,
 binary hash, settings and logs use the `codex-full-plan-*` prefix. The least-change
 choices were to reuse existing integer tag encoding and backend planning options.
 No production end-to-end or whole-program 200 GB acceptance is claimed.
+
+## Backend memory changes validated by the latest toy
+
+The backend retains automatic W/C selection. DIO2 introduces no application-specific
+concurrency controller. The current work also includes:
+
+- Family-wide Int/TypedBlob artifact payload bounds, enforced at import, so a plan
+  need not enumerate metadata for every member.
+- Lazy integer artifact captures and repeated streamed wave templates, including
+  nested Zip imports, with actual member indices preserved on replay.
+- Device-side dynamic bit extraction with BigInt-compatible sign extension,
+  without a candidate array proportional to the bit-position range.
+- Deferred sequential carries, allocation-by-allocation rebinding of composite
+  views, and explicit liveness for indexed pointer-table reads.
+- Scratch reuse within host loops while preserving the whole lifetime of wave
+  staging that can overlap replays.
+
+Four new GPU tests compare short and long chains, check results against ordinary
+matrix arithmetic, and assert bounded memory growth. They do not execute a CPU
+DIO2 round trip. Broader testing found a regression when arena lifetimes were
+shortened inside waves: streamed carry and read-ahead tests failed 21 of 330
+repetitions. Restoring the whole-wave lifetime while retaining host-loop-local
+reuse fixed the focused seven tests and all 330 subsequent repetitions across
+identity, two-logical-device, and three-logical-device configurations.
+Evidence: task logs `codex-wave-arena-smoke.log`,
+`codex-wave-arena-{identity,double,triple}.log`, and
+`codex-wave-arena-results.txt`.
+
+The warning-free CPU unit run passed 1,022 tests (21 ignored, 43 round-trip-name
+filters excluded) in nine suites. The warning-free CPU/GPU workspace compile gates
+also passed. Both n=128 sampler diagnostics were repeated on the updated backend
+and retained the allocation totals in the table above. Evidence: task logs
+`codex-wave-arena-cpu-units.log`, `codex-wave-arena-workspace-build.log`,
+`codex-wave-arena-capacity.log`, and `codex-wave-arena-capacity_retained_rows.log`.
+
+The three affected replay/read-ahead tests also passed 300 repetitions each in
+each of the identity, two-logical-device, and three-logical-device modes:
+2,700 executions, zero failures. Evidence: `codex-wave-arena-sync-progress.log`,
+`codex-wave-arena-sync-{identity,double,triple}.log`, and
+`codex-wave-arena-sync-results.txt`.
+
+Whole-program production capacity accounting remains unresolved; the latest
+successful toy above validates the backend and application changes, not a
+production end-to-end execution.
+
+The evaluator constructs temporary targets inside refreshed-component lanes,
+matching the obfuscator, and computes hint anchor parts as a parallel family with
+the existing disjoint-column sum. All 22 DIO2 unit tests passed after these
+changes, including graph-size invariance, residency, and noise checks. Both
+full-production graphs validated. The largest enclosing evaluation parent
+scope in the preimage-read diagnostic decreased from 191,230,377,984 to
+91,913,453,568 logical full-word bytes. This is a liveness comparison, not a
+physical allocation peak: captures and views can alias, and native workspaces
+must be added separately.
+
+Final application gates: `codex-hint-lanes-units.log`,
+`codex-hint-lanes-{cpu,gpu,toy}-build.log`, and
+`codex-hint-lanes-production-liveness.log`. Backend code was unchanged after
+the 330 + 2,700 successful GPU checks. The final application graph was then
+tested by the complete four-input GPU round trip.

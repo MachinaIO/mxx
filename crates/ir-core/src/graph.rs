@@ -508,13 +508,14 @@ impl ScopeSealer {
     fn value(&mut self, value: &ValueHandle) -> Result<ValueHandle, FreezeError> {
         if value.construction_scope() != self.scope {
             // A deterministic public hash needs only its small key/tag inputs in
-            // each lane. Carrying the full matrix through a parallel loop keeps
+            // each body. Carrying the full matrix through a loop keeps
             // it resident across every nested operation, including large samplers.
             // Only fixed-shape matrix values qualify: a parameter-sized packed
             // family must not be resampled in full for each selected member.
             // Preserve the exact hash metadata and reject non-ancestor values as
             // usual; fresh samplers must never be rematerialized this way.
-            if matches!(self.policy, CapturePolicy::Lexical { parallel_index: Some(_) }) &&
+            if matches!(self.policy, CapturePolicy::Lexical { .. }) &&
+                !self.preserved_values.contains(&(value.node.identity(), value.port)) &&
                 value.construction_scope().is_ancestor_of(&self.scope) &&
                 matches!(value.node.kind(), NodeKind::HashSample { .. }) &&
                 matches!(value.wire_type(), WireType::Matrix(matrix)

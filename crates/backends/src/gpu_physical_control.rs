@@ -80,7 +80,7 @@ use mxx_ir_core::{
     artifact::{ArtifactType, ManifestArtifact, ProductionId},
     concretize_wire_type,
     graph::{FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
-    node::{ConcatAxis, ConstantMatrix, LoopInputMode, MatrixBinaryOp, NodeKind},
+    node::{ConcatAxis, ConstantMatrix, LoopInputMode, NodeKind},
     types::{
         CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef,
         WireType,
@@ -1372,6 +1372,15 @@ pub(super) fn lower_control_node(
                 .get(index_wire)
                 .ok_or_else(|| "GPU dynamic family index has no physical value".to_owned())?;
             integer_range(ctx, index)?;
+            if let Some((_, hashes)) =
+                crate::gpu_physical_lowering::selected_hash_family(graph, scope_id, node_id)
+            {
+                let expected = resolved_node_output_type(scope_id, node_id, node, env)?;
+                return crate::gpu_physical_lowering::lower_selected_hash(
+                    ctx, graph, scope_id, output, &hashes, index, expected, env,
+                );
+            }
+
             if let Some(family) =
                 ctx.wire_ids.get(family_wire).and_then(|id| ctx.streaming.families.get(id)).cloned()
             {
@@ -3580,10 +3589,54 @@ fn lower_dynamic_trapdoor_member(
                 .iter()
                 .all(|encoding| *encoding == PhysicalEncoding::FullEval)
     });
-    if !public_gadget && !full_secret {
+    let compact_secret = matches!(&expected, ConcreteWireType::Trapdoor { instantiation, .. }
+        if instantiation.is_computational()) &&
+        matches!(
+            family_owner.physical().encodings.first(),
+            Some(PhysicalEncoding::CompactCoeff { magnitude_bytes: 8 })
+        );
+    if !public_gadget && !full_secret && !compact_secret {
         return Err("GPU dynamic trapdoor family has an unknown physical provenance".into());
     }
     let family_owner = Arc::clone(family_owner);
+    // A singleton selection retains the compact owner instead of expanding
+    // a secret that may stay captured across unrelated decoder loops.
+    let range = integer_range(ctx, index)?;
+    if compact_secret && range.start() == range.end() {
+        let member_index = range
+            .start()
+            .to_usize()
+            .filter(|value| *value < count)
+            .ok_or("GPU compact trapdoor index is out of range")?;
+        let selected = static_family_member(&family_owner, member_index)?;
+        let id = value_id(ctx.values.len())?;
+        ctx.values.push(selected.physical().as_ref().clone());
+        ctx.owners.insert(id, selected);
+        let writers = ctx
+            .family_member_producers
+            .get(&(family, member_index))
+            .cloned()
+            .unwrap_or_else(|| ctx.producer.get(&family).cloned().unwrap_or_default());
+        ctx.producer.insert(id, writers);
+        let public_family = *ctx
+            .trapdoor_public_ids
+            .get(&family)
+            .ok_or("GPU compact trapdoor family has no paired public family")?;
+        let owner = ctx.owners.get(&public_family).ok_or("GPU public family owner is missing")?;
+        let selected_public = static_family_member(owner, member_index)?;
+        let public = value_id(ctx.values.len())?;
+        ctx.values.push(selected_public.physical().as_ref().clone());
+        ctx.owners.insert(public, selected_public);
+        let writers = ctx
+            .family_member_producers
+            .get(&(public_family, member_index))
+            .cloned()
+            .unwrap_or_else(|| ctx.producer.get(&public_family).cloned().unwrap_or_default());
+        ctx.producer.insert(public, writers);
+        ctx.trapdoor_public_ids.insert(id, public);
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, id);
+        return Ok(());
+    }
     let leaf_types = trapdoor_leaf_types(&expected)?;
     let mut candidates =
         vec![Vec::with_capacity(count); if public_gadget { 1 } else { leaf_types.len() }];
@@ -3594,6 +3647,21 @@ fn lower_dynamic_trapdoor_member(
             .get(&(family, member_index))
             .cloned()
             .unwrap_or_else(|| ctx.producer.get(&family).cloned().unwrap_or_default());
+        let (selected, writers) = if compact_secret {
+            let id = value_id(ctx.values.len())?;
+            ctx.values.push(selected.physical().as_ref().clone());
+            ctx.owners.insert(id, selected);
+            ctx.producer.insert(id, writers);
+            let expanded = crate::gpu_physical_lowering::expand_computational_trapdoor(ctx, id)?;
+            (
+                Arc::clone(
+                    ctx.owners.get(&expanded).ok_or("GPU expanded secret owner is missing")?,
+                ),
+                ctx.producer.get(&expanded).cloned().unwrap_or_default(),
+            )
+        } else {
+            (selected, writers)
+        };
         if public_gadget {
             candidates[0].push(trapdoor_member_leaf(ctx, &selected, &leaf_types[5], 5, &writers)?);
         } else {
@@ -4891,10 +4959,11 @@ fn lift_resident_integer(
     Ok(coefficient)
 }
 
-/// Materialize loop-dependent polynomial constants with resident integer kernels, and scalar powers
-/// with a loop-dependent exponent by an indexed copy ([`lower_loop_power_of_base`]).
-/// Other loop-dependent matrix layouts fail rather than silently using iteration zero.
-pub(super) fn lower_loop_matrix_constant(
+/// Materialize unit vectors and loop-dependent polynomial constants with resident integer kernels,
+/// and scalar powers with a loop-dependent exponent by an indexed copy
+/// ([`lower_loop_power_of_base`]). Other loop-dependent matrix layouts fail rather than silently
+/// using iteration zero.
+pub(super) fn lower_resident_matrix_constant(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: &ConcreteMatrixType,
     value: &ConstantMatrix,
@@ -4909,18 +4978,28 @@ pub(super) fn lower_loop_matrix_constant(
         ConstantMatrix::Rotation { exponent } => vec![exponent],
         ConstantMatrix::AllCoefficients { value } => vec![value],
     };
-    if !expressions.iter().any(|expression| expression.contains_loop_index()) {
-        return Ok(None);
-    }
-    // A unit row or column at a loop-dependent position: one kernel writes it from the device
-    // index, so no candidate per position is planned.
+    // Unit vectors use one resident integer kernel even for static positions;
+    // uploading a dense constant would retain its full CRT payload for the plan.
     if let ConstantMatrix::UnitRow { index } | ConstantMatrix::UnitColumn { index } = value {
         let row = matches!(value, ConstantMatrix::UnitRow { .. });
         if (row && ty.rows != 1) || (!row && ty.columns != 1) {
             return Err(format!("GPU loop-dependent unit vector has the wrong shape: {value:?}"));
         }
+        if !index.contains_loop_index() {
+            let position = index
+                .evaluate(env)
+                .map_err(|error| error.to_string())?
+                .to_usize()
+                .ok_or("GPU static unit-vector index is invalid")?;
+            if position >= if row { ty.columns } else { ty.rows } {
+                return Err("GPU static unit-vector index is out of range".into());
+            }
+        }
         let device = lower_device_int_expr(ctx, index, env)?;
         return lift_resident_integer(ctx, device, ty, true).map(Some);
+    }
+    if !expressions.iter().any(|expression| expression.contains_loop_index()) {
+        return Ok(None);
     }
     if ty.rows != 1 || ty.columns != 1 {
         return Err(format!(
@@ -7200,7 +7279,9 @@ fn lower_sequential_loop(
         .iter()
         .any(crate::gpu_streamed_carry::is_streamed_carry);
     let has_scoped_artifacts = contains_scoped_artifact_input(graph, &child_id)?;
-    let host_driven = has_scoped_artifacts || has_streamed_carries;
+    let has_parallel_sum =
+        mxx_ir_core::parallel_reduction::contains_parallel_member_sum(graph, &child_id, env);
+    let host_driven = has_scoped_artifacts || has_streamed_carries || has_parallel_sum;
     if host_driven && ctx.device_body && ctx.host_loops.is_none() {
         // Per-iteration artifact reads are host-driven region boundaries,
         // which only the host's replay of a host-driven loop body can nest.
@@ -7636,7 +7717,8 @@ fn lower_sequential_loop(
     {
         return Err("GPU scoped artifact has no selected import boundary".into());
     }
-    let external_io = has_streamed_carries ||
+    let external_io = has_parallel_sum ||
+        has_streamed_carries ||
         !body_imports.is_empty() ||
         !body_ahead.is_empty() ||
         !nested.is_empty();
@@ -7916,36 +7998,28 @@ fn replay_bytes(
         .sum())
 }
 
-/// The owner of a later wave's loop member `id`: the frozen member's layout at the next ranges of
-/// the loop's member arena `arena` (one allocation for every later-wave member of the loop, so a
-/// loop of many waves allocates once), one range per planned allocation, bound by address;
-/// `cursor` advances past them. `copies` holds the lane's ranges by planned allocation, so members
-/// viewing one allocation view one copy of it.
+/// The owner of a later wave's loop member, with independently deferred storage
+/// for each distinct source allocation. Aliased output views share one copy.
+/// The memory planner can reuse a member's bytes after its last consumer instead
+/// of retaining every output in a single allocation for the whole loop family.
 fn replay_member_owner(
     ctx: &PhysicalLoweringContext<'_>,
     id: PhysicalValueId,
-    arena: &Option<Arc<crate::poly::dcrt::gpu::GpuDeviceBuffer>>,
-    cursor: &mut u64,
     copies: &mut BTreeMap<ReplayAllocation, BoundStorage>,
 ) -> Result<Arc<GpuResidentValue>, String> {
-    let arena = arena.as_ref().ok_or_else(|| "GPU loop member arena is missing".to_owned())?;
     let mut storages = BTreeMap::new();
     for (slot, planned) in replay_layout(ctx, id)? {
         let bytes = planned.bytes;
         let copy = match copies.entry(replay_allocation(&planned)) {
             std::collections::btree_map::Entry::Occupied(copy) => copy.get().clone(),
             std::collections::btree_map::Entry::Vacant(entry) => {
-                let end = cursor
-                    .checked_add(bytes)
-                    .filter(|end| *end <= arena.len() as u64)
-                    .ok_or_else(|| "GPU loop member arena is too small".to_owned())?;
-                let copy = BoundStorage {
-                    device: ctx.device,
-                    address: arena.as_ptr() as u64 + *cursor,
+                let length =
+                    usize::try_from(bytes).map_err(|_| "GPU loop member size exceeds usize")?;
+                let copy = crate::gpu_graph_memory::deferred_scratch_storage(
+                    ctx.device,
+                    ConcreteWireType::Bytes { length },
                     bytes,
-                    owner: Arc::clone(arena) as Arc<dyn std::any::Any + Send + Sync>,
-                };
-                *cursor = end.div_ceil(REPLAY_ALIGNMENT) * REPLAY_ALIGNMENT;
+                );
                 entry.insert(copy).clone()
             }
         };
@@ -8218,169 +8292,6 @@ fn lower_vectorized_parallel_loop(
 /// they reach. It never names a physical value.
 const UNLOADED_FAMILY: PhysicalValueId = PhysicalValueId(u32::MAX);
 
-/// The root sum of every member of some output ports of the root parallel
-/// loop `loop_id`, in the form a member-by-member sum lowers to: members 0 and
-/// 1 read (`FamilyGetStatic`) and added (`MatrixBinary(Add)`), then a
-/// sequential loop over the other `count - 2` members whose body adds member
-/// `index + 2` (`FamilyGetDynamic`) to its carried state. Returns that
-/// sequential loop and, per output port it sums, the two member reads, their
-/// sum, and its carried position. Every argument of the sequential loop must
-/// be one of these sums or a summed port, and its body may hold nothing else.
-fn fused_member_sums(
-    graph: &Graph,
-    loop_id: NodeId,
-    ports: usize,
-    count: usize,
-    env: &ParamEnv,
-) -> Option<(NodeId, Vec<Option<(NodeId, NodeId, NodeId, usize)>>)> {
-    if count < 3 {
-        return None;
-    }
-    let root = graph.root_scope();
-    let nodes = root.nodes();
-    let node = |id: NodeId| nodes.get(id.0 as usize);
-    let output = |id: NodeId| WireRef { node: id, port: Port(0) };
-    let consumers = |wire: WireRef| {
-        nodes
-            .iter()
-            .enumerate()
-            .flat_map(|(index, consumer)| {
-                root.arguments(consumer)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                    .filter(move |(_, argument)| *argument == wire)
-                    .map(move |(position, _)| (NodeId(index as u64), position))
-            })
-            .collect::<Vec<_>>()
-    };
-    let returned = |wire: WireRef| graph.outputs().values().any(|output| output.value == wire);
-    let evaluates_to = |expression: &IntExpr, value: usize| {
-        expression.evaluate(env).is_ok_and(|actual| actual == BigInt::from(value))
-    };
-    let mut sequential = None;
-    let mut summed = vec![None; ports];
-    for (port, summed_port) in summed.iter_mut().enumerate() {
-        let wire = WireRef { node: loop_id, port: Port(u32::try_from(port).ok()?) };
-        let uses = consumers(wire);
-        if returned(wire) || uses.len() != 3 {
-            continue;
-        }
-        let member_read = |member: usize| {
-            uses.iter().map(|(id, _)| *id).find(|id| {
-                node(*id).is_some_and(|read| {
-                    matches!(read.kind(), NodeKind::FamilyGetStatic { index } if evaluates_to(index, member))
-                })
-            })
-        };
-        let (Some(first), Some(second)) = (member_read(0), member_read(1)) else { continue };
-        let Some(&(loop_node, capture)) = uses.iter().find(|(id, _)| {
-            node(*id).is_some_and(|use_| matches!(use_.kind(), NodeKind::SequentialLoop(_)))
-        }) else {
-            continue;
-        };
-        let (first_uses, second_uses) = (consumers(output(first)), consumers(output(second)));
-        let ([(add, _)], [(other, _)]) = (first_uses.as_slice(), second_uses.as_slice()) else {
-            continue;
-        };
-        if add != other ||
-            !node(*add).is_some_and(|add| {
-                matches!(add.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add))
-            }) ||
-            [first, second, *add].into_iter().any(|id| returned(output(id)))
-        {
-            continue;
-        }
-        let [(carrier, carried)] = consumers(output(*add))[..] else { continue };
-        let Some(NodeKind::SequentialLoop(spec)) = node(loop_node).map(|node| node.kind()) else {
-            continue;
-        };
-        if carrier != loop_node ||
-            carried >= spec.carried_count ||
-            capture < spec.carried_count ||
-            !evaluates_to(&spec.count, count - 2)
-        {
-            continue;
-        }
-        // The body adds member `index + 2` of the captured family to the state.
-        let child_id = graph.child_scope_id(&FrozenGraphScopeId::Root, loop_node)?;
-        let child = graph.scope(&child_id)?;
-        let (state, family) = (*child.inputs().get(carried)?, *child.inputs().get(capture)?);
-        let result = *child.outputs().get(carried)?;
-        let child_node = |wire: WireRef| child.nodes().get(wire.node.0 as usize);
-        let body_add = child_node(result)?;
-        let arguments = child.arguments(body_add)?;
-        let read = match (body_add.kind(), arguments.as_slice()) {
-            (NodeKind::MatrixBinary(MatrixBinaryOp::Add), [left, right]) if *left == state => {
-                *right
-            }
-            (NodeKind::MatrixBinary(MatrixBinaryOp::Add), [left, right]) if *right == state => {
-                *left
-            }
-            _ => continue,
-        };
-        let read_node = child_node(read)?;
-        let [source, index] = child.arguments(read_node)?[..] else { continue };
-        let plus_two = IntExpr::Add(
-            Box::new(IntExpr::LoopIndex(spec.index_slot)),
-            Box::new(IntExpr::constant(2)),
-        )
-        .canonicalize();
-        let index_node = child_node(index)?;
-        let loop_index_plus_two = match index_node.kind() {
-            NodeKind::EvaluateInt(expression) => expression.clone().canonicalize() == plus_two,
-            NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add) => {
-                let operands = child.arguments(index_node)?;
-                let kinds = operands
-                    .iter()
-                    .map(|operand| child_node(*operand).map(|node| node.kind().clone()))
-                    .collect::<Option<Vec<_>>>()?;
-                let is_index = |kind: &NodeKind| matches!(kind, NodeKind::EvaluateInt(IntExpr::LoopIndex(slot)) if *slot == spec.index_slot);
-                let is_two = |kind: &NodeKind| matches!(kind, NodeKind::ConstantInt(value) if *value == BigInt::from(2));
-                matches!(kinds.as_slice(), [a, b] if (is_index(a) && is_two(b)) || (is_two(a) && is_index(b)))
-            }
-            _ => false,
-        };
-        if !matches!(read_node.kind(), NodeKind::FamilyGetDynamic) ||
-            source != family ||
-            !loop_index_plus_two
-        {
-            continue;
-        }
-        if *sequential.get_or_insert(loop_node) != loop_node {
-            return None;
-        }
-        *summed_port = Some((first, second, *add, carried));
-    }
-    let sequential = sequential?;
-    let loop_node = node(sequential)?;
-    let NodeKind::SequentialLoop(spec) = loop_node.kind() else { return None };
-    let accounted = root.arguments(loop_node)?.iter().enumerate().all(|(position, argument)| {
-        if position < spec.carried_count {
-            summed
-                .iter()
-                .flatten()
-                .any(|(_, _, add, carried)| *carried == position && argument.node == *add)
-        } else {
-            argument.node == loop_id &&
-                summed.get(argument.port.0 as usize).is_some_and(Option::is_some)
-        }
-    });
-    let child = graph.scope(&graph.child_scope_id(&FrozenGraphScopeId::Root, sequential)?)?;
-    let plain_body = child.nodes().iter().all(|node| {
-        matches!(
-            node.kind(),
-            NodeKind::Input { .. } |
-                NodeKind::EvaluateInt(_) |
-                NodeKind::ConstantInt(_) |
-                NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add) |
-                NodeKind::FamilyGetDynamic |
-                NodeKind::MatrixBinary(MatrixBinaryOp::Add)
-        )
-    });
-    (accounted && plain_body).then_some((sequential, summed))
-}
-
 fn lower_parallel_loop(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -8425,10 +8336,30 @@ fn lower_parallel_loop(
             .map_err(|error| error.to_string())?,
         instance_class: 0,
     };
+    let fused_sum = (!ctx.device_body)
+        .then(|| {
+            mxx_ir_core::parallel_reduction::parallel_member_sums(
+                graph,
+                scope_id,
+                node_id,
+                node.output_types().len(),
+                count,
+                env,
+            )
+        })
+        .flatten();
     let width = if ctx.device_body {
         count
     } else {
-        parallel_wave_geometry(ctx.logical, choice_site, count as u64)?.0.min(count)
+        let maximum = parallel_wave_geometry(ctx.logical, choice_site, count as u64)?.0.min(count);
+        if fused_sum.is_some() {
+            // W is a cap shared across loop sites. Use the largest admissible
+            // divisor at this site instead of rejecting the whole candidate
+            // because another site's count needs a different width.
+            (1..=maximum).rev().find(|width| count % width == 0).unwrap_or(1)
+        } else {
+            maximum
+        }
     };
     let parent_template = ctx.active_parallel_template;
     // Occurrences of the enclosing template lane that reach this loop. Every
@@ -8628,15 +8559,8 @@ fn lower_parallel_loop(
                         }))
         })
         .collect::<Vec<_>>();
-    // Output ports whose only reads sum their members: each wave adds its
-    // lanes' members to a running sum, so no member stays resident. A tail
-    // wave's inactive lanes would add again, so the width divides the count.
-    let fused_sum = (is_root && !ctx.device_body && ctx.active_parallel_template.is_none())
-        .then(|| fused_member_sums(graph, node_id, node.output_types().len(), count, env))
-        .flatten();
-    if fused_sum.is_some() && count % width != 0 {
-        return Err("GPU summed parallel loop needs a wave width dividing its count".into());
-    }
+    // Each wave adds exactly its active members. The selected width below
+    // divides the count, so no inactive tail lane enters this reduction.
     let summed_ports = (0..node.output_types().len())
         .map(|port| fused_sum.as_ref().is_some_and(|(_, ports)| ports[port].is_some()))
         .collect::<Vec<_>>();
@@ -8803,8 +8727,20 @@ fn lower_parallel_loop(
         let outer_indices = ctx.device_loop_indices.clone();
         if lane_device != home {
             for (slot, index) in &outer_indices {
-                let replica =
-                    crate::gpu_physical_lowering::replicate_to_device(ctx, *index, lane_device)?;
+                // A captured index and the active outer index must name the
+                // same replica, preserving its loop-index provenance in the
+                // child scope instead of making an unrelated second Int copy.
+                let broadcast = source_ids.iter().enumerate().find_map(|(argument, source)| {
+                    (*source == Some(*index))
+                        .then(|| broadcast_replicas.get(&(argument, lane_device)).copied())
+                        .flatten()
+                });
+                let replica = match broadcast {
+                    Some(replica) => replica,
+                    None => {
+                        crate::gpu_physical_lowering::replicate_to_device(ctx, *index, lane_device)?
+                    }
+                };
                 ctx.device_loop_indices.insert(*slot, replica);
             }
         }
@@ -9264,9 +9200,10 @@ fn lower_parallel_loop(
     // summed port, with the frozen choice of the sum's first addition; the
     // sequential loop's result is that running sum.
     if let Some((sequential, ports)) = &fused_sum {
-        let validated = ctx.validated;
-        let root = validated.source.root_scope();
-        let wire_types = &validated.root_scope().wire_types;
+        let root = graph.scope(scope_id).ok_or("GPU member sum scope is missing")?;
+        let wire_types = resolved_scope_types(root, scope_id, env)?;
+        let shape_class = crate::gpu_execution_plan::scope_shape_class(ctx.validated, scope_id)
+            .map_err(|error| error.to_string())?;
         for (port, fused) in ports.iter().enumerate() {
             let Some((first, second, add, carried)) = *fused else { continue };
             let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
@@ -9276,18 +9213,20 @@ fn lower_parallel_loop(
                 return Err("GPU summed parallel output has no matrix members".into());
             };
             let accumulator = accumulators[&port];
-            let choice = ctx
+            let choices = ctx
                 .logical
                 .nodes
                 .iter()
-                .find(|choice| {
+                .filter(|choice| {
                     choice.key.site == add.0 &&
-                        choice.key.shape_class == 0 &&
-                        choice.key.instance_class == 0 &&
-                        choice.loop_site.is_none()
+                        choice.key.shape_class == shape_class &&
+                        choice.key.instance_class == 0
                 })
                 .cloned()
-                .ok_or_else(|| "GPU member sum has no frozen root choice".to_owned())?;
+                .collect::<Vec<_>>();
+            let [choice] = choices.as_slice() else {
+                return Err("GPU member sum has no unique frozen scoped choice".into());
+            };
             let add_node = &root.nodes()[add.0 as usize];
             let [left, right] = root
                 .arguments(add_node)
@@ -9301,7 +9240,12 @@ fn lower_parallel_loop(
                 ctx.wire_ids.insert(left, total);
                 ctx.wire_ids.insert(right, ids[port]);
                 crate::gpu_physical_lowering::lower_matrix_node(
-                    ctx, root, add, add_node, wire_types, &choice,
+                    ctx,
+                    root,
+                    add,
+                    add_node,
+                    &wire_types,
+                    choice,
                 )?;
                 total = *ctx
                     .wire_ids
@@ -9420,7 +9364,7 @@ fn lower_parallel_loop(
     if ctx.device_body && !body_imports.is_empty() {
         return Err("GPU device body artifact import needs an on-demand region boundary".into());
     }
-    // Every later wave's members take ranges of one arena, allocated once for the loop.
+    // Account for the independently deferred storage of later-wave members.
     let later_waves =
         if ctx.device_body { 0 } else { (0..count).step_by(width).count().saturating_sub(1) };
     let mut wave_bytes = 0u64;
@@ -9453,22 +9397,6 @@ fn lower_parallel_loop(
         artifact_zip_lanes = artifact_zip_lanes.len(),
         "planned GPU parallel loop members"
     );
-    let arena = if later_waves > 0 && wave_bytes > 0 {
-        let stream = ctx
-            .backend
-            .parameters_on_device(ctx.device)?
-            .native_launch_stream(ctx.device)
-            .map_err(|error| error.to_string())?;
-        let bytes = usize::try_from(wave_bytes * later_waves as u64)
-            .map_err(|_| "GPU loop member arena exceeds usize".to_owned())?;
-        Some(Arc::new(
-            crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(&stream, bytes)
-                .map_err(|error| error.to_string())?,
-        ))
-    } else {
-        None
-    };
-    let mut cursor = 0u64;
     // Every member a Zip lane selects over the waves, `offset..offset + count` of its source.
     let zip_members = if ctx.device_body {
         Vec::new()
@@ -9673,7 +9601,7 @@ fn lower_parallel_loop(
                             .ok_or_else(|| "GPU first-wave output owner is missing".to_owned())?,
                     )
                 } else {
-                    replay_member_owner(ctx, id, &arena, &mut cursor, &mut copies)?
+                    replay_member_owner(ctx, id, &mut copies)?
                 };
                 // A streamed or summed member keeps its owner in every wave,
                 // so no wave rebinds it and its memory stays plan scratch.
@@ -9847,6 +9775,178 @@ fn types_depend_on_loop_index(scope: &GraphScope) -> bool {
     scope.nodes().iter().any(|node| node.output_types().iter().any(|ty| ty.contains_loop_index()))
 }
 
+/// Finish ready pure consumers of a loop before entering an unrelated loop.
+/// Stateful operations retain their original order. A consumer may move only
+/// when all stateful ancestors have already been emitted; pure dependencies
+/// are emitted once, in topological order. Independent pure branches are delayed
+/// until a consumer needs them. This shortens loop-output lifetimes
+/// without replaying sampling, I/O, or any loop body.
+fn scope_consumer_order(scope: &GraphScope) -> Result<Vec<usize>, String> {
+    let nodes = scope.nodes();
+    let mut arguments = Vec::with_capacity(nodes.len());
+    let mut children = vec![Vec::new(); nodes.len()];
+    let mut fence = vec![None; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        let pure = matches!(
+            node.kind(),
+            NodeKind::Input { .. } |
+                NodeKind::ConstantInt(_) |
+                NodeKind::EvaluateInt(_) |
+                NodeKind::ConstantReal(_) |
+                NodeKind::ConstantBool(_) |
+                NodeKind::ConstantMatrix { .. } |
+                NodeKind::IntBinary(_) |
+                NodeKind::IntCompare(_) |
+                NodeKind::BoolToInt |
+                NodeKind::MatrixBinary(_) |
+                NodeKind::MatrixMulSmallRhs |
+                NodeKind::MatrixNegate |
+                NodeKind::MatrixScale { .. } |
+                NodeKind::MultiplyMonomial |
+                NodeKind::ModulusReduce { .. } |
+                NodeKind::CenteredRebase { .. } |
+                NodeKind::GadgetDecompose { .. } |
+                NodeKind::Transpose |
+                NodeKind::Slice { .. } |
+                NodeKind::Tensor |
+                NodeKind::Concat { .. } |
+                NodeKind::HashSample { .. } |
+                NodeKind::FamilyPack { .. } |
+                NodeKind::FamilyGetStatic { .. } |
+                NodeKind::FamilyGetDynamic |
+                NodeKind::Select { .. }
+        );
+        let inputs = scope
+            .arguments(node)
+            .ok_or("GPU node has no arguments")?
+            .iter()
+            .map(|wire| {
+                usize::try_from(wire.node.0)
+                    .map_err(|_| "GPU argument index exceeds usize".to_owned())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for &input in &inputs {
+            if input >= index {
+                return Err("GPU scope is not topological".into());
+            }
+            children[input].push(index);
+            fence[index] = fence[index].max(fence[input]);
+        }
+        if !pure {
+            fence[index] = Some(index);
+        }
+        arguments.push(inputs);
+    }
+    let mut emitted = vec![false; nodes.len()];
+    let mut order = Vec::with_capacity(nodes.len());
+    fn emit(
+        root: usize,
+        arguments: &[BTreeSet<usize>],
+        emitted: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        let mut stack = vec![(root, false)];
+        while let Some((index, ready)) = stack.pop() {
+            if emitted[index] {
+                continue;
+            }
+            if ready {
+                emitted[index] = true;
+                order.push(index);
+            } else {
+                stack.push((index, true));
+                stack.extend(arguments[index].iter().rev().map(|&input| (input, false)));
+            }
+        }
+    }
+    // Materialize independent pure branches only when a stateful operation
+    // or a ready loop consumer needs them. Preserve the original no-loop
+    // ordering, where there is no unrelated loop workspace to avoid.
+    let has_loops = nodes
+        .iter()
+        .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)));
+    let roots = (0..nodes.len())
+        .filter(|&index| has_loops && fence[index] == Some(index))
+        .chain(0..nodes.len());
+    for index in roots {
+        if emitted[index] {
+            continue;
+        }
+        emit(index, &arguments, &mut emitted, &mut order);
+        if !matches!(nodes[index].kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)) {
+            continue;
+        }
+        let mut descendants = BTreeSet::new();
+        let mut pending = children[index].clone();
+        while let Some(child) = pending.pop() {
+            if fence[child].is_some_and(|last| last > index) || !descendants.insert(child) {
+                continue;
+            }
+            pending.extend(children[child].iter().copied());
+        }
+        for child in descendants {
+            emit(child, &arguments, &mut emitted, &mut order);
+        }
+    }
+    Ok(order)
+}
+
+/// Rematerialize pure expanded matrices at each consumer in this scope.
+/// Other nodes execute once in consumer order; fresh random sampling, I/O, and loops
+/// retain their original relative order. Retain the smaller SSA operand instead of the expanded
+/// matrix between consumers; already lowered consumers keep their own physical value IDs.
+/// Each consumer emits a shared pure operand only once, even with repeated edges.
+pub(super) fn scope_lowering_order(scope: &GraphScope) -> Result<Vec<usize>, String> {
+    let deferred = scope
+        .nodes()
+        .iter()
+        .map(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::GadgetDecompose { .. } | NodeKind::CenteredRebase { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut emitted = vec![false; scope.nodes().len()];
+    let mut order = Vec::with_capacity(emitted.len());
+    for root in scope_consumer_order(scope)?
+        .into_iter()
+        .filter(|&index| !deferred[index])
+        .chain(0..emitted.len())
+    {
+        if emitted[root] {
+            continue;
+        }
+        let mut local = BTreeSet::new();
+        let mut stack = vec![(root, false)];
+        while let Some((index, ready)) = stack.pop() {
+            if local.contains(&index) || (emitted[index] && !deferred[index]) {
+                continue;
+            }
+            if ready {
+                emitted[index] = true;
+                local.insert(index);
+                order.push(index);
+                continue;
+            }
+            stack.push((index, true));
+            let arguments =
+                scope.arguments(&scope.nodes()[index]).ok_or("GPU node has no arguments")?;
+            for argument in arguments.iter().rev() {
+                let input = usize::try_from(argument.node.0)
+                    .map_err(|_| "GPU argument index exceeds usize")?;
+                if input >= index {
+                    return Err("GPU scope is not topological".into());
+                }
+                if !emitted[input] || deferred[input] {
+                    stack.push((input, false));
+                }
+            }
+        }
+    }
+    Ok(order)
+}
+
 fn resolved_scope_types(
     scope: &GraphScope,
     scope_id: &FrozenGraphScopeId,
@@ -9988,6 +10088,7 @@ fn lower_inlined_child(
             return Err("GPU nested child reuses an active device loop index".into());
         }
     }
+    let outer_fused = std::mem::take(ctx.fused_nodes);
     let body = (|| {
         for (position, (argument, input)) in arguments.iter().zip(child.inputs()).enumerate() {
             if let Some(NodeKind::Input { artifact: Some(artifact), .. }) =
@@ -10092,11 +10193,17 @@ fn lower_inlined_child(
             }
             ctx.wire_ids.insert(*input, id);
         }
-        for (index, child_node) in child.nodes().iter().enumerate() {
+        let selected_sources =
+            crate::gpu_physical_lowering::selected_hash_sources(graph, child_scope_id);
+        for index in scope_lowering_order(child)? {
+            let child_node = &child.nodes()[index];
             let child_node_id = NodeId(
                 u64::try_from(index).map_err(|_| "GPU subgraph has too many nodes".to_owned())?,
             );
-            if matches!(child_node.kind(), NodeKind::Input { .. }) {
+            if ctx.fused_nodes.contains(&child_node_id) ||
+                selected_sources.contains(&child_node_id) ||
+                matches!(child_node.kind(), NodeKind::Input { .. })
+            {
                 continue;
             }
             if let (Some((slot, id)), NodeKind::EvaluateInt(IntExpr::LoopIndex(actual))) =
@@ -10256,6 +10363,7 @@ fn lower_inlined_child(
     })();
     *ctx.wire_ids = outer;
     ctx.device_loop_indices = outer_device_indices;
+    *ctx.fused_nodes = outer_fused;
     let outputs = body.map_err(|error| format!("GPU scope {child_scope_id:?}: {error}"))?;
     if !wrap_parent_outputs {
         return Ok(outputs);
@@ -10420,7 +10528,494 @@ mod tests {
     use mxx_ir_core::node::{IndexRange, ParallelLoop, SequentialLoop};
     use std::collections::BTreeMap;
 
-    /// Dynamic extraction has constant plan size and uses BigInt sign extension.
+    /// Finish a completed loop's pure consumers before unrelated later loops,
+    /// while preserving every dependency and the ordering of the loops themselves.
+    #[test]
+    fn test_scope_consumers_release_loop_outputs_before_unrelated_loops() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let first =
+            mxx_dsl::iterate(2usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let second =
+            mxx_dsl::iterate(3usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let consumed = first.clone() + first.clone();
+        let graph = DslContext::new("loop-consumer-order")
+            .output("a-first", first)
+            .unwrap()
+            .output("b-second", second.clone())
+            .unwrap()
+            .output("out", consumed + second)
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let order = scope_consumer_order(scope).unwrap();
+        let loops = scope
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| matches!(n.kind(), NodeKind::SequentialLoop(_)).then_some(i))
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 2);
+        let consumer = scope
+            .nodes()
+            .iter()
+            .enumerate()
+            .find_map(|(i, n)| {
+                (matches!(n.kind(), NodeKind::MatrixBinary(_)) &&
+                    scope.arguments(n).unwrap().iter().all(|a| a.node.0 as usize == loops[0]))
+                .then_some(i)
+            })
+            .unwrap();
+        assert!(consumer > loops[1], "fixture starts with a late consumer");
+        let position = |i| order.iter().position(|&j| i == j).unwrap();
+        assert!(position(loops[0]) < position(consumer));
+        assert!(position(consumer) < position(loops[1]));
+        let mut seen = BTreeSet::new();
+        for &i in &order {
+            assert!(
+                scope
+                    .arguments(&scope.nodes()[i])
+                    .unwrap()
+                    .iter()
+                    .all(|a| seen.contains(&(a.node.0 as usize)))
+            );
+            assert!(seen.insert(i), "ordinary nodes execute once");
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+    }
+
+    /// A pure output unrelated to a loop need not occupy memory while the loop runs.
+    #[test]
+    fn test_scope_consumers_delay_independent_pure_outputs() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let value =
+            ring.constant((1, 4), ConstantMatrix::AllCoefficients { value: IntExpr::from(3) });
+        let early = value.clone() + value;
+        let loop_value =
+            mxx_dsl::iterate(2usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let graph = DslContext::new("deferred-independent-pure-output")
+            .output("a-early", early)
+            .unwrap()
+            .output("b-loop", loop_value)
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let early = scope
+            .nodes()
+            .iter()
+            .position(|node| matches!(node.kind(), NodeKind::MatrixBinary(_)))
+            .unwrap();
+        let loop_node = scope
+            .nodes()
+            .iter()
+            .position(|node| matches!(node.kind(), NodeKind::SequentialLoop(_)))
+            .unwrap();
+        assert!(early < loop_node, "fixture materializes the independent output early");
+        let order = scope_consumer_order(scope).unwrap();
+        assert!(
+            order.iter().position(|&i| i == loop_node).unwrap() <
+                order.iter().position(|&i| i == early).unwrap()
+        );
+        let mut seen = BTreeSet::new();
+        for i in order {
+            assert!(
+                scope
+                    .arguments(&scope.nodes()[i])
+                    .unwrap()
+                    .iter()
+                    .all(|a| seen.contains(&(a.node.0 as usize)))
+            );
+            assert!(seen.insert(i));
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+    }
+
+    /// Single-use expansions move without changing unrelated node order.
+    #[test]
+    fn test_scope_lowering_delays_expansions_until_their_consumer() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let decomposed = ring.identity(1).decompose(4, 4);
+        let other =
+            ring.constant((1, 4), ConstantMatrix::AllCoefficients { value: IntExpr::from(3) });
+        let other = other.clone() + other;
+        let graph = DslContext::new("late-expansion-order")
+            .output("a-decomposed", decomposed.clone())
+            .unwrap()
+            .output("b-other", other.clone())
+            .unwrap()
+            .output("c-product", other.mul_small_rhs(decomposed))
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let order = scope_lowering_order(scope).unwrap();
+        let mut seen = BTreeSet::new();
+        for &index in &order {
+            for argument in scope.arguments(&scope.nodes()[index]).unwrap() {
+                assert!(
+                    seen.contains(&(argument.node.0 as usize)),
+                    "every operand precedes its consumer"
+                );
+            }
+            assert!(seen.insert(index), "each node is lowered once");
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+        let deferred = scope
+            .nodes()
+            .iter()
+            .position(|n| matches!(n.kind(), NodeKind::GadgetDecompose { .. }))
+            .unwrap();
+        let consumer = scope
+            .nodes()
+            .iter()
+            .position(|n| matches!(n.kind(), NodeKind::MatrixMulSmallRhs))
+            .unwrap();
+        let position = |node| order.iter().position(|&index| index == node).unwrap();
+        assert!(deferred + 1 < consumer, "fixture has unrelated work between expansion and use");
+        assert_eq!(position(deferred) + 1, position(consumer));
+        let ordinary = order.iter().copied().filter(|&index| index != deferred).collect::<Vec<_>>();
+        assert!(
+            ordinary.windows(2).all(|pair| pair[0] < pair[1]),
+            "other nodes keep their relative order"
+        );
+    }
+
+    /// Shared decompositions are recomputed from the unchanged input, both at
+    /// the root and inside a native loop; sampling and carried values are not replayed.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_shared_expansions_rematerialize_at_consumers() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let digits = cpu.modulus_digits();
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for nested in [false, true] {
+            let source = ring.polynomial([IntExpr::constant(u32::from(rand::random::<u16>()) + 1)]);
+            let left = ring.constant(
+                (1, digits),
+                ConstantMatrix::AllCoefficients { value: IntExpr::constant(3) },
+            );
+            let compute = |source: mxx_dsl::Mat| {
+                let decomposed = source.decompose(256, digits).centered_rebase(&ring);
+                let early = left.clone().mul_small_rhs(decomposed.clone());
+                let later = (left.clone() + left.clone()).mul_small_rhs(decomposed);
+                Ok(early + later)
+            };
+            let output = if nested {
+                mxx_dsl::iterate(2usize, source, |_, value| compute(value)).unwrap()
+            } else {
+                compute(source).unwrap()
+            };
+            let graph = DslContext::new("rematerialized-expansions")
+                .output("out", output)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            fn decompositions(
+                frame: &crate::gpu_physical_lowering::PhysicalFrame,
+                ops: &[CompiledGpuOp],
+            ) -> usize {
+                ops.iter()
+                    .map(|op| {
+                        usize::from(matches!(
+                            frame
+                                .program
+                                .implementations
+                                .resolve(op.implementation)
+                                .unwrap()
+                                .primitive,
+                            crate::gpu_execution_plan::GpuNativePrimitive::GadgetDecomposeCompact
+                        )) + op.body.as_deref().map_or(0, |body| decompositions(frame, body))
+                    })
+                    .sum()
+            }
+            let frame = plan.physical_frame_for_test();
+            assert!(
+                decompositions(frame, &frame.program.operations) >= 2,
+                "each distinct consumer receives a fresh expanded value"
+            );
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+    }
+
+    /// Selected transcripts preserve the eager CPU hash, replay bindings and
+    /// exported alternatives; an invalid unused U64 tag must still fail.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_selected_hash_transcripts_replay_and_preserve_exports() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        use mxx_dsl::{Family, HashTag, Int, IntType};
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), BigInt::from(0)..=BigInt::from(3));
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("value".into(), BigInt::from(-1)..=BigInt::from(300));
+        for exported in [false, true] {
+            let context = DslContext::new("selected-hash-transcripts");
+            let selector: Int = context.input("selector", IntType).unwrap();
+            let value: Int = context.input("value", IntType).unwrap();
+            let key = ring.bytes_input("key", 32);
+            let mut tag = HashTag::from(b"short".as_slice());
+            tag.push_integer(value.clone());
+            let first = ring.hash_matrix(key.clone(), tag, (1, 2));
+            let second =
+                ring.hash_matrix(key.clone(), b"longer-alternative-prefix".as_slice(), (1, 2));
+            let mut tag = HashTag::from(b"u64-alternative".as_slice());
+            tag.push("member");
+            tag.push_u64_le(value);
+            let third = ring.hash_matrix(key, tag, (1, 2));
+            let family = Family::pack(vec![first.clone(), second, third]).unwrap();
+            let context = context.output("out", family.at(selector)).unwrap();
+            let context = if exported { context.output("first", first).unwrap() } else { context };
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let bind = |selector: usize, value: i64| {
+                BTreeMap::from([
+                    ("selector".into(), RuntimeValue::Int(BigInt::from(selector))),
+                    ("value".into(), RuntimeValue::Int(BigInt::from(value))),
+                    ("key".into(), RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()))),
+                ])
+            };
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph.clone(), &bind(0, 258), 1, 1)
+                .unwrap();
+            assert_eq!(
+                plan.physical_frame_for_test().hash_resources.len(),
+                if exported { 3 } else { 1 }
+            );
+            for selector in [0, 2, 1, 0] {
+                let inputs = bind(selector, rand::random_range(0..=300));
+                let expected = execute(
+                    &graph,
+                    &mut cpu_backend([cpu.clone()]),
+                    inputs.clone(),
+                    &mut MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let result = runtime.execute(&mut plan, inputs).unwrap();
+                for name in if exported { vec!["out", "first"] } else { vec!["out"] } {
+                    let actual =
+                        runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+                    let RuntimeValue::Matrix(expected) = &expected.outputs[name] else {
+                        panic!("CPU matrix")
+                    };
+                    assert_eq!(&actual, expected.as_cpu_full().unwrap());
+                }
+            }
+            assert!(runtime.execute(&mut plan, bind(0, -1)).is_err(), "invalid unselected U64 tag");
+            assert!(runtime.execute(&mut plan, bind(3, 1)).is_err(), "out-of-range selector");
+        }
+    }
+
+    /// Nested wave and sequential indices remain resident operands of the
+    /// selected transcript, and are read again on each iteration and replay.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_selected_hash_transcripts_follow_nested_indices() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        use mxx_dsl::{Family, HashTag, Int, IntType};
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let context = DslContext::new("selected-hash-nested-indices");
+        let selector: Int = context.input("selector", IntType).unwrap();
+        let key = ring.bytes_input("key", 32);
+        let lanes = parallel(3usize, |lane| {
+            mxx_dsl::iterate(2usize, ring.zero((1, 2)), |step, state| {
+                let mut left = HashTag::from(b"nested-left".as_slice());
+                left.push_integer(lane.clone());
+                left.push_u64_le(step.clone());
+                let mut middle = HashTag::from(b"nested-middle-long".as_slice());
+                middle.push_u64_le(lane.clone());
+                middle.push_decimal(step.clone())?;
+                let mut right = HashTag::from(b"right".as_slice());
+                right.push_integer(step.clone().add(lane.clone()));
+                let candidates = Family::pack(vec![
+                    ring.hash_matrix(key.clone(), left, (1, 2)),
+                    ring.hash_matrix(key.clone(), middle, (1, 2)),
+                    ring.hash_matrix(key.clone(), right, (1, 2)),
+                ])?;
+                Ok(state + candidates.at(selector.clone().add(lane.clone()).add(step).rem(3usize)))
+            })
+        })
+        .unwrap();
+        let graph = context
+            .output("out", lanes.at(0usize) + lanes.at(1usize) + lanes.at(2usize))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), BigInt::from(0)..=BigInt::from(2));
+        let bind = |selector: usize| {
+            BTreeMap::from([
+                ("selector".into(), RuntimeValue::Int(BigInt::from(selector))),
+                ("key".into(), RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()))),
+            ])
+        };
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph.clone(), &bind(0), 1, 3).unwrap();
+        assert!(
+            plan.physical_frame_for_test().hash_resources.values().any(|spec| {
+                spec.parts.iter().any(|part| {
+                    matches!(part, crate::poly::dcrt::gpu::GpuHashTagPart::Select { .. })
+                })
+            }),
+            "nested hash selection must use the fused transcript"
+        );
+        for selector in [0, 2, 1] {
+            let inputs = bind(selector);
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let result = runtime.execute(&mut plan, inputs).unwrap();
+            let actual = runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            assert_eq!(&actual, expected.as_cpu_full().unwrap());
+        }
+    }
+
+    /// A hash used both as initial carry and immutable loop input is regenerated
+    /// from the same key inside the body. Rebinding that key on replay changes both.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_sequential_hash_captures_match_rebound_keys() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let key = ring.bytes_input("key", 32);
+        let sample = ring.hash_matrix(key.clone(), b"initial-and-captured".as_slice(), (1, 2));
+        let other = ring.hash_matrix(key, b"distinct-domain".as_slice(), (1, 2));
+        let output = mxx_dsl::iterate(2usize, sample.clone(), |_, state| {
+            Ok(state + sample.clone() + other.clone())
+        })
+        .unwrap();
+        let graph = DslContext::new("sequential-hash-capture-replay")
+            .output("out", output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let body = graph
+            .source
+            .scopes()
+            .values()
+            .find(|scope| matches!(scope.id(), FrozenGraphScopeId::SequentialBody { .. }))
+            .unwrap();
+        assert_eq!(
+            body.nodes().iter().filter(|n| matches!(n.kind(), NodeKind::HashSample { .. })).count(),
+            2
+        );
+        let inputs = || {
+            BTreeMap::from([(
+                "key".into(),
+                RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>())),
+            )])
+        };
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph.clone(), &inputs(), 1, 1).unwrap();
+        for _ in 0..2 {
+            let inputs = inputs();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let result = runtime.execute(&mut plan, inputs).unwrap();
+            let actual = runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            assert_eq!(&actual, expected.as_cpu_full().unwrap());
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
@@ -10495,6 +11090,18 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_sequential_carry_memory_tracks_liveness() {
+        sequential_carry_memory_tracks_liveness(false);
+    }
+
+    /// A native outer loop must not retain every inner stage's temporary rows.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_native_body_scratch_tracks_liveness() {
+        sequential_carry_memory_tracks_liveness(true);
+    }
+
+    fn sequential_carry_memory_tracks_liveness(nested: bool) {
         use crate::{
             backend::poly::cpu_backend,
             executor::{ExecutionConfig, execute},
@@ -10518,13 +11125,19 @@ mod tests {
                 },
             );
             let lanes = parallel(2usize, |_| {
-                let mut state = increment.clone();
-                for _ in 0..stages {
-                    state = mxx_dsl::iterate(2usize, state, |_, carried| {
-                        Ok(carried + increment.clone())
-                    })?;
+                let compute = |mut state| {
+                    for _ in 0..stages {
+                        state = mxx_dsl::iterate(2usize, state, |_, carried| {
+                            Ok(carried + increment.clone())
+                        })?;
+                    }
+                    Ok(state)
+                };
+                if nested {
+                    mxx_dsl::iterate(2usize, increment.clone(), |_, state| compute(state))
+                } else {
+                    compute(increment.clone())
                 }
-                Ok(state)
             })
             .unwrap();
             let state = lanes.at(mxx_dsl::Int::constant(0)) + lanes.at(mxx_dsl::Int::constant(1));
@@ -10559,6 +11172,84 @@ mod tests {
         }
         let row_bytes = (degree as usize * 2 * columns * 8) as u64;
         assert!(footprints[1] <= footprints[0] + 4 * row_bytes, "{footprints:?}");
+    }
+
+    /// Later-wave members stay distinct through a dynamic read, but a consumed
+    /// family does not retain its allocation across every subsequent wave loop.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_wave_member_storage_tracks_last_consumer() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let stages = 2 + 10 * crate::env::test_streamed_steps();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut footprints = Vec::new();
+        for stages in [2, stages] {
+            let increment = ring.constant(
+                (1, columns),
+                ConstantMatrix::AllCoefficients {
+                    value: IntExpr::constant(rand::random_range(1..=7)),
+                },
+            );
+            let selector =
+                mxx_dsl::int_family_input("select-last", 1usize).at(0usize).rem(2usize).mul(2usize);
+            let mut state = increment.clone();
+            for _ in 0..stages {
+                let members = parallel(3usize, |lane| {
+                    Ok((state.clone() + increment.clone()).multiply_monomial(lane))
+                })
+                .unwrap();
+                state = members.at(selector.clone());
+            }
+            let graph = DslContext::new("wave-member-last-consumer")
+                .output("out", state)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let inputs = |selected: bool| {
+                BTreeMap::from([(
+                    "select-last".into(),
+                    RuntimeValue::integer_values(vec![BigInt::from(u8::from(selected))]),
+                )])
+            };
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph.clone(), &inputs(false), 1, 1)
+                .unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for selected in [false, true, false] {
+                let expected = execute(
+                    &graph,
+                    &mut cpu_backend([cpu.clone()]),
+                    inputs(selected),
+                    &mut MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                let result = runtime.execute(&mut plan, inputs(selected)).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = u64::from(degree) * 2 * columns as u64 * 8;
+        assert!(footprints[1] <= footprints[0] + 6 * row_bytes, "{footprints:?}");
     }
 
     /// Indexed pointer-table candidates remain live through selection, then release their arena
@@ -10724,6 +11415,19 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_nested_import_arena_tracks_liveness() {
+        nested_import_arena_tracks_liveness(false);
+    }
+
+    /// Nested host-I/O loops in one wave reuse device-only carry scratch,
+    /// while the host import destinations keep their read-ahead lifetimes.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_wave_nested_import_arena_tracks_liveness() {
+        nested_import_arena_tracks_liveness(true);
+    }
+
+    fn nested_import_arena_tracks_liveness(in_wave: bool) {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .try_init();
@@ -10782,15 +11486,22 @@ mod tests {
                 (1, columns),
                 ArtifactAvailability::Cached,
             );
-            let result = mxx_dsl::iterate(2usize, ring.zero((1, columns)), |_, mut state| {
-                for _ in 0..stages {
-                    state = mxx_dsl::iterate(2usize, state, |index, state| {
-                        Ok(state + members.at(index))
-                    })?;
-                }
-                Ok(state)
-            })
-            .unwrap();
+            let compute = || {
+                mxx_dsl::iterate(2usize, ring.zero((1, columns)), |_, mut state| {
+                    for _ in 0..stages {
+                        state = mxx_dsl::iterate(2usize, state, |index, state| {
+                            Ok(state + members.at(index))
+                        })?;
+                    }
+                    Ok(state)
+                })
+            };
+            let result = if in_wave {
+                let lanes = parallel(2usize, |_| compute()).unwrap();
+                lanes.at(mxx_dsl::Int::constant(0)) + lanes.at(mxx_dsl::Int::constant(1))
+            } else {
+                compute().unwrap()
+            };
             let graph = DslContext::new("nested-import-arena")
                 .output("out", result)
                 .unwrap()
@@ -11663,6 +12374,156 @@ mod tests {
                 sum.entry(0, 0).coeffs_biguints()[0],
                 num_bigint::BigUint::from((0..8u32).map(|index| index + 3).sum::<u32>())
             );
+        }
+    }
+
+    /// Nested parallel reductions reuse one wave of members and reset each parent's sum.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_nested_parallel_member_sum_tracks_wave_memory() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut footprints = Vec::new();
+        for count in [4, 4 + 16 * crate::env::test_streamed_steps()] {
+            let constant = mxx_dsl::Int::constant(rand::random_range(1..=7))
+                .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                .tensor(ring.constant(
+                    (1, columns),
+                    ConstantMatrix::UnitRow { index: IntExpr::constant(0) },
+                ));
+            let outer = parallel(3usize, |parent| {
+                let members = parallel(count, |member| {
+                    Ok(constant.clone().multiply_monomial(member.add(parent.clone())))
+                })?;
+                let initial = members.at(0usize) + members.at(1usize);
+                mxx_dsl::iterate(count - 2, initial, |index, total| {
+                    Ok(total + members.at(index.add(2usize)))
+                })
+            })
+            .unwrap();
+            let graph = DslContext::new("nested-parallel-member-sum")
+                .output("out", outer.at(0usize) + outer.at(2usize))
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for _ in 0..3 {
+                let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = u64::from(degree) * 2 * columns as u64 * 8;
+        assert!(footprints[1] <= footprints[0] + 2 * row_bytes, "{footprints:?}");
+    }
+
+    /// Sequential ancestors replay parallel sums with site-local admissible wave widths.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_sequential_parallel_member_sum_replays_admissible_waves() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for (count, width) in [(2, 1), (6, 2), (6, 3), (5, 3)] {
+            let constant = mxx_dsl::Int::constant(rand::random_range(1..=7))
+                .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                .tensor(ring.constant(
+                    (1, columns),
+                    ConstantMatrix::UnitRow { index: IntExpr::constant(0) },
+                ));
+            let output = mxx_dsl::iterate(3usize, constant.clone(), |step, state| {
+                let members = parallel(count, |member| {
+                    Ok(state.clone().multiply_monomial(member.add(step.clone())))
+                })?;
+                let initial = members.at(0usize) + members.at(1usize);
+                mxx_dsl::iterate(count - 2, initial, |index, total| {
+                    Ok(total + members.at(index.add(2usize)))
+                })
+            })
+            .unwrap();
+            let graph = DslContext::new("sequential-parallel-member-sum")
+                .output("out", output)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, width)
+                .unwrap();
+            let admitted_width = (1..=width).rev().find(|w| count % w == 0).unwrap();
+            assert!(
+                plan.physical_frame_for_test().waves.iter().any(|wave| {
+                    wave.active_lanes == admitted_width &&
+                        wave.active_lanes * wave.repetitions == count
+                }),
+                "the reduction must exercise its admitted wave width"
+            );
+            for _ in 0..3 {
+                let result = runtime
+                    .execute_with_artifacts(
+                        &mut plan,
+                        BTreeMap::new(),
+                        &mut MemoryArtifactStore::default(),
+                        rand::random(),
+                    )
+                    .unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
         }
     }
 

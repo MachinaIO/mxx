@@ -48,8 +48,8 @@ pub const STEP_DATA_INPUT: &str = "dio2/step-data";
 pub const X_INPUT: &str = "dio2/x";
 /// The obfuscation's step input `S_0` ([`super::step::StepRows`]).
 pub const INITIAL_OUTPUT: &str = "dio2/initial";
-/// The obfuscation's anchors `B_i`, member `i`.
-pub const ANCHORS_OUTPUT: &str = "dio2/anchors";
+/// The shared public anchor `B`, published as a singleton family.
+pub const ANCHOR_OUTPUT: &str = "dio2/anchor";
 /// The evaluation's decoded final state.
 pub const STATE_OUTPUT: &str = "dio2/state";
 
@@ -284,7 +284,7 @@ pub(crate) struct KindMaterial {
 }
 
 /// An obfuscation (spec §7): the production of the obfuscation graph (the step input `S_0`, the
-/// anchors, and the Static preprocessing and anchor preimages of every step and chunk), the
+/// shared anchor, and the Static preprocessing and anchor preimages of every step and chunk), the
 /// Programs it was preprocessed for, and the public data the evaluation also reads.
 pub struct Dio2Obfuscation {
     pub(crate) function: StreamingFunction,
@@ -505,8 +505,8 @@ mod tests {
     /// number of primes (beyond the `O(w_0)` rows and `O(w_0^2)` words of one operation), the
     /// label rows, the smudge digits, the PRF outputs, the steps or the chunks (graph-only, the
     /// parameter sets of [`graphs_do_not_grow_with_the_parameters`]): every family of matrices the
-    /// plan keeps in a member arena has the same member count for both sets (the anchor trapdoors
-    /// of the steps excepted), every other one is exported, spilled to its export, or a streamed
+    /// plan keeps in a member arena has the same member count for both sets, including the
+    /// singleton anchor; every other one is exported, spilled to its export, or a streamed
     /// carry, and every matrix (or family member) has at most `2 (w_0 + 2) w_0` rows and columns
     /// and `4 (w_0 + 2)^2` entries. The resident families of one-word integers (the clear labels
     /// and the packed label-transition columns, `O(v m_v)` and `O(2^c m_v)` words) are listed.
@@ -546,6 +546,24 @@ mod tests {
                 // private/state/hint fields. An ordinary matrix output would
                 // retain its allocation throughout refresh preimage generation.
                 let initial_graph = &dio2.execution.1[0];
+                let anchor = &initial_graph.source.outputs()[ANCHOR_OUTPUT];
+                assert!(
+                    matches!(
+                        initial_graph.root_scope().wire_types.get(&anchor.value),
+                        Some(mxx_ir_core::types::ConcreteWireType::IndexedFamily { count: 1, .. })
+                    ),
+                    "all steps must share one published anchor"
+                );
+                let samples = initial_graph
+                    .source
+                    .scopes()
+                    .values()
+                    .flat_map(|scope| scope.nodes())
+                    .filter(|node| {
+                        matches!(node.kind(), mxx_ir_core::node::NodeKind::TrapdoorSample { .. })
+                    })
+                    .count();
+                assert_eq!(samples, 1, "one shared trapdoor sampling site");
                 let initial_outputs = initial_graph
                     .source
                     .outputs()
@@ -589,6 +607,9 @@ mod tests {
         );
         let mut violations = Vec::new();
         for (w0, audit) in &audits {
+            for (_, entry) in audit.iter().filter(|(_, entry)| entry.trapdoors) {
+                assert_eq!(entry.count, Some(1), "shared anchor family: {}", entry.scope);
+            }
             let bound = 2 * (w0 + 2) * w0;
             let mut totals = std::collections::BTreeMap::<_, u128>::new();
             for (graph, entry) in audit {
@@ -605,12 +626,11 @@ mod tests {
                 eprintln!("integer family (w0 {w0}): {graph} {} {}", entry.scope, entry.shape);
             }
         }
-        // The anchor trapdoors of the steps (and their public matrices) stay one family over the
-        // steps, read by every instance.
+        // The shared anchor and its public matrix have one member for every step count.
         let resident = |audit: &[(&str, crate::dio2::test_support::Residency)]| {
             audit
                 .iter()
-                .filter(|(_, entry)| entry.class == "resident" && !entry.trapdoors)
+                .filter(|(_, entry)| entry.class == "resident")
                 .map(|(graph, entry)| {
                     (
                         (graph.to_string(), entry.key.clone()),

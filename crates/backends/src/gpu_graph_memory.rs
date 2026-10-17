@@ -27,6 +27,13 @@
 //! freed in one region is free in every later one, and scratch used across
 //! regions is freed by a barrier in the region of its last use, after that
 //! region's uses.
+//! Device-only carry scratch and imports local to a nested host loop retain
+//! their actual region lifetimes inside a wave. Only the wave's own import
+//! templates extend across that entire wave to protect overlapping read-ahead;
+//! unrelated nested carries must not accumulate with the number of stages.
+//! Region scratch and host-bound arena ranges share the same device buffer.
+//! They can reuse bytes across disjoint region lifetimes, while overlapping
+//! regions keep them separate; wave read-ahead lifetimes remain extended above.
 //!
 //! Other scratch lives in memory the plan owns. A scratch value that is written before it is read
 //! shares one arena per device with the others, in the arena of the device that holds it even when
@@ -39,7 +46,12 @@
 //! regions because operations of one region may run concurrently while regions launch in order.
 //! Values whose spans share no region share bytes, so a chain of loops, each reading the running
 //! result of the one before, needs about two of them at once. Any other scratch value, together
-//! with inputs, outputs, wave-bound members, and imports, is an allocation of its own.
+//! with inputs, outputs, and nonplaced imports, is an allocation of its own.
+//! Wave-bound members stay in persistent storage, but distinct source allocations
+//! use independent ranges and may share bytes outside their widened live regions.
+
+#[path = "gpu_graph_memory/gpu_body_scratch.rs"]
+mod gpu_body_scratch;
 
 use crate::{
     backend::{BoundStorage, GpuResidentValue, poly_gpu::GpuDcrtBackend},
@@ -63,7 +75,7 @@ use std::{
 /// Owner of a scratch matrix whose memory is chosen when the plan's Graph
 /// regions are compiled.
 pub(crate) struct GpuDeferredScratch {
-    /// A full matrix, or a bounded matrix held compactly.
+    /// A full matrix, a compact bounded matrix, or an address-bound byte allocation.
     ty: ConcreteWireType,
     device: i32,
 }
@@ -215,7 +227,7 @@ pub(crate) struct GraphScratchPlan {
     pools: BTreeMap<i32, Arc<GpuDeviceBuffer>>,
 }
 
-fn visit(
+fn visit_node(
     frame: &PhysicalFrame,
     op: &CompiledGpuOp,
     each: &mut dyn FnMut(PhysicalValueId, bool),
@@ -246,6 +258,15 @@ fn visit(
     for output in op.outputs.iter() {
         each(*output, true);
     }
+    Ok(())
+}
+
+fn visit(
+    frame: &PhysicalFrame,
+    op: &CompiledGpuOp,
+    each: &mut dyn FnMut(PhysicalValueId, bool),
+) -> Result<(), String> {
+    visit_node(frame, op, each)?;
     for inner in op.body.iter().flatten() {
         visit(frame, inner, each)?;
     }
@@ -296,15 +317,18 @@ pub(crate) fn plan_graph_scratch(
     frame: &mut PhysicalFrame,
     starts: &[usize],
 ) -> Result<GraphScratchPlan, String> {
+    gpu_body_scratch::coalesce(frame)?;
     struct Group {
         placeholder: BoundStorage,
         members: Vec<PhysicalValueId>,
         eligible: bool,
         /// Whether an arena range may hold this allocation; composite views
-        /// are rebound allocation by allocation and the host never binds it.
+        /// are rebound allocation by allocation, including host wave bindings.
         packable: bool,
         references: BTreeSet<usize>,
         first_write: Option<usize>,
+        /// Wave-level host uploads can overlap waves through read-ahead or staging.
+        wave_import: bool,
     }
     let mut groups = BTreeMap::<*const (), Group>::new();
     let mut group_of = BTreeMap::<PhysicalValueId, BTreeSet<*const ()>>::new();
@@ -322,6 +346,7 @@ pub(crate) fn plan_graph_scratch(
                     packable: true,
                     references: BTreeSet::new(),
                     first_write: None,
+                    wave_import: false,
                 });
                 group.members.push(id);
                 group.eligible &= eligible;
@@ -346,10 +371,12 @@ pub(crate) fn plan_graph_scratch(
             });
         collect(id, owner, eligible, packable);
     }
-    // Wave bindings are swapped in by the host between launches.
+    // Wave bindings are swapped in by the host between launches. They must
+    // remain host-addressable, but their persistent arena ranges can be reused
+    // outside their widened replay lifetimes.
     for wave in &frame.waves {
         for (&id, owner) in &wave.owner_bindings {
-            collect(id, owner, false, false);
+            collect(id, owner, false, !frame.scratch_protected.contains(&id));
         }
     }
     // Read-ahead has a separate staging allocation with the same logical destination.
@@ -405,6 +432,12 @@ pub(crate) fn plan_graph_scratch(
             }))
             .collect::<Vec<_>>()
     };
+    let wave_imports = frame
+        .waves
+        .iter()
+        .flat_map(|wave| wave.import_template_indices.iter())
+        .map(|&index| frame.import_templates[index].destination)
+        .collect::<BTreeSet<_>>();
     for (id, load) in placed {
         let owners = groups
             .iter()
@@ -419,6 +452,7 @@ pub(crate) fn plan_graph_scratch(
             let group = groups.get_mut(pointer).expect("the group exists");
             group.references = references.clone();
             group.first_write = Some(load);
+            group.wave_import |= wave_imports.contains(&id);
             group.eligible = false;
             group.packable = true;
         }
@@ -473,6 +507,12 @@ pub(crate) fn plan_graph_scratch(
     let mut persistent = BTreeMap::<*const (), BoundStorage>::new();
     // Plan-owned scratch written before it is read: device, live span, bytes.
     let mut arena = Vec::<(*const (), i32, usize, usize, u64)>::new();
+    // Allocation identities are host pointers, not a placement priority. Keep
+    // equal-sized candidates in logical-value order so allocator reuse on the
+    // host cannot change GPU fragmentation or the chosen concurrency geometry.
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups
+        .sort_by_key(|(_, group)| (group.members.iter().copied().min(), group.placeholder.address));
     for (pointer, group) in groups {
         let graph_owned = match (group.references.first(), group.references.last()) {
             (Some(&first), Some(&last)) if group.eligible => {
@@ -536,18 +576,20 @@ pub(crate) fn plan_graph_scratch(
             loop {
                 let widened = replayed_bodies.iter().fold((start, end), |(start, end), &body| {
                     let (body_start, body_end) = body;
-                    // Host-loop-local scratch starts fresh on replay. Wave
-                    // imports and exports may overlap the next wave through
-                    // read-ahead/staging, so arena values must cover that whole
-                    // wave even when their graph uses lie inside it.
+                    // Body-local device scratch starts fresh on replay. Wave
+                    // imports can overlap the next wave through read-ahead or
+                    // staging and must cover the whole wave. Extending device
+                    // temporaries or inner host-loop imports instead retains all
+                    // nested carries, despite their ordered device uses.
                     if body_start < body_end &&
                         start < body_end &&
                         body_start <= end &&
                         (!(body_start <= start && end < body_end) ||
-                            frame.waves.iter().any(|wave| {
-                                wave.body_start as usize == body_start &&
-                                    wave.body_end as usize == body_end
-                            }))
+                            (group.wave_import &&
+                                frame.waves.iter().any(|wave| {
+                                    wave.body_start as usize == body_start &&
+                                        wave.body_end as usize == body_end
+                                })))
                     {
                         (start.min(body_start), end.max(body_end - 1))
                     } else {
@@ -578,7 +620,7 @@ pub(crate) fn plan_graph_scratch(
             .ok_or("GPU deferred scratch owner changed type")?;
         let bound = match &deferred.ty {
             // Packed scratch is bound by address: a raw buffer of its size.
-            ConcreteWireType::Matrix(_) => {
+            ConcreteWireType::Matrix(_) | ConcreteWireType::Bytes { .. } => {
                 let stream = backend
                     .parameters_on_device(deferred.device)?
                     .native_launch_stream(deferred.device)
@@ -612,13 +654,21 @@ pub(crate) fn plan_graph_scratch(
         }
         persistent.insert(pointer, bound);
     }
-    persistent.extend(
-        pack_arena(backend, arena)
-            .map_err(|error| format!("GPU persistent scratch arena: {error}"))?,
-    );
-    let sizes = plan.place(starts, frame.program.operations.len());
+    let (sizes, arena_offsets) = plan.place(starts, frame.program.operations.len(), &arena);
     plan.pools = allocate_buffers(backend, &sizes)
-        .map_err(|error| format!("GPU region scratch pools: {error}"))?;
+        .map_err(|error| format!("GPU shared scratch pools: {error}"))?;
+    for ((pointer, device, _, _, bytes), offset) in arena.into_iter().zip(arena_offsets) {
+        let buffer = &plan.pools[&device];
+        persistent.insert(
+            pointer,
+            BoundStorage {
+                device,
+                address: buffer.as_ptr() as u64 + offset,
+                bytes,
+                owner: Arc::clone(buffer) as Arc<dyn std::any::Any + Send + Sync>,
+            },
+        );
+    }
     frame.owners.rebind(|_, owner| rebound(owner, &persistent))?;
     for wave in &mut frame.waves {
         rebind(&mut wave.owner_bindings, &persistent)?;
@@ -631,46 +681,6 @@ pub(crate) fn plan_graph_scratch(
         }
     }
     Ok(plan)
-}
-
-/// Place each plan-owned scratch value of `arena` (its placeholder, device,
-/// first and last region, and bytes) at a byte range of its device's arena, reusing the
-/// bytes of values whose spans ended before its own begins, and allocate the
-/// arenas.
-fn pack_arena(
-    backend: &GpuDcrtBackend,
-    arena: Vec<(*const (), i32, usize, usize, u64)>,
-) -> Result<BTreeMap<*const (), BoundStorage>, String> {
-    let items = arena
-        .iter()
-        .map(|&(_, device, _, _, bytes)| (device, bytes.div_ceil(ALIGNMENT) * ALIGNMENT))
-        .collect::<Vec<_>>();
-    let (offsets, sizes) = pack_intervals(&items, |left, right| {
-        let ((_, _, left_start, left_end, _), (_, _, right_start, right_end, _)) =
-            (arena[left], arena[right]);
-        left_start <= right_end && right_start <= left_end
-    });
-    let placed = arena
-        .iter()
-        .zip(offsets)
-        .map(|(&(pointer, device, _, _, bytes), offset)| (pointer, device, offset, bytes))
-        .collect::<Vec<_>>();
-    let buffers = allocate_buffers(backend, &sizes)?;
-    placed
-        .into_iter()
-        .map(|(pointer, device, offset, bytes)| {
-            let buffer = &buffers[&device];
-            Ok((
-                pointer,
-                BoundStorage {
-                    device,
-                    address: buffer.as_ptr() as u64 + offset,
-                    bytes,
-                    owner: Arc::clone(buffer) as Arc<dyn std::any::Any + Send + Sync>,
-                },
-            ))
-        })
-        .collect()
 }
 
 /// Byte alignment of every value placed in a shared buffer.
@@ -762,7 +772,12 @@ impl GraphScratchPlan {
     /// frees are reused after the loop ends. Regions launch in order, so a new region reuses
     /// everything freed before it, including allocations whose last use is in the region
     /// before.
-    fn place(&mut self, starts: &[usize], operations: usize) -> BTreeMap<i32, u64> {
+    fn place(
+        &mut self,
+        starts: &[usize],
+        operations: usize,
+        arena: &[(*const (), i32, usize, usize, u64)],
+    ) -> (BTreeMap<i32, u64>, Vec<u64>) {
         // When each allocation's bytes may be reused: by any allocation from
         // `release` on, and by one of the same lane of the same loop from
         // `lane_release` on.
@@ -814,19 +829,97 @@ impl GraphScratchPlan {
                     lane_of[earlier] == lane_of[later] &&
                     lane_release[earlier].is_some_and(|free| start >= free))
         };
-        let items = self
+        let graph_items = self
             .allocations
             .iter()
             .map(|allocation| {
                 (allocation.device, (allocation.bytes as u64).div_ceil(ALIGNMENT) * ALIGNMENT)
             })
             .collect::<Vec<_>>();
-        let (offsets, sizes) =
-            pack_intervals(&items, |left, right| !after(left, right) && !after(right, left));
-        for (allocation, offset) in self.allocations.iter_mut().zip(offsets) {
+        let arena_items = arena
+            .iter()
+            .map(|&(_, device, _, _, bytes)| (device, bytes.div_ceil(ALIGNMENT) * ALIGNMENT))
+            .collect::<Vec<_>>();
+        let graph_overlap = |left, right| !after(left, right) && !after(right, left);
+        let arena_overlap = |left: usize, right: usize| {
+            let (_, _, first_a, last_a, _) = arena[left];
+            let (_, _, first_b, last_b, _) = arena[right];
+            first_a <= last_b && first_b <= last_a
+        };
+        let region_of = |operation| starts.partition_point(|start| *start <= operation) - 1;
+        let graph_regions = firsts
+            .iter()
+            .zip(&release)
+            .map(|(&first, &release)| (region_of(first), region_of(release - 1)))
+            .collect::<Vec<_>>();
+        let items = graph_items.iter().chain(&arena_items).copied().collect::<Vec<_>>();
+        let overlap = |left, right| {
+            match (left < count, right < count) {
+                (true, true) => graph_overlap(left, right),
+                (false, false) => arena_overlap(left - count, right - count),
+                _ => {
+                    let (graph, arena_index) =
+                        if left < count { (left, right - count) } else { (right, left - count) };
+                    let (first, last) = graph_regions[graph];
+                    let (_, _, arena_first, arena_last, _) = arena[arena_index];
+                    // Host-bound ranges are reserved for their entire regions.
+                    // Cross-class reuse occurs only across ordered region launches,
+                    // never between a host upload and device work in one region.
+                    first <= arena_last && arena_first <= last
+                }
+            }
+        };
+        let (mut offsets, mut sizes) = pack_intervals(&items, overlap);
+        // Equal-sized long-lived captures can fragment a pool when placed after
+        // short temporaries. Try them first without changing any overlap rule,
+        // keeping the original layout whenever the alternative is not smaller.
+        let mut priority = (0..items.len()).collect::<Vec<_>>();
+        priority.sort_by_key(|&index| {
+            let duration = if index < count {
+                release[index] - firsts[index]
+            } else {
+                let (_, _, first, last, _) = arena[index - count];
+                starts.get(last + 1).copied().unwrap_or(operations) - starts[first]
+            };
+            (std::cmp::Reverse(duration), index)
+        });
+        let prioritized = priority.iter().map(|&index| items[index]).collect::<Vec<_>>();
+        let (alternative, alternative_sizes) =
+            pack_intervals(&prioritized, |left, right| overlap(priority[left], priority[right]));
+        for (&device, size) in &mut sizes {
+            if alternative_sizes[&device] < *size {
+                *size = alternative_sizes[&device];
+                for (position, &index) in priority.iter().enumerate() {
+                    if items[index].0 == device {
+                        offsets[index] = alternative[position];
+                    }
+                }
+            }
+        }
+        // Greedy packing is not globally optimal. Keep the old separate placement
+        // as an upper bound per device so combining the pools cannot inflate VRAM.
+        let (graph_offsets, graph_sizes) = pack_intervals(&graph_items, graph_overlap);
+        let (arena_offsets, arena_sizes) = pack_intervals(&arena_items, arena_overlap);
+        for (&device, size) in &mut sizes {
+            let graph_size = graph_sizes.get(&device).copied().unwrap_or(0);
+            let separate = graph_size + arena_sizes.get(&device).copied().unwrap_or(0);
+            if *size > separate {
+                *size = separate;
+                for (index, &(owner, _)) in items.iter().enumerate() {
+                    if owner == device {
+                        offsets[index] = if index < count {
+                            graph_offsets[index]
+                        } else {
+                            graph_size + arena_offsets[index - count]
+                        };
+                    }
+                }
+            }
+        }
+        for (allocation, &offset) in self.allocations.iter_mut().zip(&offsets) {
             allocation.offset = offset;
         }
-        sizes
+        (sizes, offsets[count..].to_vec())
     }
 
     /// Move the memory-node chain to top-level operation `index` of the
@@ -971,5 +1064,48 @@ impl GraphScratchPlan {
             self.push_memory_node(index_of, token);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_joint_scratch_pool_reuses_only_disjoint_regions() {
+        let make_plan = || GraphScratchPlan {
+            allocations: vec![GraphAllocation {
+                placeholder: std::ptr::null(),
+                members: Vec::new(),
+                device: 0,
+                bytes: 1024,
+                references: BTreeSet::from([0]),
+                offset: 0,
+                lane: None,
+                allocated: None,
+            }],
+            allocate_before: BTreeMap::from([(0, vec![0])]),
+            free_after: BTreeMap::from([(0, vec![0])]),
+            referenced_by: BTreeMap::from([(0, vec![0])]),
+            loops: Vec::new(),
+            lanes: BTreeMap::new(),
+            chain: BTreeMap::new(),
+            chain_region: None,
+            open_loop: None,
+            next_loop: 0,
+            pools: BTreeMap::new(),
+        };
+        let mut disjoint = make_plan();
+        let (sizes, offsets) = disjoint.place(&[0, 1], 2, &[(std::ptr::null(), 0, 1, 1, 2048)]);
+        assert_eq!(sizes[&0], 2048);
+        assert_eq!(disjoint.allocations[0].offset, offsets[0]);
+        for last in [0, 1] {
+            let mut overlapping = make_plan();
+            let (sizes, offsets) =
+                overlapping.place(&[0, 1], 2, &[(std::ptr::null(), 0, 0, last, 2048)]);
+            assert_eq!(sizes[&0], 3072);
+            let graph = overlapping.allocations[0].offset;
+            assert!(graph + 1024 <= offsets[0] || offsets[0] + 2048 <= graph);
+        }
     }
 }

@@ -228,6 +228,71 @@ mod tests {
         assert_eq!(body.outputs()[0], body.outputs()[1]);
     }
 
+    /// Initial state stays outside the loop; immutable hash captures are generated
+    /// inside it, while fresh samples retain their single outer sampling site.
+    #[test]
+    fn sequential_hash_captures_preserve_initial_state_and_fresh_sampling() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let sample = ring.hash_matrix(key.clone(), b"public-key".as_slice(), (1, 4));
+        let other = ring.hash_matrix(key, b"another-key".as_slice(), (1, 4));
+        let fresh = ring.uniform_residue((1, 4));
+        let initial = (sample.clone(), sample.clone(), fresh.clone(), other.clone());
+        let outputs = iterate(2, initial, |_, _| {
+            Ok((sample.clone(), sample.clone(), fresh.clone(), other.clone()))
+        })
+        .unwrap();
+        let built = DslContext::new("sequential-hash-captures")
+            .output("result", outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let root = built.graph.root_scope();
+        assert_eq!(
+            root.nodes().iter().filter(|n| matches!(n.kind(), NodeKind::HashSample { .. })).count(),
+            2
+        );
+        assert_eq!(
+            root.nodes()
+                .iter()
+                .filter(|n| matches!(n.kind(), NodeKind::UniformResidueSample { .. }))
+                .count(),
+            1
+        );
+        let body = built
+            .graph
+            .scopes()
+            .values()
+            .find(|scope| {
+                matches!(scope.id(), mxx_ir_core::graph::FrozenGraphScopeId::SequentialBody { .. })
+            })
+            .unwrap();
+        let tags = body
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::HashSample { tag_prefix, .. } => Some(tag_prefix.as_slice()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            tags,
+            [b"public-key".as_slice(), b"another-key".as_slice()].into_iter().collect()
+        );
+        assert!(
+            !body.nodes().iter().any(|n| matches!(n.kind(), NodeKind::UniformResidueSample { .. }))
+        );
+        assert_eq!(body.outputs()[0], body.outputs()[1]);
+        let loop_node =
+            root.nodes().iter().find(|n| matches!(n.kind(), NodeKind::SequentialLoop(_))).unwrap();
+        assert_eq!(
+            root.arguments(loop_node).unwrap().len(),
+            6,
+            "four initial carries, one hash key and one fresh matrix capture"
+        );
+    }
+
     #[test]
     fn parallel_distinct_hash_captures_preserve_every_domain() {
         let ring = Ring::from_crt_moduli(vec![17.into()], 8);

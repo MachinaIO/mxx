@@ -16,7 +16,7 @@ use super::{
     compose::{Compose, NextStep, split_deferred},
     labels::{LabelColumns, LabelProducts},
     scheme::{
-        ANCHORS_OUTPUT, Dio2Obfuscation, EVALUATE_STAGE, INITIAL_OUTPUT, Kind, LABELS_INPUT,
+        ANCHOR_OUTPUT, Dio2Obfuscation, EVALUATE_STAGE, INITIAL_OUTPUT, Kind, LABELS_INPUT,
         STATE_OUTPUT, X_INPUT, derive, record, step_chain, step_root,
     },
     step::{PRIVATE_TAG, PUBLIC_TAG, STATE_TAG, StepRows, XBITS_TAG, xbits_exponent, xbits_row},
@@ -138,16 +138,18 @@ impl Evaluator<'_> {
         self.output(&StepRows::from_value(rows), &labels)
     }
 
-    /// The anchors `B_i` of the obfuscation.
-    fn anchors(&self) -> Family<Mat> {
+    /// The public anchor shared by every step, published as one family member.
+    fn anchor(&self) -> Mat {
         let plan = &self.obfuscation.plan;
-        self.ring().family_artifact_input(
-            self.obfuscation.production.production().clone(),
-            ANCHORS_OUTPUT,
-            self.obfuscation.function.stream_length(),
-            (2, super::anchor_columns(plan.columns)),
-            ArtifactAvailability::Transferred,
-        )
+        self.ring()
+            .family_artifact_input(
+                self.obfuscation.production.production().clone(),
+                ANCHOR_OUTPUT,
+                1usize,
+                (2, super::anchor_columns(plan.columns)),
+                ArtifactAvailability::Transferred,
+            )
+            .at(0usize)
     }
 
     /// The preimages of `kind`'s instances: `per` of each instance side by side.
@@ -323,7 +325,7 @@ impl Evaluator<'_> {
         let next = NextStep {
             root: step_root(&self.root, function, plan, step.clone().add(1usize), None),
             hash_key: self.root.hash_key_input(),
-            anchor: self.anchors().at(step.clone().add(1usize)),
+            anchor: self.anchor(),
         };
         // The instance's preimages, read by their index in the family of every instance's.
         let per = plan.blocks() * plan.primes;

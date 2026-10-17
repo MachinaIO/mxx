@@ -193,6 +193,7 @@ fn dimensions(ty: &mxx_ir_core::types::ConcreteWireType) -> Option<(usize, usize
 /// - `spilled`: an exported matrix family that loops nested in the same lane also read member by
 ///   member, which the GPU reads back from its export instead of holding it;
 /// - `streamed-carry`: a matrix-family carry of a sequential loop (streamed through the store);
+/// - `summed`: a parallel producer whose only consumer is the recognized member sum;
 /// - `dead`: an unread family;
 /// - `op`: a matrix (or a family member) of one operation, allocated in the plan's scratch;
 /// - `integer`: a resident family of one-word integers (or Booleans);
@@ -263,6 +264,20 @@ pub(crate) fn residency(graph: &mxx_ir_core::ValidatedGraph) -> Vec<Residency> {
                     ),
                     _ => (None, None, None),
                 };
+                let summed = if looped == Some(false) {
+                    count.as_ref().and_then(|n| usize::try_from(n.clone()).ok()).and_then(|count| {
+                        mxx_ir_core::parallel_reduction::parallel_member_sums(
+                            &graph.source,
+                            id,
+                            node_id,
+                            node.output_types().len(),
+                            count,
+                            &graph.bindings,
+                        )
+                    })
+                } else {
+                    None
+                };
                 let mut child_exports = BTreeSet::new();
                 let trapdoors = (0..node.output_types().len()).any(|port| {
                     types.wire_types.get(&wire(node_id, port)).is_some_and(|ty| {
@@ -289,7 +304,9 @@ pub(crate) fn residency(graph: &mxx_ir_core::ValidatedGraph) -> Vec<Residency> {
                         looped == Some(false) &&
                         scope_output.is_some() &&
                         readers.is_empty();
-                    let class = if !family {
+                    let class = if summed.as_ref().is_some_and(|(_, ports)| ports[port].is_some()) {
+                        "summed"
+                    } else if !family {
                         "op"
                     } else if (looped == Some(true) || carry_update) && streamed_matrix {
                         "streamed-carry"

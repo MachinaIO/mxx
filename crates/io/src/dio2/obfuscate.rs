@@ -1,8 +1,8 @@
 //! The obfuscator (spec §7): one graph, executed once, whose outputs (one artifact production)
 //! are the obfuscation.
 //!
-//! The graph samples the payload secret `t`, the binary mask `s_0` and one anchor trapdoor per
-//! step (a parallel loop over the steps), and encrypts the step input `S_0` at the root modulus
+//! The graph samples the payload secret `t`, the binary mask `s_0` and one anchor trapdoor shared
+//! by every step (a singleton parallel loop), and encrypts the step input `S_0` at the root modulus
 //! (the only encryption: `t` and `s_0` are read by nothing else but the Static preprocessing
 //! ciphertexts under `t`). Then, for every instance of each Program kind ([`Kind`]: every
 //! refreshing step and chunk, and every chunk of the last step) as one parallel loop, it lowers
@@ -24,7 +24,7 @@ use super::{
     compose::{Compose, NextStep, split_deferred},
     labels::{LabelColumns, LabelProducts},
     scheme::{
-        ANCHORS_OUTPUT, Dio2Obfuscation, INITIAL_OUTPUT, INITIAL_STATE_INPUT, Kind, KindMaterial,
+        ANCHOR_OUTPUT, Dio2Obfuscation, INITIAL_OUTPUT, INITIAL_STATE_INPUT, Kind, KindMaterial,
         LABELS_INPUT, OBFUSCATE_STAGE, STEP_DATA_INPUT, Y_INPUT, derive, record, selector_input,
         step_chain, step_root, table_input,
     },
@@ -51,8 +51,8 @@ struct Secrets {
     payload: Mat,
     /// `s_0 = (s_bar_0, 1)`, `s_bar_0` uniform binary.
     mask: RnsBggRow,
-    /// The anchor trapdoor `T_i` of every step.
-    anchors: Family<Trapdoor>,
+    /// The shared anchor trapdoor, kept as a singleton for member-wise publication.
+    anchor: Family<Trapdoor>,
 }
 
 /// The construction of an obfuscation graph.
@@ -115,7 +115,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         let secrets = obfuscator.secrets()?;
         let mut graph = DslContext::new("dio2-obfuscate")
             .transferred_output(INITIAL_OUTPUT, obfuscator.initial(&secrets)?)?
-            .transferred_output(ANCHORS_OUTPUT, secrets.anchors.public_matrices())?;
+            .transferred_output(ANCHOR_OUTPUT, secrets.anchor.public_matrices())?;
         let mut descriptors = Vec::new();
         for (kind, program) in kinds.iter().zip(&programs) {
             let (leaves, descriptor) = obfuscator.material(*kind, program, &secrets)?;
@@ -253,11 +253,12 @@ impl Obfuscator<'_> {
         self.root.ring()
     }
 
-    /// The secrets: `t_bar` uniform ternary, `s_bar_0` uniform binary, and the anchor trapdoors.
+    /// The secrets: `t_bar` uniform ternary, `s_bar_0` uniform binary, and the shared anchor
+    /// trapdoor.
     fn secrets(&self) -> Result<Secrets, Dio2Error> {
         let ring = self.ring();
         let bound = super::preimage_bound(self.parameters)?;
-        let anchors = mxx_dsl::parallel(self.input.function.stream_length(), |_| {
+        let anchor = mxx_dsl::parallel(1usize, |_| {
             Ok(sample_trapdoor(
                 &ring,
                 mxx_ir_core::RealExpr::from(self.parameters.trapdoor_sigma),
@@ -269,7 +270,7 @@ impl Obfuscator<'_> {
         Ok(Secrets {
             payload: ring.uniform_interval((1, 1), -1, 1),
             mask: (ring.uniform_interval((1, 1), 0, 1), ring.identity(1)),
-            anchors,
+            anchor,
         })
     }
 
@@ -357,7 +358,7 @@ impl Obfuscator<'_> {
         let hint = mxx_dsl::parallel(1usize, |_| {
             Ok(unmask_hint(
                 Mat::concat(ConcatAxis::Columns, vec![s.0.clone(), s.1.clone()]),
-                secrets.anchors.public_matrices().at(Int::constant(0)),
+                secrets.anchor.public_matrices().at(Int::constant(0)),
                 self.error(anchor_columns),
             ))
         })?;
@@ -516,9 +517,8 @@ impl Obfuscator<'_> {
             keys.iter().map(|key| key.as_ref().map(|key| key.matrix().clone())).collect(),
             Box::new(blocks),
         )?;
-        // The step's anchor trapdoor is selected where each preimage is sampled, with its public
-        // matrix at the same index.
-        let trapdoor = || secrets.anchors.at(step.clone());
+        // Every step and target samples its own preimage under the same anchor.
+        let trapdoor = || secrets.anchor.at(0usize);
         let anchor = super::anchor_columns(plan.columns);
         let preimages: Leaf = match kind {
             Kind::Last => {
@@ -529,7 +529,7 @@ impl Obfuscator<'_> {
                 let next = NextStep {
                     root: step_root(&self.root, function, plan, step.clone().add(1usize), None),
                     hash_key: self.root.hash_key_input(),
-                    anchor: secrets.anchors.public_matrices().at(step.clone().add(1usize)),
+                    anchor: secrets.anchor.public_matrices().at(0usize),
                 };
                 let preimages =
                     compose.decoded_keys(&next, (&self.columns, chunk.clone()), |key| {

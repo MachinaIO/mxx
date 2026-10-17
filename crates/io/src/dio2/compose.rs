@@ -187,16 +187,7 @@ impl<'a, C: Carrier> Compose<'a, C> {
                 .map(|entry| place_in_column(entry, columns, &index))
                 .collect())
         };
-        let first = placed(IntExpr::constant(0))?;
-        if columns == 1 {
-            return Ok(first);
-        }
-        let failure = Failure::default();
-        let row = mxx_dsl::iterate(columns - 1, first, |index, row| {
-            let value = failure.keep(placed(index.add(1usize).expression()?))?;
-            Ok(add(row, value))
-        });
-        failure.finish(row)
+        parallel_sum(columns, |index| placed(index.expression()?))
     }
 
     /// Component 1 of the smudge of decoder `smudge` (`p |P| + k` for part `p` and the prime of
@@ -216,26 +207,23 @@ impl<'a, C: Carrier> Compose<'a, C> {
         };
         let output = self.program.outputs.smudge;
         self.columns(columns, |column| {
-            let failure = Failure::default();
             let column = IntExpr::Add(Box::new(first.clone()), Box::new(column)).canonicalize();
-            let total = mxx_dsl::iterate(
-                self.parameters.smudge_digits,
-                C::zero(&ring, 1).component(1),
-                |digit, total| {
-                    let digit = digit.expression()?;
-                    let block = IntExpr::Add(
-                        Box::new(IntExpr::Mul(
-                            Box::new(digit.clone()),
-                            Box::new(IntExpr::constant(smudge_columns)),
-                        )),
-                        Box::new(column.clone()),
-                    );
-                    let weight = smudge_weight(self.parameters, &ring, &modulus, digit);
-                    let row = failure.keep(self.block(output, block, weight))?;
-                    Ok(add(total, row.component(1)))
-                },
-            );
-            failure.finish(total)
+            if self.parameters.smudge_digits == 0 {
+                return Ok(C::zero(&ring, 1).component(1));
+            }
+            parallel_sum(self.parameters.smudge_digits, |digit| {
+                let digit = digit.expression()?;
+                let block = IntExpr::Add(
+                    Box::new(IntExpr::Mul(
+                        Box::new(digit.clone()),
+                        Box::new(IntExpr::constant(smudge_columns)),
+                    )),
+                    Box::new(column.clone()),
+                );
+                let weight = smudge_weight(self.parameters, &ring, &modulus, digit);
+                let row = self.block(output, block, weight)?;
+                Ok(row.component(1))
+            })
         })
     }
 
@@ -600,20 +588,22 @@ impl Compose<'_, Row> {
             let targets =
                 self.targets(next, (columns, chunk.clone()), leaf.clone(), one.clone())?;
             let part = self.part(&index, next, &targets)?;
-            let failure = Failure::default();
-            let row = mxx_dsl::iterate(basis.len(), ring.zero((1, plan.columns)), |prime, sum| {
-                let row = failure.keep(self.decoded(&part, &prime, &targets))?.swap_remove(0);
+            let mut rows = parallel_sum(basis.len(), |prime| {
+                let row = self.decoded(&part, &prime, &targets)?.swap_remove(0);
                 let member = first.clone().add(index.clone().mul(basis.len())).add(prime.clone());
                 let unmasked = unmask(&ring, &rows.hint, preimages.at(member), row) - half.clone();
-                let term =
-                    decoded_residue_term(&basis, prime, self.parameters.ring_dimension, unmasked);
-                Ok(sum + failure.keep(term.map_err(Dio2Error::from))?)
-            });
-            failure.finish(row)
+                Ok(vec![decoded_residue_term(
+                    &basis,
+                    prime,
+                    self.parameters.ring_dimension,
+                    unmasked,
+                )?])
+            })?;
+            Ok(rows.remove(0))
         };
         // The two target components are independent. Expose both as lanes so the
         // backend chooses their concurrency; only this constant-size pair is resident.
-        // Prime recombination remains a reduction inside each lane.
+        // Prime terms are independent parallel lanes with a bounded member sum.
         let target = |target: Int| -> Result<(Mat, Mat), Dio2Error> {
             let failure = Failure::default();
             let rows = mxx_dsl::parallel(2usize, |component| {
@@ -733,6 +723,28 @@ pub(crate) fn split_deferred<W, WF>(
 fn wrap(target: &Int, offset: usize, count: usize) -> Int {
     let lift = count * (offset / count + 1) - offset;
     target.clone().add(lift).rem(count)
+}
+
+/// Independent terms followed by the canonical member sum recognized by the backend.
+/// No application concurrency limit is imposed; the planner chooses wave width.
+/// A singleton uses its term directly; larger counts retain the same graph structure.
+fn parallel_sum(
+    count: usize,
+    term: impl Fn(Int) -> Result<Vec<Mat>, Dio2Error>,
+) -> Result<Vec<Mat>, Dio2Error> {
+    match count {
+        0 => Err(Dio2Error::Input("parallel sum needs at least one term")),
+        1 => term(Int::constant(0)),
+        _ => {
+            let failure = Failure::default();
+            let members =
+                failure.finish(mxx_dsl::parallel(count, |index| failure.keep(term(index))))?;
+            let initial = add(members.at(0usize), members.at(1usize));
+            Ok(mxx_dsl::iterate(count - 2, initial, |index, total| {
+                Ok(add(total, members.at(index.add(2usize))))
+            })?)
+        }
+    }
 }
 
 /// The sum of two components, entry by entry.

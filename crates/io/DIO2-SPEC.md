@@ -293,7 +293,12 @@ One refresh has output width `2 w_0`, and `B_{i+1} ∈ R_{Q_0}^{2 × M_B}`. The 
 `N_B = ⌈M_B / (2 w_0)⌉` zero-target refreshes. The last block is padded with columns from
 `HashSample(hk, "dio2/B-pad", i + 1)`, which are discarded.
 
-A single `B_i`, sampled with a trapdoor over `Q_0`, serves every part of step `i`. A part decoding
+One pair `(B, T)` is sampled over `Q_0` and shared by every step and part of one
+obfuscation. In the indexed equations below, `B_i := B` and `T_i := T` for all `i`.
+The hints `b_i` remain step-specific because their masks `s_i` change. Preimages are
+sampled separately for every target; sharing the anchor does not reuse a sampled preimage.
+The public anchor is published as the singleton artifact `dio2/anchor`.
+A single `B_i`, sampled with this shared trapdoor over `Q_0`, serves every part of step `i`. A part decoding
 at `Q_L ⊂ Q_0` uses `B_i mod Q_L` and `b_i mod Q_L`. Its preimage is sampled over `Q_0` for a
 CRT lift `K̃` of its key `K` (any lift, for example zero on `P∖Q_L`), so that
 `B_i K_pre ≡ K̃ (mod Q_0)`, and hence `≡ K (mod Q_L)`.
@@ -306,7 +311,7 @@ CRT lift `K̃` of its key `K` (any lift, for example zero on `P∖Q_L`), so that
 | `t = (t̄, 1)` | Static payload secret, `t̄` ternary, shared by every step |
 | `z_i` | state |
 | `A_i ∈ Z_Q^{v × (m_v + 1)}` | label, **public in the clear**: `A_0` uniform, sampled and published by the obfuscator; the evaluator computes `A_{i+1} = A_i[:, 1..] D_{x_i}` |
-| `B_i ∈ R_{Q_0}^{2 × M_B}` | anchor, sampled with trapdoor `T_i` by the obfuscator |
+| `B_i ∈ R_{Q_0}^{2 × M_B}` | shared anchor `B_i = B`, with shared trapdoor `T_i = T` |
 | `A'_{i,o} = HashSample(hk, "dio2/key", i, o) ∈ R_{Q_0}^{2 × 2 w_0}` | key of input `o` of step `i`; no `x` |
 | `P'_{i,k} = HashSample(hk, "dio2/helper", i, k)` | level-0 helper key of `σ_k`, step `i` |
 
@@ -451,7 +456,7 @@ column order: PRF member `(column n + coefficient) d + r` is placed at coefficie
 use indexed bodies; adding digits changes counts, not the number of Program operations.
 The graphs never form that row (§14, *Residency*): it is a deferred output, read one
 column block at a time where a part's decoder needs it. Column `c` of a decoder's smudge
-is one sequential loop over the digits `r`, each reading block `r * smudge_columns + column`
+is a parallel loop over the digits `r` followed by an ordered sum, each digit reading block `r * smudge_columns + column`
 (one loop over its `n` coefficient members, each a PRF member lowered in place) and
 re-targeting it alone to the scalar form `P^r 2^-1 mod Q`; the columns are one loop that
 places each column with a loop-dependent unit row. The weight `P^r 2^-1 mod Q` of digit `r`
@@ -547,7 +552,7 @@ applied to `‖e'‖∞ ≤ 1`.
 ## 7. Obfuscator
 
 **Setup.**
-- Sample `hk`, `t̄`, `s̄_0`, `A_0`, and `(B_i, T_i)` for `i ≤ stream_length − 1` (§8).
+- Sample `hk`, `t̄`, `s̄_0`, `A_0`, and one shared `(B, T)` (§8).
 - Sample the PRF key layouts `k^σ_x`, `k^cbd_{x,o,j}`, and `k^sm_{x,q,o,j}` for every
   `x ∈ {0,1}^eval_chunk_bits`.
 
@@ -582,8 +587,8 @@ evaluator.
 **One graph.** The obfuscator is one DSL graph, executed once into one artifact production
 (`crates/io/src/dio2/obfuscate.rs`):
 
-1. Sample `t̄` (ternary), `s̄_0` (binary) and, in one parallel loop over the steps, the anchors
-   `(B_i, T_i)`; encrypt `S_0` and `b_0`. These are the only encryptions: no other row or
+1. Sample `t̄` (ternary), `s̄_0` (binary) and, in a singleton parallel loop, the shared anchor
+   `(B, T)`; encrypt `S_0` and `b_0`. These are the only encryptions: no other row or
    ciphertext of the obfuscation reads `s_0`.
 2. For each Program kind (a refreshing step, the last step) one parallel loop over its
    instances (every refreshing step and chunk `(i, x)`, every chunk of the last step) lowers the
@@ -595,7 +600,7 @@ evaluator.
    keys — the same composition the evaluator runs on rows, with the same key helpers — not from
    an online evaluation; neither the payload `t` nor the mask enters them. One parallel loop over
    every part and prime computes each decoded key (its target, its CBD blocks and smudge
-   blocks computed in the lane, §14 *Residency*) and samples its preimage under the step's
+   blocks computed in the lane, §14 *Residency*) and samples its preimage under the shared
    anchor trapdoor, selected in the lane, so no family of decoded keys is held.
 4. Every per-instance artifact role is published as one family of the instances' values, so the
    evaluator reads instance `(i, x_i)` by its runtime index. The RHS ciphertexts of the PRF
@@ -814,7 +819,7 @@ step. Tests need small `v`.
   repeats with equal `(i, x_{<i})` are the same computation and are harmless.
 - `A_{i+1}` is pseudorandom. With `m_v = v log2 Q` exactly, the leftover-hash argument for
   `A_i[:, 1..] D_x` has no slack.
-- One trapdoor anchor `B_i` is shared by all parts of a step (GPV preimages for many keys).
+- One trapdoor anchor `B` is shared by all steps and parts (GPV preimages for many keys).
 - The smudge heuristic of the existing decoder.
 - Circular use of `t` across all steps.
 - Hash-sampled public matrices model uniform ones.
@@ -843,7 +848,7 @@ The extensions of §10 are implemented as follows:
 
 | §10 | Implementation |
 | --- | --- |
-| 1, 2, 3, 4 | The refresh of row targets is composed in `crates/io/src/dio2/compose.rs` from the exposed refresh pieces (`RnsBggParameters::refresh_actions`, `refresh_combination`, `residue_term`, each with a symbolic prime index), the unmask of `crates/exponent-lut/src/decoder/unmask.rs`, and the anchor's preimages under one trapdoor per step. The composition is generic over its carrier (`crates/io/src/dio2/carrier.rs`): keys alone for the obfuscator, rows and keys for the evaluator, with the same key helpers (`retarget_key`, `mul_public_key`). |
+| 1, 2, 3, 4 | The refresh of row targets is composed in `crates/io/src/dio2/compose.rs` from the exposed refresh pieces (`RnsBggParameters::refresh_actions`, `refresh_combination`, `residue_term`, each with a symbolic prime index), the unmask of `crates/exponent-lut/src/decoder/unmask.rs`, and the anchor's preimages under the one shared trapdoor. The composition is generic over its carrier (`crates/io/src/dio2/carrier.rs`): keys alone for the obfuscator, rows and keys for the evaluator, with the same key helpers (`retarget_key`, `mul_public_key`). |
 | 4, 5 | Rooted chains (`RnsBggRoot`, `RnsBggParameters::with_root`, `crates/exponent-lut/src/rns_bgg/mod.rs`): input keys and LUT helper keys are `Gamma` of root keys hashed at `Q_0` under the root's hash domain (the step); the evaluator-bit keys are derived root inputs (`RnsBggRoot::with_derived_input`). Online evaluation takes the root rows as graph values (`RnsOnlineEvalBuild::bind_rows`, `bind_lut_helper_rows`), the integer data as graph values (`bind_data_values`), and reads one instance of the preprocessing (`with_material_member`); the Program's sampled public matrices carry the instance's hash domain (`RnsBggParameters::with_hash_domain`). |
 | 6 | The automorphism table `LutTable::automorphism` (`crates/exponent-lut/src/program/mod.rs`): a one-branch Static LUT with coefficient `1`, which also reads a raw coefficient wire. |
 | 7 | The label products are right-deep chains (`crates/io/src/dio2/labels.rs`) lowered with the carrier's public product; noise-only Programs retain scalar chains of the same order. |
@@ -859,10 +864,10 @@ Choices the implementation makes within the specification:
   evaluation graph, so rows and keys of every part and prime come from one lowering.
 - **Decoded keys.** The obfuscator obtains every part's decoded key from the key-only
   composition of the lowered public keys of its preprocessing (§7), then samples the preimages
-  under the step's anchor. The evaluator's row composition builds the same key subexpressions,
+  under the shared anchor. The evaluator's row composition builds the same key subexpressions,
   so keys and rows cannot diverge.
 - **Smudge weights.** The step Program packs the weight-one rows for all smudge digits `r`
-  into one output; a sequential digit loop reads each corresponding column block.
+  into one deferred output; a parallel digit loop reads each corresponding column block.
   Both refresh and output decoders re-target each digit block and its key to the BigInt scalar
   form `P^r 2^-1 mod Q` at the decoding level, then sum the digits. The noise simulation uses
   the same re-targetings. Thus the smudge range `P^d` is not limited by small-constant payload
@@ -889,7 +894,7 @@ Choices the implementation makes within the specification:
 - **Residency.** No value either graph holds grows with the parts, the number of primes (beyond
   the `O(w_0)` rows and `O(w_0^2)` words of one operation: a gadget decomposition `2 w_0 x w_0`,
   a preimage `2 (w_0 + 2) x w_0`, a part's CBD row of `w_0` blocks), the label rows, the smudge
-  digits, the PRF outputs, or the steps and chunks; the anchor trapdoors stay one family over
+  digits, the PRF outputs, or the steps and chunks; the shared anchor stays a singleton family independent of
   the steps. The step Program is lowered with deferred outputs
   (`mxx_exponent_lut::api::ProgramBuild::lower_deferred`): every Program family is lowered where
   its members are read (a member read lowers that member's body, a `Sum` is one sequential loop
@@ -951,7 +956,54 @@ Choices the implementation makes within the specification:
   These changes remove the identified
   parameter-sized resident families and the duplicate trapdoor payload.
   The arithmetic diagnostic is not a complete planner peak or a certification of the 200 GB
-  budget. Host key generation still materializes input vectors before publishing them, and
+  budget. Before sharing the anchor across steps, a reduced-control obfuscation layout with `W=C=1`, 27 60-bit CRT primes, base
+  `2^6`, and 270 gadget digits plans 472,000,004 bytes at `n=128` and 943,744,004 bytes
+  at `n=256`. Linear extrapolation of these allocated ranges to `n=65536` gives
+  241,533,184,004 bytes: 210,503,467,008 bytes of shared scratch and 31,029,716,996 bytes
+  of other allocations. These measurements use 16 chain levels, one LWR coordinate of support weight one,
+  `Q=P=4`, one smudge digit, and two anchors; they exclude prepared native workspaces and
+  CUDA management overhead, and do not cover evaluation. The two anchors correspond to
+  the two-step diagnostic function, not a validated production step count. At the production
+  ring and CRT sizes, each full evaluation-domain polynomial occupies 14,155,776 bytes.
+  Before compact secret retention, one anchor's shared R/E storage contained
+  2,160 full polynomials (30,576,476,160 bytes),
+  and its 2 x 544 public matrix contains 1,088 polynomials (15,401,484,288 bytes).
+  Their combined payload is 45,977,960,448 bytes per anchor, excluding covariance leaves
+  and sampling workspaces. The previous per-step layout retained S times this payload.
+  Sharing the anchor retains only one such payload regardless of S. Before compact
+  secret retention, with the same
+  reduced controls and independent column/digit/CRT terms exposed as parallel loops, its
+  obfuscation layout plans 441,842,160 bytes at `n=128` and 883,477,488 bytes at `n=256`.
+  Their linear extrapolation gives 226,117,494,768 bytes at `n=65536`, including a fixed
+  206,832-byte term. This is a measured layout extrapolation, not a full production run;
+  the native-workspace, CUDA-overhead, evaluation, and control-size exclusions still apply.
+  Computational TrapGen now retains its R/E stack as signed-magnitude coefficients
+  with eight magnitude bytes and one sign byte. The native sampler already produces
+  signed i64 coefficients before reducing them into all CRT limbs, so the storage
+  bound `2^63` preserves every possible sample, including `i64::MIN`; no additional
+  truncation or resampling is introduced. R and E share views of that stack, whose
+  production payload is 1,274,019,840 bytes. A preimage consumer expands one private
+  stack and transforms it in place; that expansion is not cached across consumers.
+  Covariance leaves keep their full representation, and external trapdoor formats
+  remain unchanged. With compact retention, the same W=1, C=1 diagnostic measures
+  391,785,428 bytes at n=128 and 783,364,052 bytes at n=256, extrapolating to
+  200,488,462,292 bytes at n=65536 (3,059,208 bytes per n plus 206,804 fixed bytes).
+  This reduces the projected subtotal by about 25.63 GB, but still exceeds the
+  200 GB target even before the excluded overhead. Exposing the remaining CBD
+  block terms in `refresh_fresh_term` as a parallel reduction gives a subtotal of
+  200,523,826,628 bytes. Trying long-lived equal-size scratch allocations first,
+  and retaining the smaller placement per device, reduces that subtotal to
+  197,289,231,812 bytes (385,511,876 at n=128 and 770,842,052 at n=256).
+  The unchanged overlap rules still protect replay and parallel-lane lifetimes.
+  Retaining the actual prepared native resources for all 232 regions adds
+  1,849,232 bytes at n=128 and 2,545,552 at n=256: a projected 357,668,752 bytes,
+  bringing the layout-plus-native estimate to 197,646,900,564 bytes. This still
+  excludes CUDA Graph/context overhead and the full evaluation/production-control peak.
+  A diagnostic that also instantiated the CUDA Graphs at n=128 failed with GPU OOM
+  after about 462 seconds on the local device; the allocation-only diagnostic succeeds.
+  Consequently, a complete production fit remains unverified. The available production
+  capacity was subsequently clarified as 256 GB: this subtotal leaves about 58.35 GB
+  for the excluded contributions, rather than certifying that they fit that allowance. Host key generation still materializes input vectors before publishing them, and
   production artifact volume and execution time are not made practical by bounded VRAM.
   A graph-only run at the full production shape (48 chain levels) also exposes the existing
   64-bit index limit in hash tags during evaluation graph validation. The production member
@@ -961,9 +1013,17 @@ Choices the implementation makes within the specification:
   first-prime ring used by the output decoder. Refreshes stay at the root modulus; only
   the final plaintext is switched into the single-prime ring.
 - **Concurrency.** The application exposes independent instances, targets, their two
-  components, and obfuscation preimages as `parallel` loops. The generic GPU backend selects
+  components, columns, smudge digits, CRT recombination terms, and obfuscation preimages as `parallel` loops. The generic GPU backend selects
   the wave width and chunk size from measurements and its memory budget; DIO2 has no separate
-  concurrency controller. Step carries and accumulating reductions remain `iterate` loops.
+  concurrency controller. Step carries remain `iterate` loops. Independent matrix terms
+  use a parallel family followed by an ordered sum. The backend recognizes this exact
+  consumption pattern and accumulates each bounded wave without retaining the whole family;
+  the residency audit uses the same IR recognizer. Sequential ancestors use host replay when
+  needed so nested reductions retain planner-selected wave widths. For a summed loop,
+  the backend uses the largest divisor of its member count at or below the candidate wave
+  cap; this excludes inactive tail lanes from the sum without rejecting that candidate
+  for other loop sites. This does not parallelize
+  the internal PRF recurrences or change noise-sample identities.
   `W=1` is a capacity-diagnostic setting, not an application concurrency limit.
   Both the decoded-key lane and the evaluator's refreshed-component lane construct their
   scalar target families and padded anchor locally. Unused alternatives can end before
@@ -973,10 +1033,40 @@ Choices the implementation makes within the specification:
   parallel loop and combines their disjoint columns with the existing member-sum
   reduction, so this path has the same lane-local target placement.
   Generic graph sealing
-  rematerializes fixed-shape deterministic public hash matrices inside parallel bodies,
+  rematerializes fixed-shape deterministic public hash matrices inside lexical bodies,
+  including sequential loops. Initial carried values remain outside their loop; only
+  immutable hash captures move inside,
   preserving their key and exact tag metadata; fresh samplers and parameter-sized packed
   hash matrices remain captures. This avoids keeping those full public matrices across
   nested samplers without introducing DIO2-specific scheduling.
+  For a private, single-use pack of equal-shaped plain deterministic hashes with one
+  key, the physical backend selects the exact tag transcript on the device before
+  sampling one matrix. This preserves alternative prefixes and component framing;
+  it does not replace them with a new domain encoding. All alternative scalar tag
+  operands remain dependencies and are validated, even when not selected. Exported
+  candidates, other consumers, decomposed hashes, and fresh samplers are not elided.
+  This optimization is generic backend lowering; its production peak-memory benefit
+  must be measured separately from the payload estimates above.
+  The physical backend also rematerializes gadget decomposition and centered rebasing
+  at each consumer, retaining their smaller operands between uses. Immutable constant
+  matrices with identical resolved values, shapes, rings, and devices share one upload.
+  Complete regular gadgets and unit vectors instead use existing GPU fill kernels in
+  their consuming scope, allowing their dense payloads to participate in scratch
+  lifetime reuse; truncated and small gadgets keep the canonical upload path.
+  Within a scope, completed loops' ready deterministic consumers run before unrelated
+  later loops; independent deterministic branches are materialized only when needed.
+  Fresh random sampling, I/O, and loops retain their relative order and execute once.
+  Logical node identities, hash keys and tags, loop counts, and arithmetic stay unchanged.
+  Native loop bodies reuse temporary byte ranges only when initialization dominates
+  their uses; reuse adds dependencies from every previous terminal reader to the next
+  first writer. Captures, returned values, and host-managed imports remain excluded.
+  Later-wave resident members defer each distinct source allocation separately;
+  aliased views still share one copy. Their host bindings use persistent arena ranges
+  across complete replay lifetimes instead of pinning all outputs in one native buffer.
+  Internal trapdoor/public pairs follow their explicit physical readers; external
+  trapdoor handles retain their paired public storage. Graph scratch, wave-member, and
+  host-import arenas share storage only across disjoint region lifetimes. These are backend memory and scheduling decisions, not new application
+  parameters or changes to the noise model.
 - **Graph size.** Neither graph grows with the ring dimension, the number of primes, the label
   width, the smudge digits, the stream length or the number of chunks: every such count is a
   loop or family count (`graphs_do_not_grow_with_the_parameters` in

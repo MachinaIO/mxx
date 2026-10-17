@@ -570,9 +570,9 @@ pub fn refresh_combination(
 /// The fresh terms `[fresh_k z]_k` of the entries of a fresh child's component-1 row of
 /// `blocks` column blocks: `block(k)` gives the entries' block `k` (`1 x m` each, an index
 /// expression `k`), each times the one-column action `z` of `actions` and placed in column `k`
-/// ([`super::place_in_column`]). One sequential loop over the blocks reads each block where it
-/// is needed, so the row of every block is never formed and the graph does not grow with
-/// `blocks`.
+/// ([`super::place_in_column`]). Independent blocks are a parallel family consumed by its
+/// canonical sum. The backend chooses bounded wave width and streams the reduction without
+/// materializing every block. Graph size does not grow with `blocks`.
 pub fn refresh_fresh_term(
     blocks: usize,
     actions: &RefreshActions,
@@ -588,23 +588,29 @@ pub fn refresh_fresh_term(
             })
             .collect())
     };
-    let first = placed(&IntExpr::constant(0))?;
+    if blocks == 0 {
+        return Err(RnsBggError::Binding("fresh term requires at least one block"));
+    }
     if blocks == 1 {
-        return Ok(first);
+        return placed(&IntExpr::constant(0));
     }
     let mut failure = None;
-    let sum = mxx_dsl::iterate(blocks - 1, first, |index, sum| {
-        let index = index.add(1usize).expression()?;
-        let term = placed(&index).map_err(|error| {
+    let terms = mxx_dsl::parallel(blocks, |index| {
+        placed(&index.expression()?).map_err(|error| {
             failure = Some(error);
             mxx_dsl::DslError::Schema
-        })?;
-        Ok(sum.into_iter().zip(term).map(|(sum, term)| sum + term).collect())
+        })
     });
     if let Some(error) = failure {
         return Err(error);
     }
-    sum.map_err(|error| RnsBggError::Graph(error.to_string()))
+    let terms = terms.map_err(|error| RnsBggError::Graph(error.to_string()))?;
+    let add = |left: Vec<Mat>, right: Vec<Mat>| {
+        left.into_iter().zip(right).map(|(left, right)| left + right).collect::<Vec<_>>()
+    };
+    let initial = add(terms.at(0usize), terms.at(1usize));
+    mxx_dsl::iterate(blocks - 2, initial, |index, sum| Ok(add(sum, terms.at(index.add(2usize)))))
+        .map_err(|error| RnsBggError::Graph(error.to_string()))
 }
 
 /// The fresh term of a fresh child's component-1 row `row` of `blocks` equal column blocks:

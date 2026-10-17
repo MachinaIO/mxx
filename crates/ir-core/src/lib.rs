@@ -22,6 +22,7 @@ pub mod inventory;
 pub mod lean;
 pub mod merge;
 pub mod node;
+pub mod parallel_reduction;
 pub mod protocol;
 pub mod ring;
 mod serde_support;

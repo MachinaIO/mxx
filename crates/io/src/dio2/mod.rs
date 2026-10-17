@@ -3,14 +3,14 @@
 //! it.
 //!
 //! An obfuscation of a [`StreamingFunction`] fixes the obfuscator's chunks `y_i` and the initial
-//! state. It is one graph ([`obfuscate`]): the step input `S_0`, the anchors of every step, and,
+//! state. It is one graph ([`obfuscate`]): the step input `S_0`, the shared anchor, and,
 //! in parallel loops over the steps and chunks, the Static preprocessing of the uniform step
 //! Program ([`step::ChainProgram`]) with the key-only refresh composition ([`compose`]) whose
-//! decoded keys the anchors' preimages are sampled for. Its evaluation on the evaluator's chunks
-//! `x_i` is one graph too ([`evaluate`]): a sequential loop over the refreshing steps whose state
-//! is the step input `S_i` under the step's mask `s_i` runs the step Program on the chain of the
-//! root modulus (every level of `Q_0`) and the refresh of every target, decoded for every prime,
-//! to the next step's input under the mask `s_(i+1)` the σ sampler derived; the last step's
+//! decoded keys the shared anchor's preimages are sampled for. Its evaluation on the evaluator's
+//! chunks `x_i` is one graph too ([`evaluate`]): a sequential loop over the refreshing steps whose
+//! state is the step input `S_i` under the step's mask `s_i` runs the step Program on the chain of
+//! the root modulus (every level of `Q_0`) and the refresh of every target, decoded for every
+//! prime, to the next step's input under the mask `s_(i+1)` the σ sampler derived; the last step's
 //! output decoder follows the loop. Both compositions build their keys with the same helpers
 //! ([`carrier`]). [`claim`] connects the two graphs into the correctness protocol, and [`noise`]
 //! simulates every decoder.
@@ -82,7 +82,7 @@ pub fn anchor_columns(columns: usize) -> usize {
     UNMASK_ROWS * (columns + 2)
 }
 
-/// The coefficient bound of the anchors' preimages: the default cutoff of the trapdoor's
+/// The coefficient bound of the shared anchor's preimages: the default cutoff of the trapdoor's
 /// minimum preimage width at `trapdoor_sigma`.
 pub fn preimage_bound(parameters: &Dio2Parameters) -> Result<BigUint, Dio2Error> {
     default_preimage_cutoff(

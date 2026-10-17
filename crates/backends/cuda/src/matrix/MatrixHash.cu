@@ -178,6 +178,29 @@ namespace
         if (blockIdx.x != 0 || threadIdx.x != 0) return;
         *tag_length = 0;
         size_t cursor = 0;
+        // Selection must not suppress invalid operands of an eager hash family.
+        // Validate every U64 component and every selector before skipping any
+        // branch; no device-to-host read is needed to choose the transcript.
+        bool has_selection = false;
+        for (size_t part = 0; part < segment_count; ++part)
+            has_selection |= segments[part].kind == 5;
+        if (has_selection)
+        {
+            for (size_t part = 0; part < segment_count; ++part)
+            {
+                const auto segment = segments[part];
+                if (segment.kind == 0 || segment.kind == 4) continue;
+                if (segment.operand_index >= operand_count) goto invalid;
+                size_t words = 0;
+                bool negative = false;
+                if (!hash_operand_magnitude(operands[segment.operand_index], scratch,
+                        scratch_words, words, negative)) goto invalid;
+                if ((segment.kind == 3 || segment.kind == 5) && (negative || words > 1))
+                    goto invalid;
+                if (segment.kind == 5 &&
+                    (words ? scratch[0] : 0) >= segment.static_offset) goto invalid;
+            }
+        }
         for (size_t part = 0; part < segment_count; ++part)
         {
             const auto segment = segments[part];
@@ -194,6 +217,14 @@ namespace
             bool negative = false;
             if (!hash_operand_magnitude(operand, scratch, scratch_words, words, negative))
                 goto invalid;
+            if (segment.kind == 5) continue; // Selector validated above.
+            if (segment.kind == 4)
+            {
+                if (negative || words > 1) goto invalid;
+                if ((words ? scratch[0] : 0) != segment.static_offset)
+                    part += static_cast<size_t>(segment.static_length);
+                continue;
+            }
             if (segment.kind == 3)
             {
                 if (negative || words > 1 || tag_capacity - cursor < 9) goto invalid;
@@ -463,8 +494,12 @@ extern "C" int gpu_raw_hash_plan_create(
         }
         else
         {
-            if (segment.kind > 3 || segment.operand_index >= operand_count)
+            if (segment.kind > 5 || segment.operand_index >= operand_count)
                 return set_error("invalid raw hash dynamic tag segment");
+            if (segment.kind == 4 && segment.static_length > segment_count - part - 1)
+                return set_error("raw hash branch exceeds its segment list");
+            if (segment.kind == 5 && (!segment.static_offset || segment.static_length))
+                return set_error("invalid raw hash selector range");
             const int32_t encoding = operand_encodings[segment.operand_index];
             if (encoding < 0 || encoding == 2)
                 return set_error("invalid raw hash signed integer encoding");

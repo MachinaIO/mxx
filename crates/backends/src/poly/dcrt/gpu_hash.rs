@@ -82,6 +82,13 @@ pub enum GpuHashTagPart {
     Integer(usize),
     Decimal(usize),
     U64Le(usize),
+    /// Append exactly one branch's complete transcript, selected by a resident
+    /// nonnegative scalar. All U64Le operands are validated, including those in
+    /// unselected branches, preserving eager hash-family error semantics.
+    Select {
+        index: usize,
+        choices: Vec<Vec<GpuHashTagPart>>,
+    },
 }
 
 impl GpuHashTagPart {
@@ -187,36 +194,81 @@ impl GpuHashSamplePlan {
         }
         let mut segments = Vec::with_capacity(parts.len());
         let mut static_bytes = Vec::new();
-        for part in parts {
-            let (kind, operand_index, offset, length) = match part {
-                GpuHashTagPart::Static(bytes) => {
-                    let offset = u64::try_from(static_bytes.len()).map_err(|_| {
-                        GpuNativeGraphError::Native("raw hash static tag is too long".into())
-                    })?;
-                    let length = u64::try_from(bytes.len()).map_err(|_| {
-                        GpuNativeGraphError::Native("raw hash static tag is too long".into())
-                    })?;
-                    static_bytes.extend_from_slice(bytes);
-                    (0, 0, offset, length)
+        fn append_parts(
+            parts: &[GpuHashTagPart],
+            operand_count: usize,
+            segments: &mut Vec<GpuRawHashTagSegmentAbi>,
+            static_bytes: &mut Vec<u8>,
+        ) -> Result<(), GpuNativeGraphError> {
+            for part in parts {
+                let (kind, operand_index, offset, length) = match part {
+                    GpuHashTagPart::Static(bytes) => {
+                        let offset = u64::try_from(static_bytes.len()).map_err(|_| {
+                            GpuNativeGraphError::Native("raw hash static tag is too long".into())
+                        })?;
+                        let length = u64::try_from(bytes.len()).map_err(|_| {
+                            GpuNativeGraphError::Native("raw hash static tag is too long".into())
+                        })?;
+                        static_bytes.extend_from_slice(bytes);
+                        (0, 0, offset, length)
+                    }
+                    GpuHashTagPart::Integer(index) => (1, *index, 0, 0),
+                    GpuHashTagPart::Decimal(index) => (2, *index, 0, 0),
+                    GpuHashTagPart::U64Le(index) => (3, *index, 0, 0),
+                    GpuHashTagPart::Select { index, choices } => {
+                        if choices.is_empty() ||
+                            *index >= operand_count ||
+                            *index > u32::MAX as usize
+                        {
+                            return Err(GpuNativeGraphError::Native(
+                                "raw hash selection needs branches and a valid scalar operand"
+                                    .into(),
+                            ));
+                        }
+                        segments.push(GpuRawHashTagSegmentAbi {
+                            kind: 5,
+                            operand_index: *index as u32,
+                            static_offset: u64::try_from(choices.len()).map_err(|_| {
+                                GpuNativeGraphError::Native("too many raw hash branches".into())
+                            })?,
+                            static_length: 0,
+                        });
+                        for (branch, choice) in choices.iter().enumerate() {
+                            let guard = segments.len();
+                            segments.push(GpuRawHashTagSegmentAbi {
+                                kind: 4,
+                                operand_index: *index as u32,
+                                static_offset: branch as u64,
+                                static_length: 0,
+                            });
+                            append_parts(choice, operand_count, segments, static_bytes)?;
+                            segments[guard].static_length =
+                                u64::try_from(segments.len() - guard - 1).map_err(|_| {
+                                    GpuNativeGraphError::Native(
+                                        "raw hash branch is too long".into(),
+                                    )
+                                })?;
+                        }
+                        continue;
+                    }
+                };
+                if kind != 0 &&
+                    (operand_index >= operand_count || operand_index > u32::MAX as usize)
+                {
+                    return Err(GpuNativeGraphError::Native(
+                        "raw hash tag operand index is out of range".into(),
+                    ));
                 }
-                GpuHashTagPart::Integer(index) => (1, *index, 0, 0),
-                GpuHashTagPart::Decimal(index) => (2, *index, 0, 0),
-                GpuHashTagPart::U64Le(index) => (3, *index, 0, 0),
-            };
-            if kind != 0 &&
-                (operand_index >= operand_encodings.len() || operand_index > u32::MAX as usize)
-            {
-                return Err(GpuNativeGraphError::Native(
-                    "raw hash tag operand index is out of range".into(),
-                ));
+                segments.push(GpuRawHashTagSegmentAbi {
+                    kind,
+                    operand_index: operand_index as u32,
+                    static_offset: offset,
+                    static_length: length,
+                });
             }
-            segments.push(GpuRawHashTagSegmentAbi {
-                kind,
-                operand_index: operand_index as u32,
-                static_offset: offset,
-                static_length: length,
-            });
+            Ok(())
         }
+        append_parts(parts, operand_encodings.len(), &mut segments, &mut static_bytes)?;
         let mut encoding_codes = Vec::with_capacity(operand_encodings.len());
         for encoding in operand_encodings {
             if matches!(encoding, GpuSignedValuesEncoding::SignedWords(words)

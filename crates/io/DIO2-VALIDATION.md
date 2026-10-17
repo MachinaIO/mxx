@@ -67,3 +67,15 @@ The **194,753,785,856-byte projection is a sampler-plus-eight-rows payload envel
 Evidence: `codex-initial-stream-production-liveness.log`, `codex-initial-stream-liveness.log`, `codex-native-alias-capacity.log`, and `codex-native-alias-capacity_retained_rows.log`.
 
 The least-change decision is to preserve the existing hash transcript format instead of silently introducing an unvalidated wider cryptographic format. Whole-program production capacity remains unverified. No production end-to-end or multiple-physical-GPU acceptance is claimed.
+
+### Production hash-tag diagnostic
+
+A follow-up graph-only run at the full parameters localized the failure to tag
+component 5, evaluated as `318893230573092864000` (69 bits), exceeding `u64`.
+The validator now reports the component and value, while preserving the same
+acceptance rule and hash bytes. Boundary checks cover -1, 2^64-1 and 2^64;
+the existing runtime-operand type check also passes. Evidence:
+`codex-production-hash-tag-value.log` and `codex-hash-tag-diagnostic-unit.log`.
+The rejected value must not be truncated. The backend already has an integer
+hash-tag encoding distinct from U64Le; determining whether all member-tag
+producers/readers can migrate together remains separate from capacity acceptance.

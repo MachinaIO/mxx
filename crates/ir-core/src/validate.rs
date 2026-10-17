@@ -2361,15 +2361,22 @@ fn validate_hash_key_and_tag(
     for index in 1..node.args.len() {
         require_scalar(scope, values, node, index, is_integer, "integer")?;
     }
-    for component in tag_components {
+    for (component_index, component) in tag_components.iter().enumerate() {
         match component {
             HashTagComponent::Bytes(_) => {}
             HashTagComponent::Integer(expression) | HashTagComponent::Decimal(expression) => {
                 expression.evaluate(env)?;
             }
             HashTagComponent::U64Le(expression) => {
-                if expression.evaluate(env)?.to_u64().is_none() {
-                    return node_error(scope, node.id, "little-endian hash tag must fit in u64");
+                let value = expression.evaluate(env)?;
+                if value.to_u64().is_none() {
+                    return node_error(
+                        scope,
+                        node.id,
+                        &format!(
+                            "little-endian hash tag must fit in u64: component {component_index} evaluated to {value}"
+                        ),
+                    );
                 }
             }
             HashTagComponent::Operand(index) | HashTagComponent::OperandU64Le(index) => {
@@ -2979,6 +2986,44 @@ mod tests {
         let different = make_graph(crate::ring::test_ring(17 * 193, 8));
         let error = crate::ring::test_validate(&different, &ParamEnv::default()).unwrap_err();
         assert!(node_message(error).contains("cannot change their ordered CRT basis"));
+    }
+
+    #[test]
+    fn hash_u64_le_reports_out_of_range_component_value() {
+        let key_type = WireType::Bytes { length: IntExpr::constant(32) };
+        let key = value(
+            NodeKind::Input { name: "key".to_owned(), wire_type: key_type.clone(), artifact: None },
+            Vec::new(),
+            vec![key_type],
+        );
+        let limit = BigInt::from(1u8) << 64usize;
+        for integer in [BigInt::from(-1), &limit - 1, limit.clone()] {
+            let matrix_type = matrix_type(17, 1, 1);
+            let sample = value(
+                NodeKind::HashSample {
+                    matrix_type: matrix_type.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: Vec::new(),
+                    tag_components: vec![crate::node::HashTagComponent::U64Le(IntExpr::Const(
+                        integer.clone(),
+                    ))],
+                    base: None,
+                    digit_count: None,
+                },
+                vec![key.clone()],
+                vec![WireType::Matrix(matrix_type)],
+            );
+            let result =
+                crate::ring::test_validate(&graph("u64-le-boundary", sample), &ParamEnv::default());
+            if integer == &limit - 1 {
+                result.unwrap();
+            } else {
+                assert!(
+                    node_message(result.unwrap_err())
+                        .contains(&format!("component 0 evaluated to {integer}"))
+                );
+            }
+        }
     }
 
     #[test]

@@ -4698,8 +4698,9 @@ impl GpuRuntime {
     /// wave replays this range for its body, and a host-driven loop for its
     /// body in each iteration, so each of these nests in the other.
     ///
-    /// `host_loop` is the host-driven loop whose body this range is, not
-    /// entered again at its own start. `static_imports` is false after its
+    /// `host_loop` is the enclosing host-driven loop, retained when its body
+    /// dispatches nested waves so their selected carry imports are joined.
+    /// The loop is not entered again at its own start. `static_imports` is false after its
     /// first iteration: a loop's fixed imports are read once.
     /// Selected imports are joined only in the range that issued their request;
     /// a nested replay must not consume the same completion a second time.
@@ -4753,6 +4754,7 @@ impl GpuRuntime {
             };
             for import in selected.iter().filter(|import| {
                 import.before_operation == operation &&
+                    import.request_operation >= start &&
                     self.io_trial
                         .as_ref()
                         .is_none_or(|trial| trial.contains(import.request_operation))
@@ -4852,6 +4854,7 @@ impl GpuRuntime {
                             group_index,
                             parent_occurrence,
                             active_wave.map(|wave| wave.wave_index),
+                            host_loop,
                             &path,
                             active_wave.is_none() && host_loop.is_none(),
                             pump,
@@ -5003,6 +5006,7 @@ impl GpuRuntime {
         group_index: usize,
         parent_occurrence: Option<usize>,
         parent_wave_index: Option<usize>,
+        host_loop: Option<usize>,
         parent_path: &[u64],
         trial_root: bool,
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
@@ -5297,7 +5301,7 @@ impl GpuRuntime {
                 Some(&ActiveWave { wave_index, start_index, logical_path }),
                 Some(&imports),
                 pump,
-                None,
+                host_loop,
                 true,
             )?;
             plan.graph.check_controls(&plan.frame)?;

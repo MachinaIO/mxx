@@ -820,6 +820,86 @@ mod tests {
         println!("streamed matrix scratch: m=8 {} bytes; m=64 {} bytes", bytes[0], bytes[1]);
     }
 
+    /// Device-selected carry imports inside nested waves must join their enclosing host loop's I/O.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_nested_waves_join_selected_carry_imports() {
+        let (cpu, gpu, ring) = parameters();
+        let members = 4usize;
+        let context = DslContext::new("nested-selected-carry-imports");
+        let selector: Int = context.input("selector", mxx_dsl::IntType).unwrap();
+        let seed = usize::from(rand::random::<u16>());
+        let initial =
+            parallel(members, |member| Ok(ring.polynomial([member.expression()? + seed]))).unwrap();
+        let result = iterate(crate::env::test_streamed_steps(), initial, |step, state| {
+            parallel(members, |member| {
+                let terms = parallel(2usize, |inner| {
+                    let index = selector.clone().add(member.clone()).add(inner).rem(members);
+                    Ok(state.at(index) + ring.polynomial([step.expression()? + 1]))
+                })?;
+                Ok(terms.at(0usize) + terms.at(1usize))
+            })
+        })
+        .unwrap();
+        let graph = context
+            .output("first", result.at(0usize))
+            .unwrap()
+            .output("last", result.at(members - 1))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), 0.into()..=(members - 1).into());
+        let inputs = BTreeMap::from([(
+            "selector".into(),
+            RuntimeValue::Int(rand::random_range(0..members).into()),
+        )]);
+        let expected = execute(
+            &graph,
+            &mut cpu_backend([cpu]),
+            inputs.clone(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let mut plan = runtime.plan_with_fixed_geometry_for_test(graph, &inputs, 1, 4).unwrap();
+        let frame = plan.physical_frame_for_test();
+        assert!(
+            frame.external_io_loops.iter().any(|body| body.imports.iter().any(|import| {
+                frame.waves.iter().any(|wave| {
+                    wave.body_start <= import.request_operation &&
+                        import.before_operation < wave.body_end
+                })
+            })),
+            "exercise a host-loop import requested and consumed inside a nested wave"
+        );
+        for _ in 0..3 {
+            let result = runtime
+                .execute_with_artifacts(
+                    &mut plan,
+                    inputs.clone(),
+                    &mut MemoryArtifactStore::default(),
+                    rand::random(),
+                )
+                .unwrap();
+            for name in ["first", "last"] {
+                let actual = runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs[name] else {
+                    panic!("CPU matrix output")
+                };
+                assert_eq!(&actual, expected.as_cpu_full().unwrap(), "{name}");
+            }
+        }
+    }
+
     /// Immutable artifact initials and alias/zero-count carries survive multiple invocations.
     #[test]
     #[ignore = "requires a CUDA GPU"]

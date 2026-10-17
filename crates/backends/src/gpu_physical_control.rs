@@ -7710,83 +7710,49 @@ fn lower_sequential_loop(
 fn replay_matrix_owner(
     ctx: &PhysicalLoweringContext<'_>,
     id: PhysicalValueId,
+    replacements: &mut std::collections::HashMap<*const (), BoundStorage>,
 ) -> Result<Arc<GpuResidentValue>, String> {
-    let planned = ctx
-        .values
-        .get(id.0 as usize)
-        .ok_or_else(|| "GPU loop member has no physical metadata".to_owned())?;
-    let slot = planned
-        .parts
-        .first()
-        .ok_or_else(|| "GPU loop member has no physical part".to_owned())?
-        .storage;
     let template = ctx.owners.get(&id).ok_or("GPU loop member has no planned owner")?;
-    if planned.parts.iter().all(|part| part.storage == slot) {
-        // The owner takes the frozen member's layout at an arena range of its own,
-        // chosen with the plan's scratch for the member's live span.
-        let bytes = template
-            .storage(slot)
-            .map(|storage| storage.bytes)
-            .ok_or_else(|| "GPU loop member has no planned storage".to_owned())?;
-        let storage =
-            crate::gpu_graph_memory::deferred_replay_storage(ctx.device, planned.ty.clone(), bytes);
-        return GpuResidentValue::new(
-            Arc::new(planned.clone()),
-            BTreeMap::from([(slot, storage)]),
-            Box::new([]),
-        )
-        .map(Arc::new)
-        .map_err(str::to_owned);
-    }
-    // Packed family members name each CRT part with its own storage slot.
-    // Several slots may still view one allocation. Preserve those aliases and
-    // every relative address while giving the replay its own allocations.
-    let mut spans = BTreeMap::<usize, (u64, u64)>::new();
-    let mut slots = BTreeMap::new();
-    for part in planned.parts.iter() {
-        let bound = template.storage(part.storage).ok_or("GPU loop member lost a storage slot")?;
-        if bound.device != ctx.device || part.device != ctx.device {
-            return Err("GPU loop member replay crosses devices".into());
+    // Different output ports can be views of the same produced allocation.
+    // One wave must replay that allocation once, preserving all port aliases.
+    for (_, bound) in template.storages() {
+        let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+        if replacements.contains_key(&pointer) {
+            continue;
         }
-        let end = bound
-            .address
-            .checked_add(bound.bytes)
-            .ok_or("GPU loop member storage address overflows")?;
-        let key = Arc::as_ptr(&bound.owner).cast::<()>() as usize;
-        let span = spans.entry(key).or_insert((bound.address, end));
-        span.0 = span.0.min(bound.address);
-        span.1 = span.1.max(end);
-        slots.insert(part.storage, (key, bound.clone()));
-    }
-    let stream = ctx
-        .backend
-        .parameters_on_device(ctx.device)?
-        .native_launch_stream(ctx.device)
-        .map_err(|error| error.to_string())?;
-    let mut buffers = BTreeMap::new();
-    for (&key, &(start, end)) in &spans {
-        let bytes =
-            usize::try_from(end - start).map_err(|_| "GPU loop member size exceeds usize")?;
-        let buffer = Arc::new(
-            crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(&stream, bytes)
-                .map_err(|error| error.to_string())?,
-        );
-        buffers.insert(key, buffer);
-    }
-    let mut storage = BTreeMap::new();
-    for (slot, (key, bound)) in slots {
-        let buffer = Arc::clone(&buffers[&key]);
-        let address = (buffer.as_ptr() as u64)
-            .checked_add(bound.address - spans[&key].0)
-            .ok_or("GPU replay member storage address overflows")?;
-        storage.insert(
-            slot,
-            BoundStorage { device: ctx.device, address, bytes: bound.bytes, owner: buffer },
+        let mut start = bound.address;
+        let mut end =
+            bound.address.checked_add(bound.bytes).ok_or("GPU replay allocation span overflows")?;
+        for alias in ctx.owners.viewing(pointer) {
+            for (_, other) in ctx.owners[&alias].storages() {
+                if Arc::ptr_eq(&bound.owner, &other.owner) {
+                    if other.device != ctx.device {
+                        return Err("GPU loop member replay crosses devices".into());
+                    }
+                    start = start.min(other.address);
+                    end = end.max(
+                        other
+                            .address
+                            .checked_add(other.bytes)
+                            .ok_or("GPU replay allocation span overflows")?,
+                    );
+                }
+            }
+        }
+        replacements.insert(
+            pointer,
+            crate::gpu_graph_memory::deferred_replay_storage(
+                ctx.device,
+                template.wire_type().clone(),
+                end - start,
+            ),
         );
     }
-    GpuResidentValue::new(Arc::new(planned.clone()), storage, Box::new([]))
+    template
+        .rebound(replacements, &[])
+        .map_err(str::to_owned)?
         .map(Arc::new)
-        .map_err(str::to_owned)
+        .ok_or_else(|| "GPU replay member has no storage".to_owned())
 }
 
 /// A parallel loop whose body is only scalar Int/Bool arithmetic and family
@@ -9064,6 +9030,7 @@ fn lower_parallel_loop(
             });
             wave.import_template_indices.push(template_index);
         }
+        let mut replay_allocations = std::collections::HashMap::new();
         for (lane, ids) in result_ids.iter().enumerate() {
             for (port, id) in ids.iter().copied().enumerate() {
                 // A streamed member lives only until its wave's export, so
@@ -9083,7 +9050,7 @@ fn lower_parallel_loop(
                             .ok_or_else(|| "GPU first-wave output owner is missing".to_owned())?,
                     )
                 } else {
-                    replay_matrix_owner(ctx, id)?
+                    replay_matrix_owner(ctx, id, &mut replay_allocations)?
                 };
                 // A streamed or summed member keeps its owner in every wave,
                 // so no wave rebinds it and its memory stays plan scratch.
@@ -10988,6 +10955,79 @@ mod tests {
         }
     }
 
+    /// A produced matrix and its slices share one allocation across output ports.
+    /// Later waves must preserve those aliases without overwriting earlier members.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_parallel_output_slices_preserve_replay_aliases() {
+        let dimension = std::env::var("MXX_TEST_SCRATCH_RING_DIMENSION")
+            .map_or(16, |v| v.parse::<u32>().unwrap());
+        let count =
+            std::env::var("MXX_TEST_SCRATCH_MEMBERS").map_or(3, |v| v.parse::<usize>().unwrap());
+        assert!(count >= 2);
+        let params = DCRTPolyParams::new(dimension, 2, 20, 4, None, None);
+        let gpu = GpuDCRTPolyParams::new(dimension, params.to_crt().0, 4, None);
+        let ring = Ring::from_crt_moduli(
+            gpu.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            dimension,
+        );
+        let key = ring.bytes_input("key", 32);
+        let members = parallel(count, |index| {
+            let mut tag = mxx_dsl::HashTag::from(b"replayed-output-slices".as_slice());
+            tag.push(index);
+            let full = ring.hash_matrix(key.clone(), tag, (1, 2));
+            let slice = |start| {
+                full.clone().slice(
+                    None,
+                    Some(mxx_ir_core::node::IndexRange {
+                        start: IntExpr::constant(start),
+                        end: IntExpr::constant(start + 1),
+                    }),
+                )
+            };
+            Ok((full.clone(), slice(0), slice(1)))
+        })
+        .unwrap();
+        let validated = DslContext::new("replayed-output-slices")
+            .output("full", members.field(|(full, _, _)| full).unwrap())
+            .unwrap()
+            .output("left", members.field(|(_, left, _)| left).unwrap())
+            .unwrap()
+            .output("right", members.field(|(_, _, right)| right).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = BTreeMap::from([(
+            "key".into(),
+            RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec().into()),
+        )]);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(1).unwrap();
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let result = runtime
+            .execute_with_artifacts(
+                &mut plan,
+                inputs,
+                &mut MemoryArtifactStore::default(),
+                rand::random(),
+            )
+            .unwrap();
+        let full = result.output("full").unwrap();
+        for member in 0..count {
+            let expected = runtime.download_matrix_member_output(&full, member).unwrap();
+            for (column, name) in ["left", "right"].into_iter().enumerate() {
+                let actual = runtime
+                    .download_matrix_member_output(&result.output(name).unwrap(), member)
+                    .unwrap();
+                assert_eq!(actual.entry(0, 0).to_bytes(), expected.entry(0, column).to_bytes());
+            }
+        }
+    }
+
     /// A host integer family read per lane is rebound on every execute: each
     /// wave, the tail included, reads the members supplied to that execute.
     #[test]
@@ -11491,6 +11531,61 @@ mod tests {
         .production_id
         .expect("producer identity");
         (cpu_params, gpu_params, ring, production)
+    }
+
+    /// Forwarded artifact members must follow both read-ahead lanes on every wave.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_streamed_artifact_identity_preserves_every_member() {
+        use mxx_ir_core::artifact::ArtifactAvailability;
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        assert!(count >= 4);
+        let mut store = MemoryArtifactStore::default();
+        let (_, gpu, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let expected = member_keys(&production, count)
+            .iter()
+            .map(|key| store.load(key, &manifest.artifacts["members"]).unwrap())
+            .collect::<Vec<_>>();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let graph = DslContext::new("streamed-artifact-identity")
+            .transferred_output("forwarded", parallel(count, |i| Ok(members.at(i))).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 2).unwrap();
+        for replay in 0..2 {
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let production = result.production_id.unwrap();
+            let manifest = store.load_finalized_manifest(&production).unwrap();
+            for member in 0..count {
+                let key = ArtifactKey {
+                    production: production.clone(),
+                    name: "forwarded".into(),
+                    index: Some(member),
+                };
+                let actual = store.load(&key, &manifest.artifacts["forwarded"]).unwrap();
+                assert_eq!(actual, expected[member], "replay {replay}, member {member}");
+            }
+        }
     }
 
     fn member_keys(production: &ProductionId, count: usize) -> Vec<ArtifactKey> {

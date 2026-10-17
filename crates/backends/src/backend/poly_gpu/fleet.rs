@@ -783,7 +783,10 @@ impl GpuPreparedNativeResources {
         physical_device: i32,
         stream: &GpuNativeLaunchStream,
     ) -> Result<(), GpuNativeGraphError> {
-        for (device, plan) in self.rns_conversions.values() {
+        // Static CRT conversions upload metadata asynchronously too; their
+        // consumers must wait for allocation and upload before graph launch.
+        for (device, plan) in self.modulus_conversions.values().chain(self.rns_conversions.values())
+        {
             if *device == physical_device {
                 plan.prepare_graph_launch(stream)?;
             }

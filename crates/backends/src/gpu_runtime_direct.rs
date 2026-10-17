@@ -4752,18 +4752,16 @@ impl GpuRuntime {
             // Zip inputs and refresh family views without copying payloads.
             let mut view_sources = BTreeSet::new();
             for borrowed in plan.frame.waves[wave_index].borrowed_outputs.clone() {
-                let source = if plan.frame.waves[wave_index]
-                    .zip_sources
-                    .iter()
-                    .any(|(_, _, id)| *id == borrowed.source)
-                {
-                    plan.frame.waves[wave_index].owner_bindings.get(&borrowed.source)
-                } else {
-                    plan.frame.owners.get(&borrowed.source)
-                }
-                .ok_or_else(|| {
-                    GpuRuntimeError::Execution("borrowed wave input is absent".into())
-                })?;
+                // Artifact imports also bind alternating read-ahead owners for this
+                // wave. A borrowed result must follow that binding, just like a
+                // resident Zip input, rather than retaining the previous wave.
+                let source = plan.frame.waves[wave_index]
+                    .owner_bindings
+                    .get(&borrowed.source)
+                    .or_else(|| plan.frame.owners.get(&borrowed.source))
+                    .ok_or_else(|| {
+                        GpuRuntimeError::Execution("borrowed wave input is absent".into())
+                    })?;
                 // A borrowed output may expose only a tail of its input.
                 // Canonicalize the input's complete allocation spans before
                 // redirecting the current template's other views of them.

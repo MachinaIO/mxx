@@ -41,6 +41,17 @@ column slice. This replaces the old one-hot-column concatenation proofs.
 The exporter also eliminates the identity helper-copy witnesses in encryption.
 `PeEncrypt.lean.in` uses the resulting definitional equalities directly.
 
+## One-bit plaintext contract
+
+The plaintext input and decoded result are `Fin 1 → Int`, with the input constrained
+to zero or one. Encryption lifts that bit to a constant polynomial. `PePrelude`
+defines `oneBitCoefficients` and proves this lift equals a coefficient vector whose
+constant coefficient is the input bit and whose other coefficients are zero.
+The generic all-coefficient `decrypt_bits` theorem is unchanged. `PeCertificate`
+instantiates it with this vector, and `PeDecodeRoot` / `PeDecodeLink` select only
+the constant coefficient to prove the exported one-bit claim. These adaptations
+live in the `.lean.in` templates and are reproduced by `gen_all.py`.
+
 ## Regeneration and validation
 
 Regenerate the definitions from the protocol DSL first, from the repository root:
@@ -104,3 +115,13 @@ The certificate concerns the generated DSL relations and their mathematical
 primitive and sampling semantics. It does not certify CUDA kernels, GPU memory
 lifetimes, checkpoint serialization, or a correspondence between those runtime
 implementations and the relations. Runtime round trips are validated separately.
+
+Validation on 2026-10-18 for the one-bit export succeeded with `lake build PeProof`
+(2852 jobs). The existing five tactic-linter warnings remain; the changed proofs
+introduce no additional warnings. The certificate and `run_correct` retain only
+`propext`, `Classical.choice`, and `Quot.sound`; `margin` uses only `propext`.
+The generic `decrypt_bits` theorem and its error bounds are unchanged.
+
+The combined `lake build PeGenerated PeProof` also passed (2858 jobs). Re-running
+`gen_all.py` preserved all 84 proof modules and all 26 exported modules byte for
+byte. The generated one-bit claim was not edited by the proof generators.

@@ -18,6 +18,14 @@ namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
 
+/-- Embed the one-bit plaintext in the constant coefficient; other coefficients are zero. -/
+def oneBitCoefficients (m : Fin 1 → Int) : Fin N → Int :=
+  fun k ↦ if k = 0 then m 0 else 0
+
+@[simp] theorem polynomialOfCoefficients_oneBit (m : Fin 1 → Int) :
+    polynomialOfCoefficients (q := Q) (oneBitCoefficients m) = (m 0 : ExactPoly Q N) := by
+  simp [polynomialOfCoefficients, oneBitCoefficients, ite_mul]
+
 /-- The law of the prelude samples. -/
 abbrev preludeLaw : SamplerLaw := .gaussian (319 / 100) 31
 
@@ -128,7 +136,7 @@ set_option maxHeartbeats 16000000 in
 component, each with its Gaussian error. -/
 theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Nat}
     {secret : ExactMatrix Q N 1 1} {x : Fin 2 → Int} {key : ByteArray} {BQ : ExactMatrix PQ N 1 295}
-    {m : Fin N → Int} {outputs : PreludeOutputs}
+    {m : Fin 1 → Int} {outputs : PreludeOutputs}
     (h : Stage_prelude.generatedRoot Backend.backend model tape path GeneratedClaim.stage_3_params
       (secret, key, x, BQ, m, ()) outputs)
     {sm : ErrorPoly N} (hsecret : secret = fun _ _ ↦ reducePoly Q N sm) (hs : polyNorm sm ≤ 1)
@@ -141,7 +149,7 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     CoeffBound (anchorErr tape path) 31 ∧
     outputs.2.2.2.2.2.1 = reducePoly Q N sm • messageRow model key 0 + messageRow model key 1 +
       reduceMatrix Q N 1 1 (messageErr tape path) +
-      ((halfQ : ExactPoly Q N) • (fun _ _ ↦ polynomialOfCoefficients m) : ExactMatrix Q N 1 1) ∧
+      ((halfQ : ExactPoly Q N) • (fun _ _ ↦ polynomialOfCoefficients (oneBitCoefficients m)) : ExactMatrix Q N 1 1) ∧
     CoeffBound (messageErr tape path) 31 := by
   obtain ⟨w, hbody⟩ := h
   let ctx : Stage_prelude.generatedRoot.Ctx Backend.backend model tape path GeneratedClaim.stage_3_params :=
@@ -156,7 +164,14 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
   have hw10 : Stage_prelude.generatedRoot.w_10_0 ctx = anchorSecond model key := hashSample_eq F.c0.h10_0
   have hw14 : Stage_prelude.generatedRoot.w_14_0 ctx = messageRow model key 0 := hashSample_eq F.c0.h14_0
   have hw16 : Stage_prelude.generatedRoot.w_16_0 ctx = messageRow model key 1 := hashSample_eq F.c0.h16_0
-  have hw22 : Stage_prelude.generatedRoot.w_22_0 ctx = fun _ _ ↦ polynomialOfCoefficients m := F.c0.h22_0
+  have hw22 : Stage_prelude.generatedRoot.w_22_0 ctx = m 0 := by
+    obtain ⟨index, _, hvalue⟩ := F.c0.h22_0
+    simpa only [Subsingleton.elim index 0] using hvalue
+  have hw23 : Stage_prelude.generatedRoot.w_23_0 ctx =
+      fun _ _ ↦ polynomialOfCoefficients (oneBitCoefficients m) := by
+    rw [Stage_prelude.generatedRoot.w_23_0, hw22]
+    simp only [polynomialOfCoefficients_oneBit]
+    rfl
   rw [F.c0.hout]
   refine ⟨fun i j ↦ ?_, ?_, hb10, ?_, hb16⟩
   · have hi := F.c0.h6_1 i
@@ -170,8 +185,8 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     rfl
   · show matrixAdd (matrixAdd (matrixAdd (matrixMulScalarLeft secret (Stage_prelude.generatedRoot.w_14_0 ctx))
       (Stage_prelude.generatedRoot.w_16_0 ctx)) (Stage_prelude.generatedRoot.w_18_0 ctx))
-      (matrixMulScalarLeft (matrixPolynomial [halfQ]) (Stage_prelude.generatedRoot.w_22_0 ctx)) = _
-    rw [hw14, hw16, he16, hw22, hsecret]
+      (matrixMulScalarLeft (matrixPolynomial [halfQ]) (Stage_prelude.generatedRoot.w_23_0 ctx)) = _
+    rw [hw14, hw16, he16, hw23, hsecret]
     funext r c
     rw [Subsingleton.elim r 0, Subsingleton.elim c 0]
     simp only [matrixAdd, matrixMulScalarLeft_eq, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul,

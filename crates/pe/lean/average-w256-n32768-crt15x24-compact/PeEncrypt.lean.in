@@ -89,7 +89,7 @@ set_option maxHeartbeats 16000000 in
 /-- The streamed helper ciphertexts are published by the prelude. -/
 theorem prelude_helpers {model : HashModel} {tape : SampleTape} {path : List Nat}
     {secret : ExactMatrix Q N 1 1} {key : ByteArray} {x : Fin 2 → Int}
-    {BQ : ExactMatrix PQ N 1 295} {message : Fin N → Int} {outputs : PreludeOutputs}
+    {BQ : ExactMatrix PQ N 1 295} {message : Fin 1 → Int} {outputs : PreludeOutputs}
     (h : Stage_prelude.generatedRoot Backend.backend model tape path GeneratedClaim.stage_3_params
       (secret, key, x, BQ, message, ()) outputs)
     {sm : ErrorPoly N} (hsecret : secret = fun _ _ ↦ reducePoly Q N sm) :

@@ -95,7 +95,12 @@ theorem run_correct {model : HashModel} {external : GeneratedClaim.ExternalInput
   have hbits := decrypt_bits (A := keyOf (Stage_preprocess.generatedRoot.w_236_0 ⟨_, pw⟩,
       Stage_preprocess.generatedRoot.w_242_0 ⟨_, pw⟩, Stage_preprocess.generatedRoot.w_248_0 ⟨_, pw⟩,
       Stage_preprocess.generatedRoot.w_254_0 ⟨_, pw⟩, ()))
-    hs (fun k ↦ by have := hmb k; omega) hem hcm hEb (by unfold roundedAnchor; exact hW) hEc (by unfold compressedAnchor; exact hC) hp'b
+    hs (fun k ↦ by
+      by_cases hk : k = 0
+      · have hb := hmb 0
+        simp only [oneBitCoefficients, if_pos hk]
+        omega
+      · simp [oneBitCoefficients, hk]) hem hcm hEb (by unfold roundedAnchor; exact hW) hEc (by unfold compressedAnchor; exact hC) hp'b
       (fun i ↦ (hsC i).2.2) (fun i ↦ (hsI i).2.2) (fun q ↦ (hsv q).2.2) hkFb
       (fun i ↦ by
         rw [hB0]

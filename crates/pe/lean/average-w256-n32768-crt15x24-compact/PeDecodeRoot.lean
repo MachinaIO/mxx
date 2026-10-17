@@ -21,7 +21,7 @@ noncomputable def compressedAnchor (model : HashModel) (key : ByteArray)
 set_option maxHeartbeats 16000000 in
 theorem decode_phase {model : HashModel} {tape : SampleTape} {path : List Nat}
     {ctx : Stage_decode.generatedRoot.Ctx Backend.backend model tape path GeneratedClaim.stage_9_params}
-    {o : Fin N → Int} (F : Stage_decode.generatedRoot.Facts ctx o) :
+    {o : Fin 1 → Int} (F : Stage_decode.generatedRoot.Facts ctx o) :
     let key := Stage_decode.generatedRoot.w_1_0 ctx
     let bQ := Stage_decode.generatedRoot.w_5_0 ctx
     let phase := (Stage_decode.generatedRoot.w_0_0 ctx - messageRow model key 1) -
@@ -33,7 +33,7 @@ theorem decode_phase {model : HashModel} {tape : SampleTape} {path : List Nat}
         (joinRow ![Stage_decode.generatedRoot.w_39_0 ctx, Stage_decode.generatedRoot.w_40_0 ctx] -
           joinRow ![Stage_decode.generatedRoot.w_42_0 ctx, Stage_decode.generatedRoot.w_43_0 ctx]) *
           Stage_decode.generatedRoot.w_46_0 ctx)
-    ∀ k : Fin N, o k = ((2 * (((phase 0 0).coeff k).val : Int) + (Q : Int) / 2) / (Q : Int)) % 2 := by
+    ∀ k : Fin 1, o k = ((2 * (((phase 0 0).coeff (0 : Fin N)).val : Int) + (Q : Int) / 2) / (Q : Int)) % 2 := by
   intro key bQ phase
   have e2 : Stage_decode.generatedRoot.w_2_0 ctx = messageRow model key 1 := hashSample_eq F.c0.h2_0
   have e7 : Stage_decode.generatedRoot.w_7_0 ctx = anchorSecond model key := hashSample_eq F.c0.h7_0
@@ -109,9 +109,10 @@ theorem decode_phase {model : HashModel} {tape : SampleTape} {path : List Nat}
   intro k
   rw [F.c1.hout]
   obtain ⟨-, -, -, -, idx, hidx, -, hval⟩ := F.c1.h50_0 k
-  have : idx = k := Fin.ext (by exact_mod_cast hidx)
-  subst this
-  show Stage_decode.generatedRoot.w_50_0 ctx idx = _
+  have hk : k = 0 := Subsingleton.elim _ _
+  have hi : idx = (0 : Fin N) := Fin.ext (by simpa [hk] using hidx)
+  rw [hi] at hval
+  show Stage_decode.generatedRoot.w_50_0 ctx k = _
   rw [hval, hphase]
 
 end PeProof

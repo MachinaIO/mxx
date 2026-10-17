@@ -13,15 +13,15 @@ set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Witness where
 
-abbrev generatedRoot.constraints_0 (w_0_0 : Fin 32768 → Int) (outputs : Fin 32768 → Int) : Prop :=
+abbrev generatedRoot.constraints_0 (w_0_0 : Fin 1 → Int) (outputs : Fin 1 → Int) : Prop :=
   outputs = w_0_0
 
-abbrev generatedRoot.body (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (inputs : Fin 32768 → Int) (outputs : Fin 32768 → Int) (_witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (inputs : Fin 1 → Int) (outputs : Fin 1 → Int) (_witness : generatedRoot.Witness) : Prop :=
   let _params := params
-  let w_0_0 : Fin 32768 → Int := inputs
+  let w_0_0 : Fin 1 → Int := inputs
   generatedRoot.constraints_0 w_0_0 outputs
 
-def generatedRoot (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : Fin 32768 → Int) (outputs : Fin 32768 → Int) : Prop :=
+def generatedRoot (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : Fin 1 → Int) (outputs : Fin 1 → Int) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body tape path params inputs outputs witness
 

@@ -33,7 +33,7 @@ local notation "mxxMat9" => Mxx.Primitives.ExactMatrix mxxNat0 32768 60 1
 structure ExternalInputs where
   input_0 : ByteArray
   input_1 : Fin 2 → Int
-  input_2 : Fin 32768 → Int
+  input_2 : Fin 1 → Int
   input_3 : Int
   input_4 : Int
   input_5 : Fin 2 → Int
@@ -42,7 +42,7 @@ structure ExternalInputs where
 def ValidExternals (external : ExternalInputs) : Prop :=
   (external.input_0).size = 32 ∧
   (∀ contract_i_0 : Fin 2, ((0 : Int) ≤ (external.input_1 contract_i_0) ∧ (external.input_1 contract_i_0) ≤ (248 : Int))) ∧
-  (∀ contract_i_0 : Fin 32768, ((0 : Int) ≤ (external.input_2 contract_i_0) ∧ (external.input_2 contract_i_0) ≤ (1 : Int))) ∧
+  (∀ contract_i_0 : Fin 1, ((0 : Int) ≤ (external.input_2 contract_i_0) ∧ (external.input_2 contract_i_0) ≤ (1 : Int))) ∧
   ((1 : Int) ≤ external.input_3 ∧ external.input_3 ≤ (1 : Int)) ∧
   ((0 : Int) ≤ external.input_4 ∧ external.input_4 ≤ (0 : Int)) ∧
   (∀ contract_i_0 : Fin 2, ((0 : Int) ≤ (external.input_5 contract_i_0) ∧ (external.input_5 contract_i_0) ≤ (1 : Int))) ∧
@@ -58,9 +58,9 @@ structure Execution where
   «stage_6» : Fin 256 → mxxMat6
   «stage_7» : (Fin 256 → mxxMat7) × (Fin 256 → mxxMat8) × (Fin 256 → mxxMat2) × mxxMat9 × Unit
   «stage_8» : mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × mxxMat3 × Unit
-  «stage_9» : Fin 32768 → Int
+  «stage_9» : Fin 1 → Int
   «requirement_0» : Bool
-  «ideal» : Fin 32768 → Int
+  «ideal» : Fin 1 → Int
 
 def stage_0_params : Stage_setup_trapdoor.Params := { «unit» := () }
 

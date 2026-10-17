@@ -249,10 +249,10 @@ def generatedRoot.w_48_0  (ctx : generatedRootCtx) : mxxMat0 :=
 def generatedRoot.w_49_0  (ctx : generatedRootCtx) : mxxMat0 :=
   MxxRuntime.matrixSub (generatedRoot.w_3_0 ctx) (generatedRoot.w_48_0 ctx)
 
-def generatedRoot.w_50_0  (ctx : generatedRootCtx) : Fin 32768 → Int :=
+def generatedRoot.w_50_0  (ctx : generatedRootCtx) : Fin 1 → Int :=
   ctx.witness.w_50_0
 
-def generatedRoot.outs  (ctx : generatedRootCtx) : Fin 32768 → Int :=
+def generatedRoot.outs  (ctx : generatedRootCtx) : Fin 1 → Int :=
   (generatedRoot.w_50_0 ctx)
 
 structure generatedRoot.Facts_0  (ctx : generatedRootCtx) : Prop where
@@ -289,29 +289,29 @@ structure generatedRoot.Facts_0  (ctx : generatedRootCtx) : Prop where
   h35_0 : MxxRuntime.concatColumns (generatedRoot.w_33_0 ctx) (generatedRoot.w_34_0 ctx) (generatedRoot.w_35_0 ctx)
   t31 : 0 ≤ (256)
 
-theorem generatedRoot.facts_0  {ctx : generatedRootCtx} {outputs : Fin 32768 → Int}
+theorem generatedRoot.facts_0  {ctx : generatedRootCtx} {outputs : Fin 1 → Int}
     (h : generatedRoot.constraints_0 backend hashModel tape path params (generatedRoot.w_1_0 ctx) (generatedRoot.w_5_0 ctx) (generatedRoot.w_10_0 ctx) (generatedRoot.w_27_0 ctx) (generatedRoot.w_2_0 ctx) (generatedRoot.w_4_0 ctx) (generatedRoot.w_6_0 ctx) (generatedRoot.w_7_0 ctx) (generatedRoot.w_8_0 ctx) (generatedRoot.w_9_0 ctx) (generatedRoot.w_11_0 ctx) (generatedRoot.w_12_0 ctx) (generatedRoot.w_13_0 ctx) (generatedRoot.w_14_0 ctx) (generatedRoot.w_15_0 ctx) (generatedRoot.w_16_0 ctx) (generatedRoot.w_17_0 ctx) (generatedRoot.w_19_0 ctx) (generatedRoot.w_20_0 ctx) (generatedRoot.w_21_0 ctx) (generatedRoot.w_22_0 ctx) (generatedRoot.w_23_0 ctx) (generatedRoot.w_24_0 ctx) (generatedRoot.w_26_0 ctx) (generatedRoot.w_28_0 ctx) (generatedRoot.w_33_0 ctx) (generatedRoot.w_34_0 ctx) (generatedRoot.w_35_0 ctx)) :
     generatedRoot.Facts_0 ctx :=
   ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2⟩
 
-structure generatedRoot.Facts_1  (ctx : generatedRootCtx) (outputs : Fin 32768 → Int) : Prop where
+structure generatedRoot.Facts_1  (ctx : generatedRootCtx) (outputs : Fin 1 → Int) : Prop where
   h37_0 : MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat0) => sequential_generatedRoot_37 backend hashModel tape (path ++ [37, i]) params i (current, ((generatedRoot.w_31_0 ctx), ((generatedRoot.w_32_0 ctx), ((generatedRoot.w_1_0 ctx), ((generatedRoot.w_35_0 ctx), ((generatedRoot.w_36_0 ctx), ())))))) next) (Int.toNat (256)) (generatedRoot.w_30_0 ctx) (generatedRoot.w_37_0 ctx)
   h41_0 : MxxRuntime.concatColumns (generatedRoot.w_39_0 ctx) (generatedRoot.w_40_0 ctx) (generatedRoot.w_41_0 ctx)
   h44_0 : MxxRuntime.concatColumns (generatedRoot.w_42_0 ctx) (generatedRoot.w_43_0 ctx) (generatedRoot.w_44_0 ctx)
-  t35 : (32768) = 32768
-  h50_0 : (∀ k : Fin 32768, MxxRuntime.thresholdDecode (2) (32768) (k.val : Int) (generatedRoot.w_49_0 ctx) ((generatedRoot.w_50_0 ctx) k))
+  t35 : (1) = 1
+  h50_0 : (∀ k : Fin 1, MxxRuntime.thresholdDecode (2) (1) (k.val : Int) (generatedRoot.w_49_0 ctx) ((generatedRoot.w_50_0 ctx) k))
   hout : outputs = generatedRoot.outs ctx
 
-theorem generatedRoot.facts_1  {ctx : generatedRootCtx} {outputs : Fin 32768 → Int}
+theorem generatedRoot.facts_1  {ctx : generatedRootCtx} {outputs : Fin 1 → Int}
     (h : generatedRoot.constraints_1 backend hashModel tape path params (generatedRoot.w_1_0 ctx) (generatedRoot.w_31_0 ctx) (generatedRoot.w_32_0 ctx) (generatedRoot.w_36_0 ctx) (generatedRoot.w_39_0 ctx) (generatedRoot.w_40_0 ctx) (generatedRoot.w_42_0 ctx) (generatedRoot.w_43_0 ctx) (generatedRoot.w_30_0 ctx) (generatedRoot.w_35_0 ctx) (generatedRoot.w_37_0 ctx) (generatedRoot.w_41_0 ctx) (generatedRoot.w_44_0 ctx) (generatedRoot.w_49_0 ctx) (generatedRoot.w_50_0 ctx) outputs) :
     generatedRoot.Facts_1 ctx outputs :=
   ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2⟩
 
-structure generatedRoot.Facts  (ctx : generatedRootCtx) (outputs : Fin 32768 → Int) : Prop where
+structure generatedRoot.Facts  (ctx : generatedRootCtx) (outputs : Fin 1 → Int) : Prop where
   c0 : generatedRoot.Facts_0 ctx
   c1 : generatedRoot.Facts_1 ctx outputs
 
-theorem generatedRoot.facts  (ctx : generatedRootCtx) {outputs : Fin 32768 → Int}
+theorem generatedRoot.facts  (ctx : generatedRootCtx) {outputs : Fin 1 → Int}
     (h : generatedRoot.body backend hashModel tape path params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
   have t0 := h

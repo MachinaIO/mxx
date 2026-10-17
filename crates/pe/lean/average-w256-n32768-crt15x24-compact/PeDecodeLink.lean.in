@@ -16,7 +16,7 @@ set_option maxRecDepth 200000 in
 set_option maxHeartbeats 0 in
 theorem decode_final {model : HashModel} {tape : SampleTape} {path : List Nat}
     {dctx : Stage_decode.generatedRoot.Ctx Backend.backend model tape path GeneratedClaim.stage_9_params}
-    {o : Fin N → Int} (D : Stage_decode.generatedRoot.Facts dctx o)
+    {o : Fin 1 → Int} (D : Stage_decode.generatedRoot.Facts dctx o)
     {cm : ExactMatrix Q N 1 1} {key : ByteArray} {bQ : ExactMatrix PQ N 1 295}
     {p' : Fin 256 → ErrorMatrix N 295 1} {vC' : Fin 256 → ErrorMatrix N 30 1}
     {v' : Fin 11520 → ErrorMatrix N 60 1} {kF' : ErrorMatrix N 60 1}
@@ -31,19 +31,20 @@ theorem decode_final {model : HashModel} {tape : SampleTape} {path : List Nat}
     (h549 : Stage_decode.generatedRoot.w_39_0 dctx = c0) (h550 : Stage_decode.generatedRoot.w_40_0 dctx = c1)
     (h552 : Stage_decode.generatedRoot.w_42_0 dctx = a10) (h553 : Stage_decode.generatedRoot.w_43_0 dctx = a11)
     (h556 : Stage_decode.generatedRoot.w_46_0 dctx = reduceMatrix Q N 60 1 kF')
-    {m : Fin N → Int}
+    {m : Fin 1 → Int}
     (hbits : ∀ k : Fin N, ((2 * (((((cm - messageRow model key 1) -
       (∑ i : Fin 256, σs i (roundedAnchor model key bQ * reduceMatrix Q N 295 1 (p' i)) +
         ∑ i : Fin 256, σs i (compressedAnchor model key bQ) * reduceMatrix Q N 30 1 (vC' i) +
         ∑ q : Fin 11520, helperValue model key hf0 hf1 q * reduceMatrix Q N 60 1 (v' q) +
         (joinRow ![c0, c1] - joinRow ![a10, a11]) * reduceMatrix Q N 60 1 kF')) 0 0).coeff k).val : Int) +
-      (Q : Int) / 2) / (Q : Int)) % 2 = m k) :
+      (Q : Int) / 2) / (Q : Int)) % 2 = oneBitCoefficients m k) :
     o = m := by
   have hdec := decode_phase D
   simp only [] at hdec
   rw [h0, h1, h5, hanc, h537, h541, h542, h546, h549, h550, h552, h553, h556] at hdec
   funext k
   rw [hdec k]
-  exact hbits k
+  rw [Subsingleton.elim k 0]
+  exact hbits 0
 
 end PeProof

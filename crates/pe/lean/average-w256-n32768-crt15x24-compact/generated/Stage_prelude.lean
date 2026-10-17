@@ -119,9 +119,9 @@ structure generatedRoot.Witness where
   w_14_0 : mxxMat0
   w_16_0 : mxxMat0
   w_18_0 : mxxMat0
-  w_22_0 : mxxMat0
+  w_22_0 : Int
 
-abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_0_0 : mxxMat0) (w_1_0 : ByteArray) (w_5_0 : Fin 2 → Int) (w_21_0 : Fin 32768 → Int) (w_2_0 : mxxMat0) (w_3_0 : mxxMat1) (w_4_0 : Fin 45 → mxxMat1) (w_4_1 : Fin 45 → mxxMat1) (w_6_0 : Fin 2 → mxxMat1) (w_6_1 : Fin 2 → mxxMat1) (w_7_0 : mxxMat2) (w_10_0 : mxxMat3) (w_12_0 : mxxMat3) (w_13_0 : mxxMat3) (w_14_0 : mxxMat0) (w_16_0 : mxxMat0) (w_18_0 : mxxMat0) (w_22_0 : mxxMat0) (w_24_0 : mxxMat0) (outputs : (Fin 45 → mxxMat1) × (Fin 45 → mxxMat1) × (Fin 2 → mxxMat1) × (Fin 2 → mxxMat1) × mxxMat3 × mxxMat0 × Unit) : Prop :=
+abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_0_0 : mxxMat0) (w_1_0 : ByteArray) (w_5_0 : Fin 2 → Int) (w_21_0 : Fin 1 → Int) (w_2_0 : mxxMat0) (w_3_0 : mxxMat1) (w_4_0 : Fin 45 → mxxMat1) (w_4_1 : Fin 45 → mxxMat1) (w_6_0 : Fin 2 → mxxMat1) (w_6_1 : Fin 2 → mxxMat1) (w_7_0 : mxxMat2) (w_10_0 : mxxMat3) (w_12_0 : mxxMat3) (w_13_0 : mxxMat3) (w_14_0 : mxxMat0) (w_16_0 : mxxMat0) (w_18_0 : mxxMat0) (w_22_0 : Int) (w_25_0 : mxxMat0) (outputs : (Fin 45 → mxxMat1) × (Fin 45 → mxxMat1) × (Fin 2 → mxxMat1) × (Fin 2 → mxxMat1) × mxxMat3 × mxxMat0 × Unit) : Prop :=
   MxxRuntime.gadgetMatrixRuns backend 4096 30 w_3_0 ∧
   (45) = 45 ∧
   (∀ i : Fin 45, parallel_generatedRoot_4 backend hashModel tape (path ++ [4, i.val]) params i (w_0_0, (w_1_0, (w_2_0, (w_3_0, ())))) ((w_4_0 i), ((w_4_1 i), ()))) ∧
@@ -133,17 +133,17 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   MxxRuntime.hashSample (hashModel) ([109, 120, 120, 45, 112, 101]) ([.bytes [51, 52, 101, 99, 56, 49, 55, 48, 55, 98, 100, 100, 54, 99, 102, 98, 102, 99, 99, 52, 50, 51, 99, 55, 99, 98, 54, 97, 53, 51, 51, 100, 52, 57, 98, 102, 98, 101, 99, 56, 98, 57, 100, 97, 57, 101, 98, 98, 56, 48, 97, 52, 54, 57, 52, 51, 53, 53, 52, 48, 99, 101, 50, 48], .bytes [109, 101, 115, 115, 97, 103, 101, 45, 114, 111, 119], .u64Le (0)]) (w_1_0) w_14_0 ∧
   MxxRuntime.hashSample (hashModel) ([109, 120, 120, 45, 112, 101]) ([.bytes [51, 52, 101, 99, 56, 49, 55, 48, 55, 98, 100, 100, 54, 99, 102, 98, 102, 99, 99, 52, 50, 51, 99, 55, 99, 98, 54, 97, 53, 51, 51, 100, 52, 57, 98, 102, 98, 101, 99, 56, 98, 57, 100, 97, 57, 101, 98, 98, 56, 48, 97, 52, 54, 57, 52, 51, 53, 53, 52, 48, 99, 101, 50, 48], .bytes [109, 101, 115, 115, 97, 103, 101, 45, 114, 111, 119], .u64Le (1)]) (w_1_0) w_16_0 ∧
   MxxRuntime.gaussianSampleAt tape (path ++ [18]) ((319/100)) (31) w_18_0 ∧
-  MxxRuntime.polynomialFromValues false w_21_0 w_22_0 ∧
-  outputs = (w_4_0, (w_4_1, (w_6_0, (w_6_1, (w_13_0, (w_24_0, ()))))))
+  MxxRuntime.familyGetStatic w_21_0 (0) w_22_0 ∧
+  outputs = (w_4_0, (w_4_1, (w_6_0, (w_6_1, (w_13_0, (w_25_0, ()))))))
 
-abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat3 × (Fin 32768 → Int) × Unit) (outputs : (Fin 45 → mxxMat1) × (Fin 45 → mxxMat1) × (Fin 2 → mxxMat1) × (Fin 2 → mxxMat1) × mxxMat3 × mxxMat0 × Unit) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat3 × (Fin 1 → Int) × Unit) (outputs : (Fin 45 → mxxMat1) × (Fin 45 → mxxMat1) × (Fin 2 → mxxMat1) × (Fin 2 → mxxMat1) × mxxMat3 × mxxMat0 × Unit) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat0 := inputs.1
   let w_1_0 : ByteArray := inputs.2.1
   let w_5_0 : Fin 2 → Int := inputs.2.2.1
   let w_8_0 : mxxMat3 := inputs.2.2.2.1
-  let w_21_0 : Fin 32768 → Int := inputs.2.2.2.2.1
+  let w_21_0 : Fin 1 → Int := inputs.2.2.2.2.1
   let w_2_0 : mxxMat0 := (1 : mxxMat0)
   let w_3_0 := witness.w_3_0
   let w_4_0 := witness.w_4_0
@@ -164,11 +164,12 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   let w_19_0 : mxxMat0 := MxxRuntime.matrixAdd w_17_0 w_18_0
   let w_20_0 : mxxMat0 := (MxxRuntime.matrixPolynomial [(mxxNat2)] : mxxMat0)
   let w_22_0 := witness.w_22_0
-  let w_23_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_20_0 w_22_0
-  let w_24_0 : mxxMat0 := MxxRuntime.matrixAdd w_19_0 w_23_0
-  generatedRoot.constraints_0 backend hashModel tape path params w_0_0 w_1_0 w_5_0 w_21_0 w_2_0 w_3_0 w_4_0 w_4_1 w_6_0 w_6_1 w_7_0 w_10_0 w_12_0 w_13_0 w_14_0 w_16_0 w_18_0 w_22_0 w_24_0 outputs
+  let w_23_0 : mxxMat0 := MxxRuntime.liftInteger w_22_0
+  let w_24_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_20_0 w_23_0
+  let w_25_0 : mxxMat0 := MxxRuntime.matrixAdd w_19_0 w_24_0
+  generatedRoot.constraints_0 backend hashModel tape path params w_0_0 w_1_0 w_5_0 w_21_0 w_2_0 w_3_0 w_4_0 w_4_1 w_6_0 w_6_1 w_7_0 w_10_0 w_12_0 w_13_0 w_14_0 w_16_0 w_18_0 w_22_0 w_25_0 outputs
 
-def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat3 × (Fin 32768 → Int) × Unit) (outputs : (Fin 45 → mxxMat1) × (Fin 45 → mxxMat1) × (Fin 2 → mxxMat1) × (Fin 2 → mxxMat1) × mxxMat3 × mxxMat0 × Unit) : Prop :=
+def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat3 × (Fin 1 → Int) × Unit) (outputs : (Fin 45 → mxxMat1) × (Fin 45 → mxxMat1) × (Fin 2 → mxxMat1) × (Fin 2 → mxxMat1) × mxxMat3 × mxxMat0 × Unit) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body backend hashModel tape path params inputs outputs witness
 

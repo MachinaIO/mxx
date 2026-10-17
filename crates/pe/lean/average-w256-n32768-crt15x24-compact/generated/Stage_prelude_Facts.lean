@@ -21,7 +21,7 @@ local notation "mxxMat3" => Mxx.Primitives.ExactMatrix modulus_1 32768 1 1
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Ctx (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) where
-  inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat1 × (Fin 32768 → Int) × Unit
+  inputs : mxxMat0 × ByteArray × (Fin 2 → Int) × mxxMat1 × (Fin 1 → Int) × Unit
   witness : generatedRoot.Witness
 
 section
@@ -40,7 +40,7 @@ def generatedRoot.w_5_0  (ctx : generatedRootCtx) : Fin 2 → Int :=
 def generatedRoot.w_8_0  (ctx : generatedRootCtx) : mxxMat1 :=
   ctx.inputs.2.2.2.1
 
-def generatedRoot.w_21_0  (ctx : generatedRootCtx) : Fin 32768 → Int :=
+def generatedRoot.w_21_0  (ctx : generatedRootCtx) : Fin 1 → Int :=
   ctx.inputs.2.2.2.2.1
 
 def generatedRoot.w_2_0  (ctx : generatedRootCtx) : mxxMat0 :=
@@ -100,17 +100,20 @@ def generatedRoot.w_19_0  (ctx : generatedRootCtx) : mxxMat0 :=
 def generatedRoot.w_20_0  (ctx : generatedRootCtx) : mxxMat0 :=
   (MxxRuntime.matrixPolynomial [(mxxNat0)] : mxxMat0)
 
-def generatedRoot.w_22_0  (ctx : generatedRootCtx) : mxxMat0 :=
+def generatedRoot.w_22_0  (ctx : generatedRootCtx) : Int :=
   ctx.witness.w_22_0
 
 def generatedRoot.w_23_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixMulScalarLeft (generatedRoot.w_20_0 ctx) (generatedRoot.w_22_0 ctx)
+  MxxRuntime.liftInteger (generatedRoot.w_22_0 ctx)
 
 def generatedRoot.w_24_0  (ctx : generatedRootCtx) : mxxMat0 :=
-  MxxRuntime.matrixAdd (generatedRoot.w_19_0 ctx) (generatedRoot.w_23_0 ctx)
+  MxxRuntime.matrixMulScalarLeft (generatedRoot.w_20_0 ctx) (generatedRoot.w_23_0 ctx)
+
+def generatedRoot.w_25_0  (ctx : generatedRootCtx) : mxxMat0 :=
+  MxxRuntime.matrixAdd (generatedRoot.w_19_0 ctx) (generatedRoot.w_24_0 ctx)
 
 def generatedRoot.outs  (ctx : generatedRootCtx) : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit :=
-  ((generatedRoot.w_4_0 ctx), ((generatedRoot.w_4_1 ctx), ((generatedRoot.w_6_0 ctx), ((generatedRoot.w_6_1 ctx), ((generatedRoot.w_13_0 ctx), ((generatedRoot.w_24_0 ctx), ()))))))
+  ((generatedRoot.w_4_0 ctx), ((generatedRoot.w_4_1 ctx), ((generatedRoot.w_6_0 ctx), ((generatedRoot.w_6_1 ctx), ((generatedRoot.w_13_0 ctx), ((generatedRoot.w_25_0 ctx), ()))))))
 
 structure generatedRoot.Facts_0  (ctx : generatedRootCtx) (outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit) : Prop where
   h3_0 : MxxRuntime.gadgetMatrixRuns backend 4096 30 (generatedRoot.w_3_0 ctx)
@@ -124,11 +127,11 @@ structure generatedRoot.Facts_0  (ctx : generatedRootCtx) (outputs : (Fin 45 →
   h14_0 : MxxRuntime.hashSample (hashModel) ([109, 120, 120, 45, 112, 101]) ([.bytes [51, 52, 101, 99, 56, 49, 55, 48, 55, 98, 100, 100, 54, 99, 102, 98, 102, 99, 99, 52, 50, 51, 99, 55, 99, 98, 54, 97, 53, 51, 51, 100, 52, 57, 98, 102, 98, 101, 99, 56, 98, 57, 100, 97, 57, 101, 98, 98, 56, 48, 97, 52, 54, 57, 52, 51, 53, 53, 52, 48, 99, 101, 50, 48], .bytes [109, 101, 115, 115, 97, 103, 101, 45, 114, 111, 119], .u64Le (0)]) ((generatedRoot.w_1_0 ctx)) (generatedRoot.w_14_0 ctx)
   h16_0 : MxxRuntime.hashSample (hashModel) ([109, 120, 120, 45, 112, 101]) ([.bytes [51, 52, 101, 99, 56, 49, 55, 48, 55, 98, 100, 100, 54, 99, 102, 98, 102, 99, 99, 52, 50, 51, 99, 55, 99, 98, 54, 97, 53, 51, 51, 100, 52, 57, 98, 102, 98, 101, 99, 56, 98, 57, 100, 97, 57, 101, 98, 98, 56, 48, 97, 52, 54, 57, 52, 51, 53, 53, 52, 48, 99, 101, 50, 48], .bytes [109, 101, 115, 115, 97, 103, 101, 45, 114, 111, 119], .u64Le (1)]) ((generatedRoot.w_1_0 ctx)) (generatedRoot.w_16_0 ctx)
   h18_0 : MxxRuntime.gaussianSampleAt tape (path ++ [18]) ((319/100)) (31) (generatedRoot.w_18_0 ctx)
-  h22_0 : MxxRuntime.polynomialFromValues false (generatedRoot.w_21_0 ctx) (generatedRoot.w_22_0 ctx)
+  h22_0 : MxxRuntime.familyGetStatic (generatedRoot.w_21_0 ctx) (0) (generatedRoot.w_22_0 ctx)
   hout : outputs = generatedRoot.outs ctx
 
 theorem generatedRoot.facts_0  {ctx : generatedRootCtx} {outputs : (Fin 45 → mxxMat2) × (Fin 45 → mxxMat2) × (Fin 2 → mxxMat2) × (Fin 2 → mxxMat2) × mxxMat1 × mxxMat0 × Unit}
-    (h : generatedRoot.constraints_0 backend hashModel tape path params (generatedRoot.w_0_0 ctx) (generatedRoot.w_1_0 ctx) (generatedRoot.w_5_0 ctx) (generatedRoot.w_21_0 ctx) (generatedRoot.w_2_0 ctx) (generatedRoot.w_3_0 ctx) (generatedRoot.w_4_0 ctx) (generatedRoot.w_4_1 ctx) (generatedRoot.w_6_0 ctx) (generatedRoot.w_6_1 ctx) (generatedRoot.w_7_0 ctx) (generatedRoot.w_10_0 ctx) (generatedRoot.w_12_0 ctx) (generatedRoot.w_13_0 ctx) (generatedRoot.w_14_0 ctx) (generatedRoot.w_16_0 ctx) (generatedRoot.w_18_0 ctx) (generatedRoot.w_22_0 ctx) (generatedRoot.w_24_0 ctx) outputs) :
+    (h : generatedRoot.constraints_0 backend hashModel tape path params (generatedRoot.w_0_0 ctx) (generatedRoot.w_1_0 ctx) (generatedRoot.w_5_0 ctx) (generatedRoot.w_21_0 ctx) (generatedRoot.w_2_0 ctx) (generatedRoot.w_3_0 ctx) (generatedRoot.w_4_0 ctx) (generatedRoot.w_4_1 ctx) (generatedRoot.w_6_0 ctx) (generatedRoot.w_6_1 ctx) (generatedRoot.w_7_0 ctx) (generatedRoot.w_10_0 ctx) (generatedRoot.w_12_0 ctx) (generatedRoot.w_13_0 ctx) (generatedRoot.w_14_0 ctx) (generatedRoot.w_16_0 ctx) (generatedRoot.w_18_0 ctx) (generatedRoot.w_22_0 ctx) (generatedRoot.w_25_0 ctx) outputs) :
     generatedRoot.Facts_0 ctx outputs :=
   ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.2⟩
 

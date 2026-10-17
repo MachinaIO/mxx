@@ -184,14 +184,14 @@ structure generatedRoot.Witness where
   w_37_0 : mxxMat1
   w_41_0 : mxxMat5
   w_44_0 : mxxMat5
-  w_50_0 : Fin 32768 → Int
+  w_50_0 : Fin 1 → Int
 
-abbrev generatedRoot.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_1_0 : ByteArray) (w_31_0 : Fin 45 → mxxMat3) (w_32_0 : Fin 45 → mxxMat3) (w_36_0 : Fin 256 → mxxMat7) (w_39_0 : mxxMat3) (w_40_0 : mxxMat3) (w_42_0 : mxxMat3) (w_43_0 : mxxMat3) (w_30_0 : mxxMat1) (w_35_0 : mxxMat5) (w_37_0 : mxxMat1) (w_41_0 : mxxMat5) (w_44_0 : mxxMat5) (w_49_0 : mxxMat1) (w_50_0 : Fin 32768 → Int) (outputs : Fin 32768 → Int) : Prop :=
+abbrev generatedRoot.constraints_1 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_1_0 : ByteArray) (w_31_0 : Fin 45 → mxxMat3) (w_32_0 : Fin 45 → mxxMat3) (w_36_0 : Fin 256 → mxxMat7) (w_39_0 : mxxMat3) (w_40_0 : mxxMat3) (w_42_0 : mxxMat3) (w_43_0 : mxxMat3) (w_30_0 : mxxMat1) (w_35_0 : mxxMat5) (w_37_0 : mxxMat1) (w_41_0 : mxxMat5) (w_44_0 : mxxMat5) (w_49_0 : mxxMat1) (w_50_0 : Fin 1 → Int) (outputs : Fin 1 → Int) : Prop :=
   MxxIR.IterRuns (fun (i : Nat) (current next : mxxMat1) => sequential_generatedRoot_37 backend hashModel tape (path ++ [37, i]) params i (current, (w_31_0, (w_32_0, (w_1_0, (w_35_0, (w_36_0, ())))))) next) (Int.toNat (256)) w_30_0 w_37_0 ∧
   MxxRuntime.concatColumns w_39_0 w_40_0 w_41_0 ∧
   MxxRuntime.concatColumns w_42_0 w_43_0 w_44_0 ∧
-  (32768) = 32768 ∧
-  (∀ k : Fin 32768, MxxRuntime.thresholdDecode (2) (32768) (k.val : Int) w_49_0 (w_50_0 k)) ∧
+  (1) = 1 ∧
+  (∀ k : Fin 1, MxxRuntime.thresholdDecode (2) (1) (k.val : Int) w_49_0 (w_50_0 k)) ∧
   outputs = w_50_0
 
 abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_1_0 : ByteArray) (w_5_0 : mxxMat8) (w_10_0 : Fin 256 → mxxMat0) (w_27_0 : Fin 256 → mxxMat4) (w_2_0 : mxxMat1) (w_4_0 : mxxMat1) (w_6_0 : mxxMat2) (w_7_0 : mxxMat8) (w_8_0 : mxxMat2) (w_9_0 : mxxMat2) (w_11_0 : mxxMat1) (w_12_0 : mxxMat1) (w_13_0 : mxxMat10) (w_14_0 : mxxMat3) (w_15_0 : mxxMat11) (w_16_0 : mxxMat11) (w_17_0 : mxxMat3) (w_19_0 : mxxMat8) (w_20_0 : mxxMat10) (w_21_0 : mxxMat3) (w_22_0 : mxxMat11) (w_23_0 : mxxMat11) (w_24_0 : mxxMat3) (w_26_0 : mxxMat3) (w_28_0 : mxxMat1) (w_33_0 : mxxMat3) (w_34_0 : mxxMat3) (w_35_0 : mxxMat5) : Prop :=
@@ -228,7 +228,7 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   MxxRuntime.concatColumns w_33_0 w_34_0 w_35_0 ∧
   0 ≤ (256)
 
-abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (generatedRoot.InputType)) (outputs : Fin 32768 → Int) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (generatedRoot.InputType)) (outputs : Fin 1 → Int) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_0_0 : mxxMat1 := inputs.1
@@ -285,7 +285,7 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   generatedRoot.constraints_0 backend hashModel tape path params w_1_0 w_5_0 w_10_0 w_27_0 w_2_0 w_4_0 w_6_0 w_7_0 w_8_0 w_9_0 w_11_0 w_12_0 w_13_0 w_14_0 w_15_0 w_16_0 w_17_0 w_19_0 w_20_0 w_21_0 w_22_0 w_23_0 w_24_0 w_26_0 w_28_0 w_33_0 w_34_0 w_35_0 ∧
     generatedRoot.constraints_1 backend hashModel tape path params w_1_0 w_31_0 w_32_0 w_36_0 w_39_0 w_40_0 w_42_0 w_43_0 w_30_0 w_35_0 w_37_0 w_41_0 w_44_0 w_49_0 w_50_0 outputs
 
-def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (generatedRoot.InputType)) (outputs : Fin 32768 → Int) : Prop :=
+def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : (generatedRoot.InputType)) (outputs : Fin 1 → Int) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body backend hashModel tape path params inputs outputs witness
 

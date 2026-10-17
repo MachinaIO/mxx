@@ -9393,6 +9393,18 @@ fn lower_parallel_loop(
                 }
             }
         }
+        // Scalar families use a single contiguous destination. A forwarded scalar
+        // must have a writer in this lane so rebinding writes that destination,
+        // rather than keeping a borrowed input outside the packed family.
+        for id in &mut outputs {
+            if ctx.values[id.0 as usize].ty == ConcreteWireType::Int &&
+                !ctx.producer.get(id).is_some_and(|writers| {
+                    writers.iter().any(|(_, operation)| *operation >= lane_start)
+                })
+            {
+                *id = crate::gpu_physical_lowering::replicate_to_device(ctx, *id, home)?;
+            }
+        }
         // An input, uploaded immutable constant, or view is a read-only result. Prove
         // allocation provenance rather than mistaking an absent writer for an
         // uninitialized output, or manufacturing a same-device copy.
@@ -10074,11 +10086,16 @@ fn lower_parallel_loop(
             id
         };
 
-        for wave in &mut ctx.waves[body_waves_start..] {
-            for borrowed in &mut wave.borrowed_outputs {
-                for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
-                    if ids[port] == borrowed.value {
-                        borrowed.family_members.push((id, wave.start_index + lane));
+        // Packed scalar lanes already write their final offsets. Their family
+        // has one physical part spanning all members, so publishing an individual
+        // member would replace that whole allocation with a scalar-sized binding.
+        if !scalar_families.contains_key(&port) {
+            for wave in &mut ctx.waves[body_waves_start..] {
+                for borrowed in &mut wave.borrowed_outputs {
+                    for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
+                        if ids[port] == borrowed.value {
+                            borrowed.family_members.push((id, wave.start_index + lane));
+                        }
                     }
                 }
             }
@@ -10093,13 +10110,15 @@ fn lower_parallel_loop(
         all_writers.sort_unstable_by_key(|(range, writer)| (*writer, range.start, range.end));
         all_writers.dedup();
         ctx.producer.insert(id, all_writers);
-        for wave in &mut ctx.waves[body_waves_start..] {
-            if wave.loop_site != loop_site {
-                continue;
-            }
-            for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
-                if !borrowed_outputs.contains_key(&ids[port]) {
-                    wave.produced_family_members.push((id, wave.start_index + lane, ids[port]));
+        if !scalar_families.contains_key(&port) {
+            for wave in &mut ctx.waves[body_waves_start..] {
+                if wave.loop_site != loop_site {
+                    continue;
+                }
+                for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
+                    if !borrowed_outputs.contains_key(&ids[port]) {
+                        wave.produced_family_members.push((id, wave.start_index + lane, ids[port]));
+                    }
                 }
             }
         }
@@ -13195,6 +13214,78 @@ mod tests {
                     .download_matrix_member_output(&result.output(name).unwrap(), member)
                     .unwrap();
                 assert_eq!(actual.entry(0, 0).to_bytes(), expected.entry(0, column).to_bytes());
+            }
+        }
+    }
+
+    /// Matrix-bearing waves take the general lowerer even when an output is an
+    /// integer. Packed integer outputs keep one contiguous allocation across waves.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_parallel_scalar_outputs_keep_contiguous_family_storage() {
+        use rand::Rng;
+        let count = std::env::var("MXX_TEST_SCALAR_WAVE_MEMBERS")
+            .map_or(5, |value| value.parse::<usize>().unwrap());
+        assert!(count >= 3);
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(17u64)], 8);
+        let context = DslContext::new("parallel-packed-scalars");
+        let values = context.int_family_input("values", count);
+        let members = parallel(count, |index| {
+            let input = values.at(index);
+            let matrix = input.clone().lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+            Ok((matrix.clone(), (matrix.coefficients().at(0), input)))
+        })
+        .unwrap();
+        let computed = members.field(|(_, (computed, _))| computed).unwrap();
+        let forwarded = members.field(|(_, (_, forwarded))| forwarded).unwrap();
+        let graph = context
+            .output("computed", computed)
+            .unwrap()
+            .output("forwarded", forwarded)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        for width in [1, 2] {
+            let gpu = GpuDCRTPolyParams::new(8, vec![17], 2, None);
+            let mut runtime =
+                GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+            runtime
+                .options_mut()
+                .integer_input_ranges
+                .insert("values".into(), 0.into()..=16.into());
+            let draw = || {
+                (0..count)
+                    .map(|_| BigInt::from(rand::rng().random_range(0u64..17)))
+                    .collect::<Vec<_>>()
+            };
+            let input = |values: Vec<BigInt>| {
+                BTreeMap::from([("values".to_owned(), RuntimeValue::integer_values(values))])
+            };
+            let first = draw();
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph.clone(), &input(first.clone()), 1, width)
+                .unwrap();
+            let held = runtime.execute(&mut plan, input(first.clone())).unwrap();
+            for _ in 0..2 {
+                let expected = draw();
+                let result = runtime.execute(&mut plan, input(expected.clone())).unwrap();
+                for name in ["computed", "forwarded"] {
+                    assert_eq!(
+                        runtime
+                            .download_integer_family_output(&result.output(name).unwrap())
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        runtime
+                            .download_integer_family_output(&held.output(name).unwrap())
+                            .unwrap(),
+                        first
+                    );
+                }
             }
         }
     }

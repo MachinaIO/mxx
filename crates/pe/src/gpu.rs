@@ -26,7 +26,7 @@ fn gpu_rings(parameters: &crate::PeParameters) -> Vec<GpuDCRTPolyParams> {
         .collect()
 }
 
-/// One setup, one ciphertext of a random message, and keys for an
+/// One setup, ciphertexts of both message bits, and keys for an
 /// authorized and an unauthorized equality predicate, all on the GPU, with
 /// parameters whose simulated bound guarantees correctness (by default the
 /// noise-free test parameters): the authorized key decrypts the message,
@@ -75,7 +75,7 @@ fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
     authorized_key_decrypts_on_the_gpu(class, parameters, None, &equality_programs);
 }
 
-/// One setup, one ciphertext of `attribute` (a random one if `None`) and a random message, and
+/// One setup, ciphertexts of both message bits under `attribute` (random if `None`), and
 /// keys for the programs `programs(class, attribute)`, the first authorized and the second not,
 /// all on the GPU.
 fn authorized_key_decrypts_on_the_gpu(
@@ -84,7 +84,6 @@ fn authorized_key_decrypts_on_the_gpu(
     attribute: Option<Vec<usize>>,
     programs: &dyn Fn(PeClass, &[usize]) -> [BranchingProgram; 2],
 ) {
-    let level = parameters.level();
     let mut execution = GpuRuntime::new(gpu_backend(gpu_rings(&parameters))).expect("GPU runtime");
     let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class)).unwrap();
     assert!(bound.decrypts(), "the parameters must guarantee correctness");
@@ -95,16 +94,19 @@ fn authorized_key_decrypts_on_the_gpu(
             .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
             .collect()
     });
-    let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-    let ciphertext =
-        encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+    let message = rand::random::<bool>();
+    let ciphertexts = [message, !message].map(|message| {
+        (message, encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap())
+    });
     for (predicate, value) in programs(class, &attribute).iter().zip([0, 1]) {
         assert_eq!(predicate.evaluate(&attribute).unwrap(), value);
         let key = keygen(&public_key, &master, predicate, &mut execution, &mut store).unwrap();
-        let decrypted =
-            decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
-        if value == 0 {
-            assert_eq!(decrypted, message);
+        for (message, ciphertext) in &ciphertexts {
+            let decrypted =
+                decrypt(&public_key, &key, ciphertext, &mut execution, &mut store).unwrap();
+            if value == 0 {
+                assert_eq!(decrypted, *message);
+            }
         }
     }
 }
@@ -254,9 +256,9 @@ fn test_gpu_measured_noise_against_the_bounds() {
             tables[steps - 1][(reached + 1) % entries] = 1;
         }
         let predicate = BranchingProgram::new(class, reads, tables).unwrap();
-        let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let message = rand::random::<bool>();
         let (ciphertext, secret) =
-            encrypt_with_secret(&public_key, &attribute, &message, &mut execution, &mut store)
+            encrypt_with_secret(&public_key, &attribute, message, &mut execution, &mut store)
                 .unwrap();
         let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
         let evaluated =
@@ -324,8 +326,8 @@ fn test_gpu_measured_noise_against_the_bounds() {
             .entry(0, 0)
             .coeffs_biguints()
             .into_iter()
-            .zip(&message)
-            .map(|(value, bit)| (value + &q - if *bit { half.clone() } else { 0u8.into() }) % &q)
+            .zip(std::iter::once(message).chain(std::iter::repeat(false)))
+            .map(|(value, bit)| (value + &q - if bit { half.clone() } else { 0u8.into() }) % &q)
             .collect::<Vec<_>>();
         let (p_max, p_rms) = statistics(&q, &phase);
         eprintln!(

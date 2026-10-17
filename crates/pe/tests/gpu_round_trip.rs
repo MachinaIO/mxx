@@ -499,7 +499,7 @@ fn root_inputs(graph: &Graph) -> Vec<String> {
 /// The executed authorized workflow as a closed protocol: setup, payload sampling, the prelude
 /// and the Dynamic encryption, the predicate's preprocessing and key generation, online
 /// evaluation, and decryption, compared with the message. External inputs are the hash key, the
-/// attribute exponents `Bz x_t`, the message bits, the fixed initial-state plaintext `X^0`, and
+/// attribute exponents `Bz x_t`, the message bit, the fixed initial-state plaintext `X^0`, and
 /// the program as the class Program's data (its reads and its `T_max` tables of `W` entries,
 /// read by preprocessing and online evaluation); the requirement checks that the exponents
 /// encode an attribute in the alphabet, that the program is one of the class (intermediate
@@ -525,7 +525,6 @@ fn pe_protocol(
     assert_eq!(graphs.len(), STAGES.len(), "every stage must execute once");
 
     let class = parameters.class();
-    let dimension = parameters.level().ring_dimension() as usize;
     let attributes = class.attribute_length();
     let width = class.state_width();
     let lookup = class.lookup_width();
@@ -576,7 +575,7 @@ fn pe_protocol(
                 hash_key.push(to(&name));
             } else if name == "mxx-pe/attribute-exponents" {
                 exponents.push(to(&name));
-            } else if name == "mxx-pe/message-coefficients" {
+            } else if name == "mxx-pe/message-bit" {
                 message.push(to(&name));
             } else if name.ends_with(".coefficient") {
                 unit.push(to(&name));
@@ -627,7 +626,7 @@ fn pe_protocol(
             .unwrap();
     // The ideal decryption is the message itself.
     let ideal = DslContext::new("pe-message");
-    let bits = ideal.int_family_input("message", dimension);
+    let bits = ideal.int_family_input("message", 1);
     let ideal =
         IdealSpec::new(ideal.output("message", bits).unwrap().build().unwrap().graph).unwrap();
 
@@ -661,7 +660,7 @@ fn pe_protocol(
         ),
         external(
             "message",
-            InputValueContract::Family { count: dimension.into(), element: Box::new(range(0, 1)) },
+            InputValueContract::Family { count: 1u8.into(), element: Box::new(range(0, 1)) },
             message,
         ),
         external("unit_coefficient", range(1, 1), unit),
@@ -886,7 +885,7 @@ impl Checkpoints {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EncryptedVector {
-    message: Vec<bool>,
+    message: bool,
     ciphertext: mxx_pe::PeCiphertext,
     productions: Vec<PathBuf>,
 }
@@ -1087,7 +1086,7 @@ fn predicate_round_trip(
     for (index, (attribute, expected)) in vectors.into_iter().enumerate() {
         let encryption_name = format!("vector-{index}-encryption");
         let decryption_name = format!("vector-{index}-decryption");
-        if let Some(decrypted) = checkpoints.load::<Vec<bool>>(&decryption_name) {
+        if let Some(decrypted) = checkpoints.load::<bool>(&decryption_name) {
             let saved: EncryptedVector =
                 checkpoints.load(&encryption_name).expect("encryption checkpoint");
             if expected == 0 {
@@ -1103,12 +1102,11 @@ fn predicate_round_trip(
             continue;
         }
         let saved: EncryptedVector = checkpoints.load(&encryption_name).unwrap_or_else(|| {
-            let message =
-                (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+            let message = rand::random::<bool>();
             let before = productions.as_ref().map(listing);
             let stage = Instant::now();
             let ciphertext =
-                encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+                encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
             eprintln!("encryption of {attribute:?}: {:?}", stage.elapsed());
             let created = match (&productions, &before) {
                 (Some(directory), Some(before)) => {
@@ -1219,10 +1217,9 @@ fn round_trip(
     let attribute = (0..class.attribute_length())
         .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
         .collect::<Vec<_>>();
-    let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+    let message = rand::random::<bool>();
     let stage = Instant::now();
-    let ciphertext =
-        encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+    let ciphertext = encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
     eprintln!("encryption: {:?}", stage.elapsed());
     report_device_bytes(&store);
     let authorized = program(class, &attribute, 0);
@@ -1252,8 +1249,8 @@ fn round_trip(
 
 /// [`round_trip`]'s authorized workflow as graphs only (see [`GraphOnly`]): the parameter search,
 /// then setup, the encryption of a random attribute, and key generation and decryption for an
-/// authorized program, none of them executed. The decryption of the placeholder outputs fails
-/// after its graph is recorded.
+/// authorized program, none of them executed. Decryption consumes a placeholder bit after its
+/// graph is recorded; that value is not a correctness result.
 fn export_graphs(
     class: PeClass,
     program: &dyn Fn(PeClass, &[usize], usize) -> BranchingProgram,
@@ -1297,15 +1294,11 @@ fn export_graphs(
     let attribute = (0..class.attribute_length())
         .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
         .collect::<Vec<_>>();
-    let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-    let ciphertext =
-        encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+    let message = rand::random::<bool>();
+    let ciphertext = encrypt(&public_key, &attribute, message, &mut execution, &mut store).unwrap();
     let authorized = program(class, &attribute, 0);
     let key = keygen(&public_key, &master, &authorized, &mut execution, &mut store).unwrap();
-    assert!(
-        decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).is_err(),
-        "the export-only decryption graph is not executed"
-    );
+    let _placeholder = decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
     let graphs = std::mem::take(&mut execution.graphs);
     report_measurements(&graphs);
     (graphs, parameters, failure_exponent)

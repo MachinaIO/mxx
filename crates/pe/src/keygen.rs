@@ -559,10 +559,9 @@ mod tests {
         )
         .unwrap();
         let key = restore(&key);
-        let message =
-            (0..parameters.level().ring_dimension()).map(|_| rand::random()).collect::<Vec<bool>>();
+        let message = rand::random::<bool>();
         let ciphertext =
-            crate::encrypt(&public_key, &[0], &message, &mut execution, &mut store).unwrap();
+            crate::encrypt(&public_key, &[0], message, &mut execution, &mut store).unwrap();
         let ciphertext = restore(&ciphertext);
         assert_eq!(
             crate::decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap(),

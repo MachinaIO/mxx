@@ -362,6 +362,10 @@ impl PrfKeys {
 ///   member family. The symbolic cell count is computed in 128 bits before conversion to the
 ///   arbitrary-precision `IntExpr`, so declaring `M W` cells does not require a `usize` index or
 ///   allocation. Executing with concrete keys still requires addressable tables and selectors.
+/// - With [`PrfKeyShape::with_data_tables`], the member loop encloses the bucket computations. Each
+///   bucket sums its parallel slots before the next bucket consumes the scalar state. This
+///   preserves selector indexing and noise while avoiding recursive re-expansion of earlier buckets
+///   in deferred lowering.
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrf {
     profile: SparseLwrPrfProfile,
@@ -478,65 +482,105 @@ impl SparseLwrPrf {
                 let cells_range = FamilyRange::full(IntExpr::constant(cells_count))?;
                 let members_range = FamilyRange::full(IntExpr::constant(members))?;
                 let row_range = FamilyRange::full(IntExpr::constant(width))?;
-                // The state of every member, `None` before the first bucket (the
-                // accumulator start `mono(0)` is shared).
-                let mut state = None;
-                for (selector, table) in selectors.iter().zip(&tables) {
-                    // Cell `f = o width + j` of every member `o` and slot `j`, in one
-                    // root loop that reads selector member `f` as its own member and
-                    // the input vector at the table's entry `f`.
-                    let cells = builder.parallel(cells_range.clone(), |builder, cell| {
-                        let member = IntExpr::FloorDiv(
-                            Box::new(cell.clone()),
-                            Box::new(IntExpr::constant(width)),
-                        );
-                        let state = state.map_or(Operand::Scalar(initial_input), |family| {
-                            Operand::Member { family, index: member }
-                        });
-                        // X^(acc + a_r), then weighted by the cell's selector bit.
-                        let shifted = builder.mul_public(
-                            Operand::Selected {
-                                family: input_vector,
-                                data: *table,
-                                position: cell.clone(),
-                            },
-                            state,
-                        )?;
-                        let weighted = builder.mul_private(
-                            Operand::Scalar(shifted),
-                            Operand::Member { family: selector[0], index: cell },
-                        )?;
-                        Ok(Operand::Scalar(weighted))
-                    })?;
-                    // Each member's state is the sum of its row of cells; a body
-                    // returns an operation, so each cell is read by the identity
-                    // `1 * X^0`, which keeps its noise.
-                    state = Some(builder.parallel(members_range.clone(), |builder, member| {
-                        let row = builder.parallel(row_range.clone(), |builder, slot| {
-                            let cell = IntExpr::Add(
-                                Box::new(IntExpr::Mul(
-                                    Box::new(member.clone()),
-                                    Box::new(IntExpr::constant(width)),
-                                )),
-                                Box::new(slot),
+                let family = if shape.data_tables {
+                    // Runtime-table users consume individual PRF members, often through
+                    // deferred lowering. Compute each bucket's scalar state once before
+                    // its next slot loop; a bucket-major family would recursively inline
+                    // that same state in every slot of every later bucket.
+                    builder.parallel(members_range.clone(), |builder, member| {
+                        let mut state = initial_input;
+                        for (selector, table) in selectors.iter().zip(&tables) {
+                            let row = builder.parallel(row_range.clone(), |builder, slot| {
+                                let cell = IntExpr::Add(
+                                    Box::new(IntExpr::Mul(
+                                        Box::new(member.clone()),
+                                        Box::new(IntExpr::constant(width)),
+                                    )),
+                                    Box::new(slot),
+                                );
+                                let shifted = builder.mul_public(
+                                    Operand::Selected {
+                                        family: input_vector,
+                                        data: *table,
+                                        position: cell.clone(),
+                                    },
+                                    Operand::Scalar(state),
+                                )?;
+                                builder
+                                    .mul_private(
+                                        Operand::Scalar(shifted),
+                                        Operand::Member { family: selector[0], index: cell },
+                                    )
+                                    .map(Operand::Scalar)
+                            })?;
+                            state = builder.sum(row)?;
+                        }
+                        builder.lut(Operand::Scalar(state), lut).map(Operand::Scalar)
+                    })?
+                } else {
+                    // The state of every member, `None` before the first bucket (the
+                    // accumulator start `mono(0)` is shared).
+                    let mut state = None;
+                    for (selector, table) in selectors.iter().zip(&tables) {
+                        // Cell `f = o width + j` of every member `o` and slot `j`, in one
+                        // root loop that reads selector member `f` as its own member and
+                        // the input vector at the table's entry `f`.
+                        let cells = builder.parallel(cells_range.clone(), |builder, cell| {
+                            let member = IntExpr::FloorDiv(
+                                Box::new(cell.clone()),
+                                Box::new(IntExpr::constant(width)),
                             );
-                            builder
-                                .mul_small_constant(
-                                    Operand::Member { family: cells, index: cell },
-                                    vec![1],
-                                    IntExpr::constant(0),
-                                )
-                                .map(Operand::Scalar)
+                            let state = state.map_or(Operand::Scalar(initial_input), |family| {
+                                Operand::Member { family, index: member }
+                            });
+                            // X^(acc + a_r), then weighted by the cell's selector bit.
+                            let shifted = builder.mul_public(
+                                Operand::Selected {
+                                    family: input_vector,
+                                    data: *table,
+                                    position: cell.clone(),
+                                },
+                                state,
+                            )?;
+                            let weighted = builder.mul_private(
+                                Operand::Scalar(shifted),
+                                Operand::Member { family: selector[0], index: cell },
+                            )?;
+                            Ok(Operand::Scalar(weighted))
                         })?;
-                        builder.sum(row).map(Operand::Scalar)
-                    })?);
-                }
-                let state = state.ok_or(PrfError::InvalidSparseLwrBlock)?;
-                let family = builder.parallel(members_range, |builder, member| {
-                    builder
-                        .lut(Operand::Member { family: state, index: member }, lut)
-                        .map(Operand::Scalar)
-                })?;
+                        // Each member's state is the sum of its row of cells; a body
+                        // returns an operation, so each cell is read by the identity
+                        // `1 * X^0`, which keeps its noise.
+                        state =
+                            Some(builder.parallel(members_range.clone(), |builder, member| {
+                                let row =
+                                    builder.parallel(row_range.clone(), |builder, slot| {
+                                        let cell = IntExpr::Add(
+                                            Box::new(IntExpr::Mul(
+                                                Box::new(member.clone()),
+                                                Box::new(IntExpr::constant(width)),
+                                            )),
+                                            Box::new(slot),
+                                        );
+                                        builder
+                                            .mul_small_constant(
+                                                Operand::Member { family: cells, index: cell },
+                                                vec![1],
+                                                IntExpr::constant(0),
+                                            )
+                                            .map(Operand::Scalar)
+                                    })?;
+                                builder.sum(row).map(Operand::Scalar)
+                            })?);
+                    }
+                    let state = state.ok_or(PrfError::InvalidSparseLwrBlock)?;
+                    let family = builder.parallel(members_range, |builder, member| {
+                        builder
+                            .lut(Operand::Member { family: state, index: member }, lut)
+                            .map(Operand::Scalar)
+                    })?;
+                    family
+                };
                 (selectors, tables, PrfOutput::Family(family))
             }
         };

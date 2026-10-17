@@ -529,7 +529,7 @@ fn public_encoding_row(
 /// never resident matrix payloads.
 pub struct EncodingLowering<'a> {
     /// Root helper rows supplied by graph composition; `None` reads ciphertext artifacts.
-    pub(crate) root_lut_helpers: Option<BTreeMap<String, Family<RnsBggRow>>>,
+    pub(crate) root_lut_helpers: Option<BTreeMap<String, (Family<RnsBggRow>, Vec<IntExpr>)>>,
     /// An in-graph decoder hint, instead of an encryption artifact.
     pub(crate) decoder_hint: Option<Mat>,
     /// The member of every Static preprocessing artifact read, and the member count (see
@@ -582,9 +582,44 @@ pub(crate) struct DynamicEvaluation {
     pub(crate) automorphisms: Option<(Family<RnsBggRow>, Family<RnsBggRow>)>,
 }
 
-/// A Static LUT's imported switching ciphertexts (one family per matrix
-/// port), its automorphism indices, and its helpers.
-pub(crate) type LutMaterial = (Vec<Family<Mat>>, Vec<usize>, (Family<Mat>, Family<Mat>));
+/// A Static LUT's imported switching ciphertexts (one family per matrix port, of which branch
+/// `i` is member `first + i`), its automorphism indices, and its helpers.
+pub(crate) type LutMaterial = ((Vec<Family<Mat>>, Int), Vec<usize>, LutHelperRows);
+
+/// The LUT helpers of a layout at a level, branch `i` for the `i`-th automorphism, read where a
+/// branch reads them.
+#[derive(Clone)]
+pub(crate) enum LutHelperRows {
+    /// An encryption's helpers: the families of their two components.
+    Imported(Family<Mat>, Family<Mat>),
+    /// Graph rows: branch `i` is member `positions[i]` of `rows`, re-targeted from the root to
+    /// the state form of `level` where it is read.
+    Graph { rows: Family<RnsBggRow>, positions: Vec<IntExpr>, level: usize },
+}
+
+impl LutHelperRows {
+    /// The helper of branch `index`.
+    pub(crate) fn member(
+        &self,
+        parameters: &RnsBggParameters,
+        index: Int,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        match self {
+            Self::Imported(top, bottom) => Ok((top.at(index.clone()), bottom.at(index))),
+            Self::Graph { rows, positions, level } => {
+                let position = IntExpr::Select {
+                    selector: Box::new(index.expression()?),
+                    branches: positions.clone(),
+                };
+                parameters.retarget_row(
+                    *level,
+                    RnsBggForm::State,
+                    rows.at(Int::evaluate(position.canonicalize())),
+                )
+            }
+        }
+    }
+}
 
 /// The bound value of one Dynamic RHS coordinate of an encryption.
 #[derive(Clone)]

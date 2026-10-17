@@ -795,6 +795,8 @@ mod tests {
         // Per slot: c_R x_L, the doubled vector, and the doubled public key (1x1 scalars).
         let mulmod = slots * 4 * m * limb_coefficients;
         let digit_polynomials = slots * m * m + m;
+        // Matrix-family sequential carries are streamed by the GPU runtime. They add no
+        // arithmetic operations and are no longer an unsupported-operation diagnostic.
         BTreeMap::from([
             ("gadget_decompositions".to_owned(), inverse_polys),
             ("gadget_decomposed_words".to_owned(), inverse_polys * n * crt_depth),
@@ -805,7 +807,6 @@ mod tests {
             ("ntt_forward".to_owned(), forward * crt_depth),
             ("ntt_inverse".to_owned(), inverse_polys * crt_depth),
             ("shoup_mul".to_owned(), shoup),
-            ("unsupported(sequential_family_carry)".to_owned(), 3),
             ("wide_mod_calls".to_owned(), wide_mod),
             ("wide_mul".to_owned(), wide_mul),
         ])

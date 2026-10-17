@@ -5,7 +5,7 @@
 
 use crate::{
     artifact::ArtifactKey,
-    gpu_execution_plan::{PhysicalValue, PhysicalValueId},
+    gpu_execution_plan::{GpuLoopSiteKey, PhysicalValue, PhysicalValueId},
     gpu_physical_lowering::{PhysicalLoweringContext, value_id},
 };
 use mxx_ir_core::{
@@ -39,11 +39,15 @@ pub(crate) enum CarrySource {
     Scratch,
 }
 
-/// One family with exactly two reusable generations under a fresh execution production.
+/// One family with exactly two reusable generations under a fresh execution production, or,
+/// for a spilled family ([`spilled_family_export`]), one generation per enclosing lane.
 #[derive(Clone, Debug)]
 pub(crate) struct StreamedCarry {
     pub name: String,
     pub count: usize,
+    /// The members of the scratch artifact: both generations of a carry (`2 count`), every
+    /// enclosing lane's family of a spilled family.
+    pub scratch_count: usize,
     pub element: ArtifactType,
     pub initial: CarrySource,
     /// Preserve a shared in-graph initial generation under its original scratch name.
@@ -53,11 +57,14 @@ pub(crate) struct StreamedCarry {
     pub updated: bool,
 }
 
-/// A view of a carry at a host iteration, or at a fixed final iteration outside its loop.
+/// A view of a carry at a host iteration, or at a fixed final iteration outside its loop. A
+/// spilled family's members of the enclosing template's lane occurrence `o` are at `o stride` of
+/// its scratch artifact (`parent`: the enclosing template and the stride).
 #[derive(Clone, Debug)]
 pub(crate) struct StreamedFamily {
     pub carry: StreamedCarry,
     pub iteration: IntExpr,
+    pub parent: Option<(GpuLoopSiteKey, usize)>,
 }
 
 /// A parallel output that writes one scratch generation, with no resident family allocation.
@@ -79,18 +86,63 @@ pub(super) struct StreamingLowering {
 }
 
 /// The flattened export of a root wave loop's family-valued output: the artifact names, the
-/// members of each lane's family (the stride of a parent occurrence), and whether the wave loop
-/// producing the current lane's family exports it.
+/// members of each lane's family (the stride of a parent occurrence), the root loop's count,
+/// and whether the wave loop producing the current lane's family exports it.
 pub(super) struct NestedExport {
     pub names: Vec<String>,
     pub stride: usize,
+    pub parent_count: usize,
     pub exported: bool,
+}
+
+/// The spill of a nested wave loop's matrix family that its lane both exports (a
+/// [`NestedExport`]) and reads member by member: the members are also written to a private
+/// scratch artifact, at `o stride + member` for the enclosing template's lane occurrence `o`, and
+/// the family is bound as metadata whose member reads import them back, so no member stays
+/// resident.
+pub(super) fn spilled_family_export(
+    ctx: &PhysicalLoweringContext<'_>,
+    scope: &FrozenGraphScopeId,
+    wire: WireRef,
+    ty: &ConcreteWireType,
+    parent_count: usize,
+) -> Result<Option<StreamedExport>, String> {
+    let (ConcreteWireType::IndexedFamily { element, count }, Some(parent)) =
+        (ty, ctx.active_parallel_template)
+    else {
+        return Ok(None);
+    };
+    if !is_streamed_carry(ty) {
+        return Ok(None);
+    }
+    let count = usize::try_from(*count).map_err(|_| "GPU spilled family count exceeds usize")?;
+    let scratch_count =
+        count.checked_mul(parent_count).ok_or("GPU spilled family scratch count exceeds usize")?;
+    let family = StreamedFamily {
+        carry: StreamedCarry {
+            name: carry_name(scope, wire.node, wire.port.0 as usize, Some(parent)),
+            count,
+            scratch_count,
+            element: ArtifactType::from_wire_type(element)
+                .ok_or("GPU spilled family element has no artifact type")?,
+            initial: CarrySource::Scratch,
+            initial_name: None,
+            availability: ArtifactAvailability::Cached,
+            layout: None,
+            updated: false,
+        },
+        iteration: IntExpr::constant(0),
+        parent: Some((parent.0, count)),
+    };
+    Ok(Some(StreamedExport { family, member_base: None }))
 }
 
 /// Execution-local key state copied by selected-import factories at their load sites.
 pub(crate) struct CarryRuntimeState {
     pub scratch: ProductionId,
     pub indices: BTreeMap<u32, u64>,
+    /// The lane occurrence of every enclosing wave template whose nested waves are running.
+    pub parent_occurrences: BTreeMap<GpuLoopSiteKey, usize>,
 }
 
 /// A harmless plan-time key; the runtime substitutes its fresh scratch identity before I/O.
@@ -253,9 +305,34 @@ impl StreamedFamily {
         member: usize,
         indices: &BTreeMap<u32, u64>,
         scratch: &ProductionId,
+        parent_occurrences: &BTreeMap<GpuLoopSiteKey, usize>,
     ) -> Result<(ArtifactKey, ManifestArtifact, bool), String> {
         if member >= self.carry.count {
             return Err("GPU streamed carry member is outside its family".into());
+        }
+        if let Some((site, stride)) = self.parent {
+            let occurrence = parent_occurrences.get(&site).ok_or_else(|| {
+                format!(
+                    "GPU spilled family {} is read outside its enclosing lane {site:?} (running \
+                     lanes {:?})",
+                    self.carry.name,
+                    parent_occurrences.keys().collect::<Vec<_>>()
+                )
+            })?;
+            let member = occurrence
+                .checked_mul(stride)
+                .and_then(|base| base.checked_add(member))
+                .filter(|member| *member < self.carry.scratch_count)
+                .ok_or("GPU spilled family member is outside its scratch artifact")?;
+            return Ok((
+                ArtifactKey {
+                    production: scratch.clone(),
+                    name: self.carry.name.clone(),
+                    index: Some(member),
+                },
+                self.carry.scratch_descriptor(),
+                true,
+            ));
         }
         let env = ParamEnv {
             loop_indices: indices
@@ -309,12 +386,13 @@ impl StreamedFamily {
 }
 
 impl StreamedCarry {
-    /// Scratch has room for both parities, and is never part of the public manifest.
+    /// Scratch has room for both parities (or every lane of a spilled family), and is never
+    /// part of the public manifest.
     pub(crate) fn scratch_descriptor(&self) -> ManifestArtifact {
         ManifestArtifact {
             artifact_type: self.element.clone(),
             availability: ArtifactAvailability::Cached,
-            family_count: Some(2 * self.count as u128),
+            family_count: Some(self.scratch_count as u128),
             layout: None,
         }
     }
@@ -381,6 +459,7 @@ pub(super) fn initial_parallel_export(
         carry: StreamedCarry {
             name: carry_name(scope, wire.node, wire.port.0 as usize, ctx.active_parallel_template),
             count,
+            scratch_count: 2 * count,
             element: ArtifactType::from_wire_type(element)
                 .ok_or("GPU carry element has no artifact type")?,
             initial: CarrySource::Scratch,
@@ -390,6 +469,7 @@ pub(super) fn initial_parallel_export(
             updated: true,
         },
         iteration: IntExpr::constant(0),
+        parent: None,
     };
     Ok(Some(StreamedExport { family, member_base: None }))
 }
@@ -472,6 +552,7 @@ pub(super) fn prepare_carry(
             carry: StreamedCarry {
                 name: carry_name(scope, node, position, ctx.active_parallel_template),
                 count,
+                scratch_count: 2 * count,
                 element: ArtifactType::from_wire_type(element)
                     .ok_or("GPU carry element has no artifact type")?,
                 initial: CarrySource::Artifact(ArtifactKey {
@@ -485,6 +566,7 @@ pub(super) fn prepare_carry(
                 updated: !alias,
             },
             iteration: IntExpr::constant(0),
+            parent: None,
         }
     };
     family.carry.updated = !alias;
@@ -539,6 +621,7 @@ mod tests {
             carry: StreamedCarry {
                 name: "carry".into(),
                 count: 8,
+                scratch_count: 16,
                 element: ArtifactType::Int,
                 initial: CarrySource::Artifact(ArtifactKey {
                     production: initial.clone(),
@@ -551,25 +634,27 @@ mod tests {
                 updated: true,
             },
             iteration: IntExpr::LoopIndex(7),
+            parent: None,
         };
+        let parents = BTreeMap::new();
         for iteration in 0..5 {
             let (key, descriptor, staged) =
-                family.resolve(3, &BTreeMap::from([(7, iteration)]), &scratch).unwrap();
+                family.resolve(3, &BTreeMap::from([(7, iteration)]), &scratch, &parents).unwrap();
             assert_eq!(staged, iteration != 0);
             assert_eq!(key.production, if staged { scratch.clone() } else { initial.clone() });
             assert_eq!(key.index, Some(if staged { (iteration as usize % 2) * 8 + 3 } else { 3 }));
             assert_eq!(descriptor.family_count, Some(if staged { 16 } else { 8 }));
         }
-        assert!(family.resolve(8, &BTreeMap::from([(7, 1)]), &scratch).is_err());
-        assert!(family.resolve(0, &BTreeMap::new(), &scratch).is_err());
+        assert!(family.resolve(8, &BTreeMap::from([(7, 1)]), &scratch, &parents).is_err());
+        assert!(family.resolve(0, &BTreeMap::new(), &scratch, &parents).is_err());
         family.carry.updated = false;
         assert_eq!(
-            family.resolve(2, &BTreeMap::from([(7, 99)]), &scratch).unwrap().0.production,
+            family.resolve(2, &BTreeMap::from([(7, 99)]), &scratch, &parents).unwrap().0.production,
             initial
         );
         family.carry.initial = CarrySource::Scratch;
         assert_eq!(
-            family.resolve(2, &BTreeMap::from([(7, 99)]), &scratch).unwrap().0.index,
+            family.resolve(2, &BTreeMap::from([(7, 99)]), &scratch, &parents).unwrap().0.index,
             Some(2)
         );
     }

@@ -351,6 +351,15 @@ struct MxxGpuNativeEventOpaque {
     _private: [u8; 0],
 }
 
+/// Binding values in their native form ([`GpuNativeGraphExec::bind_table`]).
+pub struct GpuGraphBindingTable(Vec<MxxGraphBindingValueRaw>);
+
+impl GpuGraphBindingTable {
+    pub fn new(values: &[GpuGraphBindingValue]) -> Self {
+        Self(values.iter().copied().map(GpuGraphBindingValue::raw).collect())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MxxGraphBindingValueRaw {
@@ -1049,6 +1058,7 @@ unsafe extern "C" {
         value_binding: u32,
         destination_binding_base: u32,
         status_binding: u32,
+        unit: c_int,
     ) -> c_int;
     fn gpu_indexed_matrix_table_create(
         ctx: *mut GpuContextOpaque,
@@ -4120,7 +4130,9 @@ impl GpuDCRTPolyParams {
     }
 
     /// Lift one resident signed integer into a coefficient-domain 1x1
-    /// constant polynomial, reducing the value modulo each ordered CRT prime.
+    /// constant polynomial, reducing the value modulo each ordered CRT prime;
+    /// with `unit`, form the unit row or column (a `1 x w` or `w x 1` destination) whose
+    /// entry of that index is the constant polynomial one.
     pub fn emit_raw_lift_integer_constant(
         &self,
         stream: &GpuNativeLaunchStream,
@@ -4128,11 +4140,16 @@ impl GpuDCRTPolyParams {
         destination: &GpuRawMatrixView,
         status: GpuRawControlStatusView,
         destination_binding_base: u32,
+        unit: bool,
     ) -> Result<(), GpuNativeGraphError> {
+        let shape_valid = if unit {
+            destination.rows == 1 || destination.columns == 1
+        } else {
+            destination.rows == 1 && destination.columns == 1
+        };
         if destination.physical_device != stream.physical_device ||
             destination.degree != self.ring_dimension ||
-            destination.rows != 1 ||
-            destination.columns != 1 ||
+            !shape_valid ||
             value.address == 0 ||
             value.count != 1 ||
             status.address == 0
@@ -4151,6 +4168,7 @@ impl GpuDCRTPolyParams {
                 value.binding,
                 destination_binding_base,
                 status.binding,
+                c_int::from(unit),
             )
         } != 0
         {
@@ -7337,7 +7355,14 @@ impl GpuNativeGraphExec {
     /// allocate any payload and updates each changed top-level node once.
     #[doc(hidden)]
     pub fn bind(&mut self, values: &[GpuGraphBindingValue]) -> Result<(), GpuNativeGraphError> {
-        let raw_values = values.iter().copied().map(GpuGraphBindingValue::raw).collect::<Vec<_>>();
+        self.bind_table(&GpuGraphBindingTable::new(values))
+    }
+
+    /// [`Self::bind`] with the native form of the values, converted once for every graph that
+    /// a plan binds to the same values.
+    #[doc(hidden)]
+    pub fn bind_table(&mut self, table: &GpuGraphBindingTable) -> Result<(), GpuNativeGraphError> {
+        let raw_values = &table.0;
         let status = unsafe { mxx_gpu_graph_bind(self.raw, raw_values.as_ptr(), raw_values.len()) };
         if status != 0 {
             return Err(GpuNativeGraphError::Native(format!(
@@ -8359,6 +8384,7 @@ mod tests {
                 &view,
                 GpuRawControlStatusView { address: status.device_address(), binding: 3 },
                 1,
+                false,
             )
             .unwrap();
         builder.finish_operation().unwrap();

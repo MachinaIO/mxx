@@ -182,22 +182,25 @@ impl Kind {
         function: &StreamingFunction,
         program: &ChainProgram,
         (step, chunk): (&Int, &Int),
-    ) -> Result<BTreeMap<DataId, Family<Int>>, Dio2Error> {
+        inputs: &super::input_storage::InputStorage,
+    ) -> Result<BTreeMap<DataId, (Family<Int>, Int)>, Dio2Error> {
         let width = function.data.width;
         let rows = step_data_input(function);
+        // The step's row, a LUT's data: its own family of the row width.
         let mut data = BTreeMap::from([(
             program.data,
-            mxx_dsl::parallel(width, |entry| Ok(rows.at(step.clone().mul(width).add(entry))))?,
+            (
+                mxx_dsl::parallel(width, |entry| Ok(rows.at(step.clone().mul(width).add(entry))))?,
+                Int::constant(0),
+            ),
         )]);
+        // The chunk's coordinate tables, read in the family of every chunk's at their first
+        // member: no family of an instance's table entries is formed.
         for (role, prf) in self.prfs(program) {
             for (bucket, table) in prf.tables().iter().enumerate() {
                 let count = IntExpr::constant(prf.selector_families()[bucket].members);
-                let tables = table_family(role, bucket, &count, function);
                 let first = chunk.clone().mul(Int::evaluate(count.clone()));
-                data.insert(
-                    *table,
-                    mxx_dsl::parallel(count, |entry| Ok(tables.at(first.clone().add(entry))))?,
-                );
+                data.insert(*table, (table_family(role, bucket, &count, function, inputs)?, first));
             }
         }
         Ok(data)
@@ -215,9 +218,10 @@ pub(crate) fn table_family(
     bucket: usize,
     count: &IntExpr,
     function: &StreamingFunction,
-) -> Family<Int> {
+    inputs: &super::input_storage::InputStorage,
+) -> Result<Family<Int>, Dio2Error> {
     let chunks = IntExpr::constant(1usize << function.eval_chunk_bits);
-    mxx_dsl::int_family_input(
+    inputs.family(
         table_input(role, bucket),
         IntExpr::Mul(Box::new(chunks), Box::new(count.clone())).canonicalize(),
     )
@@ -292,6 +296,7 @@ pub struct Dio2Obfuscation {
     /// The public runtime inputs of both graphs: `A_0`, the step rows and the PRF tables (none
     /// in shape-only mode).
     pub(crate) public: BTreeMap<String, RuntimeValue>,
+    pub(crate) input_storage: super::input_storage::InputStorage,
 }
 
 impl Dio2Obfuscation {
@@ -496,56 +501,107 @@ mod tests {
         assert_eq!(counts[0], counts[1]);
     }
 
-    /// The families and wide matrices a GPU plan of the obfuscation and evaluation graphs would
-    /// hold (graph-only), for the parameter sets of [`graphs_do_not_grow_with_the_parameters`].
+    /// No matrix a GPU plan of the obfuscation or evaluation graph holds grows with the parts, the
+    /// number of primes (beyond the `O(w_0)` rows and `O(w_0^2)` words of one operation), the
+    /// label rows, the smudge digits, the PRF outputs, the steps or the chunks (graph-only, the
+    /// parameter sets of [`graphs_do_not_grow_with_the_parameters`]): every family of matrices the
+    /// plan keeps in a member arena has the same member count for both sets (the anchor trapdoors
+    /// of the steps excepted), every other one is exported, spilled to its export, or a streamed
+    /// carry, and every matrix (or family member) has at most `2 (w_0 + 2) w_0` rows and columns
+    /// and `4 (w_0 + 2)^2` entries. The resident families of one-word integers (the clear labels
+    /// and the packed label-transition columns, `O(v m_v)` and `O(2^c m_v)` words) are listed.
     #[test]
     fn test_vram_audit_resident_families() {
         use crate::dio2::test_support::{GraphOnly, residency};
-        for (ring_dimension, primes, label_rows, digits, steps, eval_bits) in
-            [(8u32, 5usize, 1usize, 2usize, 2usize, 1usize), (16, 3, 2, 3, 3, 2)]
-        {
-            let (mut parameters, _) = toy();
-            parameters.ring_dimension = ring_dimension;
-            parameters.primes = mxx_backends::openfhe_guard::gen_modulus_and_warmup(
-                ring_dimension,
-                primes,
-                parameters.crt_bits,
-                None,
-            )
-            .unwrap();
-            parameters.prf.lwr_dimension = label_rows;
-            parameters.smudge_digits = digits;
-            let function = first_bit_function(eval_bits, steps);
-            let execution =
-                GraphOnly(CpuExecution::new(cpu_backend(parameters.rings().unwrap())), Vec::new());
-            let mut dio2 = Dio2::new(parameters.clone(), execution, MemoryArtifactStore::default())
-                .unwrap()
-                .with_inputs_by_shape();
-            let input = Dio2Function {
-                function: function.clone(),
-                y: vec![vec![false; function.obf_chunk_bits]; steps],
-                initial_state: 0,
-            };
-            let obfuscation = dio2.obfuscate_with_hash_key(&input, [7; 32]).unwrap();
-            dio2.evaluate(&obfuscation, &vec![vec![false; eval_bits]; steps]).unwrap();
-            let plan = crate::dio2::step::StepPlan::new(&parameters, &function).unwrap();
-            eprintln!(
-                "AUDIT params n={ring_dimension} primes={primes} label_rows={label_rows} digits={digits} steps={steps} eval_bits={eval_bits} w0={} blocks={} label_width={} automorphisms={}",
-                plan.columns,
-                plan.blocks(),
-                plan.label_width,
-                plan.automorphisms.len()
-            );
-            for (graph, name) in dio2.execution.1.iter().zip(["obfuscate", "evaluate"]) {
-                let row =
-                    1u128 * plan.columns as u128 * primes as u128 * ring_dimension as u128 * 8;
-                for entry in residency(graph, 8 * row) {
-                    eprintln!(
-                        "AUDIT {name} {} {} {} {} {}",
-                        entry.class, entry.scope, entry.node, entry.shape, entry.bytes
-                    );
+        let audits = [(8u32, 5usize, 1usize, 2usize, 2usize, 1usize), (16, 3, 2, 3, 3, 2)].map(
+            |(ring_dimension, primes, label_rows, digits, steps, eval_bits)| {
+                let (mut parameters, _) = toy();
+                parameters.ring_dimension = ring_dimension;
+                parameters.primes = mxx_backends::openfhe_guard::gen_modulus_and_warmup(
+                    ring_dimension,
+                    primes,
+                    parameters.crt_bits,
+                    None,
+                )
+                .unwrap();
+                parameters.prf.lwr_dimension = label_rows;
+                parameters.smudge_digits = digits;
+                let function = first_bit_function(eval_bits, steps);
+                let execution = GraphOnly(
+                    CpuExecution::new(cpu_backend(parameters.rings().unwrap())),
+                    Vec::new(),
+                );
+                let mut dio2 =
+                    Dio2::new(parameters.clone(), execution, MemoryArtifactStore::default())
+                        .unwrap()
+                        .with_inputs_by_shape();
+                let input = Dio2Function {
+                    function: function.clone(),
+                    y: vec![vec![false; function.obf_chunk_bits]; steps],
+                    initial_state: 0,
+                };
+                let obfuscation = dio2.obfuscate_with_hash_key(&input, [7; 32]).unwrap();
+                dio2.evaluate(&obfuscation, &vec![vec![false; eval_bits]; steps]).unwrap();
+                let w0 = crate::dio2::step::StepPlan::new(&parameters, &function).unwrap().columns;
+                let audit = dio2
+                    .execution
+                    .1
+                    .iter()
+                    .zip(["obfuscate", "evaluate"])
+                    .flat_map(|(graph, name)| {
+                        residency(graph).into_iter().map(move |entry| (name, entry))
+                    })
+                    .collect::<Vec<_>>();
+                (w0, audit)
+            },
+        );
+        let mut violations = Vec::new();
+        for (w0, audit) in &audits {
+            let bound = 2 * (w0 + 2) * w0;
+            let mut totals = std::collections::BTreeMap::<_, u128>::new();
+            for (graph, entry) in audit {
+                *totals.entry((*graph, entry.class)).or_default() += entry.bytes;
+                if let Some((rows, columns)) = entry.dimensions &&
+                    (rows.max(columns) > bound || rows * columns > 4 * (w0 + 2) * (w0 + 2))
+                {
+                    violations
+                        .push(format!("w0 {w0}: {graph} {} {} wide", entry.scope, entry.shape));
                 }
             }
+            eprintln!("residency (w0 {w0}): {totals:?}");
+            for (graph, entry) in audit.iter().filter(|(_, entry)| entry.class == "integer") {
+                eprintln!("integer family (w0 {w0}): {graph} {} {}", entry.scope, entry.shape);
+            }
         }
+        // The anchor trapdoors of the steps (and their public matrices) stay one family over the
+        // steps, read by every instance.
+        let resident = |audit: &[(&str, crate::dio2::test_support::Residency)]| {
+            audit
+                .iter()
+                .filter(|(_, entry)| entry.class == "resident" && !entry.trapdoors)
+                .map(|(graph, entry)| {
+                    (
+                        (graph.to_string(), entry.key.clone()),
+                        (entry.count, entry.node.clone(), entry.shape.clone()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let (first, second) = (resident(&audits[0].1), resident(&audits[1].1));
+        for (key, (count, node, shape)) in &first {
+            let other = second.get(key).map(|(count, _, shape)| (count, shape));
+            if other.map(|(count, _)| count) != Some(count) {
+                violations.push(format!("{key:?} {node}: {shape} vs {other:?}"));
+            }
+        }
+        for key in second.keys().filter(|key| !first.contains_key(*key)) {
+            violations.push(format!("{key:?} is resident only for the second set"));
+        }
+        assert!(
+            violations.is_empty(),
+            "{} violations:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
     }
 }

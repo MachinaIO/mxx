@@ -326,6 +326,12 @@ pub(crate) fn plan_graph_scratch(
             collect(id, owner, false, false);
         }
     }
+    // Read-ahead has a separate staging allocation with the same logical destination.
+    for body in &frame.external_io_loops {
+        for import in &body.ahead {
+            collect(import.template.destination, &import.staging, false, false);
+        }
+    }
     for (index, op) in frame.program.operations.iter().enumerate() {
         // Operations of any device may share one allocation: its barriers
         // order every use, and only copies reach across devices.
@@ -346,20 +352,26 @@ pub(crate) fn plan_graph_scratch(
     // arena bytes although the host binds it: the host writes it only inside
     // that span.
     let placed = {
-        use crate::gpu_physical_lowering::ImportDestination::Placed;
+        use crate::gpu_physical_lowering::ImportDestination::{Placed, PlacedBounded};
         frame
             .external_io_imports
             .iter()
             .chain(frame.external_io_loops.iter().flat_map(|body| &body.imports))
-            .filter(|import| matches!(import.upload_owner, Placed { .. }))
+            .filter(|import| matches!(import.upload_owner, Placed { .. } | PlacedBounded { .. }))
             .map(|import| (import.destination, import.request_operation as usize))
             .chain(frame.import_templates.iter().enumerate().filter_map(|(index, import)| {
                 // A wave's template is read from its wave group's start, a
                 // root one from the start of execution.
                 let in_wave =
                     frame.waves.iter().any(|wave| wave.import_template_indices.contains(&index));
-                matches!(import.upload_owner, Placed { .. }).then(|| {
+                matches!(import.upload_owner, Placed { .. } | PlacedBounded { .. }).then(|| {
                     (import.destination, if in_wave { import.before_operation as usize } else { 0 })
+                })
+            }))
+            .chain(frame.external_io_loops.iter().flat_map(|body| {
+                body.ahead.iter().filter_map(move |import| {
+                    matches!(import.template.upload_owner, Placed { .. } | PlacedBounded { .. })
+                        .then_some((import.template.destination, body.body_start as usize))
                 })
             }))
             .collect::<Vec<_>>()
@@ -559,6 +571,13 @@ pub(crate) fn plan_graph_scratch(
     frame.owners.rebind(|_, owner| rebound(owner, &persistent))?;
     for wave in &mut frame.waves {
         rebind(&mut wave.owner_bindings, &persistent)?;
+    }
+    for body in &mut frame.external_io_loops {
+        for import in &mut body.ahead {
+            if let Some(owner) = rebound(&import.staging, &persistent)? {
+                import.staging = Arc::new(owner);
+            }
+        }
     }
     Ok(plan)
 }

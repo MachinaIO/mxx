@@ -21,7 +21,7 @@
 use super::{
     Dio2, Dio2Error, Dio2Function, Dio2Parameters, Failure,
     carrier::Key,
-    compose::{Compose, NextStep},
+    compose::{Compose, NextStep, split_deferred},
     labels::{LabelColumns, LabelProducts},
     scheme::{
         ANCHORS_OUTPUT, Dio2Obfuscation, INITIAL_OUTPUT, INITIAL_STATE_INPUT, Kind, KindMaterial,
@@ -33,17 +33,17 @@ use super::{
 use mxx_backends::{RuntimeValue, SessionStore};
 use mxx_dsl::{DslContext, Family, Int, Leaf, Mat, Trapdoor};
 use mxx_exponent_lut::{
-    api::{self, GraphEmission, StageExecution},
+    api::{self, GraphEmission, ProgramBuild, StageExecution},
     decoder::unmask::{sample_trapdoor, unmask_hint},
     program::InputBinding,
     rns_bgg::{
-        RnsBggParameters, RnsBggPayloadSecret, RnsBggPreprocessOnlineEvalDescriptor, RnsBggRoot,
-        RnsBggRow, RnsOutputUse, RnsPreprocessBuild,
+        RhsPlaintexts, RnsBggParameters, RnsBggPayloadSecret, RnsBggPreprocessOnlineEvalDescriptor,
+        RnsBggRoot, RnsBggRow, RnsOutputUse, RnsPreprocessBuild,
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv, node::ConcatAxis};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap};
 
 /// The secrets and public matrices of an obfuscation graph that every part reads.
 struct Secrets {
@@ -63,6 +63,7 @@ struct Obfuscator<'a> {
     /// The root of the obfuscation (step roots add their domain).
     root: RnsBggRoot,
     hash_key: [u8; 32],
+    input_storage: &'a super::input_storage::InputStorage,
     columns: LabelColumns,
     /// The resident inputs of the graph's builders (hash keys).
     runtime: BTreeMap<String, RuntimeValue>,
@@ -95,12 +96,19 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             .iter()
             .map(|kind| kind.program(&parameters, function, &plan))
             .collect::<Result<Vec<_>, _>>()?;
+        let input_storage = super::input_storage::InputStorage::new(
+            &hash_key,
+            function,
+            &kinds.iter().copied().zip(programs.iter()).collect::<Vec<_>>(),
+            self.inputs_by_shape,
+        );
         let mut obfuscator = Obfuscator {
             parameters: &parameters,
             input,
             plan: &plan,
             root: parameters.root(derive(&hash_key, "root", &[]))?,
             hash_key,
+            input_storage: &input_storage,
             columns: LabelProducts::new(&parameters, function.eval_chunk_bits).columns(),
             runtime: BTreeMap::new(),
         };
@@ -120,19 +128,32 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
         let public = if self.inputs_by_shape {
             BTreeMap::new()
         } else {
-            let (public, secret) = self.key_values(input, &plan, &kinds, &programs)?;
+            let (mut public, mut secret) = self.key_values(input, &plan, &kinds, &programs)?;
+            if let Err(error) = input_storage.publish(&mut self.store, &mut public, &mut secret) {
+                input_storage.discard_secret(&mut self.store)?;
+                return Err(error);
+            }
             runtime.extend(secret);
             public
         };
         runtime.extend(public.clone());
-        let (graph, ()) = GraphEmission {
+        let graph = GraphEmission {
             graph,
             runtime_inputs: runtime,
-            manifests: BTreeMap::new(),
+            manifests: input_storage.manifests(true),
             descriptor: (),
         }
-        .build()?;
-        let production = api::execute_artifacts(
+        .build();
+        let (graph, ()) = match graph {
+            Ok(graph) => graph,
+            Err(error) => {
+                if !self.inputs_by_shape {
+                    input_storage.discard_secret(&mut self.store)?;
+                }
+                return Err(error.into());
+            }
+        };
+        let produced = api::execute_artifacts(
             graph,
             &ParamEnv::default(),
             (),
@@ -140,7 +161,11 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             &mut self.execution,
             &mut self.store,
             record(&mut self.graphs, OBFUSCATE_STAGE),
-        )?;
+        );
+        if !self.inputs_by_shape {
+            input_storage.discard_secret(&mut self.store)?;
+        }
+        let production = produced?;
         self.productions.insert(production.production().clone(), OBFUSCATE_STAGE.to_owned());
         let mut materials = programs
             .into_iter()
@@ -156,6 +181,7 @@ impl<E: StageExecution<S>, S: SessionStore> Dio2<E, S> {
             refreshing: materials.pop(),
             last,
             public,
+            input_storage: input_storage.public_only(),
         })
     }
 
@@ -334,8 +360,10 @@ impl Obfuscator<'_> {
         kind: Kind,
         program: &super::step::ChainProgram,
         (step, chunk): (&Int, &Int),
-    ) -> Result<BTreeMap<mxx_exponent_lut::program::RhsId, InputBinding<Mat, Family<Mat>>>, Dio2Error>
-    {
+    ) -> Result<
+        BTreeMap<mxx_exponent_lut::program::RhsId, InputBinding<Mat, RhsPlaintexts>>,
+        Dio2Error,
+    > {
         let function = &self.input.function;
         let ring = self.ring();
         let obf = function.obf_chunk_bits;
@@ -343,26 +371,25 @@ impl Obfuscator<'_> {
         let first = step.clone().mul(obf);
         let mut rhs = BTreeMap::from([(
             program.y,
-            InputBinding::Family(mxx_dsl::parallel(obf, |bit| {
+            InputBinding::Family(RhsPlaintexts::Values(mxx_dsl::parallel(obf, |bit| {
                 let set = y.at(first.clone().add(bit.clone()));
                 Ok(ring.identity(1).multiply_monomial((function.y_monomial)(bit, set)?))
-            })?),
+            })?)),
         )]);
         for (role, prf) in kind.prfs(program) {
             for (bucket, selector) in prf.selector_families().into_iter().enumerate() {
                 let count = IntExpr::constant(selector.members);
                 let chunks = IntExpr::constant(1usize << function.eval_chunk_bits);
-                let bits = mxx_dsl::int_family_input(
+                let bits = self.input_storage.family(
                     selector_input(role, bucket),
                     IntExpr::Mul(Box::new(chunks), Box::new(count.clone())).canonicalize(),
-                );
+                )?;
+                // The chunk's selector bits, lifted where each member's ciphertext is sampled.
                 let first = chunk.clone().mul(Int::evaluate(count.clone()));
-                let plaintexts = mxx_dsl::parallel(count, |member| {
-                    Ok(bits
-                        .at(first.clone().add(member))
-                        .lift_to_constant_polynomial(ring.matrix_type((1, 1))))
-                })?;
-                rhs.insert(selector.rhs, InputBinding::Family(plaintexts));
+                rhs.insert(
+                    selector.rhs,
+                    InputBinding::Family(RhsPlaintexts::Lifted { integers: bits, first, count }),
+                );
             }
         }
         for sampler in program.sigma.iter().chain(&program.cbd) {
@@ -445,7 +472,10 @@ impl Obfuscator<'_> {
             .with_artifact_prefix(kind.prefix())
             .with_root_inputs(program.root_inputs.clone())
             .with_output_use(RnsOutputUse::Gadget);
-        build.bind_data_values(&program.program, kind.data(function, program, (step, chunk))?)?;
+        build.bind_data_values(
+            &program.program,
+            kind.data(function, program, (step, chunk), self.input_storage)?,
+        )?;
         let payload = RnsBggPayloadSecret::from_row(chain, secrets.payload.clone())?;
         build.bind_rhs_values(
             &program.program,
@@ -454,20 +484,34 @@ impl Obfuscator<'_> {
             Some(&payload),
             stage_key,
         )?;
-        let keys = api::lower(&program.program, &mut build)?;
+        let lowered = build.lower_deferred(&program.program, &program.deferred_outputs())?;
+        let (keys, deferred) = split_deferred(lowered);
+        let build = RefCell::new(build);
+        let blocks = |output: usize, block: IntExpr| -> Result<Key, Dio2Error> {
+            let columns =
+                deferred.get(&output).ok_or(Dio2Error::Input("an output is not deferred"))?;
+            Ok(build
+                .borrow_mut()
+                .deferred_block(&program.program, columns, &block)?
+                .matrix()
+                .clone())
+        };
         let compose = Compose::<Key>::new(
             self.parameters,
             chain,
             plan,
             program,
-            keys.iter().map(|key| key.matrix().clone()).collect(),
+            keys.iter().map(|key| key.as_ref().map(|key| key.matrix().clone())).collect(),
+            Box::new(blocks),
         )?;
-        let trapdoor = secrets.anchors.at(step.clone());
+        // The step's anchor trapdoor is selected where each preimage is sampled, with its public
+        // matrix at the same index.
+        let trapdoor = || secrets.anchors.at(step.clone());
         let anchor = super::anchor_columns(plan.columns);
         let preimages: Leaf = match kind {
             Kind::Last => {
                 let key = compose.output_key()?;
-                Leaf::of(trapdoor.sample_preimage(key, (anchor, 1))).expect("one wire")
+                Leaf::of(trapdoor().sample_preimage(key, (anchor, 1))).expect("one wire")
             }
             Kind::Refreshing => {
                 let next = NextStep {
@@ -477,12 +521,15 @@ impl Obfuscator<'_> {
                 };
                 let preimages =
                     compose.decoded_keys(&next, (&self.columns, chunk.clone()), |key| {
-                        trapdoor.sample_preimage(key, (anchor, plan.columns))
+                        trapdoor().sample_preimage(key, (anchor, plan.columns))
                     })?;
                 Leaf::of(preimages).expect("one wire")
             }
         };
-        let emission = build.emit(DslContext::new("dio2-material"), keys)?;
+        drop(compose);
+        let emission = build
+            .into_inner()
+            .emit(DslContext::new("dio2-material"), keys.into_iter().flatten().collect())?;
         let prefix = kind.prefix();
         let mut leaves = emission
             .graph

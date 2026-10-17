@@ -240,7 +240,7 @@ pub(crate) fn static_public_lut(
     values: super::dynamic::LutEntries<'_>,
     input: (Option<RnsBggRow>, RnsBggMatrix),
     payload: Option<Mat>,
-    helpers: Option<&(Family<Mat>, Family<Mat>)>,
+    helpers: Option<&super::encoding::LutHelperRows>,
 ) -> Result<(Option<RnsBggRow>, RnsBggMatrix), RnsBggError> {
     use super::dynamic::select;
     let next_level = level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
@@ -281,10 +281,7 @@ pub(crate) fn static_public_lut(
         )
     };
     let helper_row = |position: IntExpr| {
-        helpers.map(|(top, bottom)| {
-            let position = Int::evaluate(position);
-            (top.at(position.clone()), bottom.at(position))
-        })
+        helpers.map(|helpers| helpers.member(parameters, Int::evaluate(position))).transpose()
     };
     let schema = |_| DslError::Schema;
     let (row, key) = input;
@@ -331,7 +328,7 @@ pub(crate) fn static_public_lut(
                 let r = select(routes, index.clone());
                 let j = select(&sigmas, member.clone());
                 Ok((
-                    helper_row(member).map(|row| map_row(row, route(&r))),
+                    helper_row(member).map_err(schema)?.map(|row| map_row(row, route(&r))),
                     map_matrix(public(j).map_err(schema)?, route(&r)),
                 ))
             };
@@ -370,7 +367,7 @@ pub(crate) fn static_public_lut(
                 level,
                 next_level,
                 switched,
-                (helper_row(position), Some(public(k).map_err(schema)?)),
+                (helper_row(position).map_err(schema)?, Some(public(k).map_err(schema)?)),
             )
             .map_err(schema)?;
             Ok((

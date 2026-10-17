@@ -661,6 +661,68 @@ fn compiled_raw_small_matrix_part(
     ))
 }
 
+impl GpuResidentValue {
+    /// Allocate a private template, retaining aliases between CRT limbs and trapdoor leaves.
+    /// The host binds its real member before every launch. Overlapping views of one owner
+    /// need one placeholder range, not a separate copy of each view's remaining buffer tail.
+    pub(crate) fn private_placeholder(&self, backend: &GpuDcrtBackend) -> Result<Self, String> {
+        let mut groups = BTreeMap::<(i32, *const ()), Vec<(u64, u64)>>::new();
+        for (_, bound) in self.storages() {
+            let end = bound
+                .address
+                .checked_add(bound.bytes)
+                .ok_or("GPU placeholder address range overflows")?;
+            groups
+                .entry((bound.device, Arc::as_ptr(&bound.owner).cast::<()>()))
+                .or_default()
+                .push((bound.address, end));
+        }
+        let mut replacements = BTreeMap::new();
+        for (key, mut ranges) in groups {
+            ranges.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+            for (start, end) in ranges {
+                if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            }
+            let parameters = backend.control_parameters_on_device(key.0)?;
+            let mut buffers = Vec::new();
+            for (start, end) in merged {
+                let bytes = usize::try_from(end - start)
+                    .map_err(|_| "GPU resident placeholder exceeds host address space")?;
+                let allocation = Arc::new(
+                    crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, key.0, bytes)
+                        .map_err(|error| error.to_string())?,
+                );
+                buffers.push((start, end, BoundStorage::from_device_bytes(allocation)?));
+            }
+            replacements.insert(key, buffers);
+        }
+        let mut storage = BTreeMap::new();
+        for (&slot, bound) in self.storages() {
+            let key = (bound.device, Arc::as_ptr(&bound.owner).cast::<()>());
+            let (start, _, allocation) = replacements[&key]
+                .iter()
+                .find(|(start, end, _)| {
+                    *start <= bound.address && bound.address + bound.bytes <= *end
+                })
+                .ok_or("GPU placeholder storage has no allocation")?;
+            storage.insert(
+                slot,
+                BoundStorage {
+                    address: allocation.address + (bound.address - start),
+                    bytes: bound.bytes,
+                    ..allocation.clone()
+                },
+            );
+        }
+        Self::new(Arc::clone(self.physical()), storage, Box::new([])).map_err(str::to_owned)
+    }
+}
+
 /// Emit one operation from the process-local implementation registry directly
 /// into the explicit native Graph. All addresses come from validated physical
 /// owners; a missing owner or unsupported primitive is a preparation error.
@@ -1116,6 +1178,7 @@ pub(crate) fn prepare_compiled_gpu_program(
     let mut dynamic_round_divides = BTreeMap::new();
     let mut gq = BTreeMap::new();
     let mut cutoff = BTreeMap::new();
+    let mut cutoff_shapes = BTreeMap::new();
     let mut resource_ids = BTreeSet::new();
     let mut crt_resource_ids = BTreeSet::new();
     let mut compact_pack_resource_ids = BTreeSet::new();
@@ -1822,9 +1885,6 @@ pub(crate) fn prepare_compiled_gpu_program(
                 else {
                     return Err(invalid("preimage cutoff has invalid preparation arguments"));
                 };
-                if !resource_ids.insert(*resource_id) {
-                    return Err(invalid("cutoff resource ID is duplicated"));
-                }
                 let candidate_owner = owners
                     .get(candidate_id)
                     .ok_or_else(|| invalid("cutoff candidate owner is missing"))?;
@@ -1839,6 +1899,26 @@ pub(crate) fn prepare_compiled_gpu_program(
                 {
                     return Err(invalid("cutoff candidate is not a packed tile"));
                 }
+                // The lowerer orders tiles that share this staging resource.
+                // Repeated uses must agree on every byte-layout and cutoff parameter.
+                let shape = (
+                    operation.device,
+                    candidate_ty.ring.clone(),
+                    candidate.rows,
+                    candidate.columns,
+                    *magnitude_bytes,
+                    bound_words.clone(),
+                );
+                if let Some(previous) = cutoff_shapes.get(resource_id) {
+                    if previous != &shape {
+                        return Err(invalid("shared cutoff resource has incompatible parameters"));
+                    }
+                    continue;
+                }
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("cutoff resource ID is used by another resource kind"));
+                }
+                cutoff_shapes.insert(*resource_id, shape);
                 let params = backend
                     .parameters_on_physical_device(operation.device, &candidate_ty)
                     .map_err(|error| invalid(&error))?;
@@ -3498,10 +3578,12 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(value_binding),
                 KernelArg::U32(destination_binding),
                 KernelArg::U32(status_binding),
+                KernelArg::U32(unit),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled integer lift has wrong arguments"));
             };
+            let unit = *unit != 0;
             if op.outputs.as_ref() != [*destination_id] {
                 return Err(invalid("compiled integer lift has wrong output"));
             }
@@ -3522,10 +3604,15 @@ pub(crate) fn emit_compiled_gpu_op(
                 *destination_part,
                 PhysicalEncoding::FullCoeff,
             )?;
-            if (destination_ty.rows, destination_ty.columns) != (1, 1) ||
-                destination.physical_device != op.device
-            {
-                return Err(invalid("integer lift destination must be one polynomial"));
+            let shape_valid = if unit {
+                destination_ty.rows == 1 || destination_ty.columns == 1
+            } else {
+                (destination_ty.rows, destination_ty.columns) == (1, 1)
+            };
+            if !shape_valid || destination.physical_device != op.device {
+                return Err(invalid(
+                    "integer lift destination must be one polynomial or a unit vector",
+                ));
             }
             let status = compiled_raw_control_status(
                 status_owner,
@@ -3545,6 +3632,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 &destination,
                 status,
                 *destination_binding,
+                unit,
             )?;
             for owner in [value_owner, destination_owner, status_owner] {
                 builder.retain_owner(Arc::clone(owner));

@@ -62,9 +62,25 @@ impl Dio2Parameters {
         .map_err(|_| Dio2Error::Parameters("the primes do not make a CRT basis"))
     }
 
-    /// Every ring a backend running an obfuscation hosts: the root modulus.
+    /// Every ring used by either graph: the root modulus and the output decoder's
+    /// first-prime ring. Refresh recombination stays at the root modulus, but the final
+    /// plaintext is modulus-switched into the single-prime ring before decoding.
     pub fn rings(&self) -> Result<Vec<DCRTPolyParams>, Dio2Error> {
-        Ok(vec![self.pool()?])
+        let mut rings = vec![self.pool()?];
+        if self.primes.len() > 1 {
+            rings.push(
+                DCRTPolyParams::try_new(
+                    self.ring_dimension,
+                    1,
+                    self.crt_bits,
+                    self.base_bits,
+                    Some(vec![self.primes[0]]),
+                    None,
+                )
+                .map_err(|_| Dio2Error::Parameters("the output prime does not make a CRT basis"))?,
+            );
+        }
+        Ok(rings)
     }
 
     /// The root of a step's chain under the step's root hash key `hash_key`.
@@ -132,5 +148,23 @@ impl Dio2Parameters {
     /// still use all `label_rows() * (label_width() + 1)` label targets.
     pub fn label_width(&self) -> usize {
         self.label_rows() * self.label_modulus().ilog2() as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_rings_include_output_decoder_without_duplicates() {
+        let (mut parameters, _) = super::super::test_support::toy();
+        let rings = parameters.rings().unwrap();
+        assert_eq!(rings.len(), 2);
+        assert_eq!(rings[0].to_crt().0, parameters.pool().unwrap().to_crt().0);
+        assert_eq!(rings[1].to_crt().0, vec![parameters.primes[0]]);
+        assert_eq!(rings[1].ring_dimension(), parameters.ring_dimension);
+        assert_eq!(rings[1].base_bits(), parameters.base_bits);
+        parameters.primes.truncate(1);
+        assert_eq!(parameters.rings().unwrap().len(), 1);
     }
 }

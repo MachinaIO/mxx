@@ -224,6 +224,31 @@ namespace
                 valid && coefficient == 0 ? residue : 0);
     }
 
+    // The unit vector of `entries` constant polynomials whose entry `index` (the resident
+    // integer) is one: every coefficient but the constant one of that entry is zero.
+    __global__ void raw_unit_vector_kernel(const uint64_t *value, int encoding,
+        MxxRawMatrixLimb destination, uint32_t *status, uint32_t degree, size_t entries,
+        size_t columns)
+    {
+        __shared__ uint64_t index;
+        __shared__ bool valid;
+        if (threadIdx.x == 0)
+        {
+            valid = raw_nonnegative_extent(value, encoding, entries - 1, &index);
+            if (!valid) atomicCAS(status, 0U, kRawScalarInvalid);
+        }
+        __syncthreads();
+        const size_t step = static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t item = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             item < entries * degree; item += step)
+        {
+            const size_t poly = item / degree;
+            const size_t coefficient = item % degree;
+            raw_matrix_store(destination, poly, coefficient, columns,
+                valid && poly == index && coefficient == 0 ? 1 : 0);
+        }
+    }
+
     MxxGraphPatch raw_remaining_patch(uint32_t argument, uint32_t offset,
         uint32_t binding)
     {
@@ -366,11 +391,13 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
     const void *value, int value_encoding,
     const MxxRawMatrixView *destination, uint32_t *status,
     uint32_t value_binding, uint32_t destination_binding_base,
-    uint32_t status_binding)
+    uint32_t status_binding, int unit)
 {
+    const bool vector = destination &&
+        (destination->rows == 1 || destination->columns == 1);
     if (!value || !status || value_encoding < 0 || value_encoding == 2 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
-        destination->rows != 1 || destination->columns != 1 ||
+        (unit ? !vector : destination->rows != 1 || destination->columns != 1) ||
         destination->limb_count != ctx->moduli.size() ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw integer-to-polynomial view");
@@ -380,7 +407,9 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
             return set_error("raw integer-to-polynomial requires ordered CRT basis");
     if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
-    const uint32_t grid = std::min<uint32_t>((destination->degree + 255) / 256, 65535);
+    const size_t entries = destination->rows * destination->columns;
+    const uint32_t grid = std::min<size_t>(
+        (static_cast<size_t>(destination->degree) * (unit ? entries : 1) + 255) / 256, 65535);
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     for (size_t limb = 0; limb < destination->limb_count; ++limb)
     {
@@ -390,10 +419,16 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
                 destination_binding_base + limb),
             raw_remaining_patch(3, 0, status_binding),
         };
-        const int result = mxx_gpu_launch_kernel(ctx, stream,
-            raw_lift_integer_kernel, dim3(grid), dim3(256), 0,
-            patches, std::size(patches), static_cast<const uint64_t *>(value), value_encoding,
-            destination->limbs[limb], status, destination->degree);
+        const int result = unit ?
+            mxx_gpu_launch_kernel(ctx, stream,
+                raw_unit_vector_kernel, dim3(grid), dim3(256), 0,
+                patches, std::size(patches), static_cast<const uint64_t *>(value),
+                value_encoding, destination->limbs[limb], status, destination->degree,
+                entries, static_cast<size_t>(destination->columns)) :
+            mxx_gpu_launch_kernel(ctx, stream,
+                raw_lift_integer_kernel, dim3(grid), dim3(256), 0,
+                patches, std::size(patches), static_cast<const uint64_t *>(value),
+                value_encoding, destination->limbs[limb], status, destination->degree);
         if (result != 0) return result;
     }
     return 0;

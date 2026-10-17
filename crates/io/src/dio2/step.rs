@@ -19,9 +19,12 @@
 //! prime (one PRF, one row of every smudge's columns per digit), and the label products; the last
 //! step's ([`ChainProgram::last`]) computes `Pi` and the smudge of the output decoder. The
 //! Program does not grow with the number of parts. Production label products are described by
-//! [`LabelProducts`] and lowered directly into DSL families by the refresh composition
-//! ([`super::compose`]); they are not scalar Program output ports. Noise-only Programs retain
-//! scalar product chains of the same multiplication order.
+//! [`LabelProducts`] and lowered by the refresh composition ([`super::compose`]), each in the
+//! part that decodes it; they are not scalar Program output ports. Noise-only Programs retain
+//! scalar product chains of the same multiplication order. The production graphs lower the
+//! Program with its CBD and smudge rows deferred ([`ChainProgram::deferred_outputs`]): those
+//! rows are read one column block at a time and every Program family is lowered where its
+//! members are read, while the noise model simulates the same Program eagerly.
 
 use super::{
     Dio2Error, Dio2Parameters, StreamingFunction,
@@ -369,6 +372,17 @@ impl StepPlan {
                 .map_err(|_| Dio2Error::Parameters("a LUT does not fit the ring"))?;
             plan.helper_families.insert(table.helper_family_key(), branches);
         }
+        if symbolic_labels && plan.automorphisms.len() > 1 {
+            let table = LutTable::automorphism_family(
+                plan.automorphisms.iter().copied().filter(|k| *k != 1).collect(),
+            )?;
+            plan.helper_families.insert(
+                table.helper_family_key(),
+                table
+                    .branch_automorphisms(plan.ring_dimension)
+                    .map_err(|_| Dio2Error::Parameters("a helper does not fit the ring"))?,
+            );
+        }
         let anchors = super::anchor_columns(columns).div_ceil(2 * columns);
         plan.full_target_count =
             3 + plan.label_rows * (plan.label_width + 1) + plan.automorphisms.len() + anchors;
@@ -474,6 +488,8 @@ pub struct ChainOutputs {
     pub sigma: Option<usize>,
     /// The σ sampler's automorphisms `Aut_k`, `k` in `K` but `1`.
     pub automorphed: BTreeMap<usize, usize>,
+    /// Deferred nonidentity helper automorphisms, in plan order (production only).
+    pub helper_blocks: Option<usize>,
     /// The CBD noise of every refresh part: a row of `w_0` blocks per part, part `p` at blocks
     /// `p w_0 ..` (none for the last step).
     pub cbd: Option<usize>,
@@ -516,6 +532,16 @@ pub struct ChainProgram {
 }
 
 impl ChainProgram {
+    /// The outputs a composition reads by column blocks where it decodes them: the smudge row
+    /// and, for a refreshing step, the CBD row. Their PRF members are lowered in the loops that
+    /// read the blocks (`mxx_exponent_lut::api::ProgramBuild::lower_deferred`).
+    pub fn deferred_outputs(&self) -> BTreeSet<usize> {
+        std::iter::once(self.outputs.smudge)
+            .chain(self.outputs.cbd)
+            .chain(self.outputs.helper_blocks)
+            .collect()
+    }
+
     /// The Program of a step followed by a refresh, whose `plan.blocks()` part blocks each
     /// decode a row of `w_0` columns.
     pub fn refreshing(
@@ -591,6 +617,7 @@ impl ChainProgram {
             state: 0,
             sigma: None,
             automorphed: BTreeMap::new(),
+            helper_blocks: None,
             cbd: None,
             smudge: 0,
             labels: Vec::new(),
@@ -639,12 +666,27 @@ impl ChainProgram {
             });
             outputs.sigma = Some(wires.len());
             wires.push(Operand::Scalar(packed));
-            for sigma in plan.automorphisms.iter().copied().filter(|sigma| *sigma != 1) {
-                let table = LutTable::automorphism(sigma, LutOutputRepresentation::Coefficient)?;
-                let lut = builder.register_lut(table)?;
-                let automorphed = builder.lut(Operand::Scalar(packed), lut)?;
-                outputs.automorphed.insert(sigma, wires.len());
-                wires.push(Operand::Scalar(automorphed));
+            if plan.symbolic_labels && plan.automorphisms.len() > 1 {
+                let indices =
+                    plan.automorphisms.iter().copied().filter(|k| *k != 1).collect::<Vec<_>>();
+                let count = indices.len();
+                let lut = builder.register_lut(LutTable::automorphism_family(indices)?)?;
+                let family = builder
+                    .parallel(FamilyRange::full(IntExpr::constant(count))?, |body, _| {
+                        Ok(Operand::Scalar(body.lut(Operand::Scalar(packed), lut)?))
+                    })?;
+                let row = builder.sum_columns(family, count)?;
+                outputs.helper_blocks = Some(wires.len());
+                wires.push(Operand::Scalar(row));
+            } else {
+                for sigma in plan.automorphisms.iter().copied().filter(|sigma| *sigma != 1) {
+                    let table =
+                        LutTable::automorphism(sigma, LutOutputRepresentation::Coefficient)?;
+                    let lut = builder.register_lut(table)?;
+                    let automorphed = builder.lut(Operand::Scalar(packed), lut)?;
+                    outputs.automorphed.insert(sigma, wires.len());
+                    wires.push(Operand::Scalar(automorphed));
+                }
             }
             sigma_sampler = Some(sampler);
             if let Some(shape) = &keys.cbd {

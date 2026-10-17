@@ -6,6 +6,12 @@ pub(crate) fn test_streamed_members() -> usize {
     positive_usize("MXX_TEST_STREAMED_MEMBERS", 8).expect("valid streamed test cardinality")
 }
 
+/// `MXX_TEST_STREAMED_COLUMNS`: target columns in tiled preimage tests (default: 4).
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn test_streamed_columns() -> usize {
+    positive_usize("MXX_TEST_STREAMED_COLUMNS", 4).expect("valid streamed test columns")
+}
+
 /// `MXX_TEST_STREAMED_STEPS`: sequential iterations in carry unit tests (default: 3).
 #[cfg(test)]
 pub(crate) fn test_streamed_steps() -> usize {
@@ -16,6 +22,25 @@ pub(crate) fn test_streamed_steps() -> usize {
 #[cfg(test)]
 pub(crate) fn test_streamed_ring_dimension() -> usize {
     positive_usize("MXX_TEST_STREAMED_RING_DIMENSION", 8).expect("valid streamed test ring")
+}
+
+/// Parameters of the preimage capacity diagnostic. Defaults are deliberately small;
+/// set `MXX_TEST_CAPACITY_N`, `PRIMES`, `CRT_BITS`, and `BASE_BITS` (all with the
+/// `MXX_TEST_CAPACITY_` prefix) to inspect a different sampler shape.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn test_capacity_parameters() -> (u32, usize, usize, u32) {
+    (
+        positive_usize("MXX_TEST_CAPACITY_N", 8)
+            .expect("capacity ring dimension")
+            .try_into()
+            .expect("capacity dimension fits u32"),
+        positive_usize("MXX_TEST_CAPACITY_PRIMES", 2).expect("capacity CRT depth"),
+        positive_usize("MXX_TEST_CAPACITY_CRT_BITS", 40).expect("capacity CRT bits"),
+        positive_usize("MXX_TEST_CAPACITY_BASE_BITS", 20)
+            .expect("capacity base bits")
+            .try_into()
+            .expect("capacity base bits fit u32"),
+    )
 }
 
 /// `MXX_CUDA_STREAM_POOL_SIZE`: number of reusable compute streams owned by

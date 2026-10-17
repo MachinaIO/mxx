@@ -70,7 +70,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         &mut self,
         program: &ExponentLutProgram,
         parameters: &mxx_ir_core::ParamEnv,
-        rhs: BTreeMap<RhsId, InputBinding<Mat, Family<Mat>>>,
+        rhs: BTreeMap<RhsId, InputBinding<Mat, super::RhsPlaintexts>>,
         payload: Option<&RnsBggPayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
@@ -121,14 +121,15 @@ impl<'a> RnsPreprocessBuild<'a> {
     pub fn bind_data_values(
         &mut self,
         program: &ExponentLutProgram,
-        data: BTreeMap<crate::program::DataId, Family<Int>>,
+        data: BTreeMap<crate::program::DataId, (Family<Int>, Int)>,
     ) -> Result<(), ApiError> {
         if self.evaluator.is_some() {
             return Err(ApiError::input("bind graph data before the RHS"));
         }
-        crate::program::validate_data_values(program, &data)
+        let (data, offsets) = crate::program::validate_data_values(program, data)
             .map_err(|error| ApiError::input(error.to_string()))?;
         self.graph_data = Some(data);
+        self.families.data_offsets = offsets;
         Ok(())
     }
 
@@ -482,17 +483,21 @@ impl<'a> RnsPreprocessBuild<'a> {
             .parameters
             .refresh_actions(level, a_prime, declaration.output_prime(), declaration.reference())
             .map_err(ApiError::scheme)?;
+        let fresh_term = |row| {
+            crate::rns_bgg::refresh::row_fresh_term(row, columns, &actions)
+                .map_err(ApiError::scheme)
+        };
         let top = refresh_combination(
             (one.0.0, one.0.1),
             target_top.clone(),
-            (fresh_top, columns),
+            fresh_term(fresh_top)?,
             &actions,
         )
         .map_err(ApiError::scheme)?;
         let bottom = refresh_combination(
             (one.1.0, one.1.1),
             target_bottom.clone(),
-            (fresh_bottom, columns),
+            fresh_term(fresh_bottom)?,
             &actions,
         )
         .map_err(ApiError::scheme)?;
@@ -745,11 +750,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         };
         let graph_data = self.graph_data.is_some();
         let data = match &self.graph_data {
-            Some(data) => {
-                crate::program::validate_data_values(&program, data)
-                    .map_err(|error| ApiError::input(error.to_string()))?;
-                data.clone()
-            }
+            Some(data) => data.clone(),
             None => crate::program::data_inputs(&program, name),
         };
         if (values.is_some() || self.rhs_values.is_some()) && !self.inputs_by_shape && !graph_data {
@@ -844,10 +845,15 @@ impl<'a> RnsPreprocessBuild<'a> {
                     InputBinding::Scalar(value) if value.matrix_type() == &schema => {
                         InputBinding::Scalar(value.clone())
                     }
-                    InputBinding::Family(values)
+                    InputBinding::Family(super::RhsPlaintexts::Values(values))
                         if values.schema().element == mxx_dsl::MatType(schema) =>
                     {
-                        InputBinding::Family(super::PlaintextFamily::Values(values.clone()))
+                        InputBinding::Family(super::PlaintextFamily::Graph(
+                            super::RhsPlaintexts::Values(values.clone()),
+                        ))
+                    }
+                    InputBinding::Family(lifted @ super::RhsPlaintexts::Lifted { .. }) => {
+                        InputBinding::Family(super::PlaintextFamily::Graph(lifted.clone()))
                     }
                     _ => return Err(ApiError::input("RHS values must be level-zero polynomials")),
                 }
@@ -1040,13 +1046,22 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         let name = |role: &str| instance_name(self.artifact_prefix.as_deref(), role);
         let mut evaluator =
             self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
-        let carriers = outputs
+        // Every declared output has a carrier, including one a composing graph read as deferred
+        // column blocks (`ProgramBuild::lower_deferred`) and so does not pass in `outputs`.
+        let carriers = evaluator
+            .program
+            .outputs()
             .iter()
             .map(|output| {
-                let level = evaluator.workload.level(output.wire)?;
+                let wire = match output {
+                    Operand::Scalar(wire) |
+                    Operand::Member { family: wire, .. } |
+                    Operand::Selected { family: wire, .. } => *wire,
+                };
+                let level = evaluator.workload.level(wire)?;
                 self.parameters.output_carrier(
                     &evaluator.program,
-                    output.wire,
+                    wire,
                     level,
                     evaluator.output_use,
                 )
@@ -1215,15 +1230,59 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
 
 impl ProgramBuild for RnsPreprocessBuild<'_> {
     type Wire = RnsBggPublicKey;
+    type WireFamily = super::lowering::PreprocessWireFamily;
 
     fn lower(&mut self, program: &ExponentLutProgram) -> Result<Vec<Self::Wire>, ApiError> {
+        let (evaluator, families, environment) = self.bound_lowering(program)?;
+        lower_program(program, evaluator, families, environment).map_err(ApiError::lowering)
+    }
+
+    fn lower_deferred(
+        &mut self,
+        program: &ExponentLutProgram,
+        deferred: &std::collections::BTreeSet<usize>,
+    ) -> Result<Vec<crate::program::LoweredOutput<Self::Wire, Self::WireFamily>>, ApiError> {
+        let (evaluator, families, environment) = self.bound_lowering(program)?;
+        crate::program::lower_program_deferred(program, evaluator, families, environment, deferred)
+            .map_err(ApiError::lowering)
+    }
+
+    fn deferred_block(
+        &mut self,
+        program: &ExponentLutProgram,
+        columns: &crate::program::DeferredColumns<Self::Wire, Self::WireFamily>,
+        block: &IntExpr,
+    ) -> Result<Self::Wire, ApiError> {
+        let (evaluator, families, environment) = self.bound_lowering(program)?;
+        columns.block(program, evaluator, families, environment, block).map_err(ApiError::lowering)
+    }
+}
+
+impl<'a> RnsPreprocessBuild<'a> {
+    /// The bound lowering state of `program`: its evaluator, families and environment.
+    #[allow(clippy::type_complexity)]
+    fn bound_lowering(
+        &mut self,
+        program: &ExponentLutProgram,
+    ) -> Result<
+        (
+            &mut PublicKeyLowering<'a>,
+            &mut super::encoding::OnlineEvalFamilies<'a>,
+            &mut Environment<
+                RnsBggPublicKey,
+                RhsRef<Int>,
+                super::lowering::PreprocessWireFamily,
+                Family<RhsRef<Int>>,
+            >,
+        ),
+        ApiError,
+    > {
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("preprocessing is not bound"))?;
         if evaluator.program.id() != program.id() {
             return Err(ApiError::input("lowered Program differs from the bound preprocessing"));
         }
-        lower_program(program, evaluator, &mut self.families, &mut self.environment)
-            .map_err(ApiError::lowering)
+        Ok((evaluator, &mut self.families, &mut self.environment))
     }
 }
 
@@ -1449,7 +1508,7 @@ mod test {
                 &ParamEnv::default(),
                 BTreeMap::from([(
                     rhs,
-                    InputBinding::Family(
+                    InputBinding::Family(crate::rns_bgg::RhsPlaintexts::Values(
                         mxx_dsl::parallel(2usize, |index| {
                             Ok(ring.polynomial([IntExpr::Rem(
                                 Box::new(index.expression()?),
@@ -1457,7 +1516,7 @@ mod test {
                             )]))
                         })
                         .unwrap(),
-                    ),
+                    )),
                 )]),
                 Some(&payload),
                 &hash_key,
@@ -1664,7 +1723,10 @@ mod test {
                     &program,
                     BTreeMap::from([(
                         data,
-                        mxx_dsl::parallel(1usize, |_| Ok(selections.at(member.clone())))?,
+                        (
+                            mxx_dsl::parallel(1usize, |_| Ok(selections.at(member.clone())))?,
+                            Int::constant(0),
+                        ),
                     )]),
                 )
                 .unwrap();
@@ -1678,7 +1740,10 @@ mod test {
                 .bind_rhs_values(
                     &program,
                     &ParamEnv::default(),
-                    BTreeMap::from([(rhs, InputBinding::Family(plaintexts))]),
+                    BTreeMap::from([(
+                        rhs,
+                        InputBinding::Family(crate::rns_bgg::RhsPlaintexts::Values(plaintexts)),
+                    )]),
                     Some(&payload),
                     &hash_key,
                 )
@@ -1780,10 +1845,13 @@ mod test {
                 &program,
                 BTreeMap::from([(
                     data,
-                    mxx_dsl::parallel(1usize, |_| {
-                        Ok(mxx_dsl::int_family_input("selections", 2usize).at(member.clone()))
-                    })
-                    .unwrap(),
+                    (
+                        mxx_dsl::parallel(1usize, |_| {
+                            Ok(mxx_dsl::int_family_input("selections", 2usize).at(member.clone()))
+                        })
+                        .unwrap(),
+                        Int::constant(0),
+                    ),
                 )]),
             )
             .unwrap();
@@ -1907,7 +1975,10 @@ mod test {
             .bind_rhs_values(
                 &program,
                 &ParamEnv::default(),
-                BTreeMap::from([(rhs, InputBinding::Family(plaintexts))]),
+                BTreeMap::from([(
+                    rhs,
+                    InputBinding::Family(crate::rns_bgg::RhsPlaintexts::Values(plaintexts)),
+                )]),
                 Some(&payload),
                 &rand::random::<[u8; 32]>(),
             )
@@ -1994,7 +2065,10 @@ mod test {
                     &program,
                     &ParamEnv::default(),
                     &preprocessing,
-                    BTreeMap::from([(input, InputBinding::Family(rows(3usize)))]),
+                    BTreeMap::from([(
+                        input,
+                        InputBinding::Family(crate::program::GraphFamily::Values(rows(3usize)))
+                    )]),
                     BTreeMap::new(),
                     &hash_key
                 )
@@ -2007,8 +2081,16 @@ mod test {
                     &program,
                     &ParamEnv::default(),
                     &preprocessing,
-                    BTreeMap::from([(input, InputBinding::Family(rows(2usize)))]),
-                    BTreeMap::from([(input, InputBinding::Family(plaintexts.clone()))]),
+                    BTreeMap::from([(
+                        input,
+                        InputBinding::Family(crate::program::GraphFamily::Values(rows(2usize)))
+                    )]),
+                    BTreeMap::from([(
+                        input,
+                        InputBinding::Family(crate::program::GraphFamily::Values(
+                            plaintexts.clone()
+                        ))
+                    )]),
                     &hash_key
                 )
                 .is_err()
@@ -2018,8 +2100,14 @@ mod test {
                 &program,
                 &ParamEnv::default(),
                 &preprocessing,
-                BTreeMap::from([(input, InputBinding::Family(rows(3usize)))]),
-                BTreeMap::from([(input, InputBinding::Family(plaintexts))]),
+                BTreeMap::from([(
+                    input,
+                    InputBinding::Family(crate::program::GraphFamily::Values(rows(3usize))),
+                )]),
+                BTreeMap::from([(
+                    input,
+                    InputBinding::Family(crate::program::GraphFamily::Values(plaintexts)),
+                )]),
                 &hash_key,
             )
             .unwrap();
@@ -2259,6 +2347,125 @@ mod test {
             parameters.ring(2).unwrap().matrix_type((1, parameters.component_columns(2).unwrap()));
         for entry in matrix_entries(second_material) {
             assert_eq!(entry.matrix_type(), &expected_schema);
+        }
+    }
+    /// The deferred blocks of a row `Sum` over a family of a family, read in a loop over the
+    /// blocks, equal the columns of the eagerly lowered row: the member of a lazy family reading
+    /// another lazy family's members, and the block sums, compute the same keys.
+    #[test]
+    fn test_deferred_row_blocks_match_the_row_columns() {
+        use crate::program::{FamilyRange, LoweredOutput};
+        use mxx_backends::{
+            MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
+        };
+        let parameters = emission_parameters();
+        let (columns, per) = (2usize, 3usize);
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let inputs = builder
+            .input_family(IntExpr::constant(columns * per), AttributeKnowledge::PublicPayload)
+            .unwrap();
+        let range = || FamilyRange::full(IntExpr::constant(columns * per)).unwrap();
+        let doubled = builder
+            .parallel(range(), |builder, index| {
+                builder
+                    .add(
+                        Operand::Member { family: inputs, index: index.clone() },
+                        Operand::Member { family: inputs, index },
+                    )
+                    .map(Operand::Scalar)
+            })
+            .unwrap();
+        let placed = builder
+            .parallel(range(), |builder, index| {
+                let shift = IntExpr::Rem(Box::new(index.clone()), Box::new(IntExpr::constant(per)));
+                builder
+                    .mul_small_constant(
+                        Operand::Member { family: doubled, index },
+                        vec![1, -1],
+                        shift,
+                    )
+                    .map(Operand::Scalar)
+            })
+            .unwrap();
+        let row = builder.sum_columns(placed, columns).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(row)]).unwrap();
+        let (context, hash_key): ([u8; 32], [u8; 32]) = (rand::random(), rand::random());
+        let ring = parameters.ring(0).unwrap();
+        let payload =
+            RnsBggPayloadSecret::from_row(&parameters, ring.uniform_interval((1, 1), -1, 1))
+                .unwrap();
+        let build = || {
+            let mut build = RnsPreprocessBuild::new(&parameters, context);
+            build
+                .bind_rhs_values(
+                    &program,
+                    &ParamEnv::default(),
+                    BTreeMap::new(),
+                    Some(&payload),
+                    &hash_key,
+                )
+                .unwrap();
+            build
+        };
+        let mut eager = build();
+        let row = crate::api::lower(&program, &mut eager).unwrap().remove(0);
+        let mut deferred = build();
+        let lowered =
+            deferred.lower_deferred(&program, &std::collections::BTreeSet::from([0])).unwrap();
+        let LoweredOutput::Columns(row_columns) = &lowered[0] else {
+            panic!("the row is deferred");
+        };
+        assert_eq!(row_columns.columns(), columns);
+        let blocks = mxx_dsl::parallel(columns, |block| {
+            Ok(deferred
+                .deferred_block(&program, row_columns, &block.expression()?)
+                .map_err(|_| mxx_dsl::DslError::Schema)?
+                .matrix)
+        })
+        .unwrap();
+        let ports = |matrix: &RnsBggMatrix| {
+            [matrix.0.0.clone(), matrix.0.1.clone(), matrix.1.0.clone(), matrix.1.1.clone()]
+        };
+        let width = parameters.component_columns(0).unwrap();
+        let mut emission = eager.emit(DslContext::new("deferred-row"), Vec::new()).unwrap();
+        let deferred = deferred.emit(DslContext::new("deferred-blocks"), Vec::new()).unwrap();
+        emission.runtime_inputs.extend(deferred.runtime_inputs);
+        for block in 0..columns {
+            let member = blocks.at(Int::constant(block));
+            for (port, (eager, deferred)) in
+                ports(&row.matrix).into_iter().zip(ports(&member)).enumerate()
+            {
+                let range = mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(block * width),
+                    end: IntExpr::constant((block + 1) * width),
+                };
+                emission.graph = emission
+                    .graph
+                    .output(format!("row-{block}-{port}"), eager.slice(None, Some(range)))
+                    .unwrap()
+                    .output(format!("block-{block}-{port}"), deferred)
+                    .unwrap();
+            }
+        }
+        let (graph, _) = emission.build().unwrap();
+        let mut execution = CpuExecution::new(cpu_backend(parameters.levels().to_vec()));
+        let outputs = crate::api::execute_graph(
+            graph,
+            &ParamEnv::default(),
+            &mut execution,
+            &mut MemoryArtifactStore::default(),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .outputs;
+        for block in 0..columns {
+            for port in 0..4 {
+                assert_eq!(
+                    crate::test_support::full(&outputs[&format!("row-{block}-{port}")]),
+                    crate::test_support::full(&outputs[&format!("block-{block}-{port}")]),
+                    "block {block}, port {port}"
+                );
+            }
         }
     }
 }

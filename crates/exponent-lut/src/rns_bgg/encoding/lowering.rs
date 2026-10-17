@@ -18,6 +18,18 @@ pub enum OnlineEvalWireFamily {
         rows: Family<RnsBggRow>,
         payloads: Option<Family<Mat>>,
     },
+    /// Root rows of the composing graph (`RnsOnlineEvalBuild::bind_rows`): a member is the row
+    /// of its index re-targeted to the input's level, with its key and public payload, built
+    /// where it is read.
+    Graph {
+        wire: WireId,
+        level: usize,
+        knowledge: AttributeKnowledge,
+        key: InputKeySource,
+        hash_key: Bytes,
+        rows: crate::program::GraphFamily<RnsBggRow>,
+        payloads: Option<crate::program::GraphFamily<Mat>>,
+    },
 }
 
 /// A family RHS bound for online evaluation: the stored bottom row of each
@@ -32,6 +44,9 @@ pub struct OnlineEvalRhsFamily {
     hash_key: Bytes,
     tops: Option<Family<RnsBggRow>>,
     bottoms: Family<RnsBggRow>,
+    /// The member of `bottoms` holding member `0` of this family: an instance's members in a
+    /// family of every instance's side by side (see `RnsOnlineEvalBuild::with_material_member`).
+    first: Int,
 }
 
 /// Family execution over graph families, which derives the hash-sampled parts
@@ -41,11 +56,14 @@ pub struct OnlineEvalFamilies<'a> {
     pub(crate) parameters: &'a RnsBggParameters,
     /// The Program's integer data inputs ([`crate::program::data_inputs`]).
     pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
+    /// The first member of each data family bound as a slice of a larger family
+    /// (`RnsPreprocessBuild::bind_data_values`): entry `p` is member `first + p`.
+    pub(crate) data_offsets: BTreeMap<crate::program::DataId, Int>,
 }
 
 impl<'a> OnlineEvalFamilies<'a> {
     pub(crate) fn new(parameters: &'a RnsBggParameters) -> Self {
-        Self { parameters, data: BTreeMap::new() }
+        Self { parameters, data: BTreeMap::new(), data_offsets: BTreeMap::new() }
     }
 
     /// The member index entry `position` of data family `data` selects.
@@ -54,11 +72,16 @@ impl<'a> OnlineEvalFamilies<'a> {
         data: crate::program::DataId,
         position: &IntExpr,
     ) -> Result<Int, RnsBggError> {
+        let position = Int::evaluate(position.clone());
+        let position = match self.data_offsets.get(&data) {
+            Some(first) => first.clone().add(position),
+            None => position,
+        };
         Ok(self
             .data
             .get(&data)
             .ok_or(RnsBggError::Binding("Program data is not bound"))?
-            .at(Int::evaluate(position.clone())))
+            .at(position))
     }
 }
 
@@ -77,6 +100,29 @@ impl OnlineEvalFamilies<'_> {
                 let key = key.key(self.parameters, hash_key.clone(), *wire, Some(index.clone()))?;
                 let payload = payloads.as_ref().map(|payloads| payloads.at(index.clone()));
                 Ok(RnsBggEncoding::new(key, rows.at(index), payload))
+            }
+            OnlineEvalWireFamily::Graph {
+                wire,
+                level,
+                knowledge,
+                key,
+                hash_key,
+                rows,
+                payloads,
+            } => {
+                let payload =
+                    payloads.as_ref().map(|payloads| payloads.at(index.clone())).transpose()?;
+                super::online_eval::graph_input_encoding(
+                    self.parameters,
+                    *wire,
+                    *level,
+                    *knowledge,
+                    key,
+                    hash_key.clone(),
+                    rows.at(index.clone())?,
+                    payload,
+                    Some(index),
+                )
             }
         }
     }
@@ -99,7 +145,7 @@ impl OnlineEvalFamilies<'_> {
             )?,
         };
         Ok((
-            (top, family.bottoms.at(member.clone())),
+            (top, family.bottoms.at(family.first.clone().add(member.clone()))),
             RhsRef { id: family.rhs, index: Some(member) },
         ))
     }
@@ -108,6 +154,7 @@ impl OnlineEvalFamilies<'_> {
         match family {
             OnlineEvalWireFamily::Stored(family) => family.count().clone(),
             OnlineEvalWireFamily::Input { rows, .. } => rows.count().clone(),
+            OnlineEvalWireFamily::Graph { rows, .. } => rows.count().clone(),
         }
     }
 }
@@ -193,6 +240,7 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
             return crate::program::graph_sum(evaluator, Self::count(family), member);
         }
         let per_column = super::row_sum_block(&Self::count(family), columns)?;
+        let output = evaluator.site().map_err(ProgramLowerError::Backend)?.output;
         crate::program::graph_column_sums(
             evaluator,
             (columns, per_column),
@@ -200,12 +248,33 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
             |sum, column| {
                 let place = |entry| super::place_in_column(entry, columns, column);
                 RnsBggEncoding::new(
-                    RnsBggPublicKey::new(sum.wire(), map_matrix(sum.public_key.matrix, &place)),
+                    RnsBggPublicKey::new(output, map_matrix(sum.public_key.matrix, &place)),
                     map_row(sum.row, &place),
                     sum.public_payload.map(&place),
                 )
             },
         )
+    }
+
+    fn sequential_sum(
+        &mut self,
+        evaluator: &mut EncodingLowering<'a>,
+        count: IntExpr,
+        initial: <EncodingLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+        body: impl FnOnce(
+            &mut Self,
+            &mut EncodingLowering<'a>,
+            IntExpr,
+            <EncodingLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+        ) -> Result<
+            <EncodingLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+            crate::program::ProgramLowerError<RnsBggError>,
+        >,
+    ) -> Result<
+        <EncodingLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+        crate::program::ProgramLowerError<RnsBggError>,
+    > {
+        crate::program::graph_sequential_sum(self, evaluator, count, initial, body)
     }
 }
 
@@ -266,6 +335,7 @@ pub(super) fn import_rhs_bindings(
                         hash_key: hash_key.clone(),
                         tops: Some(tops),
                         bottoms,
+                        first: Int::constant(0),
                     })
                 }
             };
@@ -301,20 +371,25 @@ pub(super) fn import_rhs_bindings(
                 InputBinding::Scalar(((top, (port(0), port(1))), RhsRef { id: *rhs, index: None }))
             }
             InputBinding::Family(count) => {
-                let families = [0, 1]
-                    .map(|port| {
-                        material_family(
-                            &ring,
-                            preprocess,
-                            name(format!("rhs/{rhs:?}/family.{port}")),
-                            count.clone(),
-                            (1, columns),
-                            member,
-                        )
-                    })
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(ApiError::scheme)?;
+                // The instances' members side by side, read at the instance's first member: no
+                // family of one instance's members is formed.
+                let (members, first) = match member {
+                    None => (count.clone(), Int::constant(0)),
+                    Some((member, members)) => (
+                        IntExpr::Mul(Box::new(members.clone()), Box::new(count.clone()))
+                            .canonicalize(),
+                        member.clone().mul(Int::evaluate(count.clone())),
+                    ),
+                };
+                let families = [0, 1].map(|port| {
+                    ring.family_artifact_input(
+                        preprocess.clone(),
+                        name(format!("rhs/{rhs:?}/family.{port}")),
+                        members.clone(),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                });
                 let element: RnsBggRow =
                     (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
                 let fields =
@@ -325,8 +400,9 @@ pub(super) fn import_rhs_bindings(
                     level: consumer_level,
                     hash_key: hash_key.clone(),
                     tops: None,
-                    bottoms: family_of_fields(&element, count.clone(), &fields)
+                    bottoms: family_of_fields(&element, members, &fields)
                         .map_err(ApiError::scheme)?,
+                    first,
                 })
             }
         };
@@ -361,9 +437,10 @@ fn material_matrix(
     }
 }
 
-/// A transferred Static preprocessing family artifact `name` of `count` matrices, or, with
-/// `member = (m, members)`, the `count` matrices of instance `m` in the family of the
-/// `members count` matrices of every instance side by side.
+/// A transferred Static preprocessing family artifact `name` of `count` matrices and the member
+/// of its member `0`: with `member = (m, members)`, the family of the `members count` matrices
+/// of every instance side by side, of which instance `m`'s start at member `m count`. No family
+/// of one instance's members is formed.
 fn material_family(
     ring: &mxx_dsl::Ring,
     production: &ProductionId,
@@ -371,25 +448,22 @@ fn material_family(
     count: IntExpr,
     shape: (usize, usize),
     member: Option<&(Int, IntExpr)>,
-) -> Result<Family<Mat>, DslError> {
-    let Some((member, members)) = member else {
-        return Ok(ring.family_artifact_input(
-            production.clone(),
-            name,
-            count,
-            shape,
-            ArtifactAvailability::Transferred,
-        ));
+) -> (Family<Mat>, Int) {
+    let (members, first) = match member {
+        None => (count, Int::constant(0)),
+        Some((member, members)) => (
+            IntExpr::Mul(Box::new(members.clone()), Box::new(count.clone())).canonicalize(),
+            member.clone().mul(Int::evaluate(count)),
+        ),
     };
-    let instances = ring.family_artifact_input(
+    let family = ring.family_artifact_input(
         production.clone(),
         name,
-        IntExpr::Mul(Box::new(members.clone()), Box::new(count.clone())).canonicalize(),
+        members,
         shape,
         ArtifactAvailability::Transferred,
     );
-    let first = member.clone().mul(Int::evaluate(count.clone()));
-    mxx_dsl::parallel(count, |index| Ok(instances.at(first.clone().add(index))))
+    (family, first)
 }
 
 impl EncodingLowering<'_> {
@@ -579,24 +653,19 @@ impl EncodingLowering<'_> {
         level: usize,
         table: &LutTable,
         count: usize,
-    ) -> Result<(Family<Mat>, Family<Mat>), RnsBggError> {
+    ) -> Result<super::LutHelperRows, RnsBggError> {
         if let Some(helpers) = &self.root_lut_helpers {
-            let rows = helpers
+            let (rows, positions) = helpers
                 .get(&table.helper_family_key())
                 .ok_or(RnsBggError::Binding("missing graph LUT helper rows"))?;
-            if rows.count() != &IntExpr::constant(count) {
+            if positions.len() != count {
                 return Err(RnsBggError::Binding("graph LUT helper count differs from layout"));
             }
-            let retargeted = mxx_dsl::parallel(count, |index| {
-                self.parameters
-                    .retarget_row(level, RnsBggForm::State, rows.at(index))
-                    .map_err(|_| DslError::Schema)
-            })
-            .map_err(graph)?;
-            return Ok((
-                retargeted.field(|row| row.0).map_err(graph)?,
-                retargeted.field(|row| row.1).map_err(graph)?,
-            ));
+            return Ok(super::LutHelperRows::Graph {
+                rows: rows.clone(),
+                positions: positions.clone(),
+                level,
+            });
         }
         let ring = self.parameters.ring(level)?;
         let columns = self.parameters.component_columns(level)?;
@@ -610,7 +679,7 @@ impl EncodingLowering<'_> {
                 ArtifactAvailability::Transferred,
             )
         };
-        Ok((member(0), member(1)))
+        Ok(super::LutHelperRows::Imported(member(0), member(1)))
     }
 
     fn lut_public_data(&self, level: usize, sigma: Int) -> Result<RnsBggMatrix, RnsBggError> {
@@ -657,7 +726,7 @@ impl EncodingLowering<'_> {
         switching: bool,
     ) -> Result<super::LutMaterial, RnsBggError> {
         if let Some(material) = self.lut_material.get(&(level, lut_id)) {
-            if !switching || !material.0.is_empty() {
+            if !switching || !material.0.0.is_empty() {
                 return Ok(material.clone());
             }
             let (switching, _) = self.lut_switching(level, lut_id, table)?;
@@ -665,8 +734,11 @@ impl EncodingLowering<'_> {
         }
         let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
         let sigmas = table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        let switching =
-            if switching { self.lut_switching(level, lut_id, table)?.0 } else { Vec::new() };
+        let switching = if switching {
+            self.lut_switching(level, lut_id, table)?.0
+        } else {
+            (Vec::new(), Int::constant(0))
+        };
         let helper = self.lut_helpers(level, table, sigmas.len())?;
         Ok((switching, sigmas, helper))
     }
@@ -713,8 +785,8 @@ impl EncodingLowering<'_> {
         evaluation_level: usize,
         lut_id: crate::program::LutId,
         table: &LutTable,
-    ) -> Result<(Vec<Family<Mat>>, Vec<usize>), RnsBggError> {
-        let count = IntExpr::constant(table.input_width());
+    ) -> Result<((Vec<Family<Mat>>, Int), Vec<usize>), RnsBggError> {
+        let count = IntExpr::constant(table.material_width());
         let decomposition_level =
             evaluation_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let decomposition_ring = self.parameters.ring(decomposition_level)?;
@@ -726,9 +798,10 @@ impl EncodingLowering<'_> {
             .lut_output_columns(decomposition_level, table.output_representation())?;
         let sigma_indices =
             table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+        let mut first = Int::constant(0);
         let families = (0..4)
             .map(|port| {
-                material_family(
+                let (family, start) = material_family(
                     &decomposition_ring,
                     self.ciphertext_production(),
                     self.preprocess_artifact_name(lut_switching_role(
@@ -740,11 +813,12 @@ impl EncodingLowering<'_> {
                     count.clone(),
                     (1, target_columns),
                     self.material_member.as_ref(),
-                )
+                );
+                first = start;
+                family
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(graph)?;
-        Ok((families, sigma_indices))
+            .collect::<Vec<_>>();
+        Ok(((families, first), sigma_indices))
     }
 
     /// For a LUT branch with automorphism `sigma` and switching ciphertext
@@ -1056,7 +1130,17 @@ impl EncodingLowering<'_> {
         let zero = evaluation_ring.zero((1, columns));
         let initial =
             ((zero.clone(), zero.clone()), ((zero.clone(), zero.clone()), (zero.clone(), zero)));
+        let (switching, first) = switching;
+        let selected = if table.is_automorphism_family() {
+            Some(self.site()?.indices.last().cloned().ok_or(RnsBggError::Binding(
+                "an automorphism family requires an enclosing Program family",
+            ))?)
+        } else {
+            None
+        };
         let b_at = |index: Int| {
+            let index = selected.clone().map(Int::from).unwrap_or(index);
+            let index = first.clone().add(index);
             (
                 (switching[0].at(index.clone()), switching[1].at(index.clone())),
                 (switching[2].at(index.clone()), switching[3].at(index)),
@@ -1064,13 +1148,14 @@ impl EncodingLowering<'_> {
         };
         let this = &*self;
         let branch = |index: Int, (row_sum, key_sum), b_sigma| {
+            let index = selected.clone().map(Int::from).unwrap_or(index);
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
             let (switched_row, switched_key_decomposition) =
                 this.lut_branch_action(input, b_sigma, sigma.clone())?;
-            let mask = (helper.0.at(index.clone()), helper.1.at(index));
+            let mask = helper.member(this.parameters, index).map_err(|_| DslError::Schema)?;
             let public_data =
                 this.lut_public_data(level, Int::from(sigma)).map_err(|_| DslError::Schema)?;
             let (masked, switched_key) =

@@ -20,6 +20,7 @@ pub mod claim;
 mod compose;
 mod evaluate;
 pub mod function;
+mod input_storage;
 mod labels;
 pub mod noise;
 mod obfuscate;

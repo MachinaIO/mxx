@@ -59,6 +59,7 @@ fn plan<S: SessionStore + Send>(
         graph = name,
         plan_seconds = started.elapsed().as_secs_f64(),
         predicted_seconds = report.predicted_seconds,
+        planned_device_bytes = ?plan.planned_device_bytes().map_err(gpu_error)?,
         io_predicted_seconds = ?report.io_predicted_seconds,
         limiting_stage = ?report.limiting_stage,
         reason = report.reason,

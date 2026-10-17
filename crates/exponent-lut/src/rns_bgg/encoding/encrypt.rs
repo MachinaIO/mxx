@@ -1564,7 +1564,7 @@ mod test {
                         Ok((ports[0].at(index.clone()), ports[1].at(index)))
                     })
                     .unwrap();
-                    (key, family)
+                    (key, (family, (0..count).map(IntExpr::constant).collect()))
                 })
                 .collect();
             graph_rows.bind_lut_helper_rows(helpers).unwrap();

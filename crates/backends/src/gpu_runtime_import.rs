@@ -188,6 +188,32 @@ unsafe fn upload_selected_payload(
         }
         (
             expected @ (ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. }),
+            ImportDestination::PlacedBounded { ty },
+            ArtifactPayload::SmallMatrix(bytes),
+        ) => {
+            if ArtifactType::from_wire_type(ty).as_ref() != Some(expected) {
+                return Err("placed bounded import differs from its artifact schema".into());
+            }
+            let (schema, semantic) =
+                expected.bounded_matrix_schema().ok_or("bounded import has no schema")?;
+            let (_, coefficients) = decode_small_matrix_artifact(&schema, &bytes, semantic)
+                .map_err(|error| error.to_string())?;
+            let destination = destination.ok_or("placed bounded import has no bound storage")?;
+            let (_, bound) =
+                destination.storages().next().ok_or("placed bounded import has no storage")?;
+            let buffer = bound
+                .owner
+                .downcast_ref::<crate::poly::dcrt::gpu::GpuDeviceBuffer>()
+                .ok_or("placed bounded import is not in plan scratch")?;
+            if coefficients.len() as u64 != bound.bytes {
+                return Err("placed bounded import size differs from its allocation".into());
+            }
+            let offset = usize::try_from(bound.address - buffer.as_ptr() as u64)
+                .map_err(|_| "placed bounded offset exceeds usize")?;
+            buffer.upload_initial(offset, coefficients).map_err(|error| error.to_string())
+        }
+        (
+            expected @ (ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. }),
             ImportDestination::Bounded { owner, ty },
             ArtifactPayload::SmallMatrix(bytes),
         ) => {

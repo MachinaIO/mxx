@@ -26,12 +26,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use builder::ExponentLutProgramBuilder;
-pub use graph::{GraphFamilyExecution, RhsRef, family_of_fields};
-pub(crate) use graph::{GraphParallelLowering, graph_column_sums, graph_parallel, graph_sum};
-pub(crate) use lowering::lower_program;
-pub use lowering::{
-    Environment, FamilyExecution, LoweringSite, ProgramLowerError, ProgramLoweringContext,
+pub use graph::{GraphFamily, GraphFamilyExecution, RhsRef, family_of_fields};
+pub(crate) use graph::{
+    GraphParallelLowering, graph_column_sums, graph_parallel, graph_sequential_sum, graph_sum,
 };
+pub use lowering::{
+    DeferredColumns, Environment, FamilyExecution, LoweredOutput, LoweringSite, ProgramLowerError,
+    ProgramLoweringContext,
+};
+pub(crate) use lowering::{lower_program, lower_program_deferred};
 
 /// A deterministic identifier for a program.  The body and declarations are
 /// committed by the canonical digest; runtime state is intentionally absent.
@@ -476,6 +479,9 @@ pub struct LutTable {
     output_representation: LutOutputRepresentation,
     #[serde(skip_serializing_if = "Option::is_none")]
     automorphism: Option<usize>,
+    /// One Aut branch selected by the immediately enclosing Program family member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automorphism_family: Option<Vec<usize>>,
 }
 
 /// The output values of a [`LutTable`].
@@ -520,6 +526,7 @@ impl LutTable {
             max_output,
             output_representation,
             automorphism: None,
+            automorphism_family: None,
         };
         validate_table(&table)?;
         Ok(table)
@@ -551,6 +558,28 @@ impl LutTable {
         Ok(table)
     }
 
+    /// A family of one-branch automorphism tables. The immediately enclosing Program
+    /// family selects the index; material contains one switching ciphertext per candidate,
+    /// while each evaluation consumes exactly one candidate (not their sum).
+    pub fn automorphism_family(indices: Vec<usize>) -> Result<Self, ProgramValidationError> {
+        if indices.is_empty() || indices.iter().any(|k| k % 2 == 0) {
+            return Err(ProgramValidationError::InvalidLut);
+        }
+        let mut table = Self::automorphism(1, LutOutputRepresentation::Coefficient)?;
+        table.automorphism_family = Some(indices);
+        Ok(table)
+    }
+
+    /// Whether a family member chooses one automorphism from this table's material.
+    pub fn is_automorphism_family(&self) -> bool {
+        self.automorphism_family.is_some()
+    }
+
+    /// Number of switching ciphertexts (one per possible automorphism).
+    pub fn material_width(&self) -> usize {
+        self.automorphism_family.as_ref().map_or(self.input_width, Vec::len)
+    }
+
     /// The index `k` of an automorphism table, `None` for a Walsh LUT.
     pub fn automorphism_index(&self) -> Option<usize> {
         self.automorphism
@@ -559,6 +588,13 @@ impl LutTable {
     /// The automorphism of every branch at ring dimension `ring_dimension`, in branch order: the
     /// input layout's automorphisms for a Walsh LUT, `[k mod 2n]` for `Aut_k`.
     pub fn branch_automorphisms(&self, ring_dimension: usize) -> Result<Vec<usize>, LayoutError> {
+        if let Some(indices) = &self.automorphism_family {
+            self.input_layout.validate(ring_dimension)?;
+            let modulus = ring_dimension
+                .checked_mul(2)
+                .ok_or(LayoutError::RingDimensionOverflow(ring_dimension))?;
+            return Ok(indices.iter().map(|k| k % modulus).collect());
+        }
         match self.automorphism {
             None => self.input_layout.automorphism_indices(ring_dimension),
             Some(k) => {
@@ -575,6 +611,9 @@ impl LutTable {
     /// for a Walsh LUT (every LUT of one layout shares the helpers of its automorphisms), the
     /// automorphism for `Aut_k`.
     pub fn helper_family_key(&self) -> String {
+        if let Some(indices) = &self.automorphism_family {
+            return format!("AutFamily({indices:?})");
+        }
         match self.automorphism {
             None => format!("{:?}", self.input_layout),
             Some(k) => format!("Aut({k})"),
@@ -605,6 +644,7 @@ impl LutTable {
             max_output: output_width.checked_sub(1).ok_or(ProgramValidationError::InvalidLut)?,
             output_representation,
             automorphism: None,
+            automorphism_family: None,
         };
         validate_table(&table)?;
         Ok(table)
@@ -914,24 +954,42 @@ pub(crate) fn data_inputs(
 
 /// Check graph-valued data (`values`, for example selected members of a larger runtime
 /// family) against `program`'s declarations: exactly its data families, each with its declared
-/// count. Entry bounds are the producer's contract; graph values have no host entries to check.
+/// count, or a family read from member `first` on (a slice of a larger family, see
+/// `RnsPreprocessBuild::bind_data_values`), whose count the caller vouches for. Entry bounds are
+/// the producer's contract; graph values have no host entries to check. Returns the families and
+/// the first members of the slices.
+#[allow(clippy::type_complexity)]
 pub(crate) fn validate_data_values(
     program: &ExponentLutProgram,
-    values: &BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>,
-) -> Result<(), ProgramValidationError> {
+    values: BTreeMap<DataId, (mxx_dsl::Family<mxx_dsl::Int>, mxx_dsl::Int)>,
+) -> Result<
+    (BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>, BTreeMap<DataId, mxx_dsl::Int>),
+    ProgramValidationError,
+> {
+    let whole = |first: &mxx_dsl::Int| {
+        first.expression().is_ok_and(|first| first.canonicalize() == IntExpr::constant(0))
+    };
     let matches = values.len() == program.data.len() &&
         program.data.iter().all(|(family, declaration)| {
-            values.get(family).is_some_and(|value| {
-                value.count().clone().canonicalize() == IntExpr::constant(declaration.count)
+            values.get(family).is_some_and(|(value, first)| {
+                !whole(first) ||
+                    value.count().clone().canonicalize() == IntExpr::constant(declaration.count)
             })
         });
-    if matches {
-        Ok(())
-    } else {
-        Err(ProgramValidationError::InvalidStructure(
+    if !matches {
+        return Err(ProgramValidationError::InvalidStructure(
             "graph data do not match the declared families".into(),
-        ))
+        ));
     }
+    let mut families = BTreeMap::new();
+    let mut offsets = BTreeMap::new();
+    for (id, (family, first)) in values {
+        if !whole(&first) {
+            offsets.insert(id, first);
+        }
+        families.insert(id, family);
+    }
+    Ok((families, offsets))
 }
 
 /// Input-only projection used by the encryption stage.  It intentionally
@@ -1164,6 +1222,12 @@ impl WireMetadata {
 }
 
 pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationError> {
+    if let Some(indices) = &table.automorphism_family {
+        if indices.is_empty() || indices.iter().any(|k| k % 2 == 0) || table.automorphism != Some(1)
+        {
+            return Err(ProgramValidationError::InvalidLut);
+        }
+    }
     let layout_width = 1usize.checked_shl(table.input_layout.width_log2);
     let valid_input_layout =
         table.input_layout.stride_log2.checked_add(table.input_layout.width_log2).is_some();
@@ -1507,8 +1571,20 @@ fn validate_body(
             }
             Step::Lut { input, table, output } => {
                 check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
-                if (*table).0 as usize >= luts.len() {
-                    return Err(ProgramValidationError::InvalidLutId(*table));
+                let definition = luts
+                    .get(table.0 as usize)
+                    .ok_or(ProgramValidationError::InvalidLutId(*table))?;
+                if let Some(indices) = &definition.automorphism_family {
+                    let slot = depth.checked_sub(1).ok_or_else(|| {
+                        ProgramValidationError::InvalidStructure(
+                            "an automorphism family requires an enclosing family".into(),
+                        )
+                    })?;
+                    check_member_bounds(
+                        &IntExpr::LoopIndex(slot),
+                        &IntExpr::constant(indices.len()),
+                        loop_bounds,
+                    )?;
                 }
                 (*output, VisibleKind::Scalar)
             }
@@ -1569,9 +1645,9 @@ fn validate_body(
                         ));
                     };
                     let columns = num_bigint::BigInt::from(*columns);
-                    if count < columns.clone() * 2u8 || !(count % columns).is_zero() {
+                    if count < columns.clone() || !(count % columns).is_zero() {
                         return Err(ProgramValidationError::InvalidStructure(
-                            "a row Sum needs at least two members per column, as many in each"
+                            "a row Sum needs at least one member per column, as many in each"
                                 .into(),
                         ));
                     }

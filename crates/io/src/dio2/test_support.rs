@@ -8,7 +8,8 @@ use mxx_exponent_lut::{ExpLayout, refresh::PrfSettings};
 /// Ring dimension `8`; five primes of 50 bits with gadget base `2^12` and six levels of `Q_0`
 /// (decoding level 4); the PRF on `Q = 16`, `P = 8` with one LWR coordinate and weight one; one
 /// smudge digit; noise-free preprocessing (`MXX_IO_DIO2_TEST_{CRT_BITS,PRIMES,BASE_BITS,LEVELS}`
-/// override the ring). The
+/// override the ring; `N`, `INPUT_MODULUS`, `OUTPUT_MODULUS`, and `STRIDE_LOG2`
+/// under the same prefix also permit checking the GPU toy parameters). The
 /// function has one state bit, one evaluator bit and one obfuscator bit, on the state layout
 /// `(1, 2)` (`mono(e) = X^(2 e)`, `e < 4`), and two table steps.
 pub(crate) fn toy() -> (Dio2Parameters, StreamingFunction) {
@@ -16,11 +17,12 @@ pub(crate) fn toy() -> (Dio2Parameters, StreamingFunction) {
         std::env::var(format!("MXX_IO_DIO2_TEST_{name}"))
             .map_or(default, |value| value.parse().unwrap())
     };
+    let n = read("N", 8) as u32;
     let crt_bits = read("CRT_BITS", 50);
     let primes =
-        gen_modulus_and_warmup(8, read("PRIMES", 5), crt_bits, None).expect("generated CRT basis");
+        gen_modulus_and_warmup(n, read("PRIMES", 5), crt_bits, None).expect("generated CRT basis");
     let parameters = Dio2Parameters {
-        ring_dimension: 8,
+        ring_dimension: n,
         crt_bits,
         base_bits: read("BASE_BITS", 12) as u32,
         primes,
@@ -28,16 +30,20 @@ pub(crate) fn toy() -> (Dio2Parameters, StreamingFunction) {
         prf: PrfSettings {
             lwr_dimension: 1,
             support_weight: 1,
-            input_modulus: 16,
-            output_modulus: 8,
+            input_modulus: read("INPUT_MODULUS", 16),
+            output_modulus: read("OUTPUT_MODULUS", 8),
             bucket_width: 0,
         },
         smudge_digits: 1,
         trapdoor_sigma: 4,
         encoding_error_sigma: BigDecimal::from(0),
     };
-    let function =
-        StreamingFunction::additive(1, 1, 1, ExpLayout { stride_log2: 1, width_log2: 2 });
+    let function = StreamingFunction::additive(
+        1,
+        1,
+        1,
+        ExpLayout { stride_log2: read("STRIDE_LOG2", 1) as u32, width_log2: 2 },
+    );
     let steps = [vec![1, 0, 1, 0], vec![0, 1, 1, 0]];
     let function =
         steps.into_iter().fold(function.clone(), |acc, table| acc.with_step_row(table).unwrap());
@@ -106,15 +112,24 @@ impl mxx_exponent_lut::api::StageExecution<mxx_backends::MemoryArtifactStore> fo
     }
 }
 
-/// One family or matrix of a validated graph that a GPU plan may hold at once: its scope (the
-/// loop counts enclosing it), producing node, shape, bytes and residency class.
+/// One family or matrix value of a validated graph that a GPU plan may hold: its scope (the
+/// loop counts enclosing it, and the scope without them, which identifies the value across
+/// parameter sets of one graph shape), producing node and port, shape, bytes and class.
 #[derive(Debug)]
 pub(crate) struct Residency {
     pub(crate) scope: String,
+    pub(crate) key: String,
+    /// The producing node's kind, abbreviated.
     pub(crate) node: String,
     pub(crate) shape: String,
+    /// The member count of a family; `None` for a matrix.
+    pub(crate) count: Option<u128>,
+    /// The rows and columns of a matrix (of a family's members).
+    pub(crate) dimensions: Option<(usize, usize)>,
     pub(crate) bytes: u128,
     pub(crate) class: &'static str,
+    /// Whether the producing node outputs a trapdoor family (and so its public matrices).
+    pub(crate) trapdoors: bool,
 }
 
 /// The bytes of a value of `ty`: full matrices `rows columns crt_depth n` words, bounded ones as
@@ -155,106 +170,180 @@ fn shape(ty: &mxx_ir_core::types::ConcreteWireType) -> String {
     }
 }
 
-/// Every loop output family and sequential carry of `graph`, and every matrix wire of at least
-/// `wide` bytes, with its class under the GPU planner's policy: a root loop's family that only
-/// artifact outputs read is exported member by member (`exported`), a matrix-family carry is
-/// streamed (`streamed-carry`), an unread family is `dead`, and every other family is `resident`.
-pub(crate) fn residency(graph: &mxx_ir_core::ValidatedGraph, wide: u128) -> Vec<Residency> {
+/// The rows and columns of a matrix type, or of the innermost members of a family type.
+fn dimensions(ty: &mxx_ir_core::types::ConcreteWireType) -> Option<(usize, usize)> {
+    use mxx_ir_core::types::ConcreteWireType as T;
+    match ty {
+        T::Matrix(m) |
+        T::SmallMatrix { matrix: m, .. } |
+        T::Preimage { matrix: m, .. } |
+        T::Trapdoor { matrix: m, .. } => Some((m.rows, m.columns)),
+        T::IndexedFamily { element, .. } => dimensions(element),
+        _ => None,
+    }
+}
+
+/// Every loop output family and sequential carry of `graph` and every matrix of its scopes,
+/// with its class under the GPU planner's policy:
+///
+/// - `exported`: a family written member by member to an artifact and read by nothing else: a root
+///   loop's family that only artifact outputs read, or that only the root loops flattening it into
+///   an artifact output read (with the members those loops select), and, nested, a loop body's
+///   output family that the enclosing loop's exported family returns per lane;
+/// - `spilled`: an exported matrix family that loops nested in the same lane also read member by
+///   member, which the GPU reads back from its export instead of holding it;
+/// - `streamed-carry`: a matrix-family carry of a sequential loop (streamed through the store);
+/// - `dead`: an unread family;
+/// - `op`: a matrix (or a family member) of one operation, allocated in the plan's scratch;
+/// - `integer`: a resident family of one-word integers (or Booleans);
+/// - `resident`: every other family of matrices, held in its loop's member arena for the whole
+///   plan.
+pub(crate) fn residency(graph: &mxx_ir_core::ValidatedGraph) -> Vec<Residency> {
     use mxx_ir_core::{
         FrozenGraphScopeId as Scope,
         node::NodeKind,
-        types::{NodeId, Port, WireRef},
+        types::{ConcreteWireType as T, NodeId, Port, WireRef},
     };
-    fn visit(
-        graph: &mxx_ir_core::ValidatedGraph,
-        id: &Scope,
-        path: String,
-        wide: u128,
-        rows: &mut Vec<Residency>,
-    ) {
-        let (Some(scope), Some(types)) = (graph.source.scope(id), graph.scope(id)) else { return };
-        let reads = |wire: WireRef| {
-            scope
-                .nodes()
-                .iter()
-                .any(|node| scope.arguments(node).is_some_and(|a| a.contains(&wire)))
-        };
-        for (index, node) in scope.nodes().iter().enumerate() {
-            // An input is a capture of a value counted where it is produced, or an artifact
-            // imported member by member.
-            if matches!(node.kind(), NodeKind::Input { .. }) {
-                continue;
-            }
-            let node_id = NodeId(index as u64);
-            let ports = node.output_types().len();
-            let wire = |port: usize| WireRef { node: node_id, port: Port(port as u32) };
-            let (label, count, child) = match node.kind() {
-                NodeKind::ParallelLoop(spec) => (
-                    "parallel",
-                    spec.count
-                        .evaluate(&graph.bindings)
-                        .ok()
-                        .map(|c| c.to_string())
-                        .unwrap_or("?".into()),
-                    Some(Scope::ParallelBody { parent: Box::new(id.clone()), owner: node_id }),
-                ),
-                NodeKind::SequentialLoop(spec) => (
-                    "sequential",
-                    spec.count
-                        .evaluate(&graph.bindings)
-                        .ok()
-                        .map(|c| c.to_string())
-                        .unwrap_or("?".into()),
-                    Some(Scope::SequentialBody { parent: Box::new(id.clone()), owner: node_id }),
-                ),
-                _ => ("", String::new(), None),
+    use std::collections::BTreeSet;
+    struct Visit<'g> {
+        graph: &'g mxx_ir_core::ValidatedGraph,
+        rows: Vec<Residency>,
+    }
+    impl Visit<'_> {
+        /// Visit scope `id`, whose body outputs at `exported` are families an enclosing loop
+        /// exports per lane.
+        fn scope(&mut self, id: &Scope, path: (String, String), exported: &BTreeSet<usize>) {
+            let graph = self.graph;
+            let (Some(scope), Some(types)) = (graph.source.scope(id), graph.scope(id)) else {
+                return;
             };
-            for port in 0..ports {
-                let Some(ty) = types.wire_types.get(&wire(port)) else { continue };
-                let bytes = wire_bytes(ty);
-                let family =
-                    matches!(ty, mxx_ir_core::types::ConcreteWireType::IndexedFamily { .. });
-                let in_loop = child.is_some();
-                if !(in_loop && family) && bytes < wide {
+            let readers = |wire: WireRef| {
+                scope
+                    .nodes()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| scope.arguments(node).is_some_and(|a| a.contains(&wire)))
+                    .map(|(index, _)| NodeId(index as u64))
+                    .collect::<Vec<_>>()
+            };
+            let root_output = |wire: WireRef| {
+                matches!(id, Scope::Root) &&
+                    graph.source.outputs().values().any(|output| output.value == wire)
+            };
+            let wire = |node: NodeId, port: usize| WireRef { node, port: Port(port as u32) };
+            // A root loop flattening a family into an artifact output: read only by outputs.
+            let flattens = |node: NodeId| {
+                matches!(id, Scope::Root) &&
+                    matches!(scope.nodes()[node.0 as usize].kind(), NodeKind::ParallelLoop(_)) &&
+                    (0..scope.nodes()[node.0 as usize].output_types().len()).all(|port| {
+                        let output = wire(node, port);
+                        readers(output).is_empty() && root_output(output)
+                    })
+            };
+            for (index, node) in scope.nodes().iter().enumerate() {
+                if matches!(node.kind(), NodeKind::Input { .. }) {
+                    // A capture of a value counted where it is produced, or an artifact
+                    // imported member by member.
                     continue;
                 }
-                let output = scope.outputs().contains(&wire(port)) ||
-                    matches!(id, Scope::Root) &&
-                        graph.source.outputs().values().any(|o| o.value == wire(port));
-                let class = if label == "sequential" &&
-                    matches!(ty, mxx_ir_core::types::ConcreteWireType::IndexedFamily { element, .. }
-                        if matches!(element.as_ref(), mxx_ir_core::types::ConcreteWireType::Matrix(_) | mxx_ir_core::types::ConcreteWireType::SmallMatrix { .. }))
-                {
-                    "streamed-carry"
-                } else if !reads(wire(port)) && !output {
-                    "dead"
-                } else if matches!(id, Scope::Root) && label == "parallel" && !reads(wire(port)) {
-                    "exported"
-                } else {
-                    "resident"
-                };
-                rows.push(Residency {
-                    scope: path.clone(),
-                    node: format!(
-                        "{index}:{}{}",
-                        if label.is_empty() {
-                            format!("{:?}", node.kind()).chars().take(24).collect::<String>()
-                        } else {
-                            label.to_owned()
-                        },
-                        if count.is_empty() { String::new() } else { format!("[{count}]") }
+                let node_id = NodeId(index as u64);
+                let (looped, count, child) = match node.kind() {
+                    NodeKind::ParallelLoop(spec) => (
+                        Some(false),
+                        spec.count.evaluate(&graph.bindings).ok(),
+                        Some(Scope::ParallelBody { parent: Box::new(id.clone()), owner: node_id }),
                     ),
-                    shape: shape(ty),
-                    bytes,
-                    class,
+                    NodeKind::SequentialLoop(spec) => (
+                        Some(true),
+                        spec.count.evaluate(&graph.bindings).ok(),
+                        Some(Scope::SequentialBody {
+                            parent: Box::new(id.clone()),
+                            owner: node_id,
+                        }),
+                    ),
+                    _ => (None, None, None),
+                };
+                let mut child_exports = BTreeSet::new();
+                let trapdoors = (0..node.output_types().len()).any(|port| {
+                    types.wire_types.get(&wire(node_id, port)).is_some_and(|ty| {
+                        matches!(ty, T::IndexedFamily { element, .. }
+                            if matches!(element.as_ref(), T::Trapdoor { .. }))
+                    })
                 });
-            }
-            if let Some(child) = child {
-                visit(graph, &child, format!("{path}/{index}[{count}]"), wide, rows);
+                for port in 0..node.output_types().len() {
+                    let output = wire(node_id, port);
+                    let Some(ty) = types.wire_types.get(&output) else { continue };
+                    let family = matches!(ty, T::IndexedFamily { .. });
+                    if !family && dimensions(ty).is_none() {
+                        continue;
+                    }
+                    let readers = readers(output);
+                    let scope_output = scope.outputs().iter().position(|out| *out == output);
+                    let lane_export =
+                        scope_output.is_some_and(|position| exported.contains(&position));
+                    let streamed_matrix = matches!(ty, T::IndexedFamily { element, .. }
+                        if matches!(element.as_ref(), T::Matrix(_) | T::SmallMatrix { .. }));
+                    // A sequential body returns its matrix-family carries from its top-level
+                    // parallel loops, which write them to the carry's next generation.
+                    let carry_update = matches!(id, Scope::SequentialBody { .. }) &&
+                        looped == Some(false) &&
+                        scope_output.is_some() &&
+                        readers.is_empty();
+                    let class = if !family {
+                        "op"
+                    } else if (looped == Some(true) || carry_update) && streamed_matrix {
+                        "streamed-carry"
+                    } else if readers.is_empty() && scope_output.is_none() && !root_output(output) {
+                        "dead"
+                    } else if matches!(id, Scope::Root) &&
+                        looped == Some(false) &&
+                        readers.iter().all(|reader| flattens(*reader))
+                    {
+                        "exported"
+                    } else if lane_export && readers.is_empty() {
+                        "exported"
+                    } else if lane_export && streamed_matrix {
+                        "spilled"
+                    } else if looped.is_none() && exported.contains(&usize::MAX) {
+                        // A member of the family a flattening loop exports.
+                        "exported"
+                    } else if dimensions(ty).is_none() {
+                        "integer"
+                    } else {
+                        "resident"
+                    };
+                    if class == "exported" || class == "spilled" {
+                        child_exports.insert(port);
+                    }
+                    self.rows.push(Residency {
+                        scope: path.0.clone(),
+                        key: format!("{}/{index}:{port}", path.1),
+                        node: format!("{:?}", node.kind()).chars().take(40).collect(),
+                        shape: shape(ty),
+                        count: match ty {
+                            T::IndexedFamily { count, .. } => Some(*count),
+                            _ => None,
+                        },
+                        dimensions: dimensions(ty),
+                        bytes: wire_bytes(ty),
+                        class,
+                        trapdoors,
+                    });
+                }
+                if let Some(child) = child {
+                    // A flattening loop's body reads members of the exported family.
+                    if flattens(node_id) {
+                        child_exports.insert(usize::MAX);
+                    }
+                    let count = count.map_or("?".into(), |count| count.to_string());
+                    let path =
+                        (format!("{}/{index}[{count}]", path.0), format!("{}/{index}", path.1));
+                    self.scope(&child, path, &child_exports);
+                }
             }
         }
     }
-    let mut rows = Vec::new();
-    visit(graph, &Scope::Root, String::new(), wide, &mut rows);
-    rows
+    let mut visit = Visit { graph, rows: Vec::new() };
+    visit.scope(&Scope::Root, (String::new(), String::new()), &BTreeSet::new());
+    visit.rows
 }

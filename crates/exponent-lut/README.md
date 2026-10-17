@@ -31,6 +31,13 @@ input bindings, dependency manifests, and descriptors. Merge the bindings and ma
 emissions, add application outputs, and call `GraphEmission::build` only once. It discards
 bindings for inputs that freezing pruned.
 
+`ProgramBuild::lower_deferred(program, deferred)` lowers the same Program without any graph
+loop over a Program family: every family member is lowered where it is read (a `Sum` is one
+sequential loop over the members), and the `Sum` outputs at the positions `deferred` come back
+as `DeferredColumns`, whose column blocks `ProgramBuild::deferred_block` lowers in the caller's
+current graph scope. A caller that reads a sampler's or PRF's row one part at a time (the
+`dio2` refresh) thus never holds the family of all members or the row of all parts.
+
 Give each Program instance a distinct, nonempty `with_artifact_prefix` **before binding**.
 Preprocessing prefixes its generated hash-key, plaintext and Program-data inputs, public keys,
 RHS ciphertexts, LUT material, and composed child artifacts. Online evaluation infers the

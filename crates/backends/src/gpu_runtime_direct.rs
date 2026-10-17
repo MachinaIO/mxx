@@ -318,14 +318,18 @@ struct GraphRegion {
     /// Launch streams of the other devices this region's operations run on,
     /// which prepare their devices' resources before each launch.
     peer_streams: Vec<GpuNativeLaunchStream>,
+    /// Status words referenced by this region, including conditional bodies.
+    controls: Vec<usize>,
 }
 
 struct DirectGraph {
     regions: Vec<GraphRegion>,
     /// When the current execute first launched a region.
     first_launch: Option<Instant>,
-    /// Each binding's bound value, and the bindings of each physical value.
+    /// Each binding's bound value (and their native form, shared by every region), and the
+    /// bindings of each physical value.
     values: Vec<GpuGraphBindingValue>,
+    table: crate::poly::dcrt::gpu::GpuGraphBindingTable,
     bindings_of: BTreeMap<PhysicalValueId, Vec<usize>>,
     /// Values whose owners a wave replaced since the regions were bound.
     rebound: BTreeSet<PhysicalValueId>,
@@ -335,6 +339,8 @@ struct DirectGraph {
     /// Whether the sample seeds hold the root invocation's; a wave clears it
     /// when it uploads its own.
     root_seeds: bool,
+    /// Controls written since the last joined status check. Unlaunched regions need no download.
+    pending_controls: BTreeSet<usize>,
 }
 
 #[derive(Clone)]
@@ -345,12 +351,35 @@ struct WaveGroup {
     body_start: u32,
     body_end: u32,
     waves: Vec<usize>,
+    controls: Vec<usize>,
 }
 
 #[derive(Clone)]
 struct ActiveWave {
     wave_index: usize,
     logical_path: Vec<u64>,
+}
+
+/// Collect status bindings recursively: a conditional region can write its children's controls.
+fn region_controls(
+    operations: &[CompiledGpuOp],
+    values: &BTreeMap<PhysicalValueId, usize>,
+) -> Vec<usize> {
+    let mut controls = BTreeSet::new();
+    let mut pending = operations.iter().collect::<Vec<_>>();
+    while let Some(operation) = pending.pop() {
+        for argument in &operation.arguments {
+            let id = match argument {
+                KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) => id,
+                _ => continue,
+            };
+            if let Some(&index) = values.get(id) {
+                controls.insert(index);
+            }
+        }
+        pending.extend(operation.body.iter().flatten());
+    }
+    controls.into_iter().collect()
 }
 
 fn wave_groups(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<WaveGroup>, String> {
@@ -397,6 +426,14 @@ fn wave_groups(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<WaveGro
             body_start: first.body_start,
             body_end: first.body_end,
             waves: indices,
+            controls: graph.regions[graph
+                .region_interval(first.body_start, first.body_end)
+                .map_err(|error| error.to_string())?]
+            .iter()
+            .flat_map(|region| region.controls.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         });
     }
     let sites = groups.iter().map(|group| group.site).collect::<BTreeSet<_>>();
@@ -824,10 +861,12 @@ impl DirectGraph {
                 regions: Vec::new(),
                 first_launch: None,
                 values: Vec::new(),
+                table: crate::poly::dcrt::gpu::GpuGraphBindingTable::new(&[]),
                 bindings_of: BTreeMap::new(),
                 rebound: BTreeSet::new(),
                 stale: BTreeSet::new(),
                 root_seeds: false,
+                pending_controls: BTreeSet::new(),
             });
         }
         let mut starts = vec![0usize];
@@ -966,25 +1005,51 @@ impl DirectGraph {
         peer_devices
             .extend(frame.preimage_replays.iter().map(|replay| replay.attempt.physical_device()));
         peer_devices.remove(&frame.device);
+        let control_addresses = frame
+            .control_resets
+            .iter()
+            .enumerate()
+            .map(|(index, control)| (control.status_address(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut control_values = BTreeMap::new();
+        for (id, owner) in frame.owners.iter() {
+            for part in &frame.program.values[id.0 as usize].parts {
+                let storage = owner.storage(part.storage).ok_or_else(|| {
+                    GpuPlanError::GraphCompile("control binding storage is absent".into())
+                })?;
+                if let Some(&index) = control_addresses
+                    .get(&(storage.device, storage.address + part.view.byte_offset))
+                {
+                    control_values.insert(*id, index);
+                }
+            }
+        }
         for (position, &start) in starts.iter().enumerate() {
             let end = starts.get(position + 1).copied().unwrap_or(length);
-            let mut program = frame.program.clone();
-            program.operations = frame.program.operations[start..end]
-                .iter()
-                .cloned()
-                .map(|mut operation| {
-                    operation.predecessors = operation
-                        .predecessors
-                        .iter()
-                        .copied()
-                        .filter(|predecessor| (*predecessor as usize) >= start)
-                        .map(|predecessor| predecessor - start as u32)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
-                    operation
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            // The region's own operations, with the program's shared tables.
+            let program = crate::gpu_execution_plan::CompiledGpuProgram {
+                values: Arc::clone(&frame.program.values),
+                implementations: frame.program.implementations.clone(),
+                operations: frame.program.operations[start..end]
+                    .iter()
+                    .cloned()
+                    .map(|mut operation| {
+                        operation.predecessors = operation
+                            .predecessors
+                            .iter()
+                            .copied()
+                            .filter(|predecessor| (*predecessor as usize) >= start)
+                            .map(|predecessor| predecessor - start as u32)
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice();
+                        operation
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                bindings: Arc::clone(&frame.program.bindings),
+                export_slots: Arc::clone(&frame.program.export_slots),
+                subgraph_kernels: frame.program.subgraph_kernels.clone(),
+            };
             let mut builder = params
                 .begin_graph(frame.device)
                 .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
@@ -1037,6 +1102,7 @@ impl DirectGraph {
                 resources,
                 device: frame.device,
                 peer_streams,
+                controls: region_controls(&program.operations, &control_values),
             });
         }
         // Upload now, so the first production launch does not pay the
@@ -1052,10 +1118,12 @@ impl DirectGraph {
             regions,
             first_launch: None,
             values: Vec::new(),
+            table: crate::poly::dcrt::gpu::GpuGraphBindingTable::new(&[]),
             bindings_of: BTreeMap::new(),
             rebound: BTreeSet::new(),
             stale: BTreeSet::new(),
             root_seeds: false,
+            pending_controls: BTreeSet::new(),
         };
         wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
         Ok(graph)
@@ -1077,8 +1145,10 @@ impl DirectGraph {
         }
         self.rebound.clear();
         self.stale.clear();
+        self.pending_controls.clear();
+        self.table = crate::poly::dcrt::gpu::GpuGraphBindingTable::new(&self.values);
         for region in &mut self.regions {
-            region.executable.bind(&self.values)?;
+            region.executable.bind_table(&self.table)?;
         }
         Ok(())
     }
@@ -1096,7 +1166,18 @@ impl DirectGraph {
             }
         }
         if changed {
+            self.table = crate::poly::dcrt::gpu::GpuGraphBindingTable::new(&self.values);
             self.stale.extend(0..self.regions.len());
+        }
+        Ok(())
+    }
+
+    /// Read only status words touched by launches since the previous check. Callers join those
+    /// launches before checking, and check before any wave resets a shared status word.
+    fn check_controls(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
+        while let Some(&index) = self.pending_controls.first() {
+            frame.control_resets[index].check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
+            self.pending_controls.remove(&index);
         }
         Ok(())
     }
@@ -1193,7 +1274,7 @@ impl DirectGraph {
             GpuRuntimeError::Execution("Graph region index is out of range".into())
         })?;
         if self.stale.remove(&index) {
-            region.executable.bind(&self.values)?;
+            region.executable.bind_table(&self.table)?;
         }
         let stream = region.executable.launch_stream().clone();
         // Each device prepares its resources on its own stream, after the
@@ -1256,6 +1337,7 @@ impl DirectGraph {
             peer.record_event()?.enqueue_wait(&stream)?;
         }
         let completion = region.executable.launch(&stream)?;
+        self.pending_controls.extend(region.controls.iter().copied());
         for (device, stream) in std::iter::once((region.device, &stream))
             .chain(region.peer_streams.iter().map(|peer| (peer.physical_device(), peer)))
         {
@@ -1329,12 +1411,39 @@ fn contract_devices(
         .collect()
 }
 
+/// Count the union of device-address ranges, including partially overlapping matrix views.
+/// Different view addresses can belong to one native allocation; summing their lengths
+/// would make the budget grow with the number of CRT limbs or aliases.
+fn allocated_range_bytes(
+    ranges: impl IntoIterator<Item = (u64, u64)>,
+) -> Result<u64, GpuPlanError> {
+    let mut ranges = ranges
+        .into_iter()
+        .map(|(address, bytes)| {
+            address
+                .checked_add(bytes)
+                .map(|end| (address, end))
+                .ok_or_else(|| GpuPlanError::Resource("allocation address range overflows".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ranges.sort_unstable();
+    let (mut total, mut covered_end) = (0u64, 0u64);
+    for (start, end) in ranges {
+        let additional = end.saturating_sub(start.max(covered_end));
+        total = total
+            .checked_add(additional)
+            .ok_or_else(|| GpuPlanError::Resource("actual allocation size overflows".into()))?;
+        covered_end = covered_end.max(end);
+    }
+    Ok(total)
+}
+
 /// Check the plan's persistent allocations against each device budget.
 fn validate_allocated_budget(
     frame: &PhysicalFrame,
     contract: &crate::gpu_execution_plan::GpuPlanContract,
     graph: Option<&DirectGraph>,
-) -> Result<(), GpuPlanError> {
+) -> Result<BTreeMap<i32, u64>, GpuPlanError> {
     // Each allocation's size with what holds it, so an over-budget plan names
     // its largest holder.
     let mut allocations = BTreeMap::<(i32, u64), (u64, String)>::new();
@@ -1348,8 +1457,17 @@ fn validate_allocated_budget(
             })
             .or_insert_with(|| (bytes, holder()));
     };
-    for (id, owner) in
-        frame.owners.iter().chain(frame.waves.iter().flat_map(|wave| wave.owner_bindings.iter()))
+    for (id, owner) in frame
+        .owners
+        .iter()
+        .chain(frame.waves.iter().flat_map(|wave| wave.owner_bindings.iter()))
+        .chain(
+            frame
+                .external_io_loops
+                .iter()
+                .flat_map(|body| body.ahead.iter())
+                .map(|import| (&import.template.destination, &import.staging)),
+        )
     {
         let physical = frame
             .program
@@ -1394,6 +1512,7 @@ fn validate_allocated_budget(
             }
         }
     }
+    let mut device_bytes = BTreeMap::new();
     for (logical, budget) in contract.device_budgets.iter().enumerate() {
         let device = i32::try_from(contract.logical_to_physical_devices[logical])
             .map_err(|_| GpuPlanError::Resource("physical device ID overflows".into()))?;
@@ -1402,11 +1521,12 @@ fn validate_allocated_budget(
             .filter(|((owner_device, _), _)| *owner_device == device)
             .map(|(_, allocation)| allocation)
             .collect::<Vec<_>>();
-        let used =
-            on_device
-                .iter()
-                .try_fold(0u64, |total, (bytes, _)| total.checked_add(*bytes))
-                .ok_or_else(|| GpuPlanError::Resource("actual allocation size overflows".into()))?;
+        let used = allocated_range_bytes(allocations.iter().filter_map(
+            |(&(owner_device, address), &(bytes, _))| {
+                (owner_device == device).then_some((address, bytes))
+            },
+        ))?;
+        device_bytes.insert(device, used);
         tracing::debug!(device, used, budget = budget.device_bytes, "GPU plan allocation check");
         if used > budget.device_bytes {
             let (largest, holder) = on_device
@@ -1421,7 +1541,7 @@ fn validate_allocated_budget(
             )));
         }
     }
-    Ok(())
+    Ok(device_bytes)
 }
 
 fn wait_for_bound_inputs(frame: &PhysicalFrame) -> Result<(), String> {
@@ -1942,6 +2062,13 @@ impl GpuExecutionPlan {
     pub fn report(&self) -> &GpuWarmupReport {
         &self.report
     }
+    /// Planned allocation bytes per physical device, including scratch pools, import staging,
+    /// and native operation workspaces. Shared allocations are counted once. CUDA context,
+    /// driver graph metadata, and artifact-store allocations are outside this plan's ledger.
+    pub fn planned_device_bytes(&self) -> Result<BTreeMap<i32, u64>, GpuPlanError> {
+        validate_allocated_budget(&self.frame, &self.logical.contract, Some(&self.graph))
+    }
+
     /// An interactive HTML view of the planned graph with concrete shapes.
     /// With `GpuRuntimeOptions::profile_nodes`, nodes are colored by their
     /// predicted share of one execute and the bottlenecks are ranked.
@@ -2067,6 +2194,7 @@ impl GpuRuntime {
                         execution_nonce: rand::random(),
                     },
                     indices: BTreeMap::new(),
+                    parent_occurrences: BTreeMap::new(),
                 },
             )),
             region_launch_seconds: BTreeMap::new(),
@@ -3303,7 +3431,11 @@ impl GpuRuntime {
         plan.graph.root_seeds = false;
         plan.graph.bind(&plan.frame)?;
         if !plan.frame.waves.is_empty() {
-            if plan.frame.import_templates.is_empty() && plan.frame.export_templates.is_empty() {
+            if plan.frame.import_templates.is_empty() &&
+                plan.frame.export_templates.is_empty() &&
+                plan.frame.external_io_imports.is_empty() &&
+                plan.frame.external_io_loops.is_empty()
+            {
                 return self.execute_waves::<std::io::Error>(plan, &inputs, execution_nonce, None);
             }
         }
@@ -3331,9 +3463,7 @@ impl GpuRuntime {
             }
             // The Graph has joined and this path owns no export slots, so a
             // reported status leaves the plan reusable after the next reset.
-            for control in &plan.frame.control_resets {
-                control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
-            }
+            plan.graph.check_controls(&plan.frame)?;
             check_preimage_replays(&plan.frame, None).map_err(GpuRuntimeError::DeviceStatus)?;
             plan.completed_runs += 1;
             return Ok(GpuExecutionPayload {
@@ -3618,7 +3748,8 @@ impl GpuRuntime {
                     GpuRuntimeError::Artifact("selected import has no I/O pump".into())
                 })?;
                 self.finish_selected_import(
-                    plan,
+                    &plan.frame,
+                    &mut plan.graph,
                     pump,
                     FrameGeneration::new(0, plan.completed_runs),
                     import,
@@ -3679,9 +3810,7 @@ impl GpuRuntime {
                         self.finish_boundary_imports(plan, pump, operation, active_imports)?;
                     }
                     if active {
-                        for control in &plan.frame.control_resets {
-                            control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
-                        }
+                        plan.graph.check_controls(&plan.frame)?;
                         let mut path = active_wave
                             .map(|parent| parent.logical_path.clone())
                             .unwrap_or_default();
@@ -3692,7 +3821,21 @@ impl GpuRuntime {
                                 )
                             })?);
                         }
-                        self.run_wave_group(
+                        // A spilled family's members are read at the enclosing lane's
+                        // occurrence while its nested waves run.
+                        let parent = group.parent_template.zip(parent_occurrence);
+                        let previous = match parent {
+                            Some(((site, _), occurrence)) => self
+                                .carry_state
+                                .write()
+                                .map_err(|_| {
+                                    GpuRuntimeError::Execution("carry state lock poisoned".into())
+                                })?
+                                .parent_occurrences
+                                .insert(site, occurrence),
+                            None => None,
+                        };
+                        let ran = self.run_wave_group(
                             plan,
                             groups,
                             inputs,
@@ -3701,7 +3844,19 @@ impl GpuRuntime {
                             parent_occurrence,
                             &path,
                             pump,
-                        )?;
+                        );
+                        if let Some(((site, _), _)) = parent {
+                            let mut state = self.carry_state.write().map_err(|_| {
+                                GpuRuntimeError::Execution("carry state lock poisoned".into())
+                            })?;
+                            match previous {
+                                Some(occurrence) => {
+                                    state.parent_occurrences.insert(site, occurrence)
+                                }
+                                None => state.parent_occurrences.remove(&site),
+                            };
+                        }
+                        ran?;
                     }
                 }
                 region = plan.graph.region_interval(group.body_start, group.body_end)?.end;
@@ -3890,14 +4045,26 @@ impl GpuRuntime {
                 plan.graph.rebound.insert(id);
             }
             plan.graph.root_seeds = false;
-            for control in &plan.frame.control_resets {
-                control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
+            plan.graph.check_controls(&plan.frame)?;
+            for &index in &group.controls {
+                plan.frame.control_resets[index]
+                    .reset_for_replay()
+                    .map_err(GpuRuntimeError::Execution)?;
             }
             reset_preimage_replays(&plan.frame, Some((group.body_start, group.body_end)))
                 .map_err(GpuRuntimeError::Execution)?;
             upload_sample_seeds(&plan.frame, execution_nonce, &logical_path)
                 .map_err(GpuRuntimeError::Execution)?;
             let wave = &plan.frame.waves[wave_index];
+            // A spilled family read in the lanes of a one-lane wave is read at the wave's
+            // occurrence ([`crate::gpu_streamed_carry::StreamedFamily`]).
+            if wave.active_lanes == 1 {
+                self.carry_state
+                    .write()
+                    .map_err(|_| GpuRuntimeError::Execution("carry state lock poisoned".into()))?
+                    .parent_occurrences
+                    .insert(wave.loop_site, wave.start_index);
+            }
             for (owner, occurrence) in &wave.export_occurrences {
                 owner
                     .upload_u64(&[*occurrence])
@@ -3929,9 +4096,7 @@ impl GpuRuntime {
                 None,
                 true,
             )?;
-            for control in &plan.frame.control_resets {
-                control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
-            }
+            plan.graph.check_controls(&plan.frame)?;
             check_preimage_replays(&plan.frame, Some((group.body_start, group.body_end)))
                 .map_err(GpuRuntimeError::DeviceStatus)?;
             // This wave has joined: write its streamed members before the next
@@ -4042,9 +4207,7 @@ impl GpuRuntime {
             }
             return Err(error);
         }
-        for control in &plan.frame.control_resets {
-            control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
-        }
+        plan.graph.check_controls(&plan.frame)?;
         check_preimage_replays(&plan.frame, None).map_err(GpuRuntimeError::DeviceStatus)?;
         if pump.is_none() {
             plan.completed_runs += 1;
@@ -4169,7 +4332,12 @@ impl GpuRuntime {
                     .read()
                     .map_err(|_| GpuRuntimeError::Execution("carry state lock poisoned".into()))?;
                 let (resolved, descriptor, staged) = family
-                    .resolve(key.index.unwrap_or(0), &self.host_loop_indices, &state.scratch)
+                    .resolve(
+                        key.index.unwrap_or(0),
+                        &self.host_loop_indices,
+                        &state.scratch,
+                        &state.parent_occurrences,
+                    )
                     .map_err(|error| {
                         GpuRuntimeError::Artifact(format!(
                             "scratch import {} at operation {} with host indices {:?}: {error}",
@@ -4317,16 +4485,15 @@ impl GpuRuntime {
     /// Wait for a selected import the observer started at its load site.
     fn finish_selected_import<E: std::error::Error + Send + Sync + 'static>(
         &self,
-        plan: &GpuExecutionPlan,
+        physical: &PhysicalFrame,
+        graph: &mut DirectGraph,
         pump: &mut ProducerIoPump<'_, E>,
         frame: FrameGeneration,
         import: &crate::gpu_physical_control::ExternalIoImport,
     ) -> Result<(), GpuRuntimeError> {
         // The selector's producer Graph region has joined. A failed integer
         // operation must suppress the artifact read even if it left index 0.
-        for control in &plan.frame.control_resets {
-            control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
-        }
+        graph.check_controls(physical)?;
         finish_import(pump, frame, import.destination).map_err(GpuRuntimeError::Artifact)
     }
 }
@@ -4412,6 +4579,7 @@ fn planned_import_requests(
                                 key.index.unwrap_or(0),
                                 &state.indices,
                                 &state.scratch,
+                                &state.parent_occurrences,
                             )?;
                             key = resolved;
                             template.descriptor = descriptor;
@@ -4621,6 +4789,18 @@ fn artifact_payload_kind(artifact: &ArtifactType) -> Option<u8> {
 mod candidate_tests {
     use super::{attribute_node_costs, geometric_candidates, per_launch_overhead};
     use mxx_ir_core::{FrozenGraphScopeId, NodeId};
+
+    #[test]
+    fn allocated_ranges_count_native_matrix_aliases_once() {
+        // Two overlapping views, one nested view, an adjacent allocation, and a gap.
+        assert_eq!(
+            super::allocated_range_bytes([(150, 100), (100, 100), (120, 10), (250, 25), (300, 25)])
+                .unwrap(),
+            200
+        );
+        assert_eq!(super::allocated_range_bytes([]).unwrap(), 0);
+        assert!(super::allocated_range_bytes([(u64::MAX - 1, 4)]).is_err());
+    }
 
     #[test]
     fn attribute_node_costs_gives_equal_ranges_to_the_innermost_node() {

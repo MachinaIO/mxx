@@ -130,17 +130,39 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
             return crate::program::graph_sum(evaluator, family.count(), member);
         }
         let per_column = super::row_sum_block(&family.count(), columns)?;
+        let output = evaluator.site().map_err(ProgramLowerError::Backend)?.output;
         crate::program::graph_column_sums(
             evaluator,
             (columns, per_column),
             member,
             |sum, column| {
                 RnsBggPublicKey::new(
-                    sum.wire,
+                    output,
                     map_matrix(sum.matrix, |entry| super::place_in_column(entry, columns, column)),
                 )
             },
         )
+    }
+
+    fn sequential_sum(
+        &mut self,
+        evaluator: &mut PublicKeyLowering<'a>,
+        count: IntExpr,
+        initial: <PublicKeyLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+        body: impl FnOnce(
+            &mut Self,
+            &mut PublicKeyLowering<'a>,
+            IntExpr,
+            <PublicKeyLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+        ) -> Result<
+            <PublicKeyLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+            crate::program::ProgramLowerError<RnsBggError>,
+        >,
+    ) -> Result<
+        <PublicKeyLowering<'a> as crate::program::ExponentLUTProgramLowering>::Wire,
+        crate::program::ProgramLowerError<RnsBggError>,
+    > {
+        crate::program::graph_sequential_sum(self, evaluator, count, initial, body)
     }
 }
 
@@ -757,7 +779,7 @@ impl<'a> PublicKeyLowering<'a> {
         if let Some(switching_ciphertexts) = self.lut_material.get(&key) {
             return Ok(switching_ciphertexts.clone());
         }
-        let count = IntExpr::constant(table.input_width());
+        let count = IntExpr::constant(table.material_width());
         let sigmas = table
             .branch_automorphisms(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
@@ -939,8 +961,19 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         let compact = match (streamed, self.rhs_material.get(&rhs.id)) {
             (Some(material), _) => material,
             (None, Some(InputBinding::Scalar(value))) => value.clone(),
+            // A member prepared at binding: its stored bottom row, and its top row hashed again
+            // where it is read, as online evaluation reads it.
             (None, Some(InputBinding::Family(values))) => {
-                values.at(rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?)
+                let index = rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?;
+                let top = rhs_top(
+                    self.parameters,
+                    self.program.id(),
+                    self.hash_key.clone(),
+                    rhs.id,
+                    self.workload.rhs_level(rhs.id)?,
+                    Some(index.clone()),
+                )?;
+                (top, values.field(|material| material.1).map_err(graph)?.at(index))
             }
             (None, None) => return Err(RnsBggError::Binding("RHS material was not prepared")),
         };
@@ -1034,8 +1067,16 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             self.parameters.lut_output_columns(next_level, table.output_representation())?;
         let zero = source_ring.zero((1, columns));
         let initial = ((zero.clone(), zero.clone()), (zero.clone(), zero));
+        let selected = if table.is_automorphism_family() {
+            Some(self.site()?.indices.last().cloned().ok_or(RnsBggError::Binding(
+                "an automorphism family requires an enclosing Program family",
+            ))?)
+        } else {
+            None
+        };
         let result =
             mxx_dsl::iterate(IntExpr::constant(table.input_width()), initial, |index, sum| {
+                let index = selected.clone().map(Int::from).unwrap_or(index);
                 let sigma = IntExpr::Select {
                     selector: Box::new(index.expression()?),
                     branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),

@@ -53,8 +53,8 @@ pub use noise::{
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 pub use refresh::{
     REFRESH_MATRIX_INPUT, RefreshActions, RefreshChain, RefreshRun, RefreshSecurity, RefreshSigma,
-    RefreshSigmaRequest, RnsBggRefresh, SIGMA_ROW_OUTPUT, refresh_combination,
-    refresh_noise_accepted, residue_term,
+    RefreshSigmaRequest, RnsBggRefresh, SIGMA_ROW_OUTPUT, decoded_residue_term,
+    refresh_combination, refresh_fresh_term, refresh_noise_accepted, residue_term,
 };
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
@@ -2161,7 +2161,7 @@ pub(crate) fn act_on_entry(entry: Mat, action: &SmallMatrix, coefficient: &mxx_d
 /// A carrier entry `E` in column `column` of a row of `columns` blocks:
 /// `e_column ⊗ E`, the unit row of the column tensored with the entry (see
 /// the row `Sum` of [`crate::program::ExponentLutProgramBuilder::sum_columns`]).
-pub(crate) fn place_in_column(entry: Mat, columns: usize, column: &IntExpr) -> Mat {
+pub fn place_in_column(entry: Mat, columns: usize, column: &IntExpr) -> Mat {
     let ring = Ring::from_ref(entry.matrix_type().ring.clone());
     ring.constant(
         (1, columns),
@@ -2309,15 +2309,27 @@ fn plaintext_monomial<P: mxx_backends::poly::Poly>(value: &P) -> Result<(BigInt,
 pub(crate) enum PlaintextFamily {
     /// Compact signed monomials supplied as resident integer inputs.
     Monomials { coefficients: Family<mxx_dsl::Int>, exponents: Family<mxx_dsl::Int> },
-    /// Arbitrary plaintext expressions supplied by a composing graph.
+    /// Plaintexts supplied by a composing graph ([`RhsPlaintexts`]).
+    Graph(RhsPlaintexts),
+}
+
+/// A family of RHS plaintexts supplied by a composing graph
+/// ([`RnsPreprocessBuild::bind_rhs_values`]).
+#[derive(Clone)]
+pub enum RhsPlaintexts {
+    /// Arbitrary level-zero plaintext expressions.
     Values(Family<Mat>),
+    /// The `count` constant polynomials of the integers `integers` from member `first`, each
+    /// lifted where it is read, so no family of plaintexts is a graph value.
+    Lifted { integers: Family<mxx_dsl::Int>, first: mxx_dsl::Int, count: IntExpr },
 }
 
 impl PlaintextFamily {
     pub(crate) fn count(&self) -> &IntExpr {
         match self {
             Self::Monomials { coefficients, .. } => coefficients.count(),
-            Self::Values(values) => values.count(),
+            Self::Graph(RhsPlaintexts::Values(values)) => values.count(),
+            Self::Graph(RhsPlaintexts::Lifted { count, .. }) => count,
         }
     }
 
@@ -2327,7 +2339,10 @@ impl PlaintextFamily {
             Self::Monomials { coefficients, exponents } => {
                 signed_monomial(ring, coefficients.at(index.clone()), exponents.at(index))
             }
-            Self::Values(values) => values.at(index),
+            Self::Graph(RhsPlaintexts::Values(values)) => values.at(index),
+            Self::Graph(RhsPlaintexts::Lifted { integers, first, .. }) => integers
+                .at(first.clone().add(index))
+                .lift_to_constant_polynomial(ring.matrix_type((1, 1))),
         }
     }
 }

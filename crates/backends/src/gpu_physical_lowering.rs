@@ -154,6 +154,10 @@ pub(crate) enum ImportDestination {
     Placed {
         ty: ConcreteMatrixType,
     },
+    /// Compact coefficients held only across the import's live span.
+    PlacedBounded {
+        ty: ConcreteWireType,
+    },
 }
 
 #[derive(Clone)]
@@ -1765,12 +1769,11 @@ pub(super) fn allocate_typed_import_destination(
     payload_capacity: Option<usize>,
 ) -> Result<(PhysicalValueId, PhysicalValueId, ImportDestination, u32), String> {
     if let ConcreteWireType::Matrix(matrix) = ty {
-        let (destination, owner, before_operation) =
-            allocate_matrix_import_destination(ctx, matrix, PhysicalEncoding::FullEval)?;
+        let (destination, before_operation) = allocate_placed_import_destination(ctx, matrix)?;
         return Ok((
             destination,
             destination,
-            ImportDestination::Matrix { owner, ty: matrix.clone() },
+            ImportDestination::Placed { ty: matrix.clone() },
             before_operation,
         ));
     }
@@ -1838,9 +1841,9 @@ pub(super) fn allocate_typed_import_destination(
     );
     let (physical, resident, upload_owner) = match ty {
         ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. } => {
-            let (physical, resident, owner, _) =
-                compact_value_owner(ctx.backend, ctx.device, ty.clone(), storage)?;
-            (physical, resident, ImportDestination::Bounded { owner, ty: ty.clone() })
+            let (physical, resident, _) =
+                deferred_compact_value(ctx.backend, ctx.device, ty.clone(), storage)?;
+            (physical, resident, ImportDestination::PlacedBounded { ty: ty.clone() })
         }
         ConcreteWireType::Int => {
             let known_size = ctx.artifact_payload_sizes.get(key).copied();
@@ -2013,6 +2016,11 @@ pub(super) fn twin_import_destination(
             )?;
             (physical, (ImportDestination::Placed { ty: ty.clone() }, resident))
         }
+        ImportDestination::PlacedBounded { ty } => {
+            let (physical, resident, _) =
+                deferred_compact_value(ctx.backend, device, ty.clone(), storage)?;
+            (physical, (ImportDestination::PlacedBounded { ty: ty.clone() }, resident))
+        }
         ImportDestination::Trapdoor { .. } => return Ok(None),
     };
     if &physical != planned {
@@ -2066,8 +2074,27 @@ pub(super) fn replicate_to_device(
                     [PhysicalEncoding::CompactCoeffPerCrtLimb { .. }]
             )
         );
+    let replica = value_id(ctx.values.len())?;
+    // Copying an owner creates new allocations. Preserve aliases between its parts,
+    // but never reuse the source's slot identities: export dependency validation and
+    // later copies must distinguish these independent allocations.
+    let replica_slots = spans
+        .keys()
+        .enumerate()
+        .map(|(allocation, &slot)| {
+            Ok((
+                slot,
+                StorageRef::Replica {
+                    value: replica,
+                    allocation: u32::try_from(allocation)
+                        .map_err(|_| "too many replica allocations")?,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
     let mut storage = BTreeMap::new();
-    for (&slot, &(start, end)) in &spans {
+    for (&source_slot, &(start, end)) in &spans {
+        let slot = replica_slots[&source_slot];
         if deferred {
             storage.insert(
                 slot,
@@ -2088,10 +2115,10 @@ pub(super) fn replicate_to_device(
     for part in physical.parts.iter_mut() {
         part.device = device;
         part.view.byte_offset -= spans[&part.storage].0;
+        part.storage = replica_slots[&part.storage];
     }
     let owner = GpuResidentValue::new(Arc::new(physical.clone()), storage, Box::new([]))
         .map_err(str::to_owned)?;
-    let replica = value_id(ctx.values.len())?;
     ctx.values.push(physical);
     ctx.owners.insert(replica, Arc::new(owner));
     let implementation =
@@ -2606,18 +2633,40 @@ pub(super) fn emit_zero_matrix(
         PhysicalEncoding::FullEval,
         storage,
     )?;
-    let bytes = resident
-        .storage(storage)
-        .ok_or_else(|| "GPU zero allocation is missing its storage".to_owned())?
-        .bytes;
     let output = value_id(ctx.values.len())?;
     ctx.values.push(physical);
     ctx.owners.insert(output, resident);
-    let binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    emit_zero_value(ctx, output)?;
+    Ok(output)
+}
+
+/// Initialize a whole deferred full or compact allocation in its graph lifetime.
+fn emit_zero_value(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    output: PhysicalValueId,
+) -> Result<u32, String> {
+    let bytes = {
+        let owner = ctx.owners.get(&output).ok_or("GPU zero allocation is missing")?;
+        let mut storages = owner.storages();
+        let bytes = storages.next().ok_or("GPU zero allocation has no storage")?.1.bytes;
+        if storages.next().is_some() {
+            return Err("GPU zero allocation needs one storage".into());
+        }
+        bytes
+    };
+    let columns = ctx.values[output.0 as usize]
+        .ty
+        .matrix_type()
+        .ok_or("GPU zero value has no matrix type")?
+        .columns;
+    let binding = if matches!(ctx.values[output.0 as usize].ty, ConcreteWireType::Matrix(_)) {
+        register_bindings(ctx.bindings, ctx.values, output)?
+    } else {
+        register_preimage_control_binding(ctx, output)?
+    };
     let implementation =
         ctx.implementations.register(GpuImplementation::zero()).map_err(str::to_owned)?;
-    let index =
-        u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    let index = u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations")?;
     ctx.operations.push(CompiledGpuOp {
         implementation,
         arguments: Box::new([
@@ -2634,8 +2683,8 @@ pub(super) fn emit_zero_matrix(
         predecessors: Box::new([]),
         body: None,
     });
-    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, index)]);
-    Ok(output)
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: columns }, index)]);
+    Ok(index)
 }
 
 /// A direct device sample uses a plan-owned seed. The execution nonce is
@@ -3784,6 +3833,38 @@ fn matrix_view(
     Ok(id)
 }
 
+/// A row slice with its own matrix shape, sharing the source allocation and writers.
+/// Computational trapdoors use this to expose R and E as views of their stacked leaf.
+pub(super) fn matrix_row_slice(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+    row: usize,
+    rows: usize,
+) -> Result<PhysicalValueId, String> {
+    let mut ty = ctx.values[source.0 as usize]
+        .ty
+        .matrix_type()
+        .ok_or("GPU row slice source is not a matrix")?
+        .clone();
+    let view = matrix_view(ctx, source, row, rows, 0, ty.columns)?;
+    ty.rows = rows;
+    let mut physical = ctx.values[view.0 as usize].clone();
+    physical.ty = ConcreteWireType::Matrix(ty);
+    for part in physical.parts.iter_mut() {
+        part.view.origin[0] = 0;
+    }
+    let owner = ctx
+        .owners
+        .get(&view)
+        .ok_or("GPU row slice owner is absent")?
+        .with_physical_view(Arc::new(physical.clone()))
+        .map_err(str::to_owned)?;
+    ctx.values[view.0 as usize] = physical;
+    ctx.owners.insert(view, Arc::new(owner));
+    ctx.producer.insert(view, ctx.producer.get(&source).cloned().unwrap_or_default());
+    Ok(view)
+}
+
 /// A compact publication addresses the full owner base and uses the semantic
 /// column origin to scatter a packed tile into that owner. Unlike a full
 /// matrix subview, its byte offset must not advance by the column stride.
@@ -4546,7 +4627,8 @@ fn allocate_trapdoor_bytes(
 }
 
 /// The leaves of a returned copy of the evaluation-domain trapdoor `source`: fresh scratch
-/// matrices for its matrix leaves (which [`emit_trapdoor_leaf_copies`] fills), then the
+/// matrices for its matrix leaves (which [`emit_trapdoor_leaf_copies`] fills), with R/E
+/// sharing the stacked computational leaf, then the
 /// precomputation of a statistical trapdoor, shared with `source`. The precomputation has its own
 /// plan allocation, outside the scratch pool, that nothing writes after TrapGen, so a copy would
 /// only double its memory.
@@ -4555,10 +4637,25 @@ fn returned_trapdoor_leaves(
     source: PhysicalValueId,
 ) -> Result<Vec<PhysicalValueId>, String> {
     let ty = ctx.values[source.0 as usize].ty.clone();
-    let mut leaves = trapdoor_leaf_types(&ty)?
-        .iter()
-        .map(|leaf_ty| allocate_scratch_matrix(ctx, leaf_ty, PhysicalEncoding::FullEval))
-        .collect::<Result<Vec<_>, _>>()?;
+    let types = trapdoor_leaf_types(&ty)?;
+    let mut leaves = if matches!(&ty, ConcreteWireType::Trapdoor { instantiation, .. }
+        if instantiation.is_computational())
+    {
+        let re = allocate_scratch_matrix(ctx, &types[5], PhysicalEncoding::FullEval)?;
+        let rows = types[0].rows;
+        let mut leaves =
+            vec![matrix_row_slice(ctx, re, 0, rows)?, matrix_row_slice(ctx, re, rows, rows)?];
+        for leaf in &types[2..5] {
+            leaves.push(allocate_scratch_matrix(ctx, leaf, PhysicalEncoding::FullEval)?);
+        }
+        leaves.push(re);
+        leaves
+    } else {
+        types
+            .iter()
+            .map(|leaf| allocate_scratch_matrix(ctx, leaf, PhysicalEncoding::FullEval))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     if trapdoor_precomputation_bytes(&ty)?.is_some() {
         leaves.push(trapdoor_precomputation_view(ctx, source)?);
     }
@@ -4615,7 +4712,16 @@ fn emit_trapdoor_leaf_copies(
         .map_err(str::to_owned)?;
     let predecessors = all_predecessors(ctx.producer, source);
     let mut writers = Vec::new();
-    for leaf in 0..leaf_count {
+    // The computational destination exposes R/E as views of [R; E]. Copying all
+    // three would create overlapping asynchronous writes, so only copy the stack.
+    let first_leaf = if matches!(&source_ty, ConcreteWireType::Trapdoor { instantiation, .. }
+        if instantiation.is_computational())
+    {
+        2
+    } else {
+        0
+    };
+    for leaf in first_leaf..leaf_count {
         let part = u32::try_from(leaf * depth)
             .map_err(|_| "GPU trapdoor copy part index exceeds u32".to_owned())?;
         // Each copy writes only its leaf, so the shared precomputation is never a copy output.
@@ -4647,7 +4753,7 @@ fn emit_trapdoor_leaf_copies(
     Ok(())
 }
 
-/// Return the coefficient-domain trapdoor of `source`, inverting each leaf
+/// Return the coefficient-domain trapdoor of `source`, inverting each distinct allocation
 /// once per lowering context: repeated preimages and exports of the same
 /// trapdoor reuse the pair recorded in `ctx.converted`.
 fn inverse_trapdoor_for_export(
@@ -4668,8 +4774,10 @@ fn inverse_trapdoor_for_export(
     let implementation =
         ctx.implementations.register(GpuImplementation::ntt(true)).map_err(str::to_owned)?;
     let predecessors = all_predecessors(ctx.producer, source);
+    let computational = matches!(&ty, ConcreteWireType::Trapdoor { instantiation, .. }
+        if instantiation.is_computational());
     let mut leaves = Vec::new();
-    for (leaf, leaf_ty) in leaf_types.iter().enumerate() {
+    for (leaf, leaf_ty) in leaf_types.iter().enumerate().skip(if computational { 2 } else { 0 }) {
         let coefficient = allocate_scratch_matrix(ctx, leaf_ty, PhysicalEncoding::FullCoeff)?;
         let destination_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
         let source_part = u32::try_from(leaf * depth)
@@ -4697,6 +4805,13 @@ fn inverse_trapdoor_for_export(
         ctx.producer
             .insert(coefficient, vec![(ColumnRange { start: 0, end: leaf_ty.columns }, index)]);
         leaves.push(coefficient);
+    }
+    if computational {
+        let re = *leaves.last().ok_or("GPU trapdoor stack was not converted")?;
+        let rows = leaf_types[0].rows;
+        let r = matrix_row_slice(ctx, re, 0, rows)?;
+        let e = matrix_row_slice(ctx, re, rows, rows)?;
+        leaves.splice(0..0, [r, e]);
     }
     // The precomputation has no evaluation form; both forms share it.
     if trapdoor_precomputation_bytes(&ty)?.is_some() {
@@ -5482,6 +5597,10 @@ pub(super) fn lower_trapdoor_sample_node(
             (ColumnRange { start: 2 * d, end: 2 * d + dk }, a1_copy),
         ],
     );
+    // Retain R/E as views of the stacked leaf. Their sampled originals are temporary;
+    // keeping both copies would double the large secret payload of every family member.
+    let r = matrix_row_slice(ctx, re, 0, d)?;
+    let e = matrix_row_slice(ctx, re, d, d)?;
     let secret = pack_trapdoor_leaves(
         ctx,
         secret_ty,
@@ -6234,33 +6353,42 @@ pub(super) fn lower_preimage_sample_node(
     .into_iter()
     .map(|leaf| trapdoor_leaf_view(ctx, secret, leaf))
     .collect::<Result<Vec<_>, _>>()?;
-    let secret_coeff = inverse_trapdoor_for_export(ctx, secret)?;
-    let depth = public_ty.ring.crt_depth();
-    let secret_coeff_bindings = register_all_parts(ctx.bindings, ctx.values, secret_coeff)?;
-    let (full_output, magnitude_bytes) = allocate_compact_value(ctx, output_ty.clone(), false)?;
-    // Per remote device: its copies of the trapdoor inputs, the coefficient
-    // bindings of its inverse trapdoor, and its output block.
+    // The computational perturbation needs only the three small covariance leaves
+    // in coefficients, not R/E or their stack. Keep those large leaves in evaluation
+    // form for the matrix products. Statistical precomputation is already compact.
+    let perturbation_source =
+        if statistical.is_some() { inverse_trapdoor_for_export(ctx, secret)? } else { secret };
+    let mut covariance_by_device = BTreeMap::<i32, Vec<PhysicalValueId>>::new();
+    // The output starts living at its zero node, not at plan construction. This
+    // lets its compact payload reuse scratch released by earlier trapdoor generation.
+    let full_output = allocate_deferred_compact_value(ctx, output_ty.clone())?;
+    let magnitude_bytes = match ctx.values[full_output.0 as usize].encodings[0] {
+        PhysicalEncoding::CompactCoeff { magnitude_bytes } => magnitude_bytes as usize,
+        _ => return Err("GPU preimage output must have global compact coefficients".into()),
+    };
+    let mut output_initializers =
+        BTreeMap::from([(full_output, emit_zero_value(ctx, full_output)?)]);
+    // Per remote device: its trapdoor inputs, perturbation source, and output block.
     let mut remote = BTreeMap::new();
     for (&device, block) in &blocks {
         let copies = std::iter::once(public)
             .chain(leaf_inputs.iter().copied())
-            .chain(std::iter::once(secret_coeff))
+            .chain(std::iter::once(perturbation_source))
             .map(|id| replicate_to_device(ctx, id, device))
             .collect::<Result<Vec<_>, _>>()?;
-        let coeff_bindings = register_all_parts(
-            ctx.bindings,
-            ctx.values,
-            *copies.last().ok_or("GPU preimage device inputs are incomplete")?,
-        )?;
         let mut block_ty = output_ty.clone();
         if let ConcreteWireType::Preimage { matrix, .. } = &mut block_ty {
             matrix.columns = block.end - block.start;
         }
         ctx.device = device;
-        let (block_output, _) = allocate_compact_value(ctx, block_ty, false)?;
+        let block_output = allocate_deferred_compact_value(ctx, block_ty)?;
+        output_initializers.insert(block_output, emit_zero_value(ctx, block_output)?);
         ctx.device = home;
-        remote.insert(device, (copies, coeff_bindings, block_output, *block));
+        remote.insert(device, (copies, block_output, *block));
     }
+    // One cutoff staging allocation per device and tile width. Tiles sharing it
+    // are ordered below; C controls their width and W controls independent lanes.
+    let mut cutoff_tiles = BTreeMap::<(i32, usize), (u32, Option<u32>)>::new();
     for &(tile_device, tile_start, tile_width) in &tiles {
         let target_source = target;
         let target = matrix_view(ctx, target_source, 0, d, tile_start, tile_width)?;
@@ -6282,32 +6410,18 @@ pub(super) fn lower_preimage_sample_node(
         let mut target_local =
             allocate_scratch_matrix(ctx, &tile_target_ty, PhysicalEncoding::FullEval)?;
         emit_matrix_operation(ctx, GpuImplementation::matrix_copy_view(), &[target], target_local)?;
-        let (public, leaves, secret_coeff, secret_coeff_bindings, tile_owner, tile_column) =
+        let (public, leaves, perturbation_source, tile_owner, tile_column) =
             match remote.get(&tile_device) {
-                Some((copies, coeff_bindings, block_output, block)) => {
+                Some((copies, block_output, block)) => {
                     target_local = replicate_to_device(ctx, target_local, tile_device)?;
                     ctx.device = tile_device;
-                    let [public, leaves @ .., secret_coeff] = &copies[..] else {
+                    let [public, leaves @ .., perturbation_source] = &copies[..] else {
                         return Err("GPU preimage device inputs are incomplete".into());
                     };
                     let column = tile_start - block.start;
-                    (
-                        *public,
-                        leaves.to_vec(),
-                        *secret_coeff,
-                        *coeff_bindings,
-                        *block_output,
-                        column,
-                    )
+                    (*public, leaves.to_vec(), *perturbation_source, *block_output, column)
                 }
-                None => (
-                    public,
-                    leaf_inputs.clone(),
-                    secret_coeff,
-                    secret_coeff_bindings,
-                    full_output,
-                    tile_start,
-                ),
+                None => (public, leaf_inputs.clone(), perturbation_source, full_output, tile_start),
             };
         let output = compact_column_view(ctx, tile_owner, tile_column, tile_width)?;
         let resource_base = u32::try_from(ctx.values.len())
@@ -6316,7 +6430,8 @@ pub(super) fn lower_preimage_sample_node(
             .ok_or("GPU preimage resource ID overflows")?;
         let p1_resource = resource_base;
         let gq_resource = resource_base + 1;
-        let cutoff_resource = resource_base + 2;
+        let (cutoff_resource, previous_cutoff) =
+            *cutoff_tiles.entry((tile_device, t)).or_insert((resource_base + 2, None));
         // The statistical sampler reads the trapdoor's precomputation on the tile's device.
         let (p1_workspace, precomputation) = match statistical {
             Some(_) => (
@@ -6326,7 +6441,7 @@ pub(super) fn lower_preimage_sample_node(
                     p1_resource,
                     3,
                 )?,
-                Some(trapdoor_precomputation_view(ctx, secret_coeff)?),
+                Some(trapdoor_precomputation_view(ctx, perturbation_source)?),
             ),
             None => (
                 register_preimage_workspace(
@@ -6341,24 +6456,43 @@ pub(super) fn lower_preimage_sample_node(
         let refresh = if statistical.is_some() {
             None
         } else {
+            if !covariance_by_device.contains_key(&tile_device) {
+                let covariances = (2..5)
+                    .map(|leaf| {
+                        let value = trapdoor_leaf_view(ctx, perturbation_source, leaf)?;
+                        full_coeff_value(ctx, value)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                covariance_by_device.insert(tile_device, covariances);
+            }
+            let covariance = &covariance_by_device[&tile_device];
+            let bindings = covariance
+                .iter()
+                .map(|id| register_bindings(ctx.bindings, ctx.values, *id))
+                .collect::<Result<Vec<_>, _>>()?;
+            let predecessors = covariance
+                .iter()
+                .flat_map(|id| all_predecessors(ctx.producer, *id))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
             Some(push_preimage_op(
                 ctx,
                 GpuImplementation::p1_covariance_refresh(),
                 Box::new([
                     KernelArg::U32(p1_resource),
-                    KernelArg::Value(secret_coeff),
-                    KernelArg::U32((2 * depth) as u32),
-                    KernelArg::Value(secret_coeff),
-                    KernelArg::U32((3 * depth) as u32),
-                    KernelArg::Value(secret_coeff),
-                    KernelArg::U32((4 * depth) as u32),
+                    KernelArg::Value(covariance[0]),
+                    KernelArg::U32(0),
+                    KernelArg::Value(covariance[1]),
+                    KernelArg::U32(0),
+                    KernelArg::Value(covariance[2]),
+                    KernelArg::U32(0),
                     KernelArg::F64(c),
                     KernelArg::F64(s),
                     KernelArg::F64(dgg_stddev),
                     KernelArg::U64(t as u64),
-                    KernelArg::U32(secret_coeff_bindings + (2 * depth) as u32),
-                    KernelArg::U32(secret_coeff_bindings + (3 * depth) as u32),
-                    KernelArg::U32(secret_coeff_bindings + (4 * depth) as u32),
+                    KernelArg::U32(bindings[0]),
+                    KernelArg::U32(bindings[1]),
+                    KernelArg::U32(bindings[2]),
                     KernelArg::U32(p1_workspace),
                     KernelArg::U32(p1_workspace + 1),
                     KernelArg::U32(p1_workspace + 2),
@@ -6366,7 +6500,7 @@ pub(super) fn lower_preimage_sample_node(
                     KernelArg::U32(p1_workspace + 4),
                 ]),
                 Box::new([]),
-                all_predecessors(ctx.producer, secret_coeff),
+                predecessors,
             )?)
         };
         let controls = allocate_retry_controls(ctx, max_attempts, None)?;
@@ -6390,6 +6524,7 @@ pub(super) fn lower_preimage_sample_node(
         {
             let mut child =
                 retry_body_context(ctx, &mut body, &mut body_producer, &mut body_converted);
+            let mut reusable_p2 = None;
             let perturb_coeff = match statistical {
                 None => {
                     let p2_seed =
@@ -6403,6 +6538,7 @@ pub(super) fn lower_preimage_sample_node(
                         Some(dgg_stddev),
                         Some(p2_seed),
                     )?;
+                    reusable_p2 = Some((p2_coeff, p2_eval));
                     let tp2_eval = allocate_scratch_matrix(
                         &mut child,
                         &shape(2 * d, t),
@@ -6572,8 +6708,14 @@ pub(super) fn lower_preimage_sample_node(
                 &[residual_eval],
                 residual_coeff,
             )?;
-            let z_coeff =
-                allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullCoeff)?;
+            // The perturbation has consumed p2 through the public product and
+            // residual. Its two buffers can hold z without overlapping readers.
+            let z_coeff = match reusable_p2 {
+                Some((coefficient, _)) => coefficient,
+                None => {
+                    allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullCoeff)?
+                }
+            };
             let gq_seed = derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 2)?;
             let residual_binding = register_bindings(child.bindings, child.values, residual_coeff)?;
             let z_binding = register_bindings(child.bindings, child.values, z_coeff)?;
@@ -6601,8 +6743,12 @@ pub(super) fn lower_preimage_sample_node(
                 residual_predecessors,
             )?;
             child.producer.insert(z_coeff, vec![(ColumnRange { start: 0, end: t }, gq_index)]);
-            let z_eval =
-                allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullEval)?;
+            let z_eval = match reusable_p2 {
+                Some((_, evaluation)) => evaluation,
+                None => {
+                    allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullEval)?
+                }
+            };
             emit_matrix_operation(&mut child, GpuImplementation::ntt(false), &[z_coeff], z_eval)?;
             let candidate_eval = match statistical {
                 None => {
@@ -6744,8 +6890,9 @@ pub(super) fn lower_preimage_sample_node(
                     candidate
                 }
             };
-            let candidate_coeff =
-                allocate_scratch_matrix(&mut child, &output_matrix, PhysicalEncoding::FullCoeff)?;
+            // The forward transform and correction have finished every read of
+            // the original perturbation coefficients before this inverse NTT.
+            let candidate_coeff = perturb_coeff;
             emit_matrix_operation(
                 &mut child,
                 GpuImplementation::ntt(true),
@@ -6821,12 +6968,15 @@ pub(super) fn lower_preimage_sample_node(
         // source window: the loop must follow that copy.
         predecessors.extend(all_predecessors(ctx.producer, target_local));
         predecessors.extend(refresh);
+        predecessors.extend(previous_cutoff);
+        predecessors.push(output_initializers[&tile_owner]);
         if let Some(precomputation) = precomputation {
             predecessors.extend(all_predecessors(ctx.producer, precomputation));
         }
         predecessors.sort_unstable();
         predecessors.dedup();
         let loop_op = emit_retry_loop(ctx, &controls, predecessors.into_boxed_slice(), body)?;
+        cutoff_tiles.insert((tile_device, t), (cutoff_resource, Some(loop_op)));
         ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: t }, loop_op)]);
         ctx.producer
             .entry(tile_owner)
@@ -6834,50 +6984,16 @@ pub(super) fn lower_preimage_sample_node(
             .push((ColumnRange { start: tile_column, end: tile_column + t }, loop_op));
         ctx.device = home;
     }
-    for (_, _, block_output, block) in remote.into_values() {
+    for (_, block_output, block) in remote.into_values() {
         let copies = copy_compact_block_home(ctx, block_output, full_output, block)?;
         ctx.producer
             .entry(full_output)
             .or_default()
             .extend(copies.into_iter().map(|copy| (block, copy)));
     }
-    let (returned, _) = allocate_compact_value(ctx, output_ty, true)?;
-    let source_bytes = ctx.values[full_output.0 as usize]
-        .parts
-        .first()
-        .ok_or("GPU preimage packed source has no physical part")?
-        .view
-        .extent
-        .iter()
-        .try_fold(1u64, |size, extent| size.checked_mul(*extent))
-        .ok_or("GPU preimage packed copy size overflows")?;
-    let source_binding = register_preimage_control_binding(ctx, full_output)?;
-    let returned_binding = register_preimage_control_binding(ctx, returned)?;
-    let implementation =
-        ctx.implementations.register(GpuImplementation::copy()).map_err(str::to_owned)?;
-    let copy_index = u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations")?;
-    ctx.operations.push(CompiledGpuOp {
-        implementation,
-        arguments: Box::new([
-            KernelArg::Value(full_output),
-            KernelArg::U32(0),
-            KernelArg::Value(returned),
-            KernelArg::U32(0),
-            KernelArg::U64(source_bytes),
-            KernelArg::U32(source_binding),
-            KernelArg::U32(returned_binding),
-        ]),
-        outputs: Box::new([returned]),
-        device: ctx.device,
-        grid: [1; 3],
-        block: [1; 3],
-        shared_bytes: 0,
-        predecessors: all_predecessors(ctx.producer, full_output),
-        body: None,
-    });
-    ctx.producer
-        .insert(returned, vec![(ColumnRange { start: 0, end: target_ty.columns }, copy_index)]);
-    ctx.wire_ids.insert(output_wire, returned);
+    // Every tile publishes directly into its final column view. Readers wait
+    // for all tile producers, so a second whole-preimage allocation is unnecessary.
+    ctx.wire_ids.insert(output_wire, full_output);
     Ok(())
 }
 
@@ -8746,10 +8862,11 @@ pub(crate) fn plan_physical_graph(
             .map_err(|_| "GPU export site occurrence count exceeds u64".to_owned())?;
         slot_ranges.push((site, count, 1));
     }
+    // The first slot of every export site, looked up once per template.
+    let first_slots = starts.iter().map(|&(start, site)| (site, start)).collect::<BTreeMap<_, _>>();
     for template in &export_templates {
-        let &(start, _) = starts
-            .iter()
-            .find(|(_, site)| *site == template.site)
+        let start = *first_slots
+            .get(&template.site)
             .ok_or_else(|| "GPU export template has no site range".to_owned())?;
         let expected = start
             .checked_add(
@@ -8785,13 +8902,23 @@ pub(crate) fn plan_physical_graph(
         .chain(
             import_templates
                 .iter()
-                .filter(|import| !matches!(import.upload_owner, ImportDestination::Placed { .. }))
+                .filter(|import| {
+                    !matches!(
+                        import.upload_owner,
+                        ImportDestination::Placed { .. } | ImportDestination::PlacedBounded { .. }
+                    )
+                })
                 .map(|import| &import.destination),
         )
         .chain(
             external_io_imports
                 .iter()
-                .filter(|import| !matches!(import.upload_owner, ImportDestination::Placed { .. }))
+                .filter(|import| {
+                    !matches!(
+                        import.upload_owner,
+                        ImportDestination::Placed { .. } | ImportDestination::PlacedBounded { .. }
+                    )
+                })
                 .map(|import| &import.destination),
         )
         .chain(external_io_loops.iter().flat_map(|body| {
@@ -8809,7 +8936,7 @@ pub(crate) fn plan_physical_graph(
         implementations,
         operations: operations.into_boxed_slice(),
         bindings: bindings.into(),
-        export_slots: reserve_gpu_export_slots(slot_ranges).map_err(str::to_owned)?,
+        export_slots: reserve_gpu_export_slots(slot_ranges).map_err(str::to_owned)?.into(),
         subgraph_kernels: subgraph_kernels.to_vec().into_boxed_slice(),
     };
     program.validate().map_err(str::to_owned)?;

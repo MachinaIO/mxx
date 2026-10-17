@@ -7,6 +7,12 @@
 //! therefore bounds the decoders of every step, and the decoders keep the invariant when they
 //! decode exactly.
 //!
+//! Deferred Program lowering changes residency, not these arithmetic bounds: a CBD block is
+//! re-targeted independently and multiplied by the same one-column action `z`; placing it in
+//! its destination column adds no overlapping error terms. Smudge digits still sum in each
+//! column with unknown covariance. Recomputing a lazy PRF member preserves its sampled RHS
+//! artifact and hash domain, so it does not create an independent noise sample.
+//!
 //! Production labels are DSL families rather than scalar Program outputs. Noise-only Programs
 //! retain scalar product chains: the family lowerer ([`super::labels`]) has their ascending
 //! leaves, two-leaf minimum and right-deep multiplication order exactly. Representative mode

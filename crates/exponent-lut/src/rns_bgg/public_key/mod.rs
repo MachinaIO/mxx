@@ -162,7 +162,7 @@ pub struct RnsPreprocessBuild<'a> {
     /// Instance namespace for graph inputs and published artifacts.
     artifact_prefix: Option<String>,
     /// RHS expressions supplied by the composing graph, without resident inputs.
-    rhs_values: Option<BTreeMap<RhsId, InputBinding<Mat, Family<Mat>>>>,
+    rhs_values: Option<BTreeMap<RhsId, InputBinding<Mat, super::RhsPlaintexts>>>,
     parameters: &'a RnsBggParameters,
     context: [u8; 32],
     hash_key_commitment: [u8; 32],

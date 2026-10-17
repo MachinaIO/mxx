@@ -5,8 +5,8 @@
 //! `2^c (m_v + 1)` columns. [`LabelProducts`] records only the seed and the dimensions: one
 //! `Sha256BitColumns` node packs each column's ascending selected row indices into binary fields,
 //! and the evaluator's runtime chunk `x` selects the column block. [`LabelProducts::next`] is the
-//! clear transition of the label values; [`LabelProducts::forest`] multiplies the label encodings
-//! of every new label, for either carrier ([`super::carrier`]).
+//! clear transition of the label values; [`LabelProducts::product`] multiplies the label encodings
+//! of one new label, for either carrier ([`super::carrier`]).
 //!
 //! The product of a label is the right-deep chain `l_0 (l_1 (... l_(p-1)))` of its selected
 //! leaves in ascending order, padded with the one-encoding to two leaves. A public product
@@ -94,7 +94,7 @@ impl LabelProducts {
     }
 
     /// The clear transition of the row-major label values `labels` (entry `(r, c)` at
-    /// `r (m_v + 1) + c`) on chunk `chunk`: the same leaves as [`Self::forest`], summed modulo
+    /// `r (m_v + 1) + c`) on chunk `chunk`: the same leaves as [`Self::product`], summed modulo
     /// the label modulus.
     pub fn next(
         &self,
@@ -122,37 +122,38 @@ impl LabelProducts {
         })
     }
 
-    /// The product of every new label `(r, c)` (member `r (m_v + 1) + c`) at level 0, as a
-    /// public encoding: the right-deep chain of the leaves `leaf(r m_v + k, r (m_v + 1) + 1 + k)`
+    /// The product of the new label `(r, c)` of member `member = r (m_v + 1) + c` at level 0, as
+    /// a public encoding: the right-deep chain of the leaves `leaf(r m_v + k, r (m_v + 1) + 1 + k)`
     /// of the rows `k` that column `c` of chunk `chunk`'s `D_x` selects (the label input member
-    /// and the label value index of `(r, 1 + k)`), padded with `one` to two leaves.
-    pub fn forest<C: Carrier>(
+    /// and the label value index of `(r, 1 + k)`), padded with `one` to two leaves. One loop
+    /// over the leaf slots, so its graph does not depend on the label width; a refresh part
+    /// computes the product of its own label where it decodes it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn product<C: Carrier>(
         &self,
         chain: &RnsBggParameters,
-        parameters: &Dio2Parameters,
         columns: &LabelColumns,
         chunk: Int,
+        member: Int,
         leaf: impl Fn(Int, Int) -> Result<C::Public, Dio2Error>,
         one: C::Public,
-    ) -> Result<Family<C::Public>, Dio2Error> {
+    ) -> Result<C::Public, Dio2Error> {
         let width = self.width;
         let (packed, counts) = columns;
         let last = self.max_leaves - 1;
         let mut failure = None;
-        let products = mxx_dsl::parallel(parameters.label_rows() * (width + 1), |member| {
-            let mut guard = |result: Result<C::Public, Dio2Error>| {
-                result.map_err(|error| {
-                    failure = Some(error);
-                    DslError::Schema
-                })
-            };
-            let row = member.clone().div(width + 1);
-            let column = member.rem(width + 1);
-            let count = counts.at(chunk.clone().mul(width + 1).add(column.clone()));
-            let padded = mxx_dsl::select(
-                count.clone().less(2).to_int(),
-                vec![count.clone(), Int::constant(2)],
-            )?;
+        let mut guard = |result: Result<C::Public, Dio2Error>| {
+            result.map_err(|error| {
+                failure = Some(error);
+                DslError::Schema
+            })
+        };
+        let row = member.clone().div(width + 1);
+        let column = member.rem(width + 1);
+        let count = counts.at(chunk.clone().mul(width + 1).add(column.clone()));
+        let padded =
+            mxx_dsl::select(count.clone().less(2).to_int(), vec![count.clone(), Int::constant(2)]);
+        let product = padded.and_then(|padded| {
             // Slot `max_leaves - 1 - i` at iteration `i`: from the innermost leaf outwards.
             mxx_dsl::iterate(self.max_leaves, one.clone(), |iteration, product| {
                 let slot = IntExpr::Sub(
@@ -178,7 +179,7 @@ impl LabelProducts {
         if let Some(error) = failure {
             return Err(error);
         }
-        Ok(products?)
+        Ok(product?)
     }
 }
 
@@ -417,10 +418,10 @@ mod tests {
         }
     }
 
-    /// The label forest of every label height has the same graph: the leaf chain and the
+    /// The label products of every label height have the same graph: the leaf chain and the
     /// index decoding are loops.
     #[test]
-    fn label_forest_does_not_grow_with_the_label_width() {
+    fn label_products_do_not_grow_with_the_label_width() {
         use mxx_dsl::DslContext;
         let counts = [1, 2, 8].map(|height| {
             let (mut parameters, _) = toy();
@@ -436,18 +437,28 @@ mod tests {
                 )
             };
             let chunk = DslContext::new("chunk").input::<Int>("chunk", mxx_dsl::IntType).unwrap();
-            let forest = products
-                .forest::<super::super::carrier::Key>(
-                    &chain,
-                    &parameters,
-                    &products.columns(),
-                    chunk,
-                    |input, _| Ok(key(input)),
-                    key(Int::constant(0)),
-                )
+            let columns = products.columns();
+            let labels = mxx_dsl::parallel(
+                parameters.label_rows() * (parameters.label_width() + 1),
+                |member| {
+                    products
+                        .product::<super::super::carrier::Key>(
+                            &chain,
+                            &columns,
+                            chunk.clone(),
+                            member,
+                            |input, _| Ok(key(input)),
+                            key(Int::constant(0)),
+                        )
+                        .map_err(|_| DslError::Schema)
+                },
+            )
+            .unwrap();
+            let graph = DslContext::new("label-products")
+                .output("labels", labels)
+                .unwrap()
+                .build()
                 .unwrap();
-            let graph =
-                DslContext::new("label-forest").output("labels", forest).unwrap().build().unwrap();
             mxx_ir_core::validate(&graph.graph, &mxx_ir_core::ParamEnv::default()).unwrap();
             graph.graph.scopes().values().map(|scope| scope.nodes().len()).sum::<usize>()
         });

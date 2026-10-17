@@ -72,6 +72,42 @@ pub fn family_of_fields<T: mxx_dsl::GraphValue>(
     <mxx_dsl::Family<T> as mxx_dsl::GraphValue>::from_values(&schema, fields)
 }
 
+/// A family of graph values bound to a Program input: stored members, or members the composing
+/// graph computes where they are read, so that no family of them is a graph value.
+#[derive(Clone)]
+pub enum GraphFamily<T: mxx_dsl::GraphValue> {
+    Values(mxx_dsl::Family<T>),
+    Computed {
+        count: IntExpr,
+        member: std::sync::Arc<dyn Fn(mxx_dsl::Int) -> Result<T, mxx_dsl::DslError>>,
+    },
+}
+
+impl<T: mxx_dsl::GraphValue> GraphFamily<T> {
+    /// The family of `count` members whose member `i` is `member(i)`, computed where it is read.
+    pub fn computed(
+        count: impl Into<IntExpr>,
+        member: impl Fn(mxx_dsl::Int) -> Result<T, mxx_dsl::DslError> + 'static,
+    ) -> Self {
+        Self::Computed { count: count.into().canonicalize(), member: std::sync::Arc::new(member) }
+    }
+
+    pub fn count(&self) -> &IntExpr {
+        match self {
+            Self::Values(values) => values.count(),
+            Self::Computed { count, .. } => count,
+        }
+    }
+
+    /// Member `index`, read or computed in the current graph scope.
+    pub fn at(&self, index: mxx_dsl::Int) -> Result<T, mxx_dsl::DslError> {
+        match self {
+            Self::Values(values) => Ok(values.at(index)),
+            Self::Computed { member, .. } => member(index),
+        }
+    }
+}
+
 /// Graph-valued execution adapter shared by all graph lowerers.
 /// Graph-valued family execution used by the built-in scheme adapters. It
 /// reads a selected member through the Program's integer data inputs, when
@@ -193,6 +229,21 @@ where
         }
         graph_sum(evaluator, family.count().clone(), |index| Ok(family.at(index)))
     }
+
+    fn sequential_sum(
+        &mut self,
+        evaluator: &mut E,
+        count: IntExpr,
+        initial: E::Wire,
+        body: impl FnOnce(
+            &mut Self,
+            &mut E,
+            IntExpr,
+            E::Wire,
+        ) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+    ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
+        graph_sequential_sum(self, evaluator, count, initial, body)
+    }
 }
 
 /// Lower `body` once as a graph parallel loop over `range`, for any family
@@ -239,6 +290,34 @@ where
     Ok(wires)
 }
 
+/// One graph sequential loop of `count` iterations from `initial`, whose body maps the state
+/// at iteration `i` (an index expression) through `body`, for any family execution whose
+/// values are graph values ([`super::FamilyExecution::sequential_sum`]).
+pub(crate) fn graph_sequential_sum<X, E>(
+    execution: &mut X,
+    evaluator: &mut E,
+    count: IntExpr,
+    initial: E::Wire,
+    body: impl FnOnce(&mut X, &mut E, IntExpr, E::Wire) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+) -> Result<E::Wire, ProgramLowerError<E::Error>>
+where
+    E: ExponentLUTProgramLowering,
+    E::Wire: mxx_dsl::GraphValue,
+{
+    let mut failure = None;
+    let result = mxx_dsl::iterate(count, initial, |index, state| {
+        let index = index.expression()?;
+        body(execution, evaluator, index, state).map_err(|error| {
+            failure = Some(error);
+            mxx_dsl::DslError::Schema
+        })
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    result.map_err(ProgramLowerError::Dsl)
+}
+
 /// Sum the `count` members that `member` reads by index, as one graph
 /// reduction. A family execution passes how it reads one member.
 pub(crate) fn graph_sum<E>(
@@ -260,19 +339,17 @@ where
     if count_value.as_ref().is_some_and(|count| *count == 1.into()) {
         return Ok(first);
     }
-    // A sum is labelled with the reduction's output wire, which a family
-    // member is not. Add the first two members before the loop so that
-    // every loop state carries that label and the state schema is the
-    // same in each iteration.
+    // The carry must use the reduction's output label from its first iteration.
+    // Multiplication by one relabels without changing the value or lowering another member.
     let initial = evaluator
-        .add(&first, &member(mxx_dsl::Int::constant(1))?)
+        .mul_small_constant(&first, &[1], &IntExpr::constant(0))
         .map_err(ProgramLowerError::Backend)?;
     let mut failure = None;
-    let result = mxx_dsl::iterate(count - 2usize, initial, |index, state| {
+    let result = mxx_dsl::iterate(count - 1usize, initial, |index, state| {
         if failure.is_some() {
             return Err(mxx_dsl::DslError::Schema);
         }
-        let rhs = match member(index.add(2usize)) {
+        let rhs = match member(index.add(1usize)) {
             Ok(rhs) => rhs,
             Err(error) => {
                 failure = Some(error);
@@ -648,11 +725,15 @@ mod tests {
         }
         fn mul_small_constant(
             &mut self,
-            _: &Self::Wire,
-            _: &[i64],
-            _: &IntExpr,
+            input: &Self::Wire,
+            coefficients: &[i64],
+            shift: &IntExpr,
         ) -> Result<Self::Wire, GraphError> {
-            Err(GraphError)
+            if coefficients == [1] && shift == &IntExpr::constant(0) {
+                Ok(input.clone())
+            } else {
+                Err(GraphError)
+            }
         }
     }
 

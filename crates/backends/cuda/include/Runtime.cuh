@@ -346,7 +346,7 @@ int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream,
     const void *value, int value_encoding,
     const MxxRawMatrixView *destination, uint32_t *status,
     uint32_t value_binding, uint32_t destination_binding_base,
-    uint32_t status_binding);
+    uint32_t status_binding, int unit);
 int gpu_indexed_matrix_table_create(GpuContext *ctx, void *stream,
     int32_t physical_device, size_t family_count, size_t limb_count,
     GpuIndexedMatrixTable **out_table);

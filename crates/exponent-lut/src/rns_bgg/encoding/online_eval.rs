@@ -87,8 +87,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         program: &ExponentLutProgram,
         parameters: &ParamEnv,
         preprocess: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
-        rows: BTreeMap<WireId, InputBinding<RnsBggRow, Family<RnsBggRow>>>,
-        public_payloads: BTreeMap<WireId, InputBinding<Mat, Family<Mat>>>,
+        rows: BTreeMap<WireId, InputBinding<RnsBggRow, crate::program::GraphFamily<RnsBggRow>>>,
+        public_payloads: BTreeMap<WireId, InputBinding<Mat, crate::program::GraphFamily<Mat>>>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         if rows.len() != program.inputs().len() ||
@@ -160,16 +160,19 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     {
                         return Err(ApiError::input("graph row or public payload family count differs"));
                     }
-                    let encodings = mxx_dsl::parallel(count.clone(), |index| {
-                        let payload = match payload {
-                            Some(InputBinding::Family(values)) => Some(values.at(index.clone())),
+                    // Each member is encoded where the Program reads it.
+                    InputBinding::Family(OnlineEvalWireFamily::Graph {
+                        wire: *wire,
+                        level,
+                        knowledge: input.knowledge(),
+                        key: key.clone(),
+                        hash_key: evaluator.hash_key.clone(),
+                        rows: rows.clone(),
+                        payloads: match payload {
+                            Some(InputBinding::Family(values)) => Some(values.clone()),
                             _ => None,
-                        };
-                        encoding(rows.at(index.clone()), payload, Some(index))
-                            .map_err(|_| DslError::Schema)
+                        },
                     })
-                    .map_err(ApiError::scheme)?;
-                    InputBinding::Family(OnlineEvalWireFamily::Stored(encodings))
                 }
                 _ => return Err(ApiError::input("graph row shape differs from Program input")),
             };
@@ -180,11 +183,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         Ok(())
     }
 
-    /// Bind root-ring LUT helper families by `LutTable::helper_family_key`, after `bind_rows`.
-    /// Each member is retargeted in the graph at the LUT's consuming level.
+    /// Bind root-ring LUT helper rows by `LutTable::helper_family_key`, after `bind_rows`: the
+    /// helper of branch `i` of a key's layout is member `positions[i]` of its family `rows`, read
+    /// and re-targeted where the branch is evaluated, at the LUT's consuming level.
     pub fn bind_lut_helper_rows(
         &mut self,
-        helpers: BTreeMap<String, Family<RnsBggRow>>,
+        helpers: BTreeMap<String, (Family<RnsBggRow>, Vec<IntExpr>)>,
     ) -> Result<(), ApiError> {
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_rows first"))?;
@@ -213,14 +217,15 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     pub fn bind_data_values(
         &mut self,
         program: &ExponentLutProgram,
-        data: BTreeMap<crate::program::DataId, Family<Int>>,
+        data: BTreeMap<crate::program::DataId, (Family<Int>, Int)>,
     ) -> Result<(), ApiError> {
         if self.evaluator.is_some() {
             return Err(ApiError::input("bind graph data before the rows"));
         }
-        crate::program::validate_data_values(program, &data)
+        let (data, offsets) = crate::program::validate_data_values(program, data)
             .map_err(|error| ApiError::input(error.to_string()))?;
         self.graph_data = Some(data);
+        self.families.data_offsets = offsets;
         Ok(())
     }
 
@@ -1199,7 +1204,9 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             declaration.output_prime(),
             declaration.reference(),
         )?;
-        let decoded = refresh_combination(one, target_row, fresh_row, &actions)?;
+        let (fresh_row, blocks) = fresh_row;
+        let fresh_term = crate::rns_bgg::refresh::row_fresh_term(fresh_row, blocks, &actions)?;
+        let decoded = refresh_combination(one, target_row, fresh_term, &actions)?;
         let (smudge_outputs, child_manifests) = lower(&mut smudge)?;
         manifests.extend(child_manifests);
         let smudge_output = smudge_outputs
@@ -1282,7 +1289,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
 
 /// Retarget a caller's root row and derive its key using the preprocessing key schedule.
 #[allow(clippy::too_many_arguments)]
-fn graph_input_encoding(
+pub(super) fn graph_input_encoding(
     parameters: &RnsBggParameters,
     wire: WireId,
     level: usize,
@@ -1323,6 +1330,7 @@ fn graph_input_encoding(
 
 impl ProgramBuild for RnsOnlineEvalBuild<'_> {
     type Wire = RnsBggEncoding;
+    type WireFamily = OnlineEvalWireFamily;
 
     fn lower(&mut self, program: &ExponentLutProgram) -> Result<Vec<Self::Wire>, ApiError> {
         let (evaluator, families, environment) = self.lowering_state_inner()?;
@@ -1331,6 +1339,32 @@ impl ProgramBuild for RnsOnlineEvalBuild<'_> {
         }
         crate::program::lower_program(program, evaluator, families, environment)
             .map_err(ApiError::lowering)
+    }
+
+    fn lower_deferred(
+        &mut self,
+        program: &ExponentLutProgram,
+        deferred: &std::collections::BTreeSet<usize>,
+    ) -> Result<Vec<crate::program::LoweredOutput<Self::Wire, Self::WireFamily>>, ApiError> {
+        let (evaluator, families, environment) = self.lowering_state_inner()?;
+        if evaluator.program.id() != program.id() {
+            return Err(ApiError::input("lowered Program differs from the bound evaluation"));
+        }
+        crate::program::lower_program_deferred(program, evaluator, families, environment, deferred)
+            .map_err(ApiError::lowering)
+    }
+
+    fn deferred_block(
+        &mut self,
+        program: &ExponentLutProgram,
+        columns: &crate::program::DeferredColumns<Self::Wire, Self::WireFamily>,
+        block: &IntExpr,
+    ) -> Result<Self::Wire, ApiError> {
+        let (evaluator, families, environment) = self.lowering_state_inner()?;
+        if evaluator.program.id() != program.id() {
+            return Err(ApiError::input("lowered Program differs from the bound evaluation"));
+        }
+        columns.block(program, evaluator, families, environment, block).map_err(ApiError::lowering)
     }
 }
 

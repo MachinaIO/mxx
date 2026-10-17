@@ -57,6 +57,11 @@ pub(crate) enum StorageRef {
     Input(u32),
     Output(u32),
     Scratch(u32),
+    /// A new allocation made by replicating a value, distinct from its source slots.
+    Replica {
+        value: PhysicalValueId,
+        allocation: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -807,7 +812,7 @@ impl GpuImplementation {
         use GpuArgumentKind::{U32, Value};
         Self {
             primitive: GpuNativePrimitive::LiftIntegerConstant,
-            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32]),
+            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32, U32]),
             output_count: 1,
         }
     }
@@ -1320,7 +1325,7 @@ pub(crate) struct CompiledGpuProgram {
     pub operations: Box<[CompiledGpuOp]>,
     /// Dense, plan-global binding indices used by native patch records.
     pub bindings: Arc<[GpuBindingSource]>,
-    pub export_slots: Box<[GpuExportSlotRange]>,
+    pub export_slots: Arc<[GpuExportSlotRange]>,
     /// The registered kernels `SubgraphKernel` operations name by index.
     pub subgraph_kernels: Box<[crate::gpu_subgraph_kernel::GpuSubgraphKernel]>,
 }
@@ -1442,6 +1447,18 @@ impl CompiledGpuProgram {
         }
         // A later writer may reuse an export source allocation after its
         // device copy has completed. No disk completion edge is required.
+        // The writers of every storage, in operation order, are indexed once.
+        let mut writers_by_storage = BTreeMap::<_, Vec<usize>>::new();
+        for (index, writer) in self.operations.iter().enumerate() {
+            let storages = writer
+                .outputs
+                .iter()
+                .flat_map(|id| self.values[id.0 as usize].parts.iter().map(|part| part.storage))
+                .collect::<BTreeSet<_>>();
+            for storage in storages {
+                writers_by_storage.entry(storage).or_default().push(index);
+            }
+        }
         for (copy_index, copy_op) in self.operations.iter().enumerate() {
             let kind = self.implementations.resolve(copy_op.implementation)?.primitive;
             if kind != GpuNativePrimitive::ExportCopy {
@@ -1459,13 +1476,14 @@ impl CompiledGpuProgram {
                 .get(*part as usize)
                 .ok_or("GPU export source part is out of range")?
                 .storage;
-            for writer in self.operations.iter().skip(copy_index + 1) {
-                let reuses_storage = writer.outputs.iter().any(|id| {
-                    self.values[id.0 as usize].parts.iter().any(|output| output.storage == storage)
-                });
-                if !reuses_storage {
-                    continue;
-                }
+            let later_writers = writers_by_storage
+                .get(&storage)
+                .map(|writers| {
+                    let first = writers.partition_point(|index| *index <= copy_index);
+                    &writers[first..]
+                })
+                .unwrap_or_default();
+            for writer in later_writers.iter().map(|index| &self.operations[*index]) {
                 let mut pending = writer.predecessors.to_vec();
                 let mut visited = BTreeSet::new();
                 let mut ordered = false;
@@ -1517,7 +1535,7 @@ impl CompiledGpuProgram {
         }
         let mut next = 0usize;
         let mut sites = BTreeSet::new();
-        for range in &self.export_slots {
+        for range in self.export_slots.iter() {
             if !sites.insert(range.site) ||
                 range.start != next ||
                 range.occurrence_count == 0 ||
@@ -1690,7 +1708,7 @@ mod gpu_export_slot_tests {
                 GpuBindingSource::ExportSlotPayload { slot: 0 },
                 GpuBindingSource::ExportSlotHeader { slot: 0 },
             ]),
-            export_slots: reserve_gpu_export_slots([(7, 1, 1)]).unwrap(),
+            export_slots: reserve_gpu_export_slots([(7, 1, 1)]).unwrap().into(),
             subgraph_kernels: Box::new([]),
         };
         assert!(program.validate().is_ok());

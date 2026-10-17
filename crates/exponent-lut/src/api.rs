@@ -8,8 +8,8 @@
 use crate::{
     decoder::{Decoder, DecoderDeclaration},
     program::{
-        Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution,
-        ProgramLowerError, RhsId, WireId, lower_program,
+        DeferredColumns, Environment, ExponentLUTProgramLowering, ExponentLutProgram,
+        FamilyExecution, LoweredOutput, ProgramLowerError, RhsId, WireId, lower_program,
     },
 };
 use mxx_backends::{
@@ -30,7 +30,11 @@ use mxx_ir_core::{
     encoding::spec_hash,
 };
 use num_bigint::BigInt;
-use std::{collections::BTreeMap, error::Error, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    path::PathBuf,
+};
 use thiserror::Error as ThisError;
 
 /// Where stages keep the artifacts they hand to later stages.
@@ -337,9 +341,30 @@ impl<D> GraphEmission<D> {
 pub trait ProgramBuild {
     /// The lowered carrier returned for each declared Program output.
     type Wire;
+    /// The lowered family of the builder's Program families.
+    type WireFamily;
 
     /// Traverse a bound Program without freezing or executing its graph.
     fn lower(&mut self, program: &ExponentLutProgram) -> Result<Vec<Self::Wire>, ApiError>;
+
+    /// [`Self::lower`], except that the `Sum` outputs at the positions `deferred` are returned
+    /// as [`DeferredColumns`] whose blocks the caller reads with [`Self::deferred_block`] where
+    /// it needs them, and that no Program family is lowered as a graph loop: every family member
+    /// is lowered where it is read (see `program::lowering::lower_program_deferred`).
+    fn lower_deferred(
+        &mut self,
+        program: &ExponentLutProgram,
+        deferred: &BTreeSet<usize>,
+    ) -> Result<Vec<LoweredOutput<Self::Wire, Self::WireFamily>>, ApiError>;
+
+    /// Column block `block` of the deferred output `columns` of [`Self::lower_deferred`],
+    /// lowered in the current graph scope.
+    fn deferred_block(
+        &mut self,
+        program: &ExponentLutProgram,
+        columns: &DeferredColumns<Self::Wire, Self::WireFamily>,
+        block: &mxx_ir_core::IntExpr,
+    ) -> Result<Self::Wire, ApiError>;
 }
 
 /// Lower a bound Program into graph values that the caller can compose further.

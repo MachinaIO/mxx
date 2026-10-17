@@ -601,12 +601,17 @@ mod tests {
         let profile =
             SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 7 }, 32, 1024)
                 .unwrap();
-        let noise = |members: usize, contract: bool| {
+        let noise = |members: usize, contract: bool, memberwise: bool| {
+            let mut keys = PrfKeys::new(&vec![layout.clone(); members]).unwrap();
+            if memberwise {
+                let PrfKeys::Shape(shape) = keys else { panic!("member family") };
+                keys = PrfKeys::Shape(shape.with_data_tables());
+            }
             let mut builder = ExponentLutProgramBuilder::new();
             let prf = SparseLwrPrf::build(
                 &mut builder,
                 profile,
-                PrfKeys::new(&vec![layout.clone(); members]).unwrap(),
+                keys,
                 LutOutputRepresentation::Coefficient,
             )
             .unwrap();
@@ -646,8 +651,11 @@ mod tests {
             }
             lower_child(&parameters, &program, &bindings, None).unwrap().remove(0)
         };
-        let (one, many) = (noise(1, true), noise(3, true));
-        let full_support = noise(3, false);
+        let (one, many) = (noise(1, true, false), noise(3, true, false));
+        let full_support = noise(3, false, false);
+        let memberwise = noise(3, true, true);
+        assert_eq!(many.bound.error, memberwise.bound.error);
+        assert_eq!(many.bound.payload_l1, memberwise.bound.payload_l1);
         assert!(
             full_support.bound.error > &many.bound.error << 100,
             "{} vs {}",
@@ -661,7 +669,9 @@ mod tests {
             num_traits::ToPrimitive::to_f64(&variance.numerator).unwrap() /
                 num_traits::ToPrimitive::to_f64(&variance.denominator).unwrap()
         };
+        let memberwise = variance(&memberwise);
         let (one, many) = (variance(&one), variance(&many));
+        assert!((many - memberwise).abs() <= 1e-9 * many);
         assert!((one - many).abs() <= 1e-9 * one, "{one:e} vs {many:e}");
     }
 

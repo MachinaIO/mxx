@@ -4,7 +4,39 @@ Implementation branch: `redesign/full`, original base `1830090b9`. Integration
 branch: `codex/diamond-io2-roundtrip`; no push. Raw evidence is retained in the
 task scratchpad `redesign/e3/`. Production capacity remains under investigation.
 
-## Latest accepted toy GPU round trip
+## Current merge validation (2026-10-18)
+
+The results below predate the merge of local `feat/exponent-lut` (`300d9124a`)
+into `redesign/full` as `560ad24e2`. They are historical acceptance evidence,
+not acceptance of the current merged implementation. The new full four-input
+GPU round trip and final synchronization repetition gate are still pending.
+
+Two backend regressions were diagnosed after the merge:
+
+- Packed scalar family replay replaced a whole-family binding with a single
+  member's allocation, causing `physical view exceeds allocation`. Commit
+  `336deb43f` preserves contiguous family storage on replay.
+- Nested parallel waves dropped their enclosing host-loop identity. Selected
+  streamed-carry imports belonged to that host loop, but the executor checked
+  root imports instead, so it could launch consumers before the requested data
+  arrived. The first observed divergence in the captured evaluation was the
+  first refresh's two-row concatenation (operation 2746, region 116), reading
+  `dio2/initial.4` and `.5`. Commit `224034ad9` propagates the enclosing loop
+  identity and avoids joining requests issued outside the current range twice.
+
+The selected-import regression failed before the fix (exit 101, 0.23 seconds)
+and passed after it. This test and three related nested-loop/carry tests each
+passed three GPU executions: 12 passes, zero failures. CPU and CUDA workspace
+library compile gates and the production toy compile were warning-free.
+The saved failing evaluation passed with ordinary production pooling, operation
+ordering and I/O trials: `dio2/state = 1`, one test passed, exit 0, 837.95 seconds
+(838.90 seconds process wall time). This is not a replacement for a fresh full
+round trip. That four-input run is now in progress, using the existing backend
+`MXX_GPU_MAX_PARALLEL_INSTANCES=1` setting to avoid a known local W=2 planning
+OOM; C remains automatically selected. Evidence uses the
+`codex-selected-carry-*` task-log prefix.
+
+## Historical accepted toy GPU round trip
 
 The RTX 4080 SUPER test passed all four clear-function equality assertions,
 `1 passed; 0 failed`, with normal exit **0**. Framework duration was

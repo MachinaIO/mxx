@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -2633,8 +2634,10 @@ extern "C++" {
         std::vector<GraphKernelUpdateRecord> body_kernels;
         std::vector<GraphMemcpyUpdateRecord> body_memcpys;
         std::vector<GraphMemsetUpdateRecord> body_memsets;
-        struct ResidentAddress { uint64_t address; size_t bytes; uint32_t binding; };
-        std::vector<ResidentAddress> resident_addresses;
+        struct ResidentAddress { uint64_t address; size_t bytes; };
+        // Bindings span every nested body in a region. Index by identity so
+        // registration and pointer patching do not scan all earlier bindings.
+        std::unordered_map<uint32_t, ResidentAddress> resident_addresses;
         std::vector<MxxGraphBindingMapEntry> binding_map;
         // Graph-owned scratch allocation and free nodes, addressed by token.
         // The caller orders each one after earlier memory nodes; CUDA may
@@ -2882,21 +2885,21 @@ extern "C++" {
         uint64_t address, size_t bytes, uint32_t binding)
     {
         if (!builder || !address || !bytes) return set_error("invalid graph binding address");
-        for (const auto &owner : builder->resident_addresses)
+        const auto found = builder->resident_addresses.find(binding);
+        if (found != builder->resident_addresses.end())
         {
-            if (owner.binding == binding)
-            {
-                if (owner.address == address && owner.bytes == bytes) return 0;
-                const std::string detail =
-                    "graph binding identity changed: binding=" + std::to_string(binding) +
-                    " old_address=" + std::to_string(owner.address) +
-                    " old_bytes=" + std::to_string(owner.bytes) +
-                    " new_address=" + std::to_string(address) +
-                    " new_bytes=" + std::to_string(bytes);
-                return set_error(detail.c_str());
-            }
+            const auto &owner = found->second;
+            if (owner.address == address && owner.bytes == bytes) return 0;
+            const std::string detail =
+                "graph binding identity changed: binding=" + std::to_string(binding) +
+                " old_address=" + std::to_string(owner.address) +
+                " old_bytes=" + std::to_string(owner.bytes) +
+                " new_address=" + std::to_string(address) +
+                " new_bytes=" + std::to_string(bytes);
+            return set_error(detail.c_str());
         }
-        builder->resident_addresses.push_back({address, bytes, binding});
+        builder->resident_addresses.emplace(binding,
+            MxxGpuGraphBuilder::ResidentAddress{address, bytes});
         return 0;
     }
 
@@ -2914,18 +2917,16 @@ extern "C++" {
                 return set_error("unmapped explicit graph local binding");
             patch->binding_index = mapping->global_binding;
         }
-        const auto owner = std::find_if(builder->resident_addresses.begin(),
-            builder->resident_addresses.end(), [patch](const auto &entry) {
-                return entry.binding == patch->binding_index;
-            });
-        if (owner != builder->resident_addresses.end())
+        const auto found = builder->resident_addresses.find(patch->binding_index);
+        if (found != builder->resident_addresses.end())
         {
-            if (captured_address < owner->address ||
-                captured_address - owner->address >= owner->bytes)
+            const auto &owner = found->second;
+            if (captured_address < owner.address ||
+                captured_address - owner.address >= owner.bytes)
                 return set_error("explicit graph pointer outside registered binding");
-            if (UINT64_MAX - patch->address_addend < captured_address - owner->address)
+            if (UINT64_MAX - patch->address_addend < captured_address - owner.address)
                 return set_error("explicit graph pointer addend overflow");
-            patch->address_addend += captured_address - owner->address;
+            patch->address_addend += captured_address - owner.address;
         }
         return 0;
     }

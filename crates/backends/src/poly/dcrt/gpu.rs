@@ -10593,6 +10593,83 @@ mod tests {
     #[test]
     #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
+    fn test_gpu_graph_sparse_resident_bindings_preserve_aliases_and_offsets() {
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let cpu = DCRTPolyParams::new(dimension, 1, bits, base_bits, None, None);
+        let params = gpu_params_from_cpu(&cpu);
+        let device = available_gpu_ids()[0];
+        let stream = params.native_launch_stream(device).unwrap();
+        let count = crate::env::test_streamed_members().checked_mul(16).unwrap().max(2);
+        let binding = |index: usize| {
+            u32::try_from(index).unwrap().checked_mul(7).unwrap().checked_add(3).unwrap()
+        };
+        let source_binding = binding(count - 1);
+        let destination_binding = source_binding.checked_add(5).unwrap();
+        let bytes = 3 * mem::size_of::<u64>();
+        let original = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+        original.upload_initial(0, values_as_bytes(&[0u64; 3])).unwrap();
+        let destination = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+        let address = original.as_ptr() as u64;
+        let mut builder = stream.begin_graph().unwrap();
+        builder.begin_operation(0, &[]).unwrap();
+        // Distinct sparse identities may alias the same address, but an existing
+        // identity must retain both its address and its span.
+        for index in 0..count {
+            builder.bind_resident_address(address, bytes, binding(index)).unwrap();
+        }
+        for index in (0..count).rev() {
+            builder.bind_resident_address(address, bytes, binding(index)).unwrap();
+        }
+        assert!(builder.bind_resident_address(address + 8, bytes, source_binding).is_err());
+        assert!(builder.bind_resident_address(address, bytes - 8, source_binding).is_err());
+        builder.bind_resident_address(address, bytes, source_binding).unwrap();
+        builder
+            .bind_resident_address(destination.as_ptr() as u64, bytes, destination_binding)
+            .unwrap();
+        builder
+            .add_device_copy(
+                destination.as_ptr() as u64 + 8,
+                device,
+                address + 8,
+                device,
+                8,
+                &[
+                    GpuGraphPatch::memcpy_source(source_binding),
+                    GpuGraphPatch::memcpy_destination(destination_binding),
+                ],
+            )
+            .unwrap();
+        builder.finish_operation().unwrap();
+        let mut graph = builder.finish().unwrap();
+        for _ in 0..2 {
+            let source = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+            let values = [rand::random::<u64>(), rand::random::<u64>() | 1, rand::random::<u64>()];
+            source.upload_initial(0, values_as_bytes(&values)).unwrap();
+            let mut expected =
+                [rand::random::<u64>(), rand::random::<u64>(), rand::random::<u64>()];
+            destination.upload_initial(0, values_as_bytes(&expected)).unwrap();
+            let mut bindings = vec![
+                GpuGraphBindingValue::DeviceAddress(address);
+                destination_binding as usize + 1
+            ];
+            // Only the selected alias moves. Resolving by address instead of
+            // identity would read the original zero buffer on replay.
+            bindings[source_binding as usize] =
+                GpuGraphBindingValue::DeviceAddress(source.as_ptr() as u64);
+            bindings[destination_binding as usize] =
+                GpuGraphBindingValue::DeviceAddress(destination.as_ptr() as u64);
+            graph.bind(&bindings).unwrap();
+            graph.launch(&stream).unwrap().wait().unwrap();
+            let mut actual = vec![0u8; bytes];
+            destination.download(0, &mut actual).unwrap();
+            expected[1] = values[1];
+            assert_eq!(actual, values_as_bytes(&expected));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[sequential(gpu_context)]
     fn test_gpu_graph_binding_descriptors_cover_imported_and_compact_owners() {
         let devices = detected_gpu_device_ids();
         assert!(!devices.is_empty(), "explicit GPU test requires a supported GPU");

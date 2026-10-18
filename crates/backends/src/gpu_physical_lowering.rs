@@ -9851,6 +9851,87 @@ mod tests {
     use mxx_dsl::{DslContext, HashTag, Int, Ring};
     use mxx_ir_core::IntExpr;
 
+    /// Body scratch pooling may place a zero-initialized matrix inside a larger
+    /// allocation. Zeroing that matrix must retain the simultaneously live guard.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_body_scratch_zero_preserves_neighbor() {
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 20, 4, None, None);
+        let moduli = cpu.to_crt().0;
+        let gpu = GpuDCRTPolyParams::new(degree, moduli.clone(), 4, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), degree);
+        let iterations = crate::env::test_streamed_members().max(2);
+        let initial = ring.polynomial([IntExpr::from(u32::from(rand::random::<u16>()) + 1)]);
+        let result = mxx_dsl::iterate(iterations, initial, |index, state| {
+            let guard = state + ring.polynomial([index.expression()?]);
+            let zero = ring.zero((1, 1));
+            Ok((guard.clone() + zero) + guard)
+        })
+        .unwrap();
+        let graph = DslContext::new("body-scratch-zero-neighbor")
+            .output("out", result)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let expected = crate::executor::execute(
+            &graph,
+            &mut cpu_backend([cpu]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            crate::transcript::SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], [detected_gpu_device_ids()[0]])).unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+        fn pooled_zero(frame: &PhysicalFrame, operations: &[CompiledGpuOp]) -> bool {
+            operations.iter().any(|op| {
+                if frame.program.implementations.resolve(op.implementation).unwrap().primitive ==
+                    crate::gpu_execution_plan::GpuNativePrimitive::Zero &&
+                    let [KernelArg::Value(id), _, KernelArg::U64(bytes), _] =
+                        op.arguments.as_ref()
+                {
+                    let owner = &frame.owners[id];
+                    let first = &owner.physical().parts[0];
+                    let storage = owner.storage(first.storage).unwrap();
+                    if first.view.byte_offset > 0 &&
+                        storage.bytes > *bytes &&
+                        frame.owners.iter().any(|(other_id, other)| {
+                            other_id != id &&
+                                other
+                                    .storages()
+                                    .any(|(_, bound)| Arc::ptr_eq(&bound.owner, &storage.owner))
+                        })
+                    {
+                        return true;
+                    }
+                }
+                op.body.as_ref().is_some_and(|body| pooled_zero(frame, body))
+            })
+        }
+        assert!(
+            pooled_zero(
+                plan.physical_frame_for_test(),
+                &plan.physical_frame_for_test().program.operations
+            ),
+            "exercise a zeroed matrix at a nonzero offset within shared body scratch"
+        );
+        for _ in 0..2 {
+            let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+            let actual = runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix output")
+            };
+            assert_eq!(&actual, expected.as_cpu_full().unwrap());
+        }
+    }
+
     /// Structured constants are generated in their consuming scope, including
     /// native loop replay, rather than retained as dense uploaded matrices.
     #[test]

@@ -2147,17 +2147,35 @@ pub(crate) fn emit_compiled_gpu_op(
                     parts.iter().any(|part| {
                         part.leaf != 0 || part.storage != first.storage || part.device != op.device
                     }) ||
-                    first.view.byte_offset != 0 ||
                     storage.device != op.device ||
-                    storage.bytes != *bytes ||
+                    first
+                        .view
+                        .byte_offset
+                        .checked_add(*bytes)
+                        .is_none_or(|end| end > storage.bytes) ||
                     view.row_origin != 0 ||
                     view.column_origin != 0 ||
                     view.rows != matrix.rows as u64 ||
                     view.columns != matrix.columns as u64
                 {
-                    return Err(invalid("compiled zero requires one complete matrix allocation"));
+                    return Err(invalid("compiled zero requires one complete matrix span"));
                 }
-                storage.address
+                // Body scratch matrices can share an allocation. Zero only this
+                // matrix's span, and ensure every CRT view lies inside that span.
+                for part in parts {
+                    let mut relative_view = part.view.clone();
+                    relative_view.byte_offset = relative_view
+                        .byte_offset
+                        .checked_sub(first.view.byte_offset)
+                        .ok_or_else(|| invalid("compiled zero matrix precedes its span"))?;
+                    relative_view
+                        .validate_in_allocation(*bytes, u64::from(relative_view.element_bytes))
+                        .map_err(invalid)?;
+                }
+                storage
+                    .address
+                    .checked_add(first.view.byte_offset)
+                    .ok_or_else(|| invalid("compiled zero matrix address overflows"))?
             } else {
                 compiled_contiguous_part(destination_owner, *destination_part, *bytes, op.device)?
             };

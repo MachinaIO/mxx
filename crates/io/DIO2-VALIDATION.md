@@ -36,6 +36,14 @@ round trip. That four-input run is now in progress, using the existing backend
 OOM; C remains automatically selected. Evidence uses the
 `codex-selected-carry-*` task-log prefix.
 
+The current noise model was also rerun for smaller toy candidates, without
+evaluating ciphertexts on the CPU. Four 60-bit primes with base `2^15` pass the
+model (168-bit maximum error, 180-bit minimum spacing), but increase the gadget
+width from 12 to 16, so a runtime improvement is not established. Ring dimension
+2 fails exact representation of the sampler distribution; two primes with base
+`2^3` fail the noise bound. The accepted two-step/four-input scope is retained.
+Evidence: `codex-selected-carry-parameter-candidates.log`.
+
 ## Historical accepted toy GPU round trip
 
 The RTX 4080 SUPER test passed all four clear-function equality assertions,

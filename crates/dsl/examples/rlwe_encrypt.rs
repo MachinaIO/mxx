@@ -2,16 +2,22 @@
 //! every execution decrypts its message to `crates/dsl/examples/rlwe/generated`, where
 //! `lake build` checks its proof.
 //!
+//! Regenerate without a GPU with `cargo run -p mxx-dsl --example rlwe_encrypt --
+//! --export-lean <directory>`. This mode only constructs and exports the protocol.
+//!
 //! Run with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
 
 use bigdecimal::BigDecimal;
+use mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound;
+#[cfg(feature = "gpu")]
 use mxx_backends::{
     GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
-    sampler::bounds::hard_cutoff_from_sigma_bound,
 };
 use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, IdealSpec, Int, IntType, Ring};
+#[cfg(feature = "gpu")]
+use mxx_ir_core::generate_crt_basis;
 use mxx_ir_core::{
-    IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis,
+    IntExpr, ParamEnv, Rational, RealExpr,
     protocol::{
         ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointBinding,
         EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
@@ -21,7 +27,9 @@ use mxx_ir_core::{
     },
 };
 use num_bigint::BigInt;
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 
 /// Describes the protocol. Named parameters stay symbolic until they are bound.
 fn rlwe_program(ring_dimension: u32) -> Result<BuiltGraph, DslError> {
@@ -62,6 +70,15 @@ fn rlwe_program(ring_dimension: u32) -> Result<BuiltGraph, DslError> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let export_directory = match args.as_slice() {
+        [] => None,
+        [flag, directory] if flag == "--export-lean" => Some(std::path::PathBuf::from(directory)),
+        _ => return Err("usage: rlwe_encrypt [--export-lean <directory>]".into()),
+    };
+    if export_directory.is_none() && !cfg!(feature = "gpu") {
+        return Err("GPU execution requires --features gpu; use --export-lean <directory> for host-only export".into());
+    }
     let ring_dimension = 4096;
     let (crt_bits, crt_depth, gadget_base_bits) = (60, 3, 20);
     let sigma = 4;
@@ -82,32 +99,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // State the program's correctness in Lean: for every seed and message bit, the decrypted bit
     // is the message. `lake build` in `crates/dsl/examples/rlwe` checks the proof.
-    let lean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated");
+    let lean = export_directory.clone().unwrap_or_else(|| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated")
+    });
     mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean)?;
 
-    let program = program.validate(&bindings)?;
+    if export_directory.is_some() {
+        return Ok(());
+    }
 
-    // Register the same ring with a GPU backend.
-    let moduli = generate_crt_basis(ring_dimension, crt_depth, crt_bits)?;
-    let gpu_params = GpuDCRTPolyParams::new(ring_dimension, moduli, gadget_base_bits, None);
-    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params]))?;
+    #[cfg(feature = "gpu")]
+    {
+        let program = program.validate(&bindings)?;
 
-    let inputs = |seed: u8, bit: bool| {
-        BTreeMap::from([
-            ("seed".to_owned(), RuntimeValue::Bytes(Arc::from([seed; 32]))),
-            ("message".to_owned(), RuntimeValue::Int(BigInt::from(bit))),
-        ])
-    };
+        // Register the same ring with a GPU backend.
+        let moduli = generate_crt_basis(ring_dimension, crt_depth, crt_bits)?;
+        let gpu_params = GpuDCRTPolyParams::new(ring_dimension, moduli, gadget_base_bits, None);
+        let mut runtime = GpuRuntime::new(gpu_backend([gpu_params]))?;
 
-    // Planning picks the parallelism and memory schedule that fit this GPU. It needs inputs of
-    // the right types, so it gets dummy ones.
-    let mut plan = runtime.plan(program, &inputs(0, false))?;
+        let inputs = |seed: u8, bit: bool| {
+            BTreeMap::from([
+                ("seed".to_owned(), RuntimeValue::Bytes(Arc::from([seed; 32]))),
+                ("message".to_owned(), RuntimeValue::Int(BigInt::from(bit))),
+            ])
+        };
 
-    // The plan then runs on real inputs without being planned again.
-    for (seed, bit) in [(1, false), (2, true)] {
-        let result = runtime.execute(&mut plan, inputs(seed, bit))?;
-        assert_eq!(runtime.download_bool(&result["decrypted"])?, bit);
-        println!("bit {bit} decrypted correctly");
+        // Planning picks the parallelism and memory schedule that fit this GPU. It needs inputs of
+        // the right types, so it gets dummy ones.
+        let mut plan = runtime.plan(program, &inputs(0, false))?;
+
+        // The plan then runs on real inputs without being planned again.
+        for (seed, bit) in [(1, false), (2, true)] {
+            let result = runtime.execute(&mut plan, inputs(seed, bit))?;
+            assert_eq!(runtime.download_bool(&result["decrypted"])?, bit);
+            println!("bit {bit} decrypted correctly");
+        }
     }
     Ok(())
 }

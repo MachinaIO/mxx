@@ -9,18 +9,23 @@ namespace Stage_multiply
 structure Params where
   unit : Unit
 
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 4 1
+local notation "mxxMat1" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1
+local notation "mxxMat2" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1
+local notation "mxxMat3" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Witness where
-  w_2_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 4 1
-  w_3_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1
-  w_4_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1
-  w_5_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1
-  w_7_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1
-  w_8_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1
-  w_8_concat_1 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
+  w_2_0 : mxxMat0
+  w_3_0 : mxxMat1
+  w_4_0 : mxxMat1
+  w_5_0 : mxxMat1
+  w_7_0 : mxxMat1
+  w_8_0 : mxxMat2
+  w_8_concat_1 : mxxMat3
 
-abbrev generatedRoot.constraints_0 (w_0_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1) (w_1_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1) (w_2_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 4 1) (w_3_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1) (w_4_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1) (w_5_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1) (w_6_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1) (w_7_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1) (w_8_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1) (w_8_concat_1 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1) (outputs : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1) : Prop :=
+abbrev generatedRoot.constraints_0 (w_0_0 : mxxMat3) (w_1_0 : mxxMat3) (w_2_0 : mxxMat0) (w_3_0 : mxxMat1) (w_4_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat1) (w_7_0 : mxxMat1) (w_8_0 : mxxMat2) (w_8_concat_1 : mxxMat3) (outputs : mxxMat2) : Prop :=
   MxxRuntime.tensorRuns w_0_0 w_1_0 w_2_0 ∧
   0 ≤ 0 ∧
   0 < 1 ∧
@@ -54,21 +59,21 @@ abbrev generatedRoot.constraints_0 (w_0_0 : Mxx.Primitives.ExactMatrix 584600654
   MxxRuntime.concatRows w_8_concat_1 w_7_0 w_8_0 ∧
   outputs = w_8_0
 
-abbrev generatedRoot.body (params : Params) (inputs : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 × Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 × Unit) (outputs : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (params : Params) (inputs : mxxMat3 × mxxMat3 × Unit) (outputs : mxxMat2) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
-  let w_0_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 := inputs.1
-  let w_1_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 := inputs.2.1
+  let w_0_0 : mxxMat3 := inputs.1
+  let w_1_0 : mxxMat3 := inputs.2.1
   let w_2_0 := witness.w_2_0
   let w_3_0 := witness.w_3_0
   let w_4_0 := witness.w_4_0
   let w_5_0 := witness.w_5_0
-  let w_6_0 : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1 := MxxRuntime.matrixAdd w_4_0 w_5_0
+  let w_6_0 : mxxMat1 := MxxRuntime.matrixAdd w_4_0 w_5_0
   let w_7_0 := witness.w_7_0
   let w_8_0 := witness.w_8_0
   let w_8_concat_1 := witness.w_8_concat_1
   generatedRoot.constraints_0 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_8_0 w_8_concat_1 outputs
 
-def generatedRoot (params : Params) (inputs : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 × Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 × Unit) (outputs : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1) : Prop :=
+def generatedRoot (params : Params) (inputs : mxxMat3 × mxxMat3 × Unit) (outputs : mxxMat2) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body params inputs outputs witness
 

@@ -7,6 +7,8 @@ set_option maxHeartbeats 2000000
 
 namespace GeneratedClaim
 
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix 1532495540865518635130821056977027158796330141975560193 4096 1 1
+
 structure ExternalInputs where
   input_0 : ByteArray
   input_1 : Int
@@ -16,7 +18,7 @@ def ValidExternals (external : ExternalInputs) : Prop :=
   ((0 : Int) ≤ external.input_1 ∧ external.input_1 ≤ (1 : Int))
 
 structure Execution where
-  «stage_0» : Mxx.Primitives.ExactMatrix 1532495540865518635130821056977027158796330141975560193 4096 1 1 × Bool × Unit
+  «stage_0» : mxxMat0 × Bool × Unit
   «ideal» : Bool
 
 def stage_0_params : Stage_rlwe.Params := { «crt_bits» := (60 : Int), «crt_depth» := (3 : Int), «cutoff» := (26 : Int), «gadget_base_bits» := (20 : Int), «sigma» := (4 / 1 : Rat) }

@@ -9,6 +9,12 @@ namespace Stage_keygen
 structure Params where
   unit : Unit
 
+theorem index_le_630_1024 : 630 ≤ 1024 := by decide
+
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix 5234636801 1024 1 12
+local notation "mxxMat1" => Mxx.Primitives.ExactMatrix 5234636801 1024 1 6
+local notation "mxxMat2" => Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+
 abbrev parallel_generatedRoot_2.constraints_0 (w_1_0 : Int) (w_2_0 : Int) (outputs : Int) : Prop :=
   w_1_0 ≠ 0 ∧
   outputs = w_2_0
@@ -21,7 +27,7 @@ def parallel_generatedRoot_2 (backend : MxxRuntime.BackendContext) (_ : MxxRunti
   let w_2_0 : Int := (w_0_0 % w_1_0)
   parallel_generatedRoot_2.constraints_0 w_1_0 w_2_0 outputs
 
-abbrev parallel_generatedRoot_4.constraints_0 (backend : MxxRuntime.BackendContext) (tape : MxxRuntime.SampleTape) (path : List Nat) (w_0_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_3_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6) (w_4_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6) (w_5_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6) (w_6_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_7_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_10_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_12_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_13_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (outputs : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 × Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 × Unit) : Prop :=
+abbrev parallel_generatedRoot_4.constraints_0 (backend : MxxRuntime.BackendContext) (tape : MxxRuntime.SampleTape) (path : List Nat) (w_0_0 : mxxMat0) (w_3_0 : mxxMat1) (w_4_0 : mxxMat1) (w_5_0 : mxxMat1) (w_6_0 : mxxMat0) (w_7_0 : mxxMat0) (w_10_0 : mxxMat0) (w_12_0 : mxxMat0) (w_13_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   MxxRuntime.uniformResidueSampleAt tape (path ++ [0]) w_0_0 ∧
   MxxRuntime.gadgetMatrixRuns backend 64 6 w_3_0 ∧
   MxxRuntime.concatColumns w_4_0 w_5_0 w_6_0 ∧
@@ -29,23 +35,23 @@ abbrev parallel_generatedRoot_4.constraints_0 (backend : MxxRuntime.BackendConte
   MxxRuntime.concatColumns w_5_0 w_4_0 w_12_0 ∧
   outputs = (w_7_0, (w_13_0, ()))
 
-def parallel_generatedRoot_4 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (_ : Nat) (inputs : Int × Mxx.Primitives.ExactMatrix 5234636801 1024 1 1 × Unit) (outputs : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 × Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 × Unit) : Prop :=
+def parallel_generatedRoot_4 (backend : MxxRuntime.BackendContext) (_ : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (_ : Nat) (inputs : Int × mxxMat2 × Unit) (outputs : mxxMat0 × mxxMat0 × Unit) : Prop :=
   let _params := params
   let _backend := backend
   let w_1_0 : Int := inputs.1
-  let w_8_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1 := inputs.2.1
-  ∃ (w_0_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12),
-    let w_2_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1 := MxxRuntime.liftInteger w_1_0
-    ∃ (w_3_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6),
-      let w_4_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6 := MxxRuntime.matrixMulScalarLeft w_2_0 w_3_0
-      let w_5_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6 := (0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 6)
-      ∃ (w_6_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12),
-        let w_7_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 := MxxRuntime.matrixAdd w_0_0 w_6_0
-        let w_9_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 := MxxRuntime.matrixMulScalarLeft w_8_0 w_0_0
-        ∃ (w_10_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12),
-          let w_11_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 := MxxRuntime.matrixAdd w_9_0 w_10_0
-          ∃ (w_12_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12),
-            let w_13_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 12 := MxxRuntime.matrixAdd w_11_0 w_12_0
+  let w_8_0 : mxxMat2 := inputs.2.1
+  ∃ (w_0_0 : mxxMat0),
+    let w_2_0 : mxxMat2 := MxxRuntime.liftInteger w_1_0
+    ∃ (w_3_0 : mxxMat1),
+      let w_4_0 : mxxMat1 := MxxRuntime.matrixMulScalarLeft w_2_0 w_3_0
+      let w_5_0 : mxxMat1 := (0 : mxxMat1)
+      ∃ (w_6_0 : mxxMat0),
+        let w_7_0 : mxxMat0 := MxxRuntime.matrixAdd w_0_0 w_6_0
+        let w_9_0 : mxxMat0 := MxxRuntime.matrixMulScalarLeft w_8_0 w_0_0
+        ∃ (w_10_0 : mxxMat0),
+          let w_11_0 : mxxMat0 := MxxRuntime.matrixAdd w_9_0 w_10_0
+          ∃ (w_12_0 : mxxMat0),
+            let w_13_0 : mxxMat0 := MxxRuntime.matrixAdd w_11_0 w_12_0
             parallel_generatedRoot_4.constraints_0 backend tape path w_0_0 w_3_0 w_4_0 w_5_0 w_6_0 w_7_0 w_10_0 w_12_0 w_13_0 outputs
 
 abbrev parallel_generatedRoot_33.constraints_1 (w_53_0 : Fin 1024 → Int) (w_36_0 : Int) (w_39_0 : Int) (w_40_0 : Int) (w_42_0 : Int) (w_44_0 : Int) (w_46_0 : Int) (w_48_0 : Int) (w_50_0 : Int) (w_52_0 : Int) (w_54_0 : Int) (w_55_0 : Int) (w_60_0 : Int) (w_62_0 : Int) (w_63_0 : Int) (w_65_0 : Int) (w_66_0 : Int) (outputs : Int) : Prop :=
@@ -173,37 +179,37 @@ def parallel_generatedRoot_33 (backend : MxxRuntime.BackendContext) (_ : MxxRunt
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Witness where
-  w_0_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_0_0 : mxxMat2
   w_1_0 : Fin 1024 → Int
   w_2_0 : Fin 630 → Int
-  w_3_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
-  w_4_0 : Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12
-  w_4_1 : Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12
+  w_3_0 : mxxMat2
+  w_4_0 : Fin 630 → mxxMat0
+  w_4_1 : Fin 630 → mxxMat0
   w_6_0 : Fin 5160960 → Int
   w_8_0 : Fin 1024 → Int
-  w_17_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_17_0 : mxxMat2
   w_18_0 : Fin 1024 → Int
-  w_19_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_19_0 : mxxMat2
   w_20_0 : Fin 1024 → Int
-  w_21_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_21_0 : mxxMat2
   w_22_0 : Fin 1024 → Int
-  w_23_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_23_0 : mxxMat2
   w_24_0 : Fin 1024 → Int
-  w_25_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_25_0 : mxxMat2
   w_26_0 : Fin 1024 → Int
-  w_27_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_27_0 : mxxMat2
   w_28_0 : Fin 1024 → Int
-  w_29_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_29_0 : mxxMat2
   w_30_0 : Fin 1024 → Int
-  w_31_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_31_0 : mxxMat2
   w_32_0 : Fin 1024 → Int
   w_33_0 : Fin 8192 → Int
 
-abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_5_0 : ByteArray) (w_0_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_1_0 : Fin 1024 → Int) (w_2_0 : Fin 630 → Int) (w_3_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_4_0 : Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_4_1 : Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) (w_6_0 : Fin 5160960 → Int) (w_7_0 : Fin 8192 → Int) (w_8_0 : Fin 1024 → Int) (w_9_0 : Int) (w_10_0 : Int) (w_11_0 : Int) (w_12_0 : Int) (w_13_0 : Int) (w_14_0 : Int) (w_15_0 : Int) (w_16_0 : Int) (w_17_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_18_0 : Fin 1024 → Int) (w_19_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_20_0 : Fin 1024 → Int) (w_21_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_22_0 : Fin 1024 → Int) (w_23_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_24_0 : Fin 1024 → Int) (w_25_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_26_0 : Fin 1024 → Int) (w_27_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_28_0 : Fin 1024 → Int) (w_29_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_30_0 : Fin 1024 → Int) (w_31_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_32_0 : Fin 1024 → Int) (w_33_0 : Fin 8192 → Int) (outputs : (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit) : Prop :=
+abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_5_0 : ByteArray) (w_0_0 : mxxMat2) (w_1_0 : Fin 1024 → Int) (w_2_0 : Fin 630 → Int) (w_3_0 : mxxMat2) (w_4_0 : Fin 630 → mxxMat0) (w_4_1 : Fin 630 → mxxMat0) (w_6_0 : Fin 5160960 → Int) (w_7_0 : Fin 8192 → Int) (w_8_0 : Fin 1024 → Int) (w_9_0 : Int) (w_10_0 : Int) (w_11_0 : Int) (w_12_0 : Int) (w_13_0 : Int) (w_14_0 : Int) (w_15_0 : Int) (w_16_0 : Int) (w_17_0 : mxxMat2) (w_18_0 : Fin 1024 → Int) (w_19_0 : mxxMat2) (w_20_0 : Fin 1024 → Int) (w_21_0 : mxxMat2) (w_22_0 : Fin 1024 → Int) (w_23_0 : mxxMat2) (w_24_0 : Fin 1024 → Int) (w_25_0 : mxxMat2) (w_26_0 : Fin 1024 → Int) (w_27_0 : mxxMat2) (w_28_0 : Fin 1024 → Int) (w_29_0 : mxxMat2) (w_30_0 : Fin 1024 → Int) (w_31_0 : mxxMat2) (w_32_0 : Fin 1024 → Int) (w_33_0 : Fin 8192 → Int) (outputs : (Fin 630 → mxxMat0) × (Fin 630 → mxxMat0) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit) : Prop :=
   MxxRuntime.uniformIntervalSampleAt tape (path ++ [0]) (0) (1) w_0_0 ∧
   MxxRuntime.polynomialValues false w_0_0 w_1_0 ∧
   (630) = 630 ∧
-  (∀ i : Fin 630, parallel_generatedRoot_2 backend hashModel tape (path ++ [2, i.val]) params i (w_1_0 ⟨i.val, by omega⟩) (w_2_0 i)) ∧
+  (∀ i : Fin 630, parallel_generatedRoot_2 backend hashModel tape (path ++ [2, i.val]) params i (w_1_0 (Fin.castLE index_le_630_1024 i)) (w_2_0 i)) ∧
   MxxRuntime.uniformIntervalSampleAt tape (path ++ [3]) (0) (1) w_3_0 ∧
   (630) = 630 ∧
   (∀ i : Fin 630, parallel_generatedRoot_4 backend hashModel tape (path ++ [4, i.val]) params i ((w_2_0 i), (w_3_0, ())) ((w_4_0 i), ((w_4_1 i), ()))) ∧
@@ -229,7 +235,7 @@ abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (hashMo
   (∀ i : Fin 8192, parallel_generatedRoot_33 backend hashModel tape (path ++ [33, i.val]) params i ((w_7_0 i), (w_8_0, (w_9_0, (w_10_0, (w_11_0, (w_12_0, (w_13_0, (w_14_0, (w_15_0, (w_16_0, (w_18_0, (w_20_0, (w_22_0, (w_24_0, (w_26_0, (w_28_0, (w_30_0, (w_32_0, ())))))))))))))))))) (w_33_0 i)) ∧
   outputs = (w_4_0, (w_4_1, (w_6_0, (w_33_0, (w_2_0, ())))))
 
-abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : ByteArray) (outputs : (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : ByteArray) (outputs : (Fin 630 → mxxMat0) × (Fin 630 → mxxMat0) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let _backend := backend
   let w_5_0 : ByteArray := inputs
@@ -269,7 +275,7 @@ abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (hashModel : Mxx
   let w_33_0 := witness.w_33_0
   generatedRoot.constraints_0 backend hashModel tape path params w_5_0 w_0_0 w_1_0 w_2_0 w_3_0 w_4_0 w_4_1 w_6_0 w_7_0 w_8_0 w_9_0 w_10_0 w_11_0 w_12_0 w_13_0 w_14_0 w_15_0 w_16_0 w_17_0 w_18_0 w_19_0 w_20_0 w_21_0 w_22_0 w_23_0 w_24_0 w_25_0 w_26_0 w_27_0 w_28_0 w_29_0 w_30_0 w_31_0 w_32_0 w_33_0 outputs
 
-def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : ByteArray) (outputs : (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit) : Prop :=
+def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : ByteArray) (outputs : (Fin 630 → mxxMat0) × (Fin 630 → mxxMat0) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit) : Prop :=
   ∃ witness : generatedRoot.Witness,
     generatedRoot.body backend hashModel tape path params inputs outputs witness
 

@@ -13,6 +13,13 @@ set_option maxHeartbeats 2000000
 
 namespace GeneratedClaim
 
+local notation "mxxNat0" => 421249166578543632464236954685046510773404157767471124412817604609
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
+local notation "mxxMat1" => Mxx.Primitives.ExactMatrix mxxNat0 8192 2 3
+local notation "mxxMat2" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1
+local notation "mxxMat3" => Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1
+local notation "mxxMat4" => Mxx.Primitives.ExactMatrix 324518553605595287786984016396289 8192 2 1
+
 structure ExternalInputs where
   input_0 : Fin 8192 → Int
   input_1 : Fin 8192 → Int
@@ -22,12 +29,12 @@ def ValidExternals (external : ExternalInputs) : Prop :=
   (∀ contract_i_0 : Fin 8192, ((0 : Int) ≤ (external.input_1 contract_i_0) ∧ (external.input_1 contract_i_0) ≤ (1032192 : Int)))
 
 structure Execution where
-  «stage_0» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1 × Mxx.Primitives.ExactMatrix 421249166578543632464236954685046510773404157767471124412817604609 8192 2 3 × Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 1 1 × Unit
-  «stage_1» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
-  «stage_2» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
-  «stage_3» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1
-  «stage_4» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
-  «stage_5» : Mxx.Primitives.ExactMatrix 324518553605595287786984016396289 8192 2 1
+  «stage_0» : mxxMat0 × mxxMat1 × mxxMat2 × Unit
+  «stage_1» : mxxMat0
+  «stage_2» : mxxMat0
+  «stage_3» : mxxMat3
+  «stage_4» : mxxMat0
+  «stage_5» : mxxMat4
   «stage_6» : Fin 8192 → Int
   «ideal» : Fin 8192 → Int
 

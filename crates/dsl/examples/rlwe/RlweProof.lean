@@ -37,12 +37,11 @@ theorem correctness : CorrectnessClaim := by
   simp only [stage_0_params] at he0
   -- `b - a s` is the error plus the scaled message.
   have hdiff : matrixSub (matrixAdd (matrixAdd (matrixMulScalarLeft w.w_1_0 w.w_2_0) w.w_4_0)
-      (matrixMulScalarLeft (matrixPolynomial [Δ])
-        (liftInteger external.input_1)))
+      (matrixScale Δ (liftInteger external.input_1)))
       (matrixMulScalarLeft w.w_1_0 w.w_2_0) 0 0 =
       reducePoly Q N (E 0 0) + ((Δ * external.input_1 : Int) : ExactPoly Q N) := by
-    simp only [matrixSub, matrixAdd, matrixMulScalarLeft, liftInteger, Matrix.sub_apply,
-      Matrix.add_apply, matrixPolynomial_single, hE, reduceMatrix_apply]
+    simp only [matrixSub, matrixAdd, matrixMulScalarLeft, matrixScale, liftInteger,
+      Matrix.sub_apply, Matrix.add_apply, hE, reduceMatrix_apply]
     push_cast
     ring
   obtain ⟨_, _, _, _, index, hindex, _, hdecoded⟩ := hdec
@@ -60,7 +59,7 @@ theorem correctness : CorrectnessClaim := by
   generalize (E 0 0).coeff ⟨0, by decide⟩ = e at hdecoded he0'
   have hlow : -26 ≤ e := by omega
   have hhigh : e ≤ 26 := by omega
-  have hbit : w.w_13_0_decoded = external.input_1 := by
+  have hbit : w.w_12_0_decoded = external.input_1 := by
     rw [hdecoded]
     clear hdecoded he0' hdiff hout
     rcases (show external.input_1 = 0 ∨ external.input_1 = 1 by omega) with h | h <;>

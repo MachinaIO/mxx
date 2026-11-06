@@ -153,7 +153,7 @@ impl ProtocolDecl {
             .map(|stage| &stage.graph)
             .chain(std::iter::once(self.bundle.ideal.graph()))
             .chain(self.bundle.requirements.iter().map(|requirement| requirement.graph()))
-            .chain(self.bundle.comparator.program().map(|program| program.graph()));
+            .chain(self.bundle.comparison.comparator.program().map(|program| program.graph()));
         for graph in graphs {
             let actual = graph
                 .parameters()

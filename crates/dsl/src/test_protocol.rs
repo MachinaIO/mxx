@@ -5,12 +5,12 @@ use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactAvailability, ProductionId, SpecHash},
     protocol::{
-        ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
-        ComparatorSpec, EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId,
-        InputContract, InputContractEntry, InputValueContract, OperationalDecoderKind,
-        OperationalDecoderTarget, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
-        ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
-        ProtocolStage, StageId, StageInputName, Workflow,
+        ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorSpec, Comparison,
+        EndpointBinding, EndpointSemanticBinding, EndpointSpecId, InputContract,
+        InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
+        OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
+        ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage,
+        StageId, StageInputName, Workflow,
     },
 };
 pub fn protocol() -> ProtocolDecl {
@@ -103,26 +103,15 @@ fn protocol_with_consumer_availability(
             },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "decoded".to_owned(),
-                    ideal_input: "result".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::ThresholdDecode,
-                    workflow_output: OutputRef {
-                        stage: StageId("decrypt".to_owned()),
-                        output: "decoded".to_owned(),
-                    },
-                    ideal_output: "result".to_owned(),
-                }],
-            },
+            comparison: Comparison::equality(EndpointBinding {
+                spec: endpoint,
+                semantics: EndpointSemanticBinding::ThresholdDecode,
+                workflow_output: OutputRef {
+                    stage: StageId("decrypt".to_owned()),
+                    output: "decoded".to_owned(),
+                },
+                ideal_output: "result".to_owned(),
+            }),
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "toy-threshold".to_owned(),
                 residual: OutputRef {
@@ -134,7 +123,7 @@ fn protocol_with_consumer_availability(
                     plaintext_modulus: IntExpr::constant(2),
                 },
             }],
-            endpoint_specs: vec![endpoint],
+
             input_contract: InputContract {
                 inputs: vec![InputContractEntry {
                     id: message_id.clone(),
@@ -170,7 +159,7 @@ mod tests {
             .join("../../test_data/lean_ir_fixtures/threshold_protocol");
         // The stage layout is part of the fixture; drop modules of an earlier layout.
         let _ = fs::remove_dir_all(&directory);
-        mxx_ir_core::lean::protocol::export(&declaration, &directory)
+        mxx_ir_core::lean::protocol::export(&declaration, &directory, false)
             .expect("generic export accepts the validated threshold decoder");
 
         let source = fs::read_to_string(directory.join("Claim.lean")).unwrap();
@@ -329,22 +318,26 @@ mod tests {
     #[test]
     fn toy_protocol_is_a_closed_bundle_with_a_decoded_endpoint() {
         let protocol = protocol();
-        assert_eq!(protocol.bundle.endpoint_specs, vec![EndpointSpecId::ToyThresholdDecode]);
         assert_eq!(
-            protocol.bundle.endpoints.entries[0].workflow_output,
+            protocol.bundle.comparison.endpoint_specs,
+            vec![EndpointSpecId::ToyThresholdDecode]
+        );
+        assert_eq!(
+            protocol.bundle.comparison.endpoints.entries[0].workflow_output,
             OutputRef { stage: StageId("decrypt".to_owned()), output: "decoded".to_owned() }
         );
         assert!(matches!(
             protocol.bundle.input_contract.inputs[0].value,
             InputValueContract::Boolean
         ));
-        assert!(matches!(protocol.bundle.comparator, ComparatorSpec::Equality { .. }));
+        assert!(matches!(protocol.bundle.comparison.comparator, ComparatorSpec::Equality { .. }));
     }
 
     #[test]
     fn direct_comparator_wiring_must_name_the_registered_endpoint_outputs() {
         let mut protocol = protocol();
-        let ComparatorSpec::Equality { endpoints } = &mut protocol.bundle.comparator else {
+        let ComparatorSpec::Equality { endpoints } = &mut protocol.bundle.comparison.comparator
+        else {
             unreachable!("toy uses direct equality")
         };
         endpoints[0].actual_input = "unrelated".to_owned();

@@ -14,12 +14,16 @@
 pub mod artifact;
 pub mod checks;
 pub mod constraints;
+pub mod cost;
 pub mod encoding;
 pub mod expr;
 pub mod graph;
+pub mod hash_columns;
 pub mod inventory;
 pub mod lean;
+pub mod merge;
 pub mod node;
+pub mod parallel_reduction;
 pub mod protocol;
 pub mod ring;
 mod serde_support;
@@ -33,7 +37,8 @@ pub use graph::{
     BenchmarkRole, CapturePolicy, CapturedValue, CompileParameter, CompileParameterKind,
     ConstructionScopeId, FreezeError, FreezeMap, FreezeResolveError, FrozenGraphScopeId, Graph,
     GraphOutput, GraphScope, NodeHandle, OutputRoot, ScopedWireRef, SealMap, SealedSubgraph,
-    SourceLocation, SubgraphHandle, ValueHandle, current_construction_scope, with_benchmark_role,
+    ShapeDependencies, SourceLocation, SubgraphHandle, ValueHandle, bind_integers,
+    current_construction_scope, loop_body_is_index_invariant, shape_env, with_benchmark_role,
     with_new_construction_scope,
 };
 pub use ring::{ConcreteRing, RingExpr, RingRef, generate_crt_basis};

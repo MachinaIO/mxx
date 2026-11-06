@@ -42,7 +42,9 @@ const SUPPORTED_ARTIFACT_VERSIONS: &[u32] = &[IR_VERSION];
 pub struct ArtifactKey {
     pub production: ProductionId,
     pub name: String,
-    pub index: Option<usize>,
+    /// Logical member position. Streamed families can exceed host addressability;
+    /// only a resident member's physical buffer offset is constrained by `usize`.
+    pub index: Option<u128>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -154,20 +156,22 @@ pub type EncodeJob<T, E> = Box<dyn FnOnce() -> Result<(T, u64), E> + Send>;
 /// Captures exact serialized lengths for a scalar artifact or every member of
 /// a family. The returned indices are suitable for the estimator's private
 /// payload-size context and are intentionally not part of the public manifest.
+/// Symbolic families exceeding host addressability are rejected before iteration.
 pub fn load_artifact_payload_sizes<S: ArtifactStore>(
     store: &mut S,
     key: &ArtifactKey,
     descriptor: &ManifestArtifact,
-) -> Result<Vec<(Option<usize>, usize)>, S::Error> {
+) -> Result<Vec<(Option<usize>, usize)>, Box<dyn std::error::Error + Send + Sync>> {
     match descriptor.family_count {
         None => Ok(vec![(None, store.load_payload_size(key, descriptor)?)]),
         Some(count) => {
+            let count = usize::try_from(count)?;
             let mut sizes = Vec::with_capacity(count);
             for index in 0..count {
                 let member_key = ArtifactKey {
                     production: key.production.clone(),
                     name: key.name.clone(),
-                    index: Some(index),
+                    index: Some(index as u128),
                 };
                 sizes.push((Some(index), store.load_payload_size(&member_key, descriptor)?));
             }
@@ -292,7 +296,14 @@ pub struct FileArtifactStore {
     /// read context. Member reads retain their own descriptor/codec checks.
     finalized_snapshot: Option<(ProductionId, Manifest)>,
     raw_stages: BTreeMap<ArtifactKey, FileRawStage>,
+    /// The committed artifacts of each open session: its session file's list plus its
+    /// append-only commit log, loaded once, so a commit costs one log append rather than a
+    /// rewrite of the whole session.
+    committed: BTreeMap<ProductionId, BTreeMap<ArtifactKey, CommittedDescriptor>>,
 }
+
+/// The descriptor a committed artifact was stored with.
+type CommittedDescriptor = (ArtifactType, ArtifactAvailability, Option<String>);
 
 /// Descriptive alias for callers that prefer the storage medium in the name.
 pub type FilesystemArtifactStore = FileArtifactStore;
@@ -345,6 +356,7 @@ impl FileArtifactStore {
             loads: BTreeMap::new(),
             finalized_snapshot: None,
             raw_stages: BTreeMap::new(),
+            committed: BTreeMap::new(),
         })
     }
 
@@ -371,7 +383,7 @@ impl FileArtifactStore {
             .unwrap_or_else(|| "scalar.artifact".to_owned());
         self.production_dir(&key.production)
             .join("artifacts")
-            .join(hex_bytes(key.name.as_bytes()))
+            .join(name_component(&key.name))
             .join(member)
     }
 
@@ -383,12 +395,46 @@ impl FileArtifactStore {
         self.production_dir(production).join("session.bin")
     }
 
+    /// The append-only log of a session's commits, one JSON record per line, merged into the
+    /// session file at finalization.
+    fn commits_path(&self, production: &ProductionId) -> PathBuf {
+        self.production_dir(production).join("commits.jsonl")
+    }
+
+    /// The committed artifacts of the open session `production` (see [`Self::committed`]).
+    fn committed_artifacts(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<&mut BTreeMap<ArtifactKey, CommittedDescriptor>, FileArtifactError> {
+        if !self.committed.contains_key(production) {
+            let session = self.session(production)?;
+            let mut committed = session.committed_artifacts.into_iter().collect::<BTreeMap<_, _>>();
+            let path = self.commits_path(production);
+            if path.exists() {
+                let bytes = fs::read(&path)
+                    .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+                for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+                    let (key, expected): (ArtifactKey, CommittedDescriptor) =
+                        serde_json::from_slice(line).map_err(|source| {
+                            FileArtifactError::Decode {
+                                path: path.clone(),
+                                message: source.to_string(),
+                            }
+                        })?;
+                    committed.insert(key, expected);
+                }
+            }
+            self.committed.insert(production.clone(), committed);
+        }
+        Ok(self.committed.get_mut(production).unwrap())
+    }
+
     fn lock_path(&self, production: &ProductionId) -> PathBuf {
         self.production_dir(production).join("writer.lock")
     }
 
     fn alias_path(&self, name: &str) -> PathBuf {
-        self.root.join("session-aliases").join(hex_bytes(name.as_bytes()) + ".bin")
+        self.root.join("session-aliases").join(name_component(name) + ".bin")
     }
 
     fn read_encoded<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, FileArtifactError> {
@@ -510,11 +556,19 @@ impl FileArtifactStore {
         let mut expected = BTreeMap::new();
         for (name, artifact) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count)
+                        .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
-                let key = ArtifactKey { production: production.clone(), name: name.clone(), index };
+                let key = ArtifactKey {
+                    production: production.clone(),
+                    name: name.clone(),
+                    index: index.map(|value| value as u128),
+                };
                 expected.insert(
                     key,
                     (
@@ -782,13 +836,24 @@ impl ArtifactStore for FileArtifactStore {
             return Err(FileArtifactError::InvalidChunk(key));
         }
         let path = stage.temporary.clone();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .open(&path)
             .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-        file.write_all(bytes).map_err(|source| FileArtifactError::Io { path, source })?;
+        // A large chunk is written by several positioned writes at once, which a single
+        // sequential write leaves far below the bandwidth of a local NVMe device.
+        const PIECE: usize = 16 << 20;
+        {
+            use rayon::prelude::*;
+            use std::os::unix::fs::FileExt;
+            bytes
+                .par_chunks(PIECE)
+                .enumerate()
+                .try_for_each(|(index, piece)| {
+                    file.write_all_at(piece, offset + (index * PIECE) as u64)
+                })
+                .map_err(|source| FileArtifactError::Io { path, source })?;
+        }
         stage.ranges.insert(offset, end);
         stage.written_bytes += bytes.len() as u64;
         Ok(stage.written_bytes == total_raw_bytes)
@@ -1126,12 +1191,13 @@ impl ArtifactStore for FileArtifactStore {
     }
 
     /// Advise the kernel to drop the artifact file's pages from the page
-    /// cache (`POSIX_FADV_DONTNEED`); the file is already synced.
+    /// cache (`POSIX_FADV_DONTNEED`); the file is already synced. Platforms
+    /// without `posix_fadvise` (macOS) only check that the file exists.
     fn evict_cached(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
         let path = self.artifact_path(key);
         let file = fs::File::open(&path)
             .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
             // SAFETY: the descriptor stays open for the call.
@@ -1267,6 +1333,7 @@ impl SessionStore for FileArtifactStore {
         if self.active_sessions.contains(production) {
             self.release_session(production)?;
         }
+        self.committed.remove(production);
         let directory = self.production_dir(production);
         match fs::remove_dir_all(&directory) {
             Ok(()) => Ok(()),
@@ -1339,36 +1406,48 @@ impl SessionStore for FileArtifactStore {
         {
             return Err(FileArtifactError::DescriptorMismatch(handle.key.clone()));
         }
-        let mut session = self.session(&handle.key.production)?;
         let expected = (handle.artifact_type.clone(), handle.availability, handle.layout.clone());
-        match session.committed_artifacts.iter().position(|(key, _)| key == &handle.key) {
-            None => session.committed_artifacts.push((handle.key.clone(), expected)),
-            Some(position) if session.committed_artifacts[position].1 == expected => return Ok(()),
+        let committed = self.committed_artifacts(&handle.key.production)?;
+        match committed.get(&handle.key) {
+            Some(existing) if *existing == expected => return Ok(()),
             Some(_) => return Err(FileArtifactError::DescriptorMismatch(handle.key.clone())),
+            None => {}
         }
-        self.store_session(&session)
+        committed.insert(handle.key.clone(), expected.clone());
+        let path = self.commits_path(&handle.key.production);
+        let mut line = serde_json::to_vec(&(&handle.key, &expected))
+            .map_err(|error| FileArtifactError::Encode(error.to_string()))?;
+        line.push(b'\n');
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+        log.write_all(&line)
+            .and_then(|()| log.sync_data())
+            .map_err(|source| FileArtifactError::Io { path, source })
     }
 
     fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
         let production = manifest.production_id.clone();
         self.ensure_session_mutable(&production)?;
+        let committed = self.committed_artifacts(&production)?.clone();
         let mut session = self.session(&production)?;
         let mut expected_keys = BTreeSet::new();
         for (name, artifact) in &manifest.artifacts {
-            let mut check_index = |index| {
-                let key = ArtifactKey { production: production.clone(), name: name.clone(), index };
+            let mut check_index = |index: Option<u128>| {
+                let key = ArtifactKey {
+                    production: production.clone(),
+                    name: name.clone(),
+                    index: index.map(|value| value as u128),
+                };
                 expected_keys.insert(key.clone());
                 let expected = (
                     artifact.artifact_type.clone(),
                     artifact.availability,
                     artifact.layout.clone(),
                 );
-                if session
-                    .committed_artifacts
-                    .iter()
-                    .find_map(|(stored_key, value)| (stored_key == &key).then_some(value)) !=
-                    Some(&expected)
-                {
+                if committed.get(&key) != Some(&expected) {
                     Err(FileArtifactError::UncommittedArtifact(key))
                 } else {
                     Ok(())
@@ -1376,21 +1455,30 @@ impl SessionStore for FileArtifactStore {
             };
             match artifact.family_count {
                 Some(count) => {
+                    let count = usize::try_from(count)
+                        .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?;
                     for index in 0..count {
-                        check_index(Some(index))?;
+                        check_index(Some((index) as u128))?;
                     }
                 }
                 None => check_index(None)?,
             }
         }
-        if let Some((key, _)) =
-            session.committed_artifacts.iter().find(|(key, _)| !expected_keys.contains(key))
-        {
+        if let Some(key) = committed.keys().find(|key| !expected_keys.contains(key)) {
             return Err(FileArtifactError::UnexpectedCommittedArtifact(key.clone()));
         }
         self.store_manifest(manifest)?;
+        session.committed_artifacts = committed.into_iter().collect();
         session.status = SessionStatus::Finalized;
-        self.store_session(&session)
+        self.store_session(&session)?;
+        self.committed.remove(&production);
+        let log = self.commits_path(&production);
+        match fs::remove_file(&log) {
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                Err(FileArtifactError::Io { path: log, source })
+            }
+            _ => Ok(()),
+        }
     }
 
     fn load_finalized_manifest(
@@ -1421,6 +1509,13 @@ impl SessionStore for FileArtifactStore {
 
 fn production_bytes(production: &ProductionId) -> Vec<u8> {
     production.spec_hash.0.iter().chain(production.execution_nonce.iter()).copied().collect()
+}
+
+/// The path component naming `name`: the hex digest of the name, so that any
+/// name fits within the file-name limit of the filesystem.
+fn name_component(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex_bytes(&Sha256::digest(name.as_bytes()))
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -1662,6 +1757,9 @@ fn try_lock(_file: &fs::File) -> io::Result<bool> {
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryArtifactStore {
+    /// High-water mark used to assert bounded private staging in executor unit tests.
+    #[cfg(test)]
+    pub(crate) test_peak_entries: usize,
     entries: BTreeMap<
         ArtifactKey,
         (ArtifactType, ArtifactAvailability, Option<String>, ArtifactPayload),
@@ -1675,6 +1773,9 @@ pub struct MemoryArtifactStore {
     /// `active_sessions`, which denotes the sole mutable writer, so opening a
     /// finalized session can never accidentally authorize a write.
     read_sessions: BTreeSet<ProductionId>,
+    /// The validated manifest of each finalized production, checked against
+    /// its committed artifacts once rather than on every member load.
+    finalized_manifests: BTreeMap<ProductionId, Manifest>,
     raw_stages: BTreeMap<ArtifactKey, MemoryRawStage>,
     /// Artifacts kept in GPU memory, when the store was created on the device.
     #[cfg(feature = "gpu")]
@@ -1776,6 +1877,11 @@ pub enum MemoryArtifactError {
 }
 
 impl MemoryArtifactStore {
+    /// Number of payload entries still held after an executor replay, for cleanup assertions.
+    #[cfg(all(test, feature = "gpu"))]
+    pub(crate) fn test_entry_count(&self) -> usize {
+        self.entries.len()
+    }
     /// A store that keeps GPU exports of matrices in GPU memory instead of
     /// host memory. Sessions, manifests, and every other artifact stay on the
     /// host as in the default store.
@@ -1883,14 +1989,19 @@ impl MemoryArtifactStore {
         let mut payloads = Vec::new();
         for (name, descriptor) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
                 let key = ArtifactKey {
                     production: manifest.production_id.clone(),
                     name: name.clone(),
-                    index,
+                    index: index.map(|value| value as u128),
                 };
                 let (artifact_type, availability, layout, payload) = self.stored_entry(&key)?;
                 if artifact_type != descriptor.artifact_type ||
@@ -1973,12 +2084,21 @@ impl MemoryArtifactStore {
         let mut manifest_expected = BTreeMap::new();
         for (name, descriptor) in &snapshot.manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
                 manifest_expected.insert(
-                    ArtifactKey { production: production.clone(), name: name.clone(), index },
+                    ArtifactKey {
+                        production: production.clone(),
+                        name: name.clone(),
+                        index: index.map(|value| value as u128),
+                    },
                     (
                         descriptor.artifact_type.clone(),
                         descriptor.availability,
@@ -2128,12 +2248,21 @@ impl MemoryArtifactStore {
         let mut expected = BTreeMap::new();
         for (name, artifact) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
                 expected.insert(
-                    ArtifactKey { production: production.clone(), name: name.clone(), index },
+                    ArtifactKey {
+                        production: production.clone(),
+                        name: name.clone(),
+                        index: index.map(|value| value as u128),
+                    },
                     (
                         artifact.artifact_type.clone(),
                         artifact.availability,
@@ -2243,7 +2372,18 @@ impl ArtifactStore for MemoryArtifactStore {
     }
 
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
-        self.validated_manifest_snapshot(production)
+        if let Some(manifest) = self.finalized_manifests.get(production) {
+            return Ok(manifest.clone());
+        }
+        let manifest = self.validated_manifest_snapshot(production)?;
+        if self
+            .sessions
+            .get(production)
+            .is_some_and(|session| session.status == SessionStatus::Finalized)
+        {
+            self.finalized_manifests.insert(production.clone(), manifest.clone());
+        }
+        Ok(manifest)
     }
 
     fn load(
@@ -2331,6 +2471,10 @@ impl ArtifactStore for MemoryArtifactStore {
                     layout.map(str::to_owned),
                     payload,
                 ));
+                #[cfg(test)]
+                {
+                    self.test_peak_entries = self.test_peak_entries.max(self.entries.len());
+                }
                 Ok(())
             }
             Entry::Occupied(entry)
@@ -2572,7 +2716,7 @@ impl SessionStore for MemoryArtifactStore {
             let session = self.open_session_record(&production)?;
             let mut expected_keys = BTreeSet::new();
             for (name, artifact) in &manifest.artifacts {
-                let mut check_index = |index| {
+                let mut check_index = |index: Option<u128>| {
                     let key =
                         ArtifactKey { production: production.clone(), name: name.clone(), index };
                     expected_keys.insert(key.clone());
@@ -2589,8 +2733,11 @@ impl SessionStore for MemoryArtifactStore {
                 };
                 match artifact.family_count {
                     Some(count) => {
+                        let count = usize::try_from(count).map_err(|error| {
+                            MemoryArtifactError::InvalidManifest(error.to_string())
+                        })?;
                         for index in 0..count {
-                            check_index(Some(index))?;
+                            check_index(Some((index) as u128))?;
                         }
                     }
                     None => check_index(None)?,
@@ -2642,12 +2789,21 @@ impl SessionStore for MemoryArtifactStore {
         let mut expected = BTreeMap::new();
         for (name, artifact) in &manifest.artifacts {
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new(
+                    (0..usize::try_from(count).map_err(|error| {
+                        MemoryArtifactError::InvalidManifest(error.to_string())
+                    })?)
+                        .map(Some),
+                ),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
                 expected.insert(
-                    ArtifactKey { production: production.clone(), name: name.clone(), index },
+                    ArtifactKey {
+                        production: production.clone(),
+                        name: name.clone(),
+                        index: index.map(|value| value as u128),
+                    },
                     (
                         artifact.artifact_type.clone(),
                         artifact.availability,
@@ -2765,6 +2921,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn symbolic_family_payload_sizes_reject_unaddressable_cardinality() {
+        let descriptor = ManifestArtifact {
+            artifact_type: ArtifactType::Bytes { length: 1 },
+            family_count: Some(usize::MAX as u128 + 1),
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        assert!(
+            load_artifact_payload_sizes(&mut MemoryArtifactStore::default(), &key(), &descriptor)
+                .is_err()
+        );
+    }
+
     fn production(seed: u8) -> ProductionId {
         ProductionId { spec_hash: SpecHash([seed; 32]), execution_nonce: [seed + 1; 32] }
     }
@@ -2813,7 +2983,7 @@ mod tests {
     }
 
     fn family_keys() -> Vec<ArtifactKey> {
-        (0..4).map(|index| ArtifactKey { index: Some(index), ..key() }).collect()
+        (0..4).map(|index| ArtifactKey { index: Some(index as u128), ..key() }).collect()
     }
 
     #[test]
@@ -3038,6 +3208,43 @@ mod tests {
         assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::TypedBlob(vec![0])));
     }
 
+    /// An artifact name longer than the file-name limit (a namespaced
+    /// LUT's switching material is named by its namespace commitment, its
+    /// level and its layout) still stores and loads: the path names it by its
+    /// digest.
+    #[test]
+    fn file_store_round_trips_an_artifact_name_beyond_the_file_name_limit() {
+        let directory = tempdir().expect("temporary artifact directory");
+        let production = production(31);
+        let name = format!("namespace/{}/child/lut-switching/2/3", "ab".repeat(200));
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let key = ArtifactKey { production: production.clone(), name: name.clone(), index: None };
+        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
+        store
+            .store(
+                key.clone(),
+                &artifact_type,
+                ArtifactAvailability::Transferred,
+                None,
+                ArtifactPayload::Bytes(vec![7]),
+            )
+            .expect("store a long-named artifact");
+        store
+            .store_manifest(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production,
+                artifacts: BTreeMap::from([(name, descriptor.clone())]),
+            })
+            .expect("store manifest");
+        assert_eq!(store.load(&key, &descriptor).expect("load"), ArtifactPayload::Bytes(vec![7]));
+    }
+
     #[test]
     fn file_store_round_trips_family_members_without_eager_sibling_loads() {
         let directory = tempdir().expect("temporary artifact directory");
@@ -3061,7 +3268,7 @@ mod tests {
                     ArtifactKey {
                         production: production.clone(),
                         name: String::from("family"),
-                        index: Some(index),
+                        index: Some((index) as u128),
                     },
                     &artifact_type,
                     ArtifactAvailability::Transferred,
@@ -3086,6 +3293,51 @@ mod tests {
         );
         assert_eq!(store.load_count(&member_zero), 1);
         assert_eq!(store.load_count(&member_one), 0);
+    }
+
+    #[test]
+    fn test_file_store_preserves_wide_member_identity() {
+        let directory = tempdir().unwrap();
+        let mut store = FileArtifactStore::new(directory.path()).unwrap();
+        let low = 7u128;
+        let high = (1u128 << 64) + low;
+        let descriptor = ManifestArtifact {
+            artifact_type: ArtifactType::Bytes { length: 1 },
+            family_count: Some(high + 1),
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let keys = [low, high].map(|index| ArtifactKey {
+            production: production(30),
+            name: "wide-family".into(),
+            index: Some(index as u128),
+        });
+        for (key, byte) in keys.iter().zip([11, 29]) {
+            store
+                .store(
+                    key.clone(),
+                    &descriptor.artifact_type,
+                    descriptor.availability,
+                    None,
+                    ArtifactPayload::Bytes(vec![byte]),
+                )
+                .unwrap();
+        }
+        store
+            .store_manifest(Manifest {
+                ir_version: IR_VERSION,
+                production_id: keys[0].production.clone(),
+                artifacts: BTreeMap::from([("wide-family".into(), descriptor.clone())]),
+            })
+            .unwrap();
+        assert_ne!(store.artifact_path(&keys[0]), store.artifact_path(&keys[1]));
+        // Reopen the store to exercise persisted identities, not just its cache.
+        let mut store = FileArtifactStore::new(directory.path()).unwrap();
+        for (key, byte) in keys.iter().zip([11, 29]) {
+            assert_eq!(store.load(key, &descriptor).unwrap(), ArtifactPayload::Bytes(vec![byte]));
+        }
+        let outside = ArtifactKey { index: Some(high + 1), ..keys[1].clone() };
+        assert!(store.load(&outside, &descriptor).is_err());
     }
 
     #[test]
@@ -3170,7 +3422,7 @@ mod tests {
             let key = ArtifactKey {
                 production: production.clone(),
                 name: "integers".into(),
-                index: Some(index),
+                index: Some(index as u128),
             };
             // Simulate corrupt external storage bypassing canonical ingress.
             write_stored_file(
@@ -3219,7 +3471,7 @@ mod tests {
                             if family { "family".to_owned() } else { format!("scalar-{index}") };
                         let descriptor = ManifestArtifact {
                             artifact_type: ArtifactType::Int,
-                            family_count: family.then_some(values.len()),
+                            family_count: family.then_some(values.len() as u128),
                             availability,
                             layout: None,
                         };
@@ -3227,7 +3479,7 @@ mod tests {
                         let key = ArtifactKey {
                             production: production.clone(),
                             name,
-                            index: family.then_some(index),
+                            index: family.then_some(index as u128),
                         };
                         store
                             .store(
@@ -3262,7 +3514,9 @@ mod tests {
                     });
                     assert_eq!(
                         store.load_payload_size(key, &manifest.artifacts[&key.name]).unwrap(),
-                        BigInt::from(values[index]).to_signed_bytes_le().len()
+                        BigInt::from(values[usize::try_from(index).unwrap()])
+                            .to_signed_bytes_le()
+                            .len()
                     );
                 }
             }
@@ -3854,7 +4108,7 @@ mod tests {
                     ArtifactKey {
                         production: production.clone(),
                         name: "family".to_owned(),
-                        index: Some(index),
+                        index: Some((index) as u128),
                     },
                     &family.artifact_type,
                     family.availability,

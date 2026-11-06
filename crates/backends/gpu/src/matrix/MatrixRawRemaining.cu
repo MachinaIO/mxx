@@ -80,6 +80,32 @@ namespace
         return *result <= limit;
     }
 
+    // A unit-row product contributes to one column. Aliased carry updates
+    // visit only that column; other outputs also copy the unchanged columns.
+    __global__ void raw_column_add_kernel(RawLimbSet sums, RawLimbSet terms,
+        RawLimbSet outputs, const uint64_t *index, int encoding,
+        size_t columns, size_t degree, bool in_place)
+    {
+        uint64_t selected = 0;
+        if (!raw_nonnegative_extent(index, encoding, columns - 1, &selected))
+            selected = columns;
+        if (in_place && selected == columns) return;
+        const auto &sum = sums.limb[blockIdx.y];
+        const auto &term = terms.limb[blockIdx.y];
+        const auto &output = outputs.limb[blockIdx.y];
+        const size_t count = degree * (in_place ? 1 : columns);
+        for (size_t flat = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             flat < count; flat += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const size_t column = in_place ? selected : flat / degree;
+            const size_t coefficient = flat % degree;
+            uint64_t value = raw_matrix_load(sum, column, coefficient, columns);
+            if (column == selected)
+                value = add_mod_u64(value, raw_matrix_load(term, 0, coefficient, 1), sum.modulus);
+            raw_matrix_store(output, column, coefficient, columns, value);
+        }
+    }
+
     __global__ void raw_dynamic_slice_kernel(
         MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
         const uint64_t *row_start_value, int row_start_encoding,
@@ -224,6 +250,31 @@ namespace
                 valid && coefficient == 0 ? residue : 0);
     }
 
+    // The unit vector of `entries` constant polynomials whose entry `index` (the resident
+    // integer) is one: every coefficient but the constant one of that entry is zero.
+    __global__ void raw_unit_vector_kernel(const uint64_t *value, int encoding,
+        MxxRawMatrixLimb destination, uint32_t *status, uint32_t degree, size_t entries,
+        size_t columns)
+    {
+        __shared__ uint64_t index;
+        __shared__ bool valid;
+        if (threadIdx.x == 0)
+        {
+            valid = raw_nonnegative_extent(value, encoding, entries - 1, &index);
+            if (!valid) atomicCAS(status, 0U, kRawScalarInvalid);
+        }
+        __syncthreads();
+        const size_t step = static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t item = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             item < entries * degree; item += step)
+        {
+            const size_t poly = item / degree;
+            const size_t coefficient = item % degree;
+            raw_matrix_store(destination, poly, coefficient, columns,
+                valid && poly == index && coefficient == 0 ? 1 : 0);
+        }
+    }
+
     MxxGraphPatch raw_remaining_patch(uint32_t argument, uint32_t offset,
         uint32_t binding)
     {
@@ -275,7 +326,8 @@ extern "C" int gpu_raw_ring_automorphism(GpuContext *ctx, void *stream_raw,
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_ring_automorphism_kernel, dim3(grid), dim3(256), 0,
             patches, std::size(patches), source->limbs[limb],
-            destination->limbs[limb], index_value, index_encoding, status,
+            destination->limbs[limb], static_cast<const uint64_t *>(index_value),
+            index_encoding, status,
             static_cast<size_t>(source->columns),
             static_cast<size_t>(source->degree),
             static_cast<size_t>(source->rows * source->columns));
@@ -351,7 +403,8 @@ extern "C" int gpu_raw_monomial_multiply(GpuContext *ctx, void *stream_raw,
         patches.push_back(raw_remaining_patch(3, 0, status_binding));
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_monomial_multiply_kernel, dim3(grid, static_cast<uint32_t>(limbs)), dim3(256), 0,
-            patches.data(), patches.size(), batch, exponent_value, exponent_encoding, status,
+            patches.data(), patches.size(), batch, static_cast<const uint64_t *>(exponent_value),
+            exponent_encoding, status,
             static_cast<size_t>(source->columns), degree, log_degree,
             static_cast<size_t>(source->rows * source->columns), subtract_source != 0);
         if (result != 0) return result;
@@ -363,11 +416,13 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
     const void *value, int value_encoding,
     const MxxRawMatrixView *destination, uint32_t *status,
     uint32_t value_binding, uint32_t destination_binding_base,
-    uint32_t status_binding)
+    uint32_t status_binding, int unit)
 {
+    const bool vector = destination &&
+        (destination->rows == 1 || destination->columns == 1);
     if (!value || !status || value_encoding < 0 || value_encoding == 2 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
-        destination->rows != 1 || destination->columns != 1 ||
+        (unit ? !vector : destination->rows != 1 || destination->columns != 1) ||
         destination->limb_count != ctx->moduli.size() ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw integer-to-polynomial view");
@@ -377,7 +432,9 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
             return set_error("raw integer-to-polynomial requires ordered CRT basis");
     if (mxx_set_device(destination->physical_device) != gpuSuccess)
         return set_error(gpuGetLastError());
-    const uint32_t grid = std::min<uint32_t>((destination->degree + 255) / 256, 65535);
+    const size_t entries = destination->rows * destination->columns;
+    const uint32_t grid = std::min<size_t>(
+        (static_cast<size_t>(destination->degree) * (unit ? entries : 1) + 255) / 256, 65535);
     const auto stream = reinterpret_cast<gpuStream_t>(stream_raw);
     for (size_t limb = 0; limb < destination->limb_count; ++limb)
     {
@@ -387,10 +444,16 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
                 destination_binding_base + limb),
             raw_remaining_patch(3, 0, status_binding),
         };
-        const int result = mxx_gpu_launch_kernel(ctx, stream,
-            raw_lift_integer_kernel, dim3(grid), dim3(256), 0,
-            patches, std::size(patches), value, value_encoding,
-            destination->limbs[limb], status, destination->degree);
+        const int result = unit ?
+            mxx_gpu_launch_kernel(ctx, stream,
+                raw_unit_vector_kernel, dim3(grid), dim3(256), 0,
+                patches, std::size(patches), static_cast<const uint64_t *>(value),
+                value_encoding, destination->limbs[limb], status, destination->degree,
+                entries, static_cast<size_t>(destination->columns)) :
+            mxx_gpu_launch_kernel(ctx, stream,
+                raw_lift_integer_kernel, dim3(grid), dim3(256), 0,
+                patches, std::size(patches), static_cast<const uint64_t *>(value),
+                value_encoding, destination->limbs[limb], status, destination->degree);
         if (result != 0) return result;
     }
     return 0;
@@ -457,15 +520,47 @@ extern "C" int gpu_raw_matrix_dynamic_slice(GpuContext *ctx, void *stream_raw,
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_dynamic_slice_kernel, dim3(grid), dim3(256), 0,
             patches, std::size(patches), source->limbs[limb],
-            destination->limbs[limb], row_start, row_start_encoding,
-            row_end, row_end_encoding, column_start, column_start_encoding,
-            column_end, column_end_encoding, status,
+            destination->limbs[limb], static_cast<const uint64_t *>(row_start),
+            row_start_encoding, static_cast<const uint64_t *>(row_end), row_end_encoding,
+            static_cast<const uint64_t *>(column_start), column_start_encoding,
+            static_cast<const uint64_t *>(column_end), column_end_encoding, status,
             static_cast<size_t>(source->rows),
             static_cast<size_t>(source->columns),
             static_cast<size_t>(destination->rows),
             static_cast<size_t>(destination->columns),
             static_cast<size_t>(source->degree));
         if (result != 0) return result;
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_matrix_column_add(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *sum, const MxxRawMatrixView *term,
+    const MxxRawMatrixView *output, const void *index, int encoding,
+    uint32_t sum_binding, uint32_t term_binding, uint32_t output_binding,
+    uint32_t index_binding)
+{
+    if (mxx_set_device(sum->physical_device) != gpuSuccess)
+        return set_error(gpuGetLastError());
+    const auto stream = reinterpret_cast<gpuStream_t>(stream_raw);
+    const bool in_place = sum->limbs[0].address == output->limbs[0].address;
+    const size_t count = output->degree * (in_place ? 1 : output->columns);
+    const uint32_t grid = static_cast<uint32_t>(std::min<size_t>((count + 255) / 256, 65535));
+    for (size_t first = 0; first < output->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, output->limb_count - first);
+        RawLimbSet sums{}, terms{}, outputs{};
+        std::vector<MxxGraphPatch> patches{{nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
+            3, 0, sizeof(void *), index_binding, 0}};
+        raw_limb_set(sum, first, limbs, 0, sum_binding, sums, patches);
+        raw_limb_set(term, first, limbs, 1, term_binding, terms, patches);
+        raw_limb_set(output, first, limbs, 2, output_binding, outputs, patches);
+        const int status = mxx_gpu_launch_kernel(ctx, stream, raw_column_add_kernel,
+            dim3(grid, static_cast<uint32_t>(limbs)), dim3(256), 0,
+            patches.data(), patches.size(), sums, terms, outputs,
+            static_cast<const uint64_t *>(index), encoding,
+            static_cast<size_t>(output->columns), static_cast<size_t>(output->degree), in_place);
+        if (status != 0) return status;
     }
     return 0;
 }

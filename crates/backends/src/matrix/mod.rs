@@ -782,6 +782,14 @@ pub enum SmallMatrixError {
     BoundMismatch,
     #[error("requested preimage bound {requested} is below the minimum {minimum}")]
     PreimageBoundTooSmall { requested: BigUint, minimum: BigUint },
+    #[error("requested preimage width {requested} is below the trapdoor's minimum {minimum}")]
+    PreimageWidthTooSmall { requested: bigdecimal::BigDecimal, minimum: bigdecimal::BigDecimal },
+    #[error("the statistical trapdoor precomputes for preimage width {trapdoor}, not {requested}")]
+    PreimageWidthMismatch { requested: bigdecimal::BigDecimal, trapdoor: bigdecimal::BigDecimal },
+    #[error(
+        "statistical TrapGen rejected {attempts} trapdoors: the perturbation covariance is not positive definite, so the singular-value estimate is wrong for these parameters"
+    )]
+    StatisticalTrapdoorRejected { attempts: usize },
     #[error("small matrix coefficient exceeds its inclusive bound")]
     BoundExceeded,
     #[error("small matrix coefficient is outside the ring")]

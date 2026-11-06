@@ -105,7 +105,18 @@ __global__ void integer_operation_kernel(
             continue;
         }
         if (operation == 7) {
-            const size_t word = argument / 64;
+            uint64_t bit = argument;
+            if (right) {
+                bool invalid = rn;
+                for (size_t word = 1; word < integer_words(re); ++word)
+                    invalid |= integer_word(right, re, word) != 0;
+                if (invalid) { control_error(status, MXX_GPU_CONTROL_INVALID_INDEX); continue; }
+                bit = integer_word(right, re, 0);
+            }
+            const size_t word = bit / 64;
+            // BigInt bit extraction uses infinite two's-complement sign extension.
+            // Avoid scanning an arbitrarily large requested position.
+            if (word >= integer_words(le)) { out[index] = ln; continue; }
             uint64_t value = integer_word(left, le, word);
             if (ln) {
                 bool borrow = true;
@@ -113,7 +124,7 @@ __global__ void integer_operation_kernel(
                     if (integer_word(left, le, previous) != 0) { borrow = false; break; }
                 value = ~(value - static_cast<uint64_t>(borrow));
             }
-            out[index] = (value >> (argument % 64)) & 1;
+            out[index] = (value >> (bit % 64)) & 1;
             continue;
         }
         if (operation == 8) {

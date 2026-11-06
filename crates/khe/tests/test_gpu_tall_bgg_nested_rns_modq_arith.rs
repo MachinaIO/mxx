@@ -2249,7 +2249,7 @@ fn noiseless_runtime_config() -> TestConfig {
 }
 
 #[test]
-#[ignore = "requires a CUDA GPU; checks a small noiseless Tall BGG+ execution against an independent plaintext product"]
+#[ignore = "requires a supported GPU; checks a small noiseless Tall BGG+ execution against an independent plaintext product"]
 fn test_gpu_tall_bgg_nested_rns_noiseless_encoding_matches_ideal_product() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

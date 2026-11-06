@@ -42,28 +42,53 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=native");
     println!("cargo::rerun-if-changed=src/poly/dcrt/native.rs");
-    cxx_build::bridge("src/poly/dcrt/native.rs")
-        .file("native/ExactBasis.cc")
-        .include("native")
-        .include("/usr/local/include")
-        .include("/usr/local/include/openfhe")
-        .include("/usr/local/include/openfhe/core")
-        .include("/usr/local/include/openfhe/pke")
-        .include("/usr/local/include/openfhe/binfhe")
-        .include("/usr/local/include/openfhe/third-party/include")
-        .flag_if_supported("-std=c++17")
-        .flag_if_supported("-fopenmp")
-        .compile("mxx_exact_basis");
+    // OpenFHE is installed under /usr/local by the repository setup; OPENFHE_ROOT overrides it.
+    let openfhe = env::var("OPENFHE_ROOT").unwrap_or_else(|_| "/usr/local".into());
+    let mut native = cxx_build::bridge("src/poly/dcrt/native.rs");
+    native.file("native/ExactBasis.cc").include("native").include(format!("{openfhe}/include"));
+    for sub in ["", "/core", "/pke", "/binfhe", "/third-party/include"] {
+        native.include(format!("{openfhe}/include/openfhe{sub}"));
+    }
+    native.flag_if_supported("-std=c++17");
+    // OpenMP: GCC's libgomp on Linux. Apple clang has no `-fopenmp`, so macOS uses LLVM's
+    // libomp (LIBOMP_ROOT, else Homebrew's) when it is installed and builds serially otherwise.
+    let openmp = if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos") {
+        let libomp = env::var("LIBOMP_ROOT").ok().or_else(|| {
+            ["/opt/homebrew/opt/libomp", "/usr/local/opt/libomp"]
+                .into_iter()
+                .find(|root| Path::new(root).join("include/omp.h").is_file())
+                .map(str::to_owned)
+        });
+        match libomp {
+            Some(root) => {
+                native.flag("-Xpreprocessor").flag("-fopenmp").include(format!("{root}/include"));
+                println!("cargo::rustc-link-search=native={root}/lib");
+                Some("omp")
+            }
+            None => {
+                native.flag_if_supported("-Wno-unknown-pragmas");
+                None
+            }
+        }
+    } else {
+        native.flag_if_supported("-fopenmp");
+        Some("gomp")
+    };
+    native.compile("mxx_exact_basis");
 
     // Native library metadata propagates through mxx-backends to its users.
-    println!("cargo::rustc-link-search=native=/usr/local/lib");
+    println!("cargo::rustc-link-search=native={openfhe}/lib");
     println!("cargo::rustc-link-lib=dylib=OPENFHEpke");
     println!("cargo::rustc-link-lib=dylib=OPENFHEbinfhe");
     println!("cargo::rustc-link-lib=dylib=OPENFHEcore");
-    println!("cargo::rustc-link-lib=dylib=gomp");
+    if let Some(openmp) = openmp {
+        println!("cargo::rustc-link-lib=dylib={openmp}");
+    }
 
     println!("cargo::rustc-check-cfg=cfg(mxx_gpu_backend, values(\"cuda\", \"hip\"))");
     for name in [
+        "OPENFHE_ROOT",
+        "LIBOMP_ROOT",
         "MXX_GPU_BACKEND",
         "CUDA_HOME",
         "CUDA_LIB_DIR",
@@ -100,7 +125,10 @@ fn main() {
     let gpu_dir = manifest.join("gpu");
     let include = gpu_dir.join("include");
     println!("cargo::rerun-if-changed={}", gpu_dir.display());
-    let debug = env::var("DEBUG").is_ok_and(|value| value == "true");
+    // Device debug code (`-G`) disables nvcc's optimizations, so only an unoptimized build
+    // gets it; an optimized build with host debug info (`DEBUG=true`) keeps optimized kernels.
+    let debug = env::var("DEBUG").is_ok_and(|value| value == "true") &&
+        env::var("OPT_LEVEL").is_ok_and(|level| level == "0");
     let (sdk, compiler, arch, lib_dir) = if backend == "cuda" {
         let sdk = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
         let compiler = env::var("NVCC").unwrap_or_else(|_| format!("{sdk}/bin/nvcc"));
@@ -194,6 +222,7 @@ fn main() {
         .file("gpu/src/Real.cu")
         .file("gpu/src/matrix/Matrix.cu")
         .include(&include)
+        .debug(debug)
         .flag("-std=c++17");
     if backend == "cuda" {
         // SAFETY: no worker threads have been started by this build script.

@@ -1,33 +1,13 @@
 //! Declarative BGG+ encoding graph values.
 
-use crate::bgg::BggPublicKeyWire;
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Preimage, Ring};
+use crate::bgg::{BggPublicKeyFamily, BggPublicKeyWire};
+use mxx_dsl::{DslError, Family, GraphValue, GraphValueSchema, Mat, MatType, Preimage, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr, ValueHandle, WireType,
     node::{ConcatAxis, IndexRange},
 };
 use rayon::prelude::*;
 use thiserror::Error;
-
-/// Worst-case BGG product error for a scalar plaintext with the given coefficient l1 norm.
-/// The final term is `x_L * s * (A_R - G D(A_R))`, sharing the actual decomposition residual.
-/// For binary plaintexts pass one; no Gaussian independence assumption is made.
-pub fn multiplication_error_bound<P: mxx_backends::poly::PolyParams>(
-    params: &P,
-    secret_dimension: usize,
-    left_error: &num_bigint::BigUint,
-    right_error: &num_bigint::BigUint,
-    secret_bound: &num_bigint::BigUint,
-    plaintext_l1_bound: &num_bigint::BigUint,
-) -> num_bigint::BigUint {
-    let n = num_bigint::BigUint::from(params.ring_dimension());
-    let columns = num_bigint::BigUint::from(secret_dimension) * params.modulus_digits();
-    let digit_bound = num_bigint::BigUint::from(1u8) << (params.base_bits() - 1);
-    columns * &n * left_error * digit_bound +
-        plaintext_l1_bound *
-            (right_error +
-                n * secret_dimension * secret_bound * params.gadget_error_bound(None))
-}
 
 #[derive(Clone)]
 pub struct BggEncodingWire {
@@ -298,6 +278,54 @@ impl BggEncodingSampler {
                     .then(|| extended_plaintexts[index].clone()),
             })
             .collect())
+    }
+}
+
+impl BggEncodingSampler {
+    /// Builds `s A_i - x_i (s G) + e_i` for every member `i` of the public-key and plaintext
+    /// families as one parallel loop, so the graph does not grow with the family size. Every
+    /// member draws a fresh error. An encoding reveals its plaintext when its key does.
+    pub fn sample_family(
+        &self,
+        secret: Mat,
+        public_keys: &BggPublicKeyFamily,
+        plaintexts: &Family<Mat>,
+    ) -> Result<Family<BggEncodingWire>, BggSampleError> {
+        let count = public_keys.count().clone();
+        if count.canonicalize() != plaintexts.count().canonicalize() {
+            return Err(BggSampleError::SlotCountMismatch);
+        }
+        let ring = self.layout.ring();
+        if !same_matrix_type(
+            secret.matrix_type(),
+            &ring.matrix_type((1, self.layout.secret_dimension)),
+        ) {
+            return Err(BggSampleError::MatrixTypeMismatch);
+        }
+        let columns = self.layout.public_key_columns();
+        let gadget = ring.gadget(
+            self.layout.secret_dimension,
+            self.layout.gadget_base.clone(),
+            self.layout.digit_count,
+        );
+        let secret_gadget = &secret * gadget;
+        let error = match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+            (Some(sigma), Some(bound)) => Some((sigma.clone(), bound.clone())),
+            (None, None) => None,
+            _ => return Err(BggSampleError::MissingGaussianBound),
+        };
+        Ok(mxx_dsl::parallel(count, |index| {
+            let key = public_keys.at(&index);
+            let plaintext = plaintexts.at(&index);
+            let error = match &error {
+                Some((sigma, bound)) => ring.gaussian((1, columns), sigma.clone(), bound.clone()),
+                None => ring.zero((1, columns)),
+            };
+            Ok(BggEncodingWire {
+                vector: &secret * &key.matrix - &plaintext * &secret_gadget + error,
+                plaintext: key.reveal_plaintext.then_some(plaintext),
+            })
+        })?)
     }
 }
 
@@ -589,7 +617,7 @@ mod tests {
             let actual_error = matrix_output(&result, "vector") - &ideal;
             let residual = &right - &(&gadget * right.decompose());
             assert_eq!(actual_error, residual * secret);
-            let bound = multiplication_error_bound(
+            let bound = crate::noise_simulate::rules::multiplication_error_bound(
                 &parameters,
                 1,
                 &BigUint::from(0u8),

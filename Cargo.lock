@@ -372,6 +372,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
+name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures",
+]
+
+[[package]]
 name = "keccak-asm"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -490,6 +499,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxx-exponent-lut"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "keccak-asm",
+ "mxx-backends",
+ "mxx-dsl",
+ "mxx-ir-core",
+ "num-bigint",
+ "num-traits",
+ "rand 0.9.2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "sha3",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mxx-fhe"
 version = "0.1.0"
 dependencies = [
@@ -552,6 +585,28 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mxx-pe"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "mxx-backends",
+ "mxx-dsl",
+ "mxx-exponent-lut",
+ "mxx-ir-core",
+ "num-bigint",
+ "num-traits",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -870,6 +925,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest",
+ "keccak",
 ]
 
 [[package]]

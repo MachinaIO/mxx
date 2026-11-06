@@ -401,6 +401,24 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
 #[ignore = "requires a supported GPU"]
 #[serial_test::serial]
 fn root_dynamic_integer_import_replays_mixed_signed_widths() {
+    integer_import_replays(false, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial]
+fn test_gpu_integer_family_bound_avoids_metadata_and_rejects_oversize() {
+    integer_import_replays(true, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial_test::serial]
+fn test_gpu_integer_family_capture_loads_only_selected_member() {
+    integer_import_replays(true, true);
+}
+
+fn integer_import_replays(bounded: bool, captured: bool) {
     let cpu_params = DCRTPolyParams::new(8, 2, 20, 4, None, None);
     let gpu_params = GpuDCRTPolyParams::new(
         cpu_params.ring_dimension(),
@@ -433,7 +451,7 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     let producer = mxx_ir_core::validate(&producer, &ParamEnv::default()).unwrap();
     let values = [
         -(BigInt::from(1u8) << 80usize) + BigInt::from(7u8),
-        BigInt::from(42u8),
+        BigInt::from(128u16),
         (BigInt::from(1u8) << 127usize) + BigInt::from(3u8),
     ];
     let mut store = MemoryArtifactStore::default();
@@ -477,10 +495,85 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     )
     .output(0)
     .unwrap();
-    let selected =
-        NodeHandle::new(NodeKind::FamilyGetDynamic, vec![artifact, selector], vec![WireType::Int])
+    let selected = if captured {
+        use mxx_ir_core::{
+            graph::{SubgraphHandle, with_new_construction_scope},
+            node::{LoopInputMode, ParallelLoop},
+        };
+        let body = with_new_construction_scope(|scope| {
+            let family = NodeHandle::new(
+                NodeKind::Input {
+                    name: "captured-members".into(),
+                    wire_type: artifact.wire_type().clone(),
+                    artifact: Some(ArtifactInput {
+                        production_id: production.clone(),
+                        artifact_name: "members".into(),
+                        availability: ArtifactAvailability::Cached,
+                    }),
+                },
+                vec![],
+                vec![artifact.wire_type().clone()],
+            )
             .output(0)
             .unwrap();
+            let index = NodeHandle::new(
+                NodeKind::Input {
+                    name: "captured-selector".into(),
+                    wire_type: WireType::Int,
+                    artifact: None,
+                },
+                vec![],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            let selected = NodeHandle::new(
+                NodeKind::FamilyGetDynamic,
+                vec![family.clone(), index.clone()],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            // Consume the imported value in lane computation before returning it.
+            let selected = NodeHandle::new(
+                NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add),
+                vec![selected, index.clone()],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("selected-integer-body", scope, vec![family, index], vec![selected])
+                .unwrap()
+        });
+        let lanes = NodeHandle::parallel_loop(
+            body,
+            vec![artifact, selector],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: IntExpr::constant(1),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(1),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![LoopInputMode::Broadcast, LoopInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![lanes],
+            vec![WireType::Int],
+        )
+        .output(0)
+        .unwrap()
+    } else {
+        NodeHandle::new(NodeKind::FamilyGetDynamic, vec![artifact, selector], vec![WireType::Int])
+            .output(0)
+            .unwrap()
+    };
     let consumer = Graph::freeze(
         "selected-integer-consumer",
         vec![],
@@ -502,7 +595,19 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     let bind = |index: usize| {
         BTreeMap::from([("selector".into(), RuntimeValue::Int(BigInt::from(index)))])
     };
-    let mut plan = runtime.plan_with_store(consumer, &bind(2), &mut store).unwrap();
+    let family_key =
+        ArtifactKey { production: production.clone(), name: "members".into(), index: None };
+    if bounded {
+        runtime.options_mut().artifact_payload_size_bounds.insert(
+            family_key.clone(),
+            values.iter().map(|value| value.to_signed_bytes_le().len()).max().unwrap(),
+        );
+    }
+    let mut plan = if bounded {
+        runtime.plan(consumer.clone(), &bind(2)).unwrap()
+    } else {
+        runtime.plan_with_store(consumer.clone(), &bind(2), &mut store).unwrap()
+    };
     let keys = (0..3)
         .map(|index| ArtifactKey {
             production: production.clone(),
@@ -512,7 +617,10 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
         .collect::<Vec<_>>();
     // The planning I/O trial of this memory store reads the selected member
     // itself, since its type has no zero payload to emulate the load with.
-    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0, 0, 1]);
+    assert_eq!(
+        keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(),
+        [0, 0, usize::from(!bounded)]
+    );
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
@@ -525,12 +633,22 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
                     &result.output("selected").expect("selected output")
                 )
                 .unwrap(),
-            vec![values[index].clone()],
+            vec![values[index].clone() + BigInt::from(if captured { index } else { 0 })],
         );
         let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
         for member in 0..3 {
             assert_eq!(after[member] - before[member], usize::from(member == index));
         }
+    }
+    if bounded {
+        drop(plan);
+        runtime.options_mut().artifact_payload_size_bounds.insert(family_key, 1);
+        let mut narrow = runtime.plan(consumer, &bind(1)).unwrap();
+        let error = runtime
+            .execute_with_artifacts(&mut narrow, bind(1), &mut store, rand::random())
+            .err()
+            .expect("oversized import must fail");
+        assert!(error.to_string().contains("payload capacity"), "{error}");
     }
 }
 
@@ -702,6 +820,137 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     }
 }
 
+/// A root trapdoor import whose public matrix is its own projection: the
+/// imported trapdoor samples a preimage of a fresh target on the GPU, which
+/// publishes the compact preimage and the target, and both `B K - target`
+/// returned by the GPU and the one the CPU computes from the published
+/// artifacts are zero.
+#[test]
+#[serial_test::serial]
+fn root_trapdoor_import_samples_and_publishes_a_preimage() {
+    let cpu_params = DCRTPolyParams::new(32, 2, 40, 20, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let digits = cpu_params.modulus_digits();
+    let base = 1u32 << cpu_params.base_bits();
+    let bound = crate::sampler::bounds::default_preimage_cutoff(
+        cpu_params.ring_dimension(),
+        2,
+        digits,
+        base,
+        4.0,
+        mxx_ir_core::types::TrapdoorInstantiation::Computational,
+    )
+    .unwrap();
+    let bound = BigInt::from(bound);
+    let producer = DslContext::new("root-trapdoor-producer")
+        .transferred_output("trapdoor", ring.sample_trapdoor(2, 4, base, digits, bound.clone()))
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut store = MemoryArtifactStore::default();
+    let setup = execute_in_session(
+        &producer,
+        &mut cpu_backend([cpu_params.clone()]),
+        BTreeMap::new(),
+        &mut store,
+        rand::random(),
+        ExecutionConfig::default(),
+    )
+    .unwrap()
+    .production_id
+    .expect("setup identity");
+    let setup_manifest = store.load_finalized_manifest(&setup).unwrap();
+    let import = |ring: &Ring| {
+        ring.trapdoor_artifact_input(setup.clone(), "trapdoor.1", 2, 4, base, digits, bound.clone())
+    };
+    let columns = 2 * (digits + 2);
+
+    let trapdoor = import(&ring);
+    let target = ring.uniform_residue((2, 3));
+    let preimage = trapdoor.sample_preimage(target.clone(), (columns, 3));
+    let consumer = DslContext::new("root-trapdoor-consumer")
+        .transferred_output("target", target.clone())
+        .unwrap()
+        .transferred_output("preimage", preimage.clone())
+        .unwrap()
+        .output("residual", trapdoor.public_matrix().mul_small_rhs(preimage) - target)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate_with_manifests(
+            &ParamEnv::default(),
+            &BTreeMap::from([(setup.clone(), setup_manifest.clone())]),
+        )
+        .unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    let mut plan = runtime.plan(consumer, &BTreeMap::new()).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+        .unwrap();
+    let residual = runtime.download_matrix_output(&result.output("residual").unwrap()).unwrap();
+    let zero = |matrix: &DCRTPolyMatrix| {
+        (0..matrix.size().0).all(|row| {
+            (0..matrix.size().1)
+                .all(|column| matrix.entry(row, column).coeffs_biguints().iter().all(Zero::is_zero))
+        })
+    };
+    assert!(zero(&residual), "the GPU preimage must satisfy B K = target");
+    let published = result.production_id.clone().expect("consumer identity");
+    drop(result);
+    let published_manifest = store.load_finalized_manifest(&published).unwrap();
+
+    let trapdoor = import(&ring);
+    let preimage = ring.preimage_artifact_input(
+        published.clone(),
+        "preimage",
+        (columns, 3),
+        bound.clone(),
+        ArtifactAvailability::Transferred,
+    );
+    let target =
+        ring.artifact_input(published.clone(), "target", (2, 3), ArtifactAvailability::Transferred);
+    let check = DslContext::new("root-trapdoor-check")
+        .output("residual", trapdoor.public_matrix().mul_small_rhs(preimage) - target)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate_with_manifests(
+            &ParamEnv::default(),
+            &BTreeMap::from([(setup, setup_manifest), (published, published_manifest)]),
+        )
+        .unwrap();
+    let mut backend = cpu_backend([cpu_params.clone()]);
+    let mut checked = execute_in_session(
+        &check,
+        &mut backend,
+        BTreeMap::new(),
+        &mut store,
+        rand::random(),
+        ExecutionConfig::default(),
+    )
+    .unwrap();
+    let RuntimeValue::Matrix(residual) =
+        checked.materialize_output("residual", &backend, &mut store).unwrap().clone()
+    else {
+        panic!("the CPU residual is not a matrix");
+    };
+    assert!(
+        zero(residual.cpu_full_arc().expect("host residual").as_ref()),
+        "the published preimage must satisfy B K = target"
+    );
+}
+
 fn download_resident_trapdoor_leaf(
     runtime: &GpuRuntime,
     secret: &Arc<GpuResidentValue>,
@@ -719,12 +968,12 @@ fn download_resident_trapdoor_leaf(
             part
         })
         .collect::<Vec<_>>();
-    let view = Arc::new(PhysicalValue {
+    let view = Arc::new(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::Matrix(ty),
         encodings: Box::new([physical.encodings[leaf].clone()]),
         parts: parts.into_boxed_slice(),
         integer_ranges: BTreeMap::new(),
-    });
+    }));
     let owner = Arc::new(secret.with_physical_view(view).unwrap());
     runtime.download_matrix(&RuntimeValue::Resident(owner)).unwrap()
 }
@@ -830,4 +1079,75 @@ fn exported_family_consumed_by_later_loop_commits_every_member() {
 #[serial_test::serial]
 fn family_consumed_by_later_loop_reads_every_member() {
     run_family_consumed_by_later_loop(false);
+}
+
+/// A root preimage retry next to a wave group: each wave resets and checks
+/// only the retries of its own body, so the root retry, which runs once
+/// outside the waves, keeps its status and the waves do not report it as
+/// never attempted.
+#[test]
+#[serial_test::serial]
+fn root_preimage_retry_is_not_checked_by_the_waves_of_another_loop() {
+    let cpu_params = DCRTPolyParams::new(32, 2, 40, 20, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let digits = cpu_params.modulus_digits();
+    let base = 1u32 << cpu_params.base_bits();
+    let bound = BigInt::from(
+        crate::sampler::bounds::default_preimage_cutoff(
+            cpu_params.ring_dimension(),
+            2,
+            digits,
+            base,
+            4.0,
+            mxx_ir_core::types::TrapdoorInstantiation::Computational,
+        )
+        .unwrap(),
+    );
+    let lanes = 6;
+    let members = {
+        let ring = ring.clone();
+        parallel(lanes, move |_| Ok(ring.uniform_residue((1, 1)))).unwrap()
+    };
+    let trapdoor = ring.sample_trapdoor(2, 4, base, digits, bound);
+    let target = ring.uniform_residue((2, 3));
+    let preimage = trapdoor.sample_preimage(target.clone(), (2 * (digits + 2), 3));
+    let validated = DslContext::new("root-preimage-beside-waves")
+        .output("members", members)
+        .unwrap()
+        .output("residual", trapdoor.public_matrix().mul_small_rhs(preimage) - target)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+    let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+    let frame = plan.physical_frame_for_test();
+    assert!(!frame.waves.is_empty(), "the member loop must run in waves");
+    assert_eq!(frame.preimage_replays.len(), 1);
+    let mut store = MemoryArtifactStore::default();
+    for replay in 0..2 {
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap_or_else(|error| panic!("replay {replay}: {error}"));
+        let residual = runtime.download_matrix_output(&result.output("residual").unwrap()).unwrap();
+        assert!(
+            (0..residual.size().0).all(|row| (0..residual.size().1).all(|column| residual
+                .entry(row, column)
+                .coeffs_biguints()
+                .iter()
+                .all(Zero::is_zero))),
+            "replay {replay}: the GPU preimage must satisfy B K = target"
+        );
+    }
 }

@@ -1,0 +1,26 @@
+name = "MxxPeAverageW2N32768Crt6x30Compact"
+version = "0.1.0"
+defaultTargets = ["PeGenerated", "PeProof"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxPe"
+path = ".."
+
+# Modules written by `test_gpu_pe_round_trip` (`tests/gpu_round_trip.rs`) for this parameter set.
+[[lean_lib]]
+name = "PeGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_setup_trapdoor", "Stage_setup_public",
+  "Stage_payload", "Stage_prelude", "Stage_encrypt", "Stage_preprocess", "Stage_keygen",
+  "Stage_online_eval", "Stage_decode"
+]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "PeProof"
+roots = ["PeSetup", "PeOnline", "PeOnlineRel", "PePreprocess", "PeEncrypt", "PePrelude", "PeKeygen", "PeDecode", "PePhase", "PeModel", "PeLink", "PeIndep", "PeInteger", "PeCertificate"]

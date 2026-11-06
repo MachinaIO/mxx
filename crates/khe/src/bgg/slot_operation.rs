@@ -580,12 +580,11 @@ mod artifact {
     use std::collections::BTreeMap;
     use thiserror::Error;
 
-    // A trapdoor output flattens into its public matrix (`.0`) and its trapdoor (`.1`).
+    // A trapdoor output flattens into its public matrix (`.0`) and its trapdoor (`.1`), whose
+    // payload also carries the public matrix.
     const B0: &str = "slot_transfer_b0";
-    const B0_PUBLIC: &str = "slot_transfer_b0.0";
     const B0_TRAPDOOR: &str = "slot_transfer_b0.1";
     const B1: &str = "slot_transfer_b1";
-    const B1_PUBLIC: &str = "slot_transfer_b1.0";
     const B1_TRAPDOOR: &str = "slot_transfer_b1.1";
     const SLOT_SECRET: &str = "slot_transfer_slot_secret";
     const SLOT_PUBLIC_KEY: &str = "slot_transfer_slot_a";
@@ -713,7 +712,6 @@ mod artifact {
             Ok(BggSlotTransferBaseWires {
                 b0: ring.trapdoor_artifact_input(
                     artifacts.production_id.clone(),
-                    B0_PUBLIC,
                     B0_TRAPDOOR,
                     self.secret_size,
                     self.trapdoor_sigma.clone(),
@@ -723,7 +721,6 @@ mod artifact {
                 ),
                 b1: ring.trapdoor_artifact_input(
                     artifacts.production_id.clone(),
-                    B1_PUBLIC,
                     B1_TRAPDOOR,
                     self.secret_size * 2,
                     self.trapdoor_sigma.clone(),
@@ -1227,10 +1224,14 @@ mod artifact {
             self.secret_size * self.digit_count
         }
         pub(crate) fn b0_public_columns(&self) -> usize {
-            self.secret_size * (self.digit_count + 2)
+            mxx_ir_core::types::TrapdoorInstantiation::Computational
+                .columns(self.secret_size, self.digit_count)
+                .expect("slot transfer trapdoor width fits usize")
         }
         pub(crate) fn b1_public_columns(&self) -> usize {
-            self.secret_size * 2 * (self.digit_count + 2)
+            mxx_ir_core::types::TrapdoorInstantiation::Computational
+                .columns(self.secret_size * 2, self.digit_count)
+                .expect("slot transfer trapdoor width fits usize")
         }
         pub(crate) fn chunks(&self, columns: usize) -> Vec<IndexRange> {
             (0..columns)
@@ -1288,8 +1289,15 @@ mod artifact {
         }
 
         fn compiler() -> BggSlotTransferArtifactCompiler {
-            let preimage_max_coefficient_bound = default_preimage_cutoff(8, 4, 4, 4, 5.0)
-                .expect("default preimage cutoff should be computable");
+            let preimage_max_coefficient_bound = default_preimage_cutoff(
+                8,
+                4,
+                4,
+                4,
+                5.0,
+                mxx_ir_core::types::TrapdoorInstantiation::Computational,
+            )
+            .expect("default preimage cutoff should be computable");
             BggSlotTransferArtifactCompiler {
                 ring: Ring::from_crt_moduli(vec![65_537.into()], 8),
                 secret_size: 2,
@@ -1326,6 +1334,7 @@ mod artifact {
                 parameters.modulus_digits(),
                 1u32 << parameters.base_bits(),
                 trapdoor_sigma,
+                mxx_ir_core::types::TrapdoorInstantiation::Computational,
             )
             .expect("default preimage cutoff should be computable");
             let compiler = BggSlotTransferArtifactCompiler {

@@ -87,7 +87,7 @@ one parameter set per ring.
 `Replay(&TranscriptReplayer)` replays a recording (`recorder.into_replayer()`), so two runs see
 the same samples.
 
-`ExecutionConfig` has `max_parallel_instances` (default 64), the number of parallel-loop
+`ExecutionConfig` has `max_parallel_instances` (default 1), the number of parallel-loop
 iterations executed together, which bounds memory use; `preimage_progress`, optional progress
 reporting for preimage sampling; and `release_fence_interval`.
 
@@ -170,12 +170,12 @@ program.
 
 | Option (`runtime.options_mut()`) | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 | The most parallel-loop iterations one wave runs. |
-| `measurement_warmups`, `measurement_iterations` | `MXX_GPU_MEASUREMENT_WARMUPS`, `MXX_GPU_MEASUREMENT_ITERATIONS` | 1, 2 | Trials per candidate during planning. |
-| `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset | Waves of each root wave group (and iterations of each root host-driven loop) that `plan_with_store` executes with artifact I/O to add an I/O-inclusive estimate to the report. A host or file store always runs this trial, with 2 waves when unset; a GPU-resident store runs it only when set. |
+| `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 1 | The most parallel-loop iterations one wave runs. |
+| `measurement_warmups`, `measurement_iterations` | `MXX_GPU_MEASUREMENT_WARMUPS`, `MXX_GPU_MEASUREMENT_ITERATIONS` | 0, 1 | Trials per candidate during planning. |
+| `io_trial` | `MXX_GPU_IO_TRIAL` | false | Enable an artifact I/O trial for GPU-resident stores. Host and file stores always run it. Each root group measures one cold and one steady wave or iteration (only one for count-one groups). |
 | `integer_input_ranges` | (code only) | empty | Declared value ranges of host integer inputs. |
 | `subgraph_kernels` | (code only) | empty | Native kernels that replace named subgraphs on the GPU. |
-| — | `MXX_GPU_MEMORY_FRACTION` | 0.8 | The fraction of each GPU's memory one plan may use. |
+| — | `MXX_GPU_MEMORY_FRACTION` | 0.95 | The fraction of each GPU's memory one plan may use. |
 | — | `MXX_GPU_LOGICAL_DEVICES` | one per GPU | Maps logical devices to physical GPUs; `0,0` simulates two devices on GPU 0. |
 | — | `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` | 1 | Columns of a bounded right operand one small-RHS product transforms at a time. Each extra column adds a workspace of the right operand's rows × one column, so a wider chunk means fewer launches and more memory. |
 

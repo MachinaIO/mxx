@@ -3,3 +3,8 @@
 # runtime search path on every final workspace binary, including downstream
 # crate tests, examples, and benchmarks.
 rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]
+
+[target.'cfg(target_os = "macos")']
+# The same search path on macOS, where OpenFHE's libraries are named `@rpath/...`.
+# Homebrew's prefix on Apple silicon is /opt/homebrew.
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib", "-C", "link-arg=-Wl,-rpath,/opt/homebrew/lib"]

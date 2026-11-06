@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -32,6 +33,18 @@ static_assert(offsetof(MxxExportSlotHeader, artifact_offset) == 16, "export slot
 static_assert(offsetof(MxxExportSlotHeader, payload_bytes) == 24, "export slot payload size offset");
 static_assert(offsetof(MxxExportSlotHeader, site) == 32, "export slot site offset");
 static_assert(offsetof(MxxExportSlotHeader, flags) == 36, "export slot flags offset");
+
+#if defined(MXX_GPU_BACKEND_HIP)
+// HIP's default stream-ordered pool keeps a virtual-memory heap whose hipMallocAsync latency grows
+// with the number of live allocations (about 74 ms per 16-byte allocation during a production
+// plan on HIP 7.14), and which failed large allocations that the plain heap serves. The runtime
+// reads DEBUG_HIP_MEM_POOL_VMHEAP at its first API call, so it is set at load time, before any
+// HIP call; an explicit value in the environment is kept.
+__attribute__((constructor)) static void mxx_default_hip_mem_pool_heap()
+{
+    setenv("DEBUG_HIP_MEM_POOL_VMHEAP", "0", 0);
+}
+#endif
 
 // A graph copy between two GPUs, run by one of them through peer access.
 // CUDA rebinds a peer memcpy node only while its operands keep their original
@@ -1712,6 +1725,7 @@ extern "C"
         int *out_driver_version,
         int *out_runtime_version,
         uint64_t *out_context_generation,
+        size_t *out_resident_threads,
         char *out_backend, size_t backend_capacity,
         char *out_architecture, size_t architecture_capacity,
         int *out_wave_size)
@@ -1719,8 +1733,9 @@ extern "C"
         if (device < 0 || !out_name || name_capacity == 0 || !out_compute_major ||
             !out_uuid || uuid_capacity < 33 || !out_compute_minor ||
             !out_total_global_memory || !out_driver_version || !out_runtime_version ||
-            !out_context_generation || !out_backend || backend_capacity < 5 ||
-            !out_architecture || architecture_capacity == 0 || !out_wave_size)
+            !out_context_generation || !out_resident_threads || !out_backend ||
+            backend_capacity < 5 || !out_architecture || architecture_capacity == 0 ||
+            !out_wave_size)
         {
             return set_error("invalid gpu_device_get_identity arguments");
         }
@@ -1770,6 +1785,8 @@ extern "C"
 #endif
         *out_wave_size = properties.warpSize;
         *out_total_global_memory = properties.totalGlobalMem;
+        *out_resident_threads = static_cast<size_t>(properties.multiProcessorCount) *
+                                static_cast<size_t>(properties.maxThreadsPerMultiProcessor);
         return 0;
     }
 
@@ -2106,6 +2123,23 @@ extern "C"
         return 0;
     }
 
+    int gpu_device_address_copy(
+        int destination_device, void *destination, const void *source, size_t bytes)
+    {
+        if (bytes == 0) return 0;
+        if (!destination || !source) return set_error("invalid device address copy arguments");
+        gpuError_t error = mxx_set_device(destination_device);
+        gpuStream_t stream = nullptr;
+        if (error == gpuSuccess) error = gpuStreamCreateWithFlags(&stream, gpuStreamNonBlocking);
+        if (error != gpuSuccess) return set_error(error);
+        error = gpuMemcpyAsync(destination, source, bytes, gpuMemcpyDefault, stream);
+        const gpuError_t synchronized = gpuStreamSynchronize(stream);
+        if (error == gpuSuccess) error = synchronized;
+        const gpuError_t destroyed = gpuStreamDestroy(stream);
+        if (error == gpuSuccess) error = destroyed;
+        return error == gpuSuccess ? 0 : set_error(error);
+    }
+
     int gpu_device_memory_download(
         int device, const void *source, void *destination, size_t bytes,
         const MxxGpuDeviceMemory *owner)
@@ -2152,9 +2186,10 @@ extern "C"
         return 0;
     }
 
-    int gpu_device_buffer_alloc(void *stream_raw, size_t bytes, MxxGpuDeviceBuffer **out)
+    int gpu_device_buffer_alloc(const GpuContext *ctx, void *stream_raw, size_t bytes,
+        bool host_mapped, MxxGpuDeviceBuffer **out)
     {
-        if (!stream_raw || !out || bytes == 0)
+        if (!ctx || !ctx->execution || !stream_raw || !out || bytes == 0)
             return set_error("invalid gpu_device_buffer_alloc arguments");
         *out = nullptr;
         auto *buffer = new (std::nothrow) MxxGpuDeviceBuffer();
@@ -2162,11 +2197,21 @@ extern "C"
             return set_error("failed to allocate device buffer owner");
         buffer->allocation_stream = reinterpret_cast<gpuStream_t>(stream_raw);
         buffer->bytes = bytes;
+        buffer->execution = ctx->execution;
         gpuError_t status = mxx_get_device(&buffer->device);
         if (status == gpuSuccess)
         {
-            status = gpuMallocAsync(
-                reinterpret_cast<void **>(&buffer->address), bytes, buffer->allocation_stream);
+            if (host_mapped)
+            {
+                status = gpuHostAlloc(&buffer->mapped_host, bytes,
+                    gpuHostAllocMapped | gpuHostAllocPortable);
+                if (status == gpuSuccess)
+                    status = gpuHostGetDevicePointer(
+                        reinterpret_cast<void **>(&buffer->address), buffer->mapped_host, 0);
+            }
+            else
+                status = gpuMallocAsync(
+                    reinterpret_cast<void **>(&buffer->address), bytes, buffer->allocation_stream);
         }
         if (status == gpuSuccess)
             // A new buffer starts zeroed: pool memory may hold another owner's bytes, and a
@@ -2183,9 +2228,9 @@ extern "C"
         }
         if (status != gpuSuccess)
         {
-            if (buffer->producer) (void)gpuEventDestroy(buffer->producer);
-            if (buffer->address) (void)gpuFreeAsync(buffer->address, buffer->allocation_stream);
-            delete buffer;
+            // The memset may already be queued. Use the same stream-ordered
+            // retirement as a live owner, never immediately unpin its backing.
+            (void)gpu_device_buffer_free(buffer);
             return set_error(status);
         }
         buffer->producer_valid = true;
@@ -2209,9 +2254,58 @@ extern "C"
     {
         if (!buffer)
             return 0;
+        if (buffer->mapped_host)
+        {
+            // A compiled submission queues waits on allocation_stream without
+            // changing producer. Record a new fence AFTER all those waits.
+            // The global reclaimer retains the execution until this fence, so
+            // neither the host pages nor their streams can be destroyed early.
+            if (buffer->release_blocked)
+                return set_error("mapped buffer retirement completion is uncertain");
+            auto *guard = new (std::nothrow) std::shared_ptr<GpuExecutionOwner>(buffer->execution);
+            if (!guard) return set_error("failed to retain mapped buffer execution");
+            auto status = mxx_set_device(buffer->device);
+            gpuEvent_t retired = nullptr;
+            if (status == gpuSuccess)
+                status = gpuEventCreateWithFlags(&retired, gpuEventDisableTiming);
+            if (status == gpuSuccess && buffer->producer_valid)
+                status = gpuStreamWaitEvent(buffer->allocation_stream, buffer->producer, 0);
+            if (status == gpuSuccess)
+                status = gpuEventRecord(retired, buffer->allocation_stream);
+            if (status != gpuSuccess)
+            {
+                // Retain the owner and guard when completion is unknown.
+                buffer->release_blocked = true;
+                return set_error(status);
+            }
+            if (artifact_reclaimer().enqueue(buffer->device, retired, {buffer->mapped_host}, guard) != 0)
+            {
+                buffer->release_blocked = true;
+                return set_error("failed to retain mapped buffer retirement");
+            }
+            if (buffer->producer) (void)gpuEventDestroy(buffer->producer);
+            delete buffer;
+            return 0;
+        }
+        if (buffer->release_blocked)
+        {
+            // A Graph may still read the allocation: keep it.
+            const gpuError_t status = buffer->producer
+                ? gpuEventDestroy(buffer->producer)
+                : gpuSuccess;
+            delete buffer;
+            return status == gpuSuccess ? 0 : set_error(status);
+        }
         gpuError_t status = mxx_set_device(buffer->device);
         if (status == gpuSuccess && buffer->producer_valid) {
-            status = gpuStreamWaitEvent(buffer->allocation_stream, buffer->producer, 0);
+            // Completed producer work needs no new stream dependency. In particular,
+            // planning releases many tiny owners after an explicit completion wait;
+            // registering an already-satisfied wait for each can dominate HIP teardown.
+            // Querying never waits for device work. Pending producers retain the same
+            // dependency as before, and the allocation is still freed in stream order.
+            status = gpuEventQuery(buffer->producer);
+            if (status == gpuErrorNotReady)
+                status = gpuStreamWaitEvent(buffer->allocation_stream, buffer->producer, 0);
         }
         if (status == gpuSuccess) {
             status = gpuFreeAsync(buffer->address, buffer->allocation_stream);
@@ -2225,6 +2319,26 @@ extern "C"
         return status == gpuSuccess ? 0 : set_error(status);
     }
 
+    // Order the buffer's free after one compiled-Graph submission that reads
+    // or writes it: the free is queued on the allocation stream, which waits
+    // for the submission's completion event.
+    int gpu_device_buffer_protect_compiled_submission(
+        MxxGpuDeviceBuffer *buffer, void *completion_event)
+    {
+        if (!buffer || !completion_event)
+            return set_error("invalid device buffer protection arguments");
+        gpuError_t status = mxx_set_device(buffer->device);
+        if (status == gpuSuccess)
+            status = gpuStreamWaitEvent(buffer->allocation_stream,
+                reinterpret_cast<gpuEvent_t>(completion_event), 0);
+        if (status != gpuSuccess)
+        {
+            buffer->release_blocked = true;
+            return set_error(status);
+        }
+        return 0;
+    }
+
     int gpu_device_buffer_upload(
         MxxGpuDeviceBuffer *buffer,
         size_t offset,
@@ -2233,8 +2347,8 @@ extern "C"
     {
         if (!buffer || !source || offset > buffer->bytes || bytes > buffer->bytes - offset)
             return set_error("invalid gpu_device_buffer_upload arguments");
-        // The buffer is pool memory of its own device, which only that
-        // device may name as a copy operand.
+        // Use the owning device for both device-pool and mapped-host aliases;
+        // keep the copy ordered after previous consumers on allocation_stream.
         gpuError_t status = mxx_set_device(buffer->device);
         if (status == gpuSuccess)
             status = gpuMemcpyAsync(buffer->address + offset, source, bytes,
@@ -2585,8 +2699,10 @@ extern "C++" {
         std::vector<GraphKernelUpdateRecord> body_kernels;
         std::vector<GraphMemcpyUpdateRecord> body_memcpys;
         std::vector<GraphMemsetUpdateRecord> body_memsets;
-        struct ResidentAddress { uint64_t address; size_t bytes; uint32_t binding; };
-        std::vector<ResidentAddress> resident_addresses;
+        struct ResidentAddress { uint64_t address; size_t bytes; };
+        // Bindings span every nested body in a region. Index by identity so
+        // registration and pointer patching do not scan all earlier bindings.
+        std::unordered_map<uint32_t, ResidentAddress> resident_addresses;
         std::vector<MxxGraphBindingMapEntry> binding_map;
         // Graph-owned scratch allocation and free nodes, addressed by token.
         // The caller orders each one after earlier memory nodes; CUDA may
@@ -2834,21 +2950,21 @@ extern "C++" {
         uint64_t address, size_t bytes, uint32_t binding)
     {
         if (!builder || !address || !bytes) return set_error("invalid graph binding address");
-        for (const auto &owner : builder->resident_addresses)
+        const auto found = builder->resident_addresses.find(binding);
+        if (found != builder->resident_addresses.end())
         {
-            if (owner.binding == binding)
-            {
-                if (owner.address == address && owner.bytes == bytes) return 0;
-                const std::string detail =
-                    "graph binding identity changed: binding=" + std::to_string(binding) +
-                    " old_address=" + std::to_string(owner.address) +
-                    " old_bytes=" + std::to_string(owner.bytes) +
-                    " new_address=" + std::to_string(address) +
-                    " new_bytes=" + std::to_string(bytes);
-                return set_error(detail.c_str());
-            }
+            const auto &owner = found->second;
+            if (owner.address == address && owner.bytes == bytes) return 0;
+            const std::string detail =
+                "graph binding identity changed: binding=" + std::to_string(binding) +
+                " old_address=" + std::to_string(owner.address) +
+                " old_bytes=" + std::to_string(owner.bytes) +
+                " new_address=" + std::to_string(address) +
+                " new_bytes=" + std::to_string(bytes);
+            return set_error(detail.c_str());
         }
-        builder->resident_addresses.push_back({address, bytes, binding});
+        builder->resident_addresses.emplace(binding,
+            MxxGpuGraphBuilder::ResidentAddress{address, bytes});
         return 0;
     }
 
@@ -2866,18 +2982,16 @@ extern "C++" {
                 return set_error("unmapped explicit graph local binding");
             patch->binding_index = mapping->global_binding;
         }
-        const auto owner = std::find_if(builder->resident_addresses.begin(),
-            builder->resident_addresses.end(), [patch](const auto &entry) {
-                return entry.binding == patch->binding_index;
-            });
-        if (owner != builder->resident_addresses.end())
+        const auto found = builder->resident_addresses.find(patch->binding_index);
+        if (found != builder->resident_addresses.end())
         {
-            if (captured_address < owner->address ||
-                captured_address - owner->address >= owner->bytes)
+            const auto &owner = found->second;
+            if (captured_address < owner.address ||
+                captured_address - owner.address >= owner.bytes)
                 return set_error("explicit graph pointer outside registered binding");
-            if (UINT64_MAX - patch->address_addend < captured_address - owner->address)
+            if (UINT64_MAX - patch->address_addend < captured_address - owner.address)
                 return set_error("explicit graph pointer addend overflow");
-            patch->address_addend += captured_address - owner->address;
+            patch->address_addend += captured_address - owner.address;
         }
         return 0;
     }

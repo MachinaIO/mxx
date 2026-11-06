@@ -20,6 +20,33 @@ pub struct GpuColumnJob {
     pub end: usize,
 }
 
+/// A repeated affine run of equal-width jobs in one owner interval.
+/// Its size is independent of the number of jobs; at most a full run and
+/// one tail are needed per interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct GpuColumnRun {
+    pub device: usize,
+    pub source_interval: usize,
+    pub start: usize,
+    pub width: usize,
+    pub count: usize,
+}
+
+impl GpuColumnRun {
+    pub fn job(&self, index: usize) -> Option<GpuColumnJob> {
+        if index >= self.count {
+            return None;
+        }
+        let start = self.start.checked_add(index.checked_mul(self.width)?)?;
+        Some(GpuColumnJob {
+            device: self.device,
+            source_interval: self.source_interval,
+            start,
+            end: start.checked_add(self.width)?,
+        })
+    }
+}
+
 /// One distinct fleet wave shape of an actual schedule: the active devices with
 /// their local job widths, how many waves have exactly that shape, and the
 /// representative jobs of the first such wave with their global column ranges.
@@ -151,6 +178,35 @@ impl GpuColumnSchedule {
     pub fn with_rotation_class(mut self, rotation_class: usize) -> Self {
         self.rotation_class = rotation_class;
         self
+    }
+
+    /// Array relations for every repeated column job, without enumerating
+    /// waves or allocating descriptors proportional to columns / width.
+    pub fn runs(&self) -> impl Iterator<Item = GpuColumnRun> + '_ {
+        self.intervals.iter().enumerate().flat_map(|(source_interval, interval)| {
+            let width = self.widths[interval.device];
+            let columns = interval.end - interval.start;
+            let count = columns / width;
+            let tail = columns % width;
+            [
+                (count > 0).then_some(GpuColumnRun {
+                    device: interval.device,
+                    source_interval,
+                    start: interval.start,
+                    width,
+                    count,
+                }),
+                (tail > 0).then_some(GpuColumnRun {
+                    device: interval.device,
+                    source_interval,
+                    start: interval.start + count * width,
+                    width: tail,
+                    count: 1,
+                }),
+            ]
+            .into_iter()
+            .flatten()
+        })
     }
 
     pub fn local_job_counts(&self) -> &[usize] {
@@ -346,6 +402,41 @@ impl GpuColumnSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_runs_match_existing_jobs_without_expanding_large_counts() {
+        for columns in [1, 7, 270, 544] {
+            for width in [1, 3, 17, 1080] {
+                let schedule = GpuColumnSchedule::new(
+                    columns,
+                    vec![width],
+                    vec![GpuColumnInterval { device: 0, start: 0, end: columns }],
+                )
+                .unwrap();
+                let expected = schedule.waves().flatten().collect::<Vec<_>>();
+                let runs = schedule.runs().collect::<Vec<_>>();
+                assert!(runs.len() <= 2);
+                let actual = runs
+                    .iter()
+                    .flat_map(|run| (0..run.count).map(|i| run.job(i).unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                for run in runs {
+                    assert!(run.job(run.count).is_none());
+                }
+            }
+        }
+        let huge = GpuColumnSchedule::new(
+            usize::MAX,
+            vec![1],
+            vec![GpuColumnInterval { device: 0, start: 0, end: usize::MAX }],
+        )
+        .unwrap();
+        let runs = huge.runs().collect::<Vec<_>>();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].count, usize::MAX);
+        assert_eq!(runs[0].job(usize::MAX - 1).unwrap().end, usize::MAX);
+    }
 
     #[test]
     fn test_batch_classes_match_native_wave_grouping_and_keep_owner_identity() {

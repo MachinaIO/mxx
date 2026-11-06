@@ -680,6 +680,30 @@ namespace
                          raw_matrix_load(batch.source[entry], poly, coefficient, batch.columns[entry]));
     }
 
+    // One bounded column grid traverses the complete owner interval. Neither
+    // the host graph nor its bindings expand with ceil(columns / C).
+    __global__ void raw_matrix_column_binary_kernel(
+        RawLimbSet lefts, RawLimbSet rights, RawLimbSet destinations,
+        size_t columns, size_t rows, size_t degree, unsigned kind)
+    {
+        const auto &left = lefts.limb[blockIdx.z];
+        const auto &right = rights.limb[blockIdx.z];
+        const auto &destination = destinations.limb[blockIdx.z];
+        const size_t coefficient = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= degree)
+            return;
+        for (size_t poly = blockIdx.y; poly < rows * columns; poly += gridDim.y)
+        {
+            const uint64_t lhs = raw_matrix_load(left, poly, coefficient, columns);
+            const uint64_t rhs = raw_matrix_load(right, kind == 3 ? 0 : poly, coefficient,
+                                                 kind == 3 ? 1 : columns);
+            const uint64_t result = kind == 0 ? add_mod_u64(lhs, rhs, destination.modulus)
+                : kind == 1 ? sub_mod_u64(lhs, rhs, destination.modulus)
+                            : mul_mod_u64(lhs, rhs, destination.modulus);
+            raw_matrix_store(destination, poly, coefficient, columns, result);
+        }
+    }
+
     __global__ void raw_matrix_add_sub_kernel(
         RawLimbSet lefts, RawLimbSet rights,
         RawLimbSet destinations, size_t columns,
@@ -882,6 +906,68 @@ namespace
         if (accumulate)
             sum = add_mod_u64(sum, raw_matrix_load(addends.limb[blockIdx.z], output_poly, coefficient, output_columns), modulus);
         raw_matrix_store(destination, output_poly, coefficient, output_columns, sum);
+    }
+
+    __global__ void raw_matrix_column_mul_kernel(
+        RawLimbSet lefts, RawLimbSet rights,
+        RawLimbSet destinations, size_t left_columns,
+        size_t right_columns, size_t output_columns, size_t output_rows,
+        size_t degree)
+    {
+        __shared__ uint64_t partial[kMulSlices][kMulCoefficients];
+        const MxxRawMatrixLimb &left = lefts.limb[blockIdx.z];
+        const MxxRawMatrixLimb &right = rights.limb[blockIdx.z];
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const bool transpose_rhs = false;
+        for (size_t output_poly = blockIdx.y; output_poly < output_rows * output_columns; output_poly += gridDim.y)
+        {
+        const size_t row = output_poly / output_columns;
+        const size_t column = output_poly - row * output_columns;
+        const bool active = coefficient < degree && row < output_rows;
+        const uint64_t modulus = destination.modulus;
+        const unsigned bits = 64 - __clzll(modulus);
+        const unsigned headroom = bits <= 63 ? 128 - 2 * bits : 0;
+        const size_t batch = headroom >= 6 ? 63 : headroom ? (size_t(1) << headroom) - 1
+                                                           : 0;
+        uint64_t sum = 0;
+        if (active)
+        {
+            unsigned __int128 wide = 0;
+            size_t pending = 0;
+            for (size_t inner = threadIdx.y; inner < left_columns; inner += kMulSlices)
+            {
+                const uint64_t lhs = raw_matrix_load(
+                    left, row * left_columns + inner, coefficient, left_columns);
+                const size_t rhs_poly = transpose_rhs ? column * left_columns + inner : inner * right_columns + column;
+                const uint64_t rhs = raw_matrix_load(right, rhs_poly, coefficient,
+                                                     transpose_rhs ? left_columns : right_columns);
+                if (!batch)
+                {
+                    sum = add_mod_u64(sum, mul_mod_u64(lhs, rhs, modulus), modulus);
+                    continue;
+                }
+                wide += static_cast<unsigned __int128>(lhs) * rhs;
+                if (++pending == batch)
+                {
+                    wide = raw_wide_mod(wide, modulus);
+                    pending = 0;
+                }
+            }
+            if (batch)
+                sum = static_cast<uint64_t>(raw_wide_mod(wide, modulus));
+        }
+        partial[threadIdx.y][threadIdx.x] = sum;
+        __syncthreads();
+        if (threadIdx.y == 0 && active)
+        {
+            for (unsigned slice = 1; slice < kMulSlices; ++slice)
+                sum = add_mod_u64(sum, partial[slice][threadIdx.x], modulus);
+            raw_matrix_store(destination, output_poly, coefficient, output_columns, sum);
+        }
+        // Every thread finishes reading partial before the next column writes it.
+        __syncthreads();
+        }
     }
 
     // Multiply every polynomial of `matrix` by the single polynomial of
@@ -1217,6 +1303,138 @@ extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
 {
     return raw_matrix_ntt(ctx, stream_raw, source, destination, inverse, source_binding_base,
                           destination_binding_base, RawNttMatrixSource{0}, {});
+}
+
+namespace {
+__global__ void raw_matrix_column_gather_kernel(RawLimbSet sources, RawLimbSet destinations,
+    const uint64_t *index, size_t first, size_t stride, size_t count,
+    size_t source_columns, size_t columns, size_t rows, size_t degree)
+{
+    const size_t iteration = static_cast<size_t>(*index);
+    if (iteration >= count) return;
+    const auto source = sources.limb[blockIdx.z];
+    const auto destination = destinations.limb[blockIdx.z];
+    const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (coefficient >= degree) return;
+    for (size_t polynomial = blockIdx.y; polynomial < rows * columns; polynomial += gridDim.y) {
+        const size_t row = polynomial / columns;
+        const size_t column = first + iteration * stride + polynomial % columns;
+        raw_matrix_store(destination, polynomial, coefficient, columns,
+            raw_matrix_load(source, row * source_columns + column, coefficient, source_columns));
+    }
+}
+}
+
+extern "C" int gpu_raw_matrix_column_gather(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+    const uint64_t *index, uint64_t first, uint64_t stride, uint64_t count,
+    uint32_t source_binding, uint32_t destination_binding, uint32_t index_binding)
+{
+    if (validate_raw_view(ctx, source, stream_raw) || validate_raw_view(ctx, destination, stream_raw) ||
+        !index || !stride || !count || (count - 1) > UINT64_MAX / stride ||
+        source->physical_device != destination->physical_device || source->rows != destination->rows ||
+        source->degree != destination->degree || source->limb_count != destination->limb_count ||
+        destination->columns > source->columns || first > source->columns - destination->columns ||
+        (count - 1) * stride > source->columns - destination->columns - first ||
+        source_binding > UINT32_MAX - source->limb_count ||
+        destination_binding > UINT32_MAX - destination->limb_count)
+        return set_error("invalid affine matrix column gather");
+    for (size_t limb = 0; limb < source->limb_count; ++limb)
+        if (source->limbs[limb].modulus != destination->limbs[limb].modulus ||
+            source->limbs[limb].crt_limb_index != destination->limbs[limb].crt_limb_index ||
+            source->limbs[limb].address == destination->limbs[limb].address)
+            return set_error("affine column gather basis or alias mismatch");
+    if (mxx_set_device(source->physical_device) != gpuSuccess) return set_error(gpuGetLastError());
+    const dim3 grid((destination->degree + kTransformThreads - 1) / kTransformThreads,
+        std::min<size_t>(destination->rows * destination->columns, kMaxGridY), 1);
+    for (size_t first_limb = 0; first_limb < source->limb_count; first_limb += kRawNttLimbs) {
+        const size_t limbs = std::min(kRawNttLimbs, source->limb_count - first_limb);
+        RawLimbSet sources{}, destinations{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(source, first_limb, limbs, 0, source_binding, sources, patches);
+        raw_limb_set(destination, first_limb, limbs, 1, destination_binding, destinations, patches);
+        patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0,
+            static_cast<uint32_t>(sizeof(void *)), index_binding, 0});
+        const int result = mxx_gpu_launch_kernel(ctx, reinterpret_cast<gpuStream_t>(stream_raw),
+            raw_matrix_column_gather_kernel, dim3(grid.x, grid.y, limbs), dim3(kTransformThreads),
+            0, patches.data(), patches.size(), sources, destinations, index, size_t(first),
+            size_t(stride), size_t(count), size_t(source->columns), size_t(destination->columns),
+            size_t(destination->rows), size_t(destination->degree));
+        if (result != 0) return result;
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_matrix_column_binary(
+    GpuContext *ctx, void *stream_raw, const MxxRawMatrixView *left,
+    const MxxRawMatrixView *right, const MxxRawMatrixView *destination,
+    uint32_t kind, uint64_t columns_per_job, uint32_t left_binding_base,
+    uint32_t right_binding_base, uint32_t destination_binding_base)
+{
+    if (validate_raw_view(ctx, left, stream_raw) != 0 ||
+        validate_raw_view(ctx, right, stream_raw) != 0 ||
+        validate_raw_view(ctx, destination, stream_raw) != 0 || kind > 3 || !columns_per_job ||
+        left->physical_device != right->physical_device ||
+        left->physical_device != destination->physical_device ||
+        left->degree != right->degree || left->degree != destination->degree ||
+        left->limb_count != right->limb_count || left->limb_count != destination->limb_count ||
+        left_binding_base > UINT32_MAX - left->limb_count ||
+        right_binding_base > UINT32_MAX - right->limb_count ||
+        destination_binding_base > UINT32_MAX - destination->limb_count)
+        return set_error("invalid affine column binary views");
+    const bool shapes = kind <= 1 ? same_raw_extent(left, right) && same_raw_extent(left, destination)
+        : kind == 2 ? left->rows == destination->rows && left->columns == right->rows &&
+                      right->columns == destination->columns && left->row_origin == destination->row_origin &&
+                      left->column_origin == right->row_origin && right->column_origin == destination->column_origin
+                    : same_raw_extent(left, destination) && right->rows == 1 && right->columns == 1;
+    if (!shapes)
+        return set_error("affine column binary shapes disagree");
+    for (size_t limb = 0; limb < left->limb_count; ++limb)
+        if (left->limbs[limb].crt_limb_index != right->limbs[limb].crt_limb_index ||
+            left->limbs[limb].crt_limb_index != destination->limbs[limb].crt_limb_index ||
+            left->limbs[limb].modulus != right->limbs[limb].modulus ||
+            left->limbs[limb].modulus != destination->limbs[limb].modulus ||
+            (kind == 2 && (left->limbs[limb].address == destination->limbs[limb].address ||
+                           right->limbs[limb].address == destination->limbs[limb].address)))
+            return set_error("affine column binary limb mismatch or product alias");
+    if (mxx_set_device(left->physical_device) != gpuSuccess)
+        return set_error(gpuGetLastError());
+    const auto stream = reinterpret_cast<gpuStream_t>(stream_raw);
+    const size_t active_columns = std::min(uint64_t(destination->columns), columns_per_job);
+    // Avoid overflow even when rows * active_columns exceeds the native grid.
+    const size_t grid_rows = active_columns > kMaxGridY / destination->rows
+        ? kMaxGridY : active_columns * destination->rows;
+    for (size_t first = 0; first < left->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, left->limb_count - first);
+        RawLimbSet lefts{}, rights{}, destinations{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(left, first, limbs, 0, left_binding_base, lefts, patches);
+        raw_limb_set(right, first, limbs, 1, right_binding_base, rights, patches);
+        raw_limb_set(destination, first, limbs, 2, destination_binding_base, destinations, patches);
+        int status;
+        if (kind == 2)
+        {
+            const dim3 grid((destination->degree + kMulCoefficients - 1) / kMulCoefficients,
+                            grid_rows, limbs);
+            status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_column_mul_kernel,
+                grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
+                lefts, rights, destinations, left->columns, right->columns, destination->columns,
+                destination->rows, size_t(destination->degree));
+        }
+        else
+        {
+            const dim3 grid((destination->degree + kTransformThreads - 1) / kTransformThreads,
+                            grid_rows, limbs);
+            status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_column_binary_kernel,
+                grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
+                lefts, rights, destinations, destination->columns,
+                destination->rows, size_t(destination->degree), unsigned(kind));
+        }
+        if (status != 0)
+            return status;
+    }
+    return 0;
 }
 
 extern "C" int gpu_raw_matrix_add_sub(GpuContext *ctx, void *stream_raw,

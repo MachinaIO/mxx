@@ -12,6 +12,7 @@ name = "MxxIR"
 roots = [
   "IRExpr",
   "IRIterRuns",
+  "IRCost",
   "IRRegression",
   "IRRel",
   "IRScopeSpec",
@@ -39,6 +40,7 @@ name = "MxxRuntime"
 leanOptions = { relaxedAutoImplicit = false }
 roots = [
   "MxxRuntime",
+  "RuntimeAllCoefficients",
   "RuntimeGaussian",
   "RuntimeHash",
   "RuntimeLemmas",
@@ -47,10 +49,11 @@ roots = [
   "RuntimePrimitives",
   "RuntimeProbability",
   "RuntimeSampling",
+  "RuntimeSubGaussian",
 ]
 
 # Concrete layouts checking the runtime facts generated relations rely on.
 [[lean_lib]]
 name = "RuntimeExamples"
 leanOptions = { relaxedAutoImplicit = false }
-roots = ["RuntimeLayoutExamples"]
+roots = ["RuntimeLayoutExamples", "RuntimeHashColumnsExamples"]

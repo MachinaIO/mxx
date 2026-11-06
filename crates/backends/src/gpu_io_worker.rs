@@ -27,9 +27,7 @@ use crate::{
     poly::dcrt::gpu::{GpuExportPayload, GpuExportSlot, download_device_memory},
     session::SessionStore,
 };
-#[cfg(test)]
-use mxx_ir_core::artifact::ProductionId;
-use mxx_ir_core::artifact::{Manifest, ManifestArtifact};
+use mxx_ir_core::artifact::{Manifest, ManifestArtifact, ProductionId};
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -173,6 +171,19 @@ impl<'scope, E: std::error::Error + 'static> IoRequest<'scope, E> {
 }
 
 pub(crate) enum IoCommand<E: std::error::Error + 'static> {
+    /// Discard one execution-private production after its users have joined.
+    DiscardScratch {
+        frame: FrameGeneration,
+        production: ProductionId,
+        reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
+    },
+    /// Release a contiguous private generation after all its GPU and I/O users have joined.
+    RemoveStaged {
+        frame: FrameGeneration,
+        key: ArtifactKey,
+        count: u128,
+        reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
+    },
     Import {
         frame: FrameGeneration,
         key: ArtifactKey,
@@ -328,6 +339,23 @@ pub struct ProducerIoClient<'scope, E: std::error::Error + 'static> {
 }
 
 impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
+    /// Remove private carry members without publishing them into a producer session.
+    pub(crate) fn try_remove_staged(
+        &self,
+        frame: FrameGeneration,
+        key: ArtifactKey,
+        count: u128,
+    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
+        self.core.submit_with(|reply| IoCommand::RemoveStaged { frame, key, count, reply })
+    }
+    pub(crate) fn try_discard_scratch(
+        &self,
+        frame: FrameGeneration,
+        production: ProductionId,
+    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
+        self.core.submit_with(|reply| IoCommand::DiscardScratch { frame, production, reply })
+    }
+
     pub(crate) fn observer_sender(&self) -> SyncSender<IoCommand<E>> {
         self.core.sender.clone()
     }
@@ -509,6 +537,8 @@ where
     while let Ok(command) = receiver.recv() {
         let started = std::time::Instant::now();
         let (kind, bytes) = match &command {
+            IoCommand::RemoveStaged { .. } => ("remove_staged", 0),
+            IoCommand::DiscardScratch { .. } => ("discard_scratch", 0),
             IoCommand::Import { .. } => ("import", 0),
             IoCommand::ExportSlot { raw_bytes, key, .. } => {
                 *raw_by_key
@@ -664,7 +694,16 @@ where
                             // copy is written. A write failure fails every
                             // later command, the publication included.
                             GpuExportPayload::Host(bytes) => {
-                                let bytes = bytes.to_vec();
+                                // Copied by several threads: one thread reads
+                                // mapped memory well below its bandwidth.
+                                let bytes = {
+                                    use rayon::prelude::*;
+                                    let mut copy = vec![0u8; bytes.len()];
+                                    copy.par_chunks_mut(16 << 20)
+                                        .zip(bytes.par_chunks(16 << 20))
+                                        .for_each(|(to, from)| to.copy_from_slice(from));
+                                    copy
+                                };
                                 if let Some(reply) = early_reply.take() {
                                     let _ = reply.send(Ok(IoCompletion::Exported { frame }));
                                 }
@@ -748,6 +787,37 @@ where
                         }
                     }
                 }
+            }
+            IoCommand::DiscardScratch { frame, production, reply } => {
+                // An encoder may still own a file in this directory. Join only
+                // the actual submitted jobs, never enumerate declared members.
+                while let Some(key) = encodings
+                    .running
+                    .iter()
+                    .find(|(key, _)| key.production == production)
+                    .map(|(key, _)| key.clone())
+                {
+                    drop(encodings.take(&key));
+                }
+                encodings.finished.retain(|key, _| key.production != production);
+                device_staged.retain(|key| key.production != production);
+                let result = store
+                    .discard_session(&production)
+                    .map(|()| IoCompletion::Exported { frame })
+                    .map_err(IoWorkerError::Store);
+                let _ = reply.send(result);
+            }
+            IoCommand::RemoveStaged { frame, key, count, reply } => {
+                let start = key.index.unwrap_or(0);
+                let result = (0..count).try_for_each(|offset| {
+                    let index = start.checked_add(offset as u128).ok_or_else(|| {
+                        IoWorkerError::InvalidExport("scratch removal index overflows".into())
+                    })?;
+                    store
+                        .remove_staged(&ArtifactKey { index: Some(index), ..key.clone() })
+                        .map_err(IoWorkerError::Store)
+                });
+                let _ = reply.send(result.map(|()| IoCompletion::Exported { frame }));
             }
             IoCommand::Commit { frame, handle, reply } => {
                 if failed {
@@ -945,6 +1015,47 @@ mod tests {
             record.wait().expect("record completion");
         })
         .expect("worker join");
+    }
+
+    #[test]
+    fn test_gpu_worker_discards_sparse_wide_scratch_only() {
+        use crate::artifact::{ArtifactPayload, ArtifactStore};
+        let mut store = MemoryArtifactStore::default();
+        let scratch =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let other =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let member = (1u128 << 80) + 7;
+        let descriptor = ManifestArtifact { family_count: Some(member + 1), ..descriptor() };
+        let keys = [scratch.clone(), other].map(|production| ArtifactKey {
+            production,
+            name: "scratch".into(),
+            index: Some(member),
+        });
+        for key in &keys {
+            store
+                .store(
+                    key.clone(),
+                    &descriptor.artifact_type,
+                    descriptor.availability,
+                    None,
+                    ArtifactPayload::Bytes(vec![1, 2, 3]),
+                )
+                .unwrap();
+        }
+        with_scoped_producer_io_worker(&mut store, NonZeroUsize::new(2).unwrap(), |client| {
+            client
+                .try_discard_scratch(FrameGeneration::new(0, 0), scratch)
+                .unwrap()
+                .wait()
+                .unwrap();
+        })
+        .unwrap();
+        assert!(store.load_staged(&keys[0], &descriptor).is_err());
+        assert_eq!(
+            store.load_staged(&keys[1], &descriptor).unwrap(),
+            ArtifactPayload::Bytes(vec![1, 2, 3])
+        );
     }
 
     #[test]

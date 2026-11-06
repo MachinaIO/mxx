@@ -5,6 +5,9 @@
 //! cannot be swapped. It depends on the serialized structure (node kinds, postorder ids, canonical
 //! expressions, rings, graph name), not on allocation addresses, source locations, or construction
 //! order.
+//!
+//! JSON integers retain arbitrary precision, including symbolic family cardinalities above
+//! `u64::MAX`. Existing addressable counts keep the same numeric encoding and hashes.
 
 use crate::{
     artifact::SpecHash,
@@ -245,6 +248,16 @@ mod tests {
             spec_hash(&graph, &changed_real).unwrap(),
             spec_hash(&decoded, &changed_real).unwrap()
         );
+    }
+
+    #[test]
+    fn wide_family_cardinalities_round_trip_without_changing_small_encodings() {
+        let count = (usize::MAX as u128) * 130;
+        let encoded = canonical_json(&count).unwrap();
+        assert_eq!(encoded, count.to_string().as_bytes());
+        assert_eq!(serde_json::from_slice::<u128>(&encoded).unwrap(), count);
+        assert_eq!(canonical_json(&7u128).unwrap(), canonical_json(&7usize).unwrap());
+        assert_eq!(hash_canonical(&7u128).unwrap(), hash_canonical(&7usize).unwrap());
     }
 
     #[test]

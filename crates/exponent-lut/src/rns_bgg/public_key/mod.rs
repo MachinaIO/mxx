@@ -1,0 +1,193 @@
+//! Public-key preparation and preprocessing for RNS-BGG.
+#![warn(missing_docs)]
+
+use super::*;
+use crate::{
+    api::{ApiError, GraphEmission, PlaintextInputs, PreprocessBuild, ProgramBuild},
+    program::{
+        AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
+        GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, Operand,
+        ProgramLoweringContext, RhsId, RhsRef, WireId, lower_program,
+    },
+};
+use mxx_backends::{RuntimeValue, poly::Poly};
+use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
+use mxx_ir_core::{
+    IntExpr, ValueHandle,
+    artifact::{ArtifactAvailability, ProductionId},
+    types::WireType,
+};
+use num_traits::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+mod lowering;
+mod preprocess;
+mod sampling;
+
+pub(super) use self::{lowering::*, sampling::*};
+#[cfg(test)]
+use crate::api::StageGraph;
+#[cfg(test)]
+use mxx_ir_core::node::ConstantMatrix;
+
+/// Public-key carrier paired with its validated Program wire.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct RnsBggPublicKey<M = RnsBggMatrix> {
+    pub(crate) wire: WireId,
+    pub(crate) matrix: M,
+}
+
+impl<M> RnsBggPublicKey<M> {
+    /// Construct a carrier for `wire` with a matrix matching that wire's
+    /// validated public-key schema.
+    ///
+    /// Callers are responsible for preserving the Program wire identity and
+    /// matrix schema; stage builders validate both when the carrier is used.
+    pub fn new(wire: WireId, matrix: M) -> Self {
+        Self { wire, matrix }
+    }
+    /// Program wire represented by this key.
+    pub fn wire(&self) -> WireId {
+        self.wire
+    }
+    /// Matrix carried by this key.
+    pub fn matrix(&self) -> &M {
+        &self.matrix
+    }
+}
+
+impl<M: GraphValue> GraphValue for RnsBggPublicKey<M> {
+    type Schema = RnsBggPublicKey<M::Schema>;
+    fn flatten(&self) -> Vec<ValueHandle> {
+        self.matrix.flatten()
+    }
+    fn schema(&self) -> Self::Schema {
+        RnsBggPublicKey::new(self.wire, self.matrix.schema())
+    }
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[ValueHandle],
+    ) -> Result<Self, mxx_dsl::DslError> {
+        Ok(Self::new(schema.wire, M::from_values(&schema.matrix, values)?))
+    }
+}
+
+impl<M: GraphValueSchema> GraphValueSchema for RnsBggPublicKey<M> {
+    type Value = RnsBggPublicKey<M::Value>;
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        RnsBggPublicKey::new(self.wire, self.matrix.placeholders_from(next))
+    }
+    fn wire_types(&self) -> Vec<WireType> {
+        self.matrix.wire_types()
+    }
+}
+
+fn graph(error: impl std::fmt::Display) -> RnsBggError {
+    RnsBggError::Graph(error.to_string())
+}
+
+fn matrix_entries(matrix: &RnsBggMatrix) -> [Mat; 4] {
+    [matrix.0.0.clone(), matrix.0.1.clone(), matrix.1.0.clone(), matrix.1.1.clone()]
+}
+
+/// Structural public-key lowerer. All prepared values are compact graph
+/// handles; the maps do not own expanded matrices or concrete family members.
+pub struct PublicKeyLowering<'a> {
+    pub(crate) parameters: &'a RnsBggParameters,
+    pub(crate) program: Arc<ExponentLutProgram>,
+    pub(crate) workload: Arc<RnsBggDerivedWorkload>,
+    /// The Static payload secret; Dynamic preprocessing has none.
+    pub(crate) payload_secret: Option<RnsBggPayloadSecret>,
+    pub(crate) hash_key: Bytes,
+    /// How the Program's outputs are consumed (see [`RnsOutputUse`]).
+    pub(crate) output_use: RnsOutputUse,
+    /// Dynamic: the setup and the Program's mapping to its coordinates.
+    pub(crate) dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+    /// The Program's integer data inputs ([`crate::program::data_inputs`]).
+    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
+    /// RHS plaintext graph expressions or resident inputs; families are read member by member.
+    pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
+    /// Setup-fixed RHS ciphertexts.  These are compact matrices; their signed
+    /// decompositions are constructed at the consuming level only.
+    pub(crate) rhs_material: BTreeMap<RhsId, InputBinding<RnsBggMatrix, Family<RnsBggMatrix>>>,
+    /// Compact LUT switching ciphertexts, keyed by the complete table/layout
+    /// identity.  The family member is the concrete automorphism branch.
+    pub(crate) lut_material:
+        BTreeMap<(usize, usize, crate::program::LutId, ExpLayout), Family<RnsBggMatrix>>,
+    /// The values of the Program's integer data (`None` when bound by shape
+    /// only, see [`super::RnsPreprocessBuild::bind_rhs_inputs`]).
+    pub(crate) data_values: Option<crate::program::ProgramData>,
+    pub(crate) current_site: Option<LoweringSite>,
+    /// Dynamic: the public action of every root-scope `MulPrivate` and
+    /// `Lut` site, its output key and a LUT's product keys `T_k`, which
+    /// preprocessing publishes for online evaluation to import.
+    pub(crate) public_actions: BTreeMap<WireId, (RnsBggMatrix, Vec<super::BranchKeys>)>,
+    /// Open parallel bodies, outermost first: each one's instance count and
+    /// member index, and the RHS family members it prepared.
+    parallel_bodies: Vec<(IntExpr, IntExpr, Vec<(RhsId, RnsBggMatrix)>)>,
+    /// The RHS families of each finished body, awaiting its loop's commit.
+    finished_bodies: Vec<Vec<RhsId>>,
+    /// RHS families whose members the loop reading them prepares (see
+    /// `streamed_rhs_member`), with the family that loop returned.
+    streamed_rhs: BTreeMap<RhsId, Option<Family<RnsBggMatrix>>>,
+    /// RHS families read from the materials prepared at binding.
+    prepared_rhs_reads: std::collections::BTreeSet<RhsId>,
+    /// The root tag of every input read from a root object of a rooted chain (see
+    /// [`super::RnsBggRoot`]); other inputs keep their hash-sampled keys.
+    pub(crate) root_inputs: BTreeMap<WireId, String>,
+    /// The root hash key input of a rooted chain, created in the stage's root scope.
+    pub(crate) root_hash_key: Option<Bytes>,
+}
+
+/// Preprocessing stage adapter using the common stage lifecycle.
+pub struct RnsPreprocessBuild<'a> {
+    /// Instance namespace for graph inputs and published artifacts.
+    artifact_prefix: Option<String>,
+    /// RHS expressions supplied by the composing graph, without resident inputs.
+    rhs_values: Option<BTreeMap<RhsId, InputBinding<Mat, super::RhsPlaintexts>>>,
+    parameters: &'a RnsBggParameters,
+    context: [u8; 32],
+    hash_key_commitment: [u8; 32],
+    evaluator: Option<PublicKeyLowering<'a>>,
+    families: super::encoding::OnlineEvalFamilies<'a>,
+    environment:
+        Environment<RnsBggPublicKey, RhsRef<Int>, PreprocessWireFamily, Family<RhsRef<Int>>>,
+    runtime: BTreeMap<String, RuntimeValue>,
+    /// How the Program's outputs are consumed.
+    output_use: RnsOutputUse,
+    /// Dynamic: the setup and the Program's mapping to its coordinates.
+    dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+    /// The values of the Program's integer data.
+    data: crate::program::ProgramData,
+    /// The Program's integer data as graph values (see `RnsPreprocessBuild::bind_data_values`),
+    /// replacing [`Self::data`] and its resident inputs.
+    graph_data: Option<BTreeMap<crate::program::DataId, Family<Int>>>,
+    /// The namespace its hash key is derived under (see `rns_bgg::child_hash_key`).
+    hash_namespace: Option<[u8; 32]>,
+    /// Bind the Program's RHS plaintexts and data by their shapes only, whatever the stage is
+    /// given (see `RnsPreprocessBuild::with_inputs_by_shape`).
+    inputs_by_shape: bool,
+    /// The root tags of the Program's inputs (see `RnsPreprocessBuild::with_root_inputs`).
+    root_inputs: BTreeMap<WireId, String>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn public_key_carrier_is_wire_and_matrix() {
+        let ring = crate::test_support::explicit_ring(&[17], 4);
+        let key = RnsBggPublicKey::<Mat>::new(
+            WireId(3),
+            ring.polynomial([IntExpr::constant(BigInt::from(0u8))]),
+        );
+        assert_eq!(key.wire(), WireId(3));
+        assert_eq!(key.matrix().matrix_type(), &ring.matrix_type((1, 1)));
+    }
+}

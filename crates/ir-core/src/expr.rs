@@ -531,6 +531,8 @@ pub enum ExprError {
     NonFiniteReal,
     #[error("ring resolution failed: {0}")]
     RingResolution(String),
+    #[error("an operation count does not fit u128")]
+    CountOverflow,
 }
 
 impl IntExpr {
@@ -639,6 +641,19 @@ impl IntExpr {
         Polynomial::from_expr(self).into_expr()
     }
 
+    /// The constant this expression's terms cancel to, such as the width
+    /// `(h + 1) - h` of a unit slice. Unlike [`Self::canonicalize`], a
+    /// cancelled partial generator (a division or remainder) is dropped: the
+    /// caller evaluates the original bounds, which keep it.
+    pub fn cancelled_constant(&self) -> Option<BigInt> {
+        let polynomial = Polynomial::from_expr(self);
+        match polynomial.terms.len() {
+            0 => Some(BigInt::zero()),
+            1 => polynomial.terms.get(&Vec::new()).cloned(),
+            _ => None,
+        }
+    }
+
     pub fn contains_variable(&self, variable: &str) -> bool {
         match self {
             Self::Const(_) => false,
@@ -688,6 +703,52 @@ impl IntExpr {
             Self::RingCrtModulus { ring, index } => {
                 ring.expression().contains_loop_index() || index.contains_loop_index()
             }
+        }
+    }
+
+    /// This expression with every `LoopIndex(slot)` replaced by `value`, canonicalized (so a
+    /// selection by a constant index is the selected branch).
+    pub fn substitute_loop_index(&self, slot: u32, value: &Self) -> Self {
+        self.substitute_loop_index_raw(slot, value).canonicalize()
+    }
+
+    fn substitute_loop_index_raw(&self, slot: u32, value: &Self) -> Self {
+        let sub = |expression: &Self| Box::new(expression.substitute_loop_index(slot, value));
+        match self {
+            Self::Const(_) | Self::Var(_) => self.clone(),
+            Self::LoopIndex(index) if *index == slot => value.clone(),
+            Self::LoopIndex(_) => self.clone(),
+            Self::Add(a, b) => Self::Add(sub(a), sub(b)),
+            Self::Sub(a, b) => Self::Sub(sub(a), sub(b)),
+            Self::Mul(a, b) => Self::Mul(sub(a), sub(b)),
+            Self::Div(a, b) => Self::Div(sub(a), sub(b)),
+            Self::FloorDiv(a, b) => Self::FloorDiv(sub(a), sub(b)),
+            Self::Rem(a, b) => Self::Rem(sub(a), sub(b)),
+            Self::RoundDiv(a, b) => Self::RoundDiv(sub(a), sub(b)),
+            Self::Log2Ceil(a) => Self::Log2Ceil(sub(a)),
+            Self::Select { selector, branches } => {
+                let selector = sub(selector);
+                let branches = branches
+                    .iter()
+                    .map(|branch| branch.substitute_loop_index_raw(slot, value))
+                    .collect::<Vec<_>>();
+                // A constant selector picks its branch.
+                match selector.canonicalize() {
+                    Self::Const(index) => {
+                        match usize::try_from(&index).ok().and_then(|index| branches.get(index)) {
+                            Some(branch) => branch.clone(),
+                            None => Self::Select { selector, branches },
+                        }
+                    }
+                    _ => Self::Select { selector, branches },
+                }
+            }
+            Self::RingModulus(ring) => Self::RingModulus(ring.substitute_loop_index(slot, value)),
+            Self::RingCrtDepth(ring) => Self::RingCrtDepth(ring.substitute_loop_index(slot, value)),
+            Self::RingCrtModulus { ring, index } => Self::RingCrtModulus {
+                ring: ring.substitute_loop_index(slot, value),
+                index: sub(index),
+            },
         }
     }
 }
@@ -878,6 +939,32 @@ impl Rational {
 }
 
 impl RealExpr {
+    pub fn contains_loop_index(&self) -> bool {
+        match self {
+            Self::FromInt(value) => value.contains_loop_index(),
+            Self::Add(left, right) |
+            Self::Sub(left, right) |
+            Self::Mul(left, right) |
+            Self::Div(left, right) => left.contains_loop_index() || right.contains_loop_index(),
+            Self::Sqrt(value) => value.contains_loop_index(),
+            Self::Rational(_) | Self::Var(_) => false,
+        }
+    }
+
+    /// This expression with every `LoopIndex(slot)` replaced by `value`.
+    pub fn substitute_loop_index(&self, slot: u32, value: &IntExpr) -> Self {
+        let sub = |expression: &Self| Box::new(expression.substitute_loop_index(slot, value));
+        match self {
+            Self::Rational(_) | Self::Var(_) => self.clone(),
+            Self::FromInt(integer) => Self::FromInt(integer.substitute_loop_index(slot, value)),
+            Self::Add(a, b) => Self::Add(sub(a), sub(b)),
+            Self::Sub(a, b) => Self::Sub(sub(a), sub(b)),
+            Self::Mul(a, b) => Self::Mul(sub(a), sub(b)),
+            Self::Div(a, b) => Self::Div(sub(a), sub(b)),
+            Self::Sqrt(a) => Self::Sqrt(sub(a)),
+        }
+    }
+
     pub fn from_integer(value: impl Into<BigInt>) -> Self {
         Self::Rational(Rational::from_integer(value.into()))
     }
@@ -1273,6 +1360,16 @@ pub fn euclidean_div_rem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_constant_drops_cancelled_partial_generators() {
+        let remainder =
+            IntExpr::Rem(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(3)));
+        let width = (remainder.clone() + IntExpr::constant(1)) - remainder.clone();
+        assert_eq!(width.cancelled_constant(), Some(BigInt::from(1)));
+        assert!(width.canonicalize().contains_loop_index());
+        assert_eq!(remainder.cancelled_constant(), None);
+    }
 
     #[test]
     fn test_integer_division_remainder_and_negation_preserve_existing_semantics() {

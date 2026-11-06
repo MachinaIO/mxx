@@ -1,0 +1,54 @@
+name = "MxxPeAverageW256N32768Crt15x24Compact"
+version = "0.1.0"
+defaultTargets = ["PeGenerated", "PeProof"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxPe"
+path = ".."
+
+# Modules written by `test_gpu_pe_round_trip` (`tests/gpu_round_trip.rs`) for this parameter set.
+[[lean_lib]]
+name = "PeGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_setup_trapdoor", "Stage_setup_public",
+  "Stage_payload", "Stage_prelude", "Stage_encrypt", "Stage_preprocess", "Stage_keygen_helpers", "Stage_keygen",
+  "Stage_online_eval", "Stage_decode", "Ideal_Facts", "Requirement_0_Facts",
+  "Stage_setup_trapdoor_Facts", "Stage_setup_public_Facts", "Stage_payload_Facts",
+  "Stage_prelude_Facts", "Stage_encrypt_Facts", "Stage_preprocess_Facts", "Stage_keygen_helpers_Facts", "Stage_keygen_Facts",
+  "Stage_online_eval_Facts", "Stage_decode_Facts"
+]
+# The chained constraint fragments of the large stages need a deep elaboration stack.
+moreLeanArgs = ["--tstack=4000000", "-j2"]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "PeProof"
+roots = [
+  "PeAnchor", "PeBranch", "PeCertificate", "PeChain0",
+  "PeChain1", "PeChainAll", "PeCompanions", "PeDecode",
+  "PeDecodeLink", "PeDecodeRoot", "PeDecrypt", "PeDecryptBits",
+  "PeDigits", "PeEncrypt", "PeKeyLink", "PeKeygen",
+  "PeKeygenRoot", "PeKeygenScatterBase", "PeKeygenScatter", "PeLut", "PeNumeric", "PeOnlineBase",
+  "PeOnlineGlue", "PeOnlineRoot0", "PeOnlineRoot1", "PeOnlineStep0",
+  "PeOnlineStep1", "PePhase", "PePreBase", "PePreGlue",
+  "PePreLaneI0", "PePreLaneI1", "PePreLaneL0", "PePreLaneL0G1",
+  "PePreLaneL0G2", "PePreLaneL0G3", "PePreLaneL1", "PePreLaneL1G1",
+  "PePreLaneL1G2", "PePreLaneL1G3", "PePreLaneLInner0", "PePreLaneLInner0G1",
+  "PePreLaneLInner0G2", "PePreLaneLInner0G3", "PePreLaneLInner1", "PePreLaneLInner1G1",
+  "PePreLaneLInner1G2", "PePreLaneLInner1G3", "PePreLaneLTop0", "PePreLaneLTop0G1",
+  "PePreLaneLTop0G2", "PePreLaneLTop0G3", "PePreLaneLTop1", "PePreLaneLTop1G1",
+  "PePreLaneLTop1G2", "PePreLaneLTop1G3", "PePreLaneM0", "PePreLaneM0G1Group",
+  "PePreLaneM0G2Group", "PePreLaneM0G3Group", "PePreLaneM0Group", "PePreLaneM1",
+  "PePreLaneM1G1Group", "PePreLaneM1G2Group", "PePreLaneM1G3Group", "PePreLaneM1Group",
+  "PePreRoot0", "PePreRoot1", "PePreRootKey0_0", "PePreRootKey0_1",
+  "PePreRootKey1_0", "PePreRootKey1_1", "PePreRootLayout", "PePreSum0",
+  "PePreSum1", "PePrelude", "PeProduct", "PeProductGlue",
+  "PeRequirement", "PeSetup", "PeSlots", "PeStepData",
+  "PeStepRel", "PeStepSum",
+]
+moreLeanArgs = ["--tstack=4000000", "-j2"]

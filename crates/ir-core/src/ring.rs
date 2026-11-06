@@ -141,6 +141,22 @@ pub fn generate_crt_basis(
     Ok(basis)
 }
 
+/// [`is_prime`], remembered for every prime seen: a ring is resolved again for every wire type a
+/// planner concretizes outside one resolution cache, and the test dominates resolving it.
+fn is_prime_memoized(n: u64) -> bool {
+    static PRIMES: std::sync::OnceLock<std::sync::RwLock<BTreeSet<u64>>> =
+        std::sync::OnceLock::new();
+    let primes = PRIMES.get_or_init(Default::default);
+    if primes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&n) {
+        return true;
+    }
+    let prime = is_prime(n);
+    if prime {
+        primes.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(n);
+    }
+    prime
+}
+
 /// Deterministic Miller-Rabin test; these bases decide primality for every `u64`.
 pub(crate) fn is_prime(n: u64) -> bool {
     if n < 2 {
@@ -245,6 +261,38 @@ impl RingRef {
     /// Whether this ring's ordered CRT basis depends on a loop index.
     pub fn contains_loop_index(&self) -> bool {
         self.expression().contains_loop_index()
+    }
+
+    /// This ring with every `LoopIndex(slot)` in its basis replaced by `value`.
+    pub fn substitute_loop_index(&self, slot: u32, value: &IntExpr) -> Self {
+        if !self.contains_loop_index() {
+            return self.clone();
+        }
+        let sub = |expression: &IntExpr| expression.substitute_loop_index(slot, value);
+        Self::new(match self.expression() {
+            RingExpr::Generated { crt_bits, crt_depth, ring_dimension } => RingExpr::Generated {
+                crt_bits: sub(crt_bits),
+                crt_depth: sub(crt_depth),
+                ring_dimension: *ring_dimension,
+            },
+            RingExpr::Explicit { crt_moduli, ring_dimension } => RingExpr::Explicit {
+                crt_moduli: crt_moduli.iter().map(sub).collect(),
+                ring_dimension: *ring_dimension,
+            },
+            RingExpr::Slice { source, start, end } => RingExpr::Slice {
+                source: source.substitute_loop_index(slot, value),
+                start: sub(start),
+                end: sub(end),
+            },
+            RingExpr::Select { source, indices } => RingExpr::Select {
+                source: source.substitute_loop_index(slot, value),
+                indices: indices.iter().map(sub).collect(),
+            },
+            RingExpr::Concat { left, right } => RingExpr::Concat {
+                left: left.substitute_loop_index(slot, value),
+                right: right.substitute_loop_index(slot, value),
+            },
+        })
     }
     pub fn ring_dimension(&self) -> u32 {
         match self.expression() {
@@ -358,7 +406,7 @@ impl ConcreteRing {
             if q <= 2 ||
                 q > (1u64 << 60) - 1 ||
                 (q - 1) % modulus != 0 ||
-                !is_prime(q) ||
+                !is_prime_memoized(q) ||
                 !seen.insert(q)
             {
                 return Err(ExprError::RingResolution(format!(

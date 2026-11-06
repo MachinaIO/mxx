@@ -10,7 +10,7 @@ workspace crate.
 
 | Module | What it defines |
 | --- | --- |
-| `graph` | Construction handles and scopes, subgraph sealing and captures, freezing, and serialization. |
+| `graph` | Construction handles and scopes, subgraph sealing and captures, freezing, serialization, operation counts, and the shape dependencies that let loops be counted in closed form. |
 | `node` | `NodeKind`, the complete vocabulary of executable operations. |
 | `types` | Node and wire identities, symbolic and concrete wire types. |
 | `ring` | Rings as ordered CRT bases, their resolution, and CRT basis generation. |

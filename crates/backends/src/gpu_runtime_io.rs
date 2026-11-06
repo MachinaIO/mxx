@@ -42,9 +42,9 @@ use crate::{
         SessionStore,
     },
 };
-#[cfg(test)]
-use mxx_ir_core::artifact::ProductionId;
-use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact};
+use mxx_ir_core::artifact::{
+    ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+};
 use num_traits::ToPrimitive;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -97,6 +97,7 @@ pub enum IoPumpError<E: std::error::Error + 'static> {
 
 /// One statically bounded write occurrence. The mapped payload owner remains
 /// alive through the worker's file write, even if the Graph has completed.
+#[derive(Clone)]
 pub(crate) struct PlannedExportSlot {
     pub(crate) frame: FrameGeneration,
     pub(crate) key: ArtifactKey,
@@ -130,7 +131,7 @@ pub(crate) struct PlannedImportRequest {
     pub(crate) destination: u32,
     /// The family key; the published selector supplies its index.
     pub(crate) key: ArtifactKey,
-    pub(crate) family_count: usize,
+    pub(crate) family_count: u128,
     pub(crate) encoding: GpuSignedValuesEncoding,
     /// The worker command that reads a member and uploads it to the
     /// destination.
@@ -345,14 +346,37 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
         self.streamed = slots;
     }
 
-    /// Write the streamed export of `template` once its wave has joined:
+    /// Write the export of `template` once its wave or root region has joined:
     /// submit its published slot, wait until the worker has staged it, queue
-    /// its publication, and rearm the slot for the next wave, which writes
-    /// another member into it. A template this execute does not write (a
-    /// consumer, or a finalized replay) is skipped.
-    pub(crate) fn export_streamed(&mut self, template: usize) -> Result<(), IoPumpError<E>> {
-        let Some(slot) = self.streamed.remove(&template) else { return Ok(()) };
-        let handle = slot.commit_to_session.then(|| ArtifactHandle {
+    /// its publication, and rearm the mapping for its next joined producer.
+    /// A wave writes another member; a root region may write another artifact. A template this
+    /// execute does not write (a consumer, or a finalized replay) is skipped.
+    pub(crate) fn export_streamed(
+        &mut self,
+        template: usize,
+        scratch_key: Option<ArtifactKey>,
+        member_offset: u128,
+    ) -> Result<(), IoPumpError<E>> {
+        let Some(mut slot) = self.streamed.get(&template).cloned() else { return Ok(()) };
+        let scratch = scratch_key.is_some();
+        if let Some(key) = scratch_key {
+            slot.key = key;
+        }
+        // Resolve both the repeated wave and nested parent's member before
+        // replacing a scratch artifact; the template's first member is reused.
+        slot.key.index = slot
+            .key
+            .index
+            .map(|index| {
+                index.checked_add(member_offset).ok_or_else(|| {
+                    IoPumpError::Import("streamed export member exceeds u128".into())
+                })
+            })
+            .transpose()?;
+        if scratch && slot.raw_offset == 0 {
+            self.remove_staged(slot.frame, slot.key.clone(), 1)?;
+        }
+        let handle = (slot.commit_to_session || scratch).then(|| ArtifactHandle {
             key: slot.key.clone(),
             artifact_type: slot.artifact_type.clone(),
             availability: slot.availability,
@@ -386,6 +410,27 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                 actual: completion.frame(),
             });
         }
+        if scratch && slot.final_chunk {
+            self.core
+                .client
+                .try_publish(
+                    slot.frame,
+                    handle.expect("scratch export has a handle"),
+                    slot.payload_kind,
+                    Arc::clone(&slot.export),
+                )
+                .map_err(IoPumpError::Submit)?
+                .wait()
+                .map_err(IoPumpError::Worker)?;
+            unsafe { slot.slot.reset_after_completion() }
+                .map_err(|error| IoPumpError::Observer(error.to_string()))?;
+            return Ok(());
+        }
+        if scratch {
+            unsafe { slot.slot.reset_after_completion() }
+                .map_err(|error| IoPumpError::Observer(error.to_string()))?;
+            return Ok(());
+        }
         if let Some(handle) = handle {
             self.pending_publishes.entry(handle.key.clone()).or_insert((
                 slot.frame,
@@ -394,10 +439,42 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                 slot.export,
             ));
         }
-        // SAFETY: the wave that wrote the slot has joined, and the worker has
+        // SAFETY: the region that wrote the slot has joined, and the worker has
         // finished reading it.
         unsafe { slot.slot.reset_after_completion() }
             .map_err(|error| IoPumpError::Observer(error.to_string()))
+    }
+
+    /// Remove only the data created under this execution's private identity.
+    /// Cost depends on stored artifacts, not the declared logical cardinality.
+    pub(crate) fn discard_scratch(
+        &mut self,
+        frame: FrameGeneration,
+        production: ProductionId,
+    ) -> Result<(), IoPumpError<E>> {
+        self.core
+            .client
+            .try_discard_scratch(frame, production)
+            .map_err(IoPumpError::Submit)?
+            .wait()
+            .map_err(IoPumpError::Worker)?;
+        Ok(())
+    }
+
+    /// Join removal of private scratch, including after a failed iteration.
+    pub(crate) fn remove_staged(
+        &mut self,
+        frame: FrameGeneration,
+        key: ArtifactKey,
+        count: u128,
+    ) -> Result<(), IoPumpError<E>> {
+        self.core
+            .client
+            .try_remove_staged(frame, key, count)
+            .map_err(IoPumpError::Submit)?
+            .wait()
+            .map_err(IoPumpError::Worker)?;
+        Ok(())
     }
 
     /// Begin observing the preallocated write slots and the import request
@@ -487,14 +564,15 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                     let started = index
                         .and_then(|index| {
                             index
-                                .to_usize()
+                                .to_u128()
                                 .filter(|index| *index < request.family_count)
                                 .ok_or_else(|| {
                                     format!("selected artifact index {index} is out of range")
                                 })
                         })
                         .and_then(|index| {
-                            let key = ArtifactKey { index: Some(index), ..request.key.clone() };
+                            let key =
+                                ArtifactKey { index: Some(index as u128), ..request.key.clone() };
                             let RuntimeIoOperation::Import {
                                 key,
                                 descriptor,

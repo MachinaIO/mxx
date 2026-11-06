@@ -45,25 +45,27 @@ mod tests {
             },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "decoded".to_owned(),
-                    ideal_input: "ideal".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::ThresholdDecode,
-                    workflow_output: OutputRef {
-                        stage: stage_id.clone(),
-                        output: "decoded".to_owned(),
-                    },
-                    ideal_output: "ideal".to_owned(),
-                }],
+            comparison: Comparison {
+                comparator: ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "ideal".to_owned(),
+                        result_output: "failure".to_owned(),
+                    }],
+                },
+                endpoints: EndpointBindings {
+                    entries: vec![EndpointBinding {
+                        spec: endpoint,
+                        semantics: EndpointSemanticBinding::ThresholdDecode,
+                        workflow_output: OutputRef {
+                            stage: stage_id.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "ideal".to_owned(),
+                    }],
+                },
+                endpoint_specs: vec![endpoint],
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "threshold-family".to_owned(),
@@ -73,7 +75,7 @@ mod tests {
                     plaintext_modulus: IntExpr::constant(17),
                 },
             }],
-            endpoint_specs: vec![endpoint],
+
             input_contract: InputContract::default(),
             input_bindings: Vec::new(),
             precondition_spec: ProtocolPreconditionSpec::default(),
@@ -129,7 +131,7 @@ mod tests {
         let comparator_ideal = ring.bool_input("ideal").to_int();
         let comparator = IdealSpec::new(
             DslContext::new("comparator")
-                .output("failure", comparator_actual.equal(comparator_ideal))
+                .output("failure", !comparator_actual.equal(comparator_ideal))
                 .expect("comparator output")
                 .build()
                 .expect("comparator graph")
@@ -159,26 +161,30 @@ mod tests {
             },
             ideal,
             requirements: vec![requirement],
-            comparator: ComparatorSpec::EqualityAfterMap {
-                program: comparator,
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint: interval_endpoint,
-                    actual_input: "actual".to_owned(),
-                    ideal_input: "ideal".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: false,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: interval_endpoint,
-                    semantics: EndpointSemanticBinding::DiamondBoolean { message: input.clone() },
-                    workflow_output: OutputRef {
-                        stage: decoder_stage_id.clone(),
-                        output: "decoded".to_owned(),
-                    },
-                    ideal_output: "result".to_owned(),
-                }],
+            comparison: Comparison {
+                comparator: ComparatorSpec::EqualityAfterMap {
+                    program: comparator,
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint: interval_endpoint,
+                        actual_input: "actual".to_owned(),
+                        ideal_input: "ideal".to_owned(),
+                        result_output: "failure".to_owned(),
+                    }],
+                },
+                endpoints: EndpointBindings {
+                    entries: vec![EndpointBinding {
+                        spec: interval_endpoint,
+                        semantics: EndpointSemanticBinding::DiamondBoolean {
+                            message: input.clone(),
+                        },
+                        workflow_output: OutputRef {
+                            stage: decoder_stage_id.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "result".to_owned(),
+                    }],
+                },
+                endpoint_specs: vec![interval_endpoint],
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "interval".to_owned(),
@@ -189,7 +195,7 @@ mod tests {
                 endpoint: EndpointSpecId::DiamondBooleanInterval,
                 kind: OperationalDecoderKind::BooleanInterval,
             }],
-            endpoint_specs: vec![interval_endpoint],
+
             input_contract: InputContract {
                 inputs: vec![
                     InputContractEntry {
@@ -289,27 +295,29 @@ mod tests {
             },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "decoded".to_owned(),
-                    ideal_input: "result".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::DiamondBoolean {
-                        message: message_input.clone(),
-                    },
-                    workflow_output: OutputRef {
-                        stage: stage_id.clone(),
-                        output: "decoded".to_owned(),
-                    },
-                    ideal_output: "result".to_owned(),
-                }],
+            comparison: Comparison {
+                comparator: ComparatorSpec::Equality {
+                    endpoints: vec![ComparatorEndpointBinding {
+                        endpoint,
+                        actual_input: "decoded".to_owned(),
+                        ideal_input: "result".to_owned(),
+                        result_output: "failure".to_owned(),
+                    }],
+                },
+                endpoints: EndpointBindings {
+                    entries: vec![EndpointBinding {
+                        spec: endpoint,
+                        semantics: EndpointSemanticBinding::DiamondBoolean {
+                            message: message_input.clone(),
+                        },
+                        workflow_output: OutputRef {
+                            stage: stage_id.clone(),
+                            output: "decoded".to_owned(),
+                        },
+                        ideal_output: "result".to_owned(),
+                    }],
+                },
+                endpoint_specs: vec![endpoint],
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "boolean-interval".to_owned(),
@@ -317,7 +325,7 @@ mod tests {
                 endpoint: EndpointSpecId::DiamondBooleanInterval,
                 kind: OperationalDecoderKind::BooleanInterval,
             }],
-            endpoint_specs: vec![endpoint],
+
             input_contract: InputContract {
                 inputs: vec![
                     InputContractEntry {
@@ -388,10 +396,11 @@ mod tests {
     #[test]
     fn endpoint_binding_requires_an_existing_output() {
         let mut bundle = valid_bundle();
-        bundle.endpoints.entries[0].workflow_output.output = "missing".to_owned();
+        bundle.comparison.endpoints.entries[0].workflow_output.output = "missing".to_owned();
         assert_eq!(bundle.validate(), Err(BundleValidationError::MissingEndpointBinding));
         let mut bundle = valid_bundle();
-        bundle.endpoints.entries[0].workflow_output.stage = StageId("missing".to_owned());
+        bundle.comparison.endpoints.entries[0].workflow_output.stage =
+            StageId("missing".to_owned());
         assert_eq!(bundle.validate(), Err(BundleValidationError::MissingEndpointBinding));
     }
 
@@ -418,8 +427,11 @@ mod tests {
     #[test]
     fn boolean_interval_target_rejects_an_unrelated_boolean_endpoint() {
         let mut bundle = boolean_interval_bundle(None);
-        bundle.endpoints.entries[0].workflow_output.output = "unrelated-result".to_owned();
-        let ComparatorSpec::Equality { endpoints } = &mut bundle.comparator else { unreachable!() };
+        bundle.comparison.endpoints.entries[0].workflow_output.output =
+            "unrelated-result".to_owned();
+        let ComparatorSpec::Equality { endpoints } = &mut bundle.comparison.comparator else {
+            unreachable!()
+        };
         endpoints[0].actual_input = "unrelated-result".to_owned();
         assert_eq!(
             bundle.validate(),
@@ -430,7 +442,7 @@ mod tests {
     #[test]
     fn boolean_endpoint_still_requires_a_boolean_message_contract() {
         let mut bundle = valid_bundle();
-        bundle.endpoints.entries[0].semantics =
+        bundle.comparison.endpoints.entries[0].semantics =
             EndpointSemanticBinding::DiamondBoolean { message: ProtocolInputId::from("residual") };
         assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidEndpointSemantics));
     }
@@ -526,15 +538,15 @@ mod tests {
     #[test]
     fn endpoint_cardinality_is_rejected_before_analysis() {
         let mut bundle = valid_bundle();
-        bundle.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
+        bundle.comparison.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
         assert_eq!(bundle.validate(), Err(BundleValidationError::EndpointCardinalityMismatch));
     }
 
     #[test]
     fn structural_validation_does_not_claim_endpoint_soundness() {
         let mut bundle = valid_bundle();
-        bundle.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
-        bundle.endpoints.entries.push(EndpointBinding {
+        bundle.comparison.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
+        bundle.comparison.endpoints.entries.push(EndpointBinding {
             spec: EndpointSpecId::ToyThresholdDecode,
             semantics: EndpointSemanticBinding::ThresholdDecode,
             workflow_output: OutputRef {
@@ -543,7 +555,8 @@ mod tests {
             },
             ideal_output: "result".to_owned(),
         });
-        let ComparatorSpec::EqualityAfterMap { endpoints, .. } = &mut bundle.comparator else {
+        let ComparatorSpec::EqualityAfterMap { endpoints, .. } = &mut bundle.comparison.comparator
+        else {
             unreachable!("fixture uses mapped equality")
         };
         endpoints.push(ComparatorEndpointBinding {
@@ -551,7 +564,6 @@ mod tests {
             actual_input: "actual".to_owned(),
             ideal_input: "ideal".to_owned(),
             result_output: "failure".to_owned(),
-            failure_value: false,
         });
         assert_eq!(bundle.validate(), Ok(()));
     }

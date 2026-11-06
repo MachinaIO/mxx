@@ -1,5 +1,8 @@
 //! Direct GPU Graph lowering for structural control scopes.
 //!
+//! Symbolic family cardinalities are checked for host addressability at physical allocation
+//! and iteration boundaries. Graph-only validation does not allocate their members.
+//!
 //! A loop without external I/O uses one reusable conditional body: CUDA
 //! conditional nodes or HIP graph regions selected at D2H control boundaries. A loop that
 //! selects an artifact member needs an explicit I/O boundary between bounded
@@ -18,12 +21,22 @@
 //!   division) go to a per-device status word, first error wins, and the word is checked only after
 //!   the launch joins.
 //! - **Sequential-loop carries.** A sequential loop may carry matrices, scalars, and integer
-//!   families. An integer carry is sized by a range closed over every iteration, and a Euclidean
-//!   remainder by a positive constant has the exact range `[0, divisor)`.
+//!   families. Matrix-family carries use private, double-buffered artifact generations and
+//!   top-level parallel bodies replay bounded waves. Loop-dependent polynomial constants read
+//!   resident indices on every replay, and a loop-dependent unit row or column is written by one
+//!   kernel from its device index. An integer carry is sized by a range closed over every
+//!   iteration, and a Euclidean remainder by a positive constant has the exact range `[0,
+//!   divisor)`.
+//! - **Spilled families.** A nested wave loop's matrix family that its root lane exports flattened
+//!   and also reads member by member is written to a private scratch artifact as well, at the
+//!   enclosing lane occurrence's block, and its readers (including sequential loops in later loops
+//!   of the lane) import the members back, so the lane holds no member arena.
 //! - **Scalar kernels.** Hash integer families share the hash-sample primitive and match the CPU
 //!   transcript. Monomial products multiply each evaluation slot by the matching twiddle, with no
 //!   NTT of their own. Integer matrix-vector products use one warp per row (`M v`) or chunked
 //!   atomics per column (`v^T M`) and accumulate exactly in `int64`.
+//! - **Invariant digits.** A decomposition used only as small right operands inside loops expands
+//!   and transforms once before the loop; its consumers use ordinary products.
 //! - **Lanes on several devices.** The lanes of an outermost wave loop are spread over the devices:
 //!   lane `l` runs on device `l mod G`. Shared inputs are copied once per loop to each remote
 //!   device, zipped members are copied into the lane inside the template, and a remote lane's
@@ -44,14 +57,14 @@ use crate::{
         ImportDestination, ImportTemplate, IndexedMatrixTableReplay, PhysicalLoweringContext,
         all_predecessors, allocate_compact_value, allocate_deferred_compact_value,
         allocate_scratch_matrix, column_block_view, copy_compact_block_home, copy_matrix_view,
-        device_column_blocks, emit_matrix_operation, full_coeff_value, full_eval_value,
-        hash_tag_resource, lower_centered_rebase_node, lower_crt_recompose_node,
+        device_column_blocks, emit_expand_compact, emit_matrix_operation, full_coeff_value,
+        full_eval_value, hash_tag_resource, lower_centered_rebase_node, lower_crt_recompose_node,
         lower_gadget_trapdoor_node, lower_hash_sample_node, lower_matrix_node,
         lower_preimage_sample_node, lower_rns_conversion_node, lower_sample_matrix_node,
         lower_static_matrix_node, lower_trapdoor_sample_node, matrix_columns_on_device,
-        pack_trapdoor_leaves, physical_matrix, predecessors_for, push_hash_sample,
-        record_node_operations, register_bindings, register_preimage_control_binding,
-        replicate_to_device, root_matrix_operation_identity, trapdoor_leaf_types, value_id,
+        pack_trapdoor_leaves, predecessors_for, push_hash_sample, record_node_operations,
+        register_bindings, register_preimage_control_binding, replicate_to_device,
+        root_matrix_operation_identity, trapdoor_leaf_types, value_id,
     },
     gpu_subgraph_kernel::GpuKernelOperandKind,
     poly::{
@@ -70,7 +83,7 @@ use mxx_ir_core::{
     artifact::{ArtifactType, ManifestArtifact, ProductionId},
     concretize_wire_type,
     graph::{FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
-    node::{ConcatAxis, LoopInputMode, MatrixBinaryOp, NodeKind},
+    node::{ConcatAxis, ConstantMatrix, LoopInputMode, NodeKind},
     types::{
         CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef,
         WireType,
@@ -87,7 +100,9 @@ use std::{
 /// Typed owners for native control and integer status nodes. The frame retains
 /// these across sequential executions; erased physical bindings are never
 /// downcast. Direct integer operations share one first-wins status word per
-/// frame, so concurrent branches can only publish the first error.
+/// frame, so concurrent branches can only publish the first error. Static loop
+/// limits remain host-owned at every nesting depth for planner probes; a
+/// nested body resets only its index before each invocation.
 pub(super) enum ControlReset {
     Loop {
         index: Arc<GpuSignedValues>,
@@ -279,6 +294,67 @@ pub(crate) struct GpuValueView {
     pub binding: Option<BorrowedWaveOutput>,
 }
 
+/// Reachable parent positions without materializing one entry per logical lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ParentOccurrences {
+    Explicit(Vec<u128>),
+    Strided { start: u128, end: u128, step: usize },
+}
+
+impl ParentOccurrences {
+    pub(crate) fn len(&self) -> u128 {
+        match self {
+            Self::Explicit(values) => values.len() as u128,
+            Self::Strided { start, end, step } => {
+                end.saturating_sub(*start).div_ceil(*step as u128)
+            }
+        }
+    }
+
+    pub(crate) fn contains(&self, value: u128) -> bool {
+        match self {
+            Self::Explicit(values) => values.binary_search(&value).is_ok(),
+            Self::Strided { start, end, step } => {
+                value >= *start && value < *end && (value - start) % *step as u128 == 0
+            }
+        }
+    }
+
+    pub(crate) fn normalize(&mut self) -> Result<(), String> {
+        match self {
+            Self::Explicit(values) => {
+                values.sort_unstable();
+                if values.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err("GPU wave variant has duplicate parent occurrences".into());
+                }
+            }
+            Self::Strided { start, end, step } if *step == 0 || *start > *end => {
+                return Err("GPU wave variant has invalid parent occurrence range".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn valid_for_lane(&self, count: u128, width: usize, lane: usize) -> bool {
+        if width == 0 || lane >= width {
+            return false;
+        }
+        match self {
+            Self::Explicit(values) => {
+                values.iter().all(|&value| value < count && value % width as u128 == lane as u128)
+            }
+            Self::Strided { start, end, step } => {
+                *step > 0 &&
+                    start <= end &&
+                    *end <= count &&
+                    start % width as u128 == lane as u128 &&
+                    *step % width == 0
+            }
+        }
+    }
+}
+
 /// One bounded replay of the same W-lane Graph. Each computed member
 /// has a distinct owner, even when the Graph reuses its
 /// physical value identifier. Read-only forwarded members retain their inputs.
@@ -289,7 +365,7 @@ pub(crate) struct PhysicalWave {
     /// on replay and is not part of this stable Graph identity.
     pub parent_template: Option<(GpuLoopSiteKey, usize)>,
     /// Actual parent occurrences served by this finite shape/count variant.
-    pub active_parent_occurrences: Vec<usize>,
+    pub active_parent_occurrences: ParentOccurrences,
     /// Global flat operation interval for one wave replay, end exclusive.
     pub body_start: u32,
     pub body_end: u32,
@@ -302,15 +378,21 @@ pub(crate) struct PhysicalWave {
     pub produced_family_members: Vec<(PhysicalValueId, usize, PhysicalValueId)>,
     pub nested_owner_bindings: Vec<(usize, PhysicalValueId, Arc<GpuResidentValue>)>,
     /// First logical loop occurrence represented by this Graph replay.
-    pub start_index: usize,
+    pub start_index: u128,
     pub active_lanes: usize,
+    /// Identical streamed waves represented by this template; resident waves use one.
+    pub repetitions: u128,
+    /// Flattened member stride for each streamed export template.
+    pub streamed_export_strides: BTreeMap<usize, u128>,
     /// Upload these plan-owned device occurrence scalars at each wave boundary.
-    pub export_occurrences: Vec<(Arc<GpuSignedValues>, u64)>,
+    pub export_occurrences: Vec<(Arc<GpuSignedValues>, u128)>,
     pub import_template_indices: Vec<usize>,
+    /// Zip/Gather templates whose member positions advance with a repeated wave.
+    pub indexed_imports: BTreeSet<usize>,
     /// Reached-only selected templates when a child template is reused for
     /// several actual parent occurrences. No payloads are read during plan.
-    pub invocation_imports: BTreeMap<usize, Vec<usize>>,
-    pub family_members: BTreeMap<String, Vec<(usize, PhysicalValueId)>>,
+    pub invocation_imports: BTreeMap<u128, Vec<usize>>,
+    pub family_members: BTreeMap<String, Vec<(u128, PhysicalValueId)>>,
     /// Export templates of this wave's streamed members, which the runtime
     /// writes once the wave has joined, before the next wave reuses their
     /// slots.
@@ -335,52 +417,91 @@ pub(super) struct ExternalIoImport {
     pub destination: PhysicalValueId,
     pub upload_owner: ImportDestination,
     pub selector: PhysicalValueId,
+    /// A private carry whose key is resolved at its host load boundary.
+    pub carry: Option<crate::gpu_streamed_carry::StreamedFamily>,
+}
+
+/// A selected artifact read in a host-driven loop whose member the host
+/// computes from the loop index: `member` at loop index slot `slot` under
+/// `env`. The executor reads iteration `k + 1`'s member into `staging`, an
+/// owner with the destination's layout, while iteration `k` runs, and copies
+/// it into `template.destination` before iteration `k + 1`; the Graph
+/// publishes no selector and its bound addresses never change.
+pub(super) struct AheadImport {
+    pub template: ImportTemplate,
+    pub slot: u32,
+    pub member: IntExpr,
+    pub env: ParamEnv,
+    pub staging: Arc<GpuResidentValue>,
 }
 
 /// A finite one-iteration Graph body replayed around selected artifact loads.
 /// The body writes results back into stable carried owners with explicit
 /// device-copy operations; no host arithmetic or per-iteration allocation is
 /// required. `body_end` is exclusive.
+///
+/// Host-driven loops nest: a body may contain the whole body of another,
+/// whose host-selected members may depend on this loop's index `index_slot`.
 pub(super) struct ExternalIoLoop {
     pub body_start: u32,
     pub body_end: u32,
     pub count: u64,
+    pub index_slot: u32,
     pub index_owner: Arc<GpuSignedValues>,
     pub carried_ids: Vec<PhysicalValueId>,
     pub carry_copy_ops: Vec<u32>,
     pub imports: Vec<ExternalIoImport>,
+    pub ahead: Vec<AheadImport>,
+    /// Matrix-family carries whose exports must join before the next iteration.
+    pub streamed_carries: Vec<crate::gpu_streamed_carry::StreamedCarry>,
 }
 
 fn allocate_wave_occurrence(
     ctx: &mut PhysicalLoweringContext<'_>,
-    initial: u64,
-    maximum: u64,
+    initial: u128,
+    maximum: u128,
 ) -> Result<(PhysicalValueId, Arc<GpuSignedValues>), String> {
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
+    if initial > maximum {
+        return Err("GPU wave occurrence exceeds its declared range".into());
+    }
+    // Keep the compact native scalar for small loops. Wide logical families
+    // use the existing signed-word GPU arithmetic, including their high word.
     let native = Arc::new(
-        GpuSignedValues::from_canonical_u64(&params, ctx.device, &[initial])
-            .map_err(|error| error.to_string())?,
+        if maximum <= u64::MAX as u128 {
+            GpuSignedValues::from_canonical_u64(&params, ctx.device, &[initial as u64])
+        } else {
+            GpuSignedValues::from_bigints_with_words(
+                &params,
+                ctx.device,
+                &[BigInt::from(initial)],
+                2,
+            )
+        }
+        .map_err(|error| error.to_string())?,
     );
+    let encoding = native.encoding();
+    let element_bytes = encoding.words_per_value() * std::mem::size_of::<u64>();
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU wave scalars".to_owned())?,
     );
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::Int,
-        encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)]),
+        encodings: Box::new([PhysicalEncoding::Signed(encoding)]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0, 0]),
-                extent: Box::new([1, 1]),
-                byte_strides: Box::new([8, 8]),
+                extent: Box::new([1, encoding.words_per_value() as u64]),
+                byte_strides: Box::new([element_bytes as u64, 8]),
                 element_bytes: 8,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::from([(0, BigInt::from(0)..=BigInt::from(maximum))]),
-    };
+    });
     let owner = GpuResidentValue::new(
         Arc::new(physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_signed_values(Arc::clone(&native))?)]),
@@ -394,6 +515,9 @@ fn allocate_wave_occurrence(
 }
 
 struct ArtifactZipLane {
+    /// Imported in a window of its wave body ([`ImportTemplate::window_start`]), without a
+    /// read-ahead twin.
+    windowed: bool,
     argument: usize,
     name: String,
     production: ProductionId,
@@ -407,6 +531,12 @@ struct ArtifactZipLane {
     /// A `Gather` lane's resident index family and its Zip offset: the lane
     /// of the wave starting at `w` reads member `indices[w + lane + offset]`.
     gather: Option<(PhysicalValueId, usize)>,
+    /// Broadcast runtime base, added to the wave and lane index.
+    base: Option<PhysicalValueId>,
+    /// Mapped publication of the runtime base, shared by every lane.
+    base_slot: Option<usize>,
+    /// Private sequential carry whose generation changes with its host iteration.
+    carry: Option<crate::gpu_streamed_carry::StreamedFamily>,
     /// The second owner odd waves read into, so each wave's members are read
     /// while the previous wave runs.
     twin: Option<(ImportDestination, Arc<GpuResidentValue>)>,
@@ -417,17 +547,31 @@ fn selected_import_capacity(
     ty: &ConcreteWireType,
     production: &ProductionId,
     name: &str,
-    indexes: impl IntoIterator<Item = usize>,
+    indexes: impl IntoIterator<Item = u128>,
 ) -> Result<Option<usize>, String> {
     if !matches!(ty, ConcreteWireType::Int | ConcreteWireType::TypedBlob { .. }) {
         return Ok(None);
+    }
+    let mut indexes = indexes.into_iter().peekable();
+    if indexes.peek().is_none() {
+        return Err("GPU selected artifact has no possible member".into());
+    }
+    if let Some(size) = ctx.artifact_payload_sizes.get(&ArtifactKey {
+        production: production.clone(),
+        name: name.to_owned(),
+        index: None,
+    }) {
+        if *size == 0 {
+            return Err("GPU selected artifact has no payload capacity".into());
+        }
+        return Ok(Some(*size));
     }
     let mut maximum = None;
     for index in indexes {
         let key = ArtifactKey {
             production: production.clone(),
             name: name.to_owned(),
-            index: Some(index),
+            index: Some(index as u128),
         };
         let size = *ctx.artifact_payload_sizes.get(&key).ok_or_else(|| {
             format!("GPU selected artifact {name}[{index}] needs plan_with_store payload size")
@@ -441,6 +585,14 @@ fn selected_import_capacity(
 }
 
 impl ControlReset {
+    /// The stable status allocation used to associate this control with its compiled regions.
+    pub(super) fn status_address(&self) -> (i32, u64) {
+        let status = match self {
+            Self::Loop { status, .. } | Self::IntegerStatus(status) => status,
+        };
+        (status.physical_device(), status.device_address())
+    }
+
     /// The caller must first join the previous GPU launch and its I/O writes.
     /// Graphs read these words from other streams without waiting, so the
     /// uploads complete before this returns.
@@ -501,23 +653,23 @@ pub(super) fn allocate_loop_control(
     let status =
         Arc::new(GpuExportStatus::new(&params, device).map_err(|error| error.to_string())?);
     let integer = |slot: StorageRef, owner: Arc<GpuSignedValues>, range| {
-        let physical = PhysicalValue {
+        let physical = PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty: ConcreteWireType::Int,
             encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)]),
             parts: Box::new([PhysicalPart {
                 leaf: 0,
                 storage: slot,
                 device,
-                view: PhysicalView {
+                view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 0,
                     origin: Box::new([0, 0]),
                     extent: Box::new([1, 1]),
                     byte_strides: Box::new([8, 8]),
                     element_bytes: 8,
-                },
+                }),
             }]),
             integer_ranges: BTreeMap::from([(0, range)]),
-        };
+        });
         let bound = BoundStorage::from_signed_values(owner)?;
         let resident = GpuResidentValue::new(
             Arc::new(physical.clone()),
@@ -531,23 +683,23 @@ pub(super) fn allocate_loop_control(
         integer(storage[0], Arc::clone(&index), BigInt::from(0)..=BigInt::from(count))?;
     let limit_value =
         integer(storage[1], Arc::clone(&limit), BigInt::from(count)..=BigInt::from(count))?;
-    let status_value = PhysicalValue {
+    let status_value = PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::Bytes { length: 4 },
         encodings: Box::new([PhysicalEncoding::Bytes]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage: storage[2],
             device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0]),
                 extent: Box::new([4]),
                 byte_strides: Box::new([1]),
                 element_bytes: 1,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::new(),
-    };
+    });
     let status_resident = GpuResidentValue::new(
         Arc::new(status_value.clone()),
         BTreeMap::from([(storage[2], BoundStorage::from_export_status(Arc::clone(&status))?)]),
@@ -560,14 +712,23 @@ pub(super) fn allocate_loop_control(
     ))
 }
 
-/// Resolve the maximum iteration count against the actual enclosing bindings.
-/// No sample input value or validator's index-zero child environment is used.
+/// Checks a symbolic cardinality before constructing concrete GPU storage or member indices.
+pub(super) fn host_family_count(count: u128) -> Result<usize, String> {
+    usize::try_from(count)
+        .map_err(|_| format!("GPU family cardinality {count} exceeds host addressability"))
+}
+
+/// Resolve the logical iteration count against the actual enclosing bindings.
+/// Streamed parallel families use the IR's full 128-bit cardinality. Native
+/// sequential controls and resident storage must check their narrower limits at
+/// their respective allocation boundaries. No sample input value or validator's
+/// index-zero child environment is used.
 pub(super) fn finite_loop_count(
     scope: &FrozenGraphScopeId,
     node: NodeId,
     kind: &NodeKind,
     env: &ParamEnv,
-) -> Result<u64, String> {
+) -> Result<u128, String> {
     let (count, minimum) = match kind {
         NodeKind::ParallelLoop(spec) => (&spec.count, spec.minimum_count),
         NodeKind::SequentialLoop(spec) => (&spec.count, 0),
@@ -576,10 +737,10 @@ pub(super) fn finite_loop_count(
     let value = count
         .evaluate(env)
         .map_err(|error| format!("{scope:?} node {node:?} loop count: {error}"))?;
-    let count = value.to_u64().ok_or_else(|| {
-        format!("{scope:?} node {node:?} loop count is negative or exceeds native u64")
+    let count = value.to_u128().ok_or_else(|| {
+        format!("{scope:?} node {node:?} loop count {value} is negative or exceeds u128")
     })?;
-    if count < minimum as u64 {
+    if count < minimum as u128 {
         return Err(format!("{scope:?} node {node:?} loop count is below its minimum"));
     }
     Ok(count)
@@ -590,17 +751,15 @@ pub(super) fn finite_loop_count(
 pub(super) fn parallel_wave_geometry(
     plan: &FrozenGpuPlan,
     key: GpuLoopSiteKey,
-    count: u64,
+    count: u128,
 ) -> Result<(usize, usize), String> {
     let choices = plan.loops.iter().filter(|choice| choice.key == key).collect::<Vec<_>>();
     let [choice] = choices.as_slice() else {
         return Err(format!("GPU loop site {key:?} has no unique frozen choice"));
     };
-    let count = usize::try_from(count)
-        .map_err(|_| format!("GPU loop site {key:?} count exceeds host address space"))?;
     if choice.loop_count != count ||
         choice.wave_instances == 0 ||
-        choice.tail_instances != count % choice.wave_instances
+        choice.tail_instances as u128 != count % choice.wave_instances as u128
     {
         return Err(format!(
             "GPU loop site {key:?} frozen wave geometry differs from actual bindings"
@@ -629,7 +788,29 @@ pub(super) fn wave_family_member(
     source: &GpuResidentValue,
     index: usize,
 ) -> Result<Arc<GpuResidentValue>, String> {
-    let (selected, bindings) = wave_member_layout(source.physical(), index)?;
+    wave_selected_member(source, static_family_physical(source.physical(), index)?)
+}
+
+/// The members `indices` of a resident family rebased as in [`wave_family_member`], selected in
+/// one pass over the family's parts (a loop over every member of a family stored as one part per
+/// member would otherwise scan every part for every member).
+pub(super) fn wave_family_members(
+    source: &GpuResidentValue,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<Arc<GpuResidentValue>>, String> {
+    static_family_physicals(source.physical(), indices)?
+        .into_iter()
+        .map(|selected| wave_selected_member(source, selected))
+        .collect()
+}
+
+/// Rebase the member `selected` of `source` (a static selection of it) as in
+/// [`wave_family_member`].
+fn wave_selected_member(
+    source: &GpuResidentValue,
+    selected: PhysicalValue,
+) -> Result<Arc<GpuResidentValue>, String> {
+    let (selected, bindings) = wave_member_layout(selected)?;
     let mut storage = BTreeMap::new();
     for (old_slot, slot, offset) in bindings {
         let mut bound = source
@@ -659,10 +840,8 @@ pub(super) fn wave_family_member(
 }
 
 fn wave_member_layout(
-    family: &PhysicalValue,
-    index: usize,
+    mut selected: PhysicalValue,
 ) -> Result<(PhysicalValue, Vec<(StorageRef, StorageRef, u64)>), String> {
-    let mut selected = static_family_physical(family, index)?;
     let mut bindings = Vec::with_capacity(selected.parts.len());
     for (part_index, part) in selected.parts.iter_mut().enumerate() {
         let slot = StorageRef::Input(
@@ -723,7 +902,7 @@ pub(super) fn pack_resident_family(
     let ConcreteWireType::IndexedFamily { element, count } = &expected else {
         return Err("GPU packed input is not an indexed family".into());
     };
-    if *count != members.len() {
+    if *count != members.len() as u128 {
         return Err("GPU packed family needs every declared resident member".into());
     }
     if *count == 0 {
@@ -738,8 +917,14 @@ pub(super) fn pack_resident_family(
                     PhysicalEncoding::CompactCoeffPerCrtLimb { magnitude_bytes: 1 }
                 }
             }]),
-            ConcreteWireType::Trapdoor { .. } => {
-                vec![PhysicalEncoding::FullEval; 6].into_boxed_slice()
+            trapdoor @ ConcreteWireType::Trapdoor { .. } => {
+                let mut encodings =
+                    vec![PhysicalEncoding::FullEval; trapdoor_leaf_types(trapdoor)?.len()];
+                if crate::gpu_physical_lowering::trapdoor_precomputation_bytes(trapdoor)?.is_some()
+                {
+                    encodings.push(PhysicalEncoding::Bytes);
+                }
+                encodings.into_boxed_slice()
             }
             ConcreteWireType::Int | ConcreteWireType::ConstantInt => {
                 Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedI64)])
@@ -754,16 +939,16 @@ pub(super) fn pack_resident_family(
             ConcreteWireType::TypedBlob { .. } => {
                 Box::new([PhysicalEncoding::TypedBlobLengthPrefixed])
             }
-            ConcreteWireType::IndexedFamily { .. } => {
+            ConcreteWireType::IndexedFamily { .. } | ConcreteWireType::DependentFamily { .. } => {
                 return Err("GPU nested indexed family has no valid element type".into());
             }
         };
-        let physical = PhysicalValue {
+        let physical = PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty: expected,
             encodings,
             parts: Box::new([]),
             integer_ranges: BTreeMap::new(),
-        };
+        });
         return GpuResidentValue::new(Arc::new(physical), BTreeMap::new(), Box::new([]))
             .map(Arc::new)
             .map_err(str::to_owned);
@@ -827,20 +1012,56 @@ pub(super) fn pack_resident_family(
             parts.push(part);
         }
     }
-    let physical = PhysicalValue {
+    let physical = PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
         ty: expected,
         encodings: encodings.expect("nonempty GPU family has an encoding"),
         parts: parts.into_boxed_slice(),
         integer_ranges: integer_ranges.unwrap_or_default(),
-    };
+    });
     GpuResidentValue::new(Arc::new(physical), storage, ready.into_boxed_slice())
         .map(Arc::new)
         .map_err(str::to_owned)
 }
 
-/// Lower a non-matrix semantic node using only physical owners and direct
-/// Graph operations. Unsupported semantics return a preparation error; no
-/// legacy capture, host execution, or eager artifact-family load is invoked.
+/// Lower one member read of a private carry into an on-demand, iteration-resolved import.
+fn lower_streamed_member(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    family: crate::gpu_streamed_carry::StreamedFamily,
+    selector: PhysicalValueId,
+    output: WireRef,
+    expected: ConcreteWireType,
+) -> Result<(), String> {
+    let request_operation = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU streamed carry operations")?;
+    let request_slot = crate::gpu_physical_lowering::emit_import_request(ctx, selector)?;
+    let key = crate::gpu_streamed_carry::scratch_key(&family.carry.name);
+    let (destination, graph_value, upload_owner, before_operation) =
+        crate::gpu_physical_lowering::allocate_typed_import_destination(
+            ctx, &expected, &key, None,
+        )?;
+    ctx.external_io_imports.push(ExternalIoImport {
+        before_operation,
+        request_operation,
+        request_slot,
+        key,
+        descriptor: ManifestArtifact {
+            artifact_type: family.carry.element.clone(),
+            availability: family.carry.availability,
+            family_count: Some(family.carry.count as u128),
+            layout: family.carry.layout.clone(),
+        },
+        expected_type: family.carry.element.clone(),
+        staged: true,
+        destination,
+        upload_owner,
+        selector,
+        carry: Some(family),
+    });
+    ctx.wire_ids.insert(output, graph_value);
+    Ok(())
+}
+
+/// Lower semantic control with explicit rejection of whole-family streamed consumers.
 pub(super) fn lower_control_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -853,8 +1074,27 @@ pub(super) fn lower_control_node(
         .scope(scope_id)
         .ok_or_else(|| format!("GPU control scope {scope_id:?} is missing"))?;
     let output = WireRef { node: node_id, port: Port(0) };
+    let streamed_argument = scope.arguments(node).is_some_and(|arguments| {
+        arguments.iter().any(|wire| {
+            ctx.wire_ids.get(wire).is_some_and(|id| ctx.streaming.families.contains_key(id))
+        })
+    });
+    if streamed_argument &&
+        !matches!(
+            node.kind(),
+            NodeKind::FamilyGetStatic { .. } |
+                NodeKind::FamilyGetDynamic |
+                NodeKind::ParallelLoop(_) |
+                NodeKind::SequentialLoop(_)
+        )
+    {
+        return Err("GPU streamed carry does not support a whole-family consumer".into());
+    }
     match node.kind() {
         NodeKind::Concat { axis } => lower_concat(ctx, scope, scope_id, node_id, node, env, *axis),
+        NodeKind::BlockDiagonal { .. } => {
+            lower_concat(ctx, scope, scope_id, node_id, node, env, ConcatAxis::Diagonal)
+        }
         NodeKind::ModulusReduce { .. } => {
             lower_modulus_reduce(ctx, scope, scope_id, node_id, node, env)
         }
@@ -908,7 +1148,7 @@ pub(super) fn lower_control_node(
                 coefficient_bits,
             )
         }
-        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, family } => {
             lower_threshold_decode(
                 ctx,
                 scope,
@@ -919,6 +1159,7 @@ pub(super) fn lower_control_node(
                 plaintext_modulus,
                 length,
                 *output_bool,
+                *family,
             )
         }
         NodeKind::PolynomialFromValues { evaluation, .. } => {
@@ -971,6 +1212,23 @@ pub(super) fn lower_control_node(
             env,
             GpuImplementation::matrix_transpose(),
         ),
+        NodeKind::Tensor
+            if ctx.streaming.placed_tensors.contains_key(&(scope_id.clone(), node_id)) =>
+        {
+            // A placed member of a summed output: the lane returns its entry and the column the
+            // running sum adds it to (`lower_parallel_loop`), with no placed row.
+            let column = ctx.streaming.placed_tensors[&(scope_id.clone(), node_id)].clone();
+            let entry = *scope
+                .arguments(node)
+                .and_then(|arguments| arguments.get(1).copied())
+                .and_then(|entry| ctx.wire_ids.get(&entry))
+                .ok_or("GPU placed member has no entry")?;
+            let entry = full_eval_value(ctx, entry)?;
+            let column = lower_device_int_expr(ctx, &column, env)?;
+            ctx.streaming.placed_columns.insert((scope_id.clone(), output), column);
+            ctx.wire_ids.insert(output, entry);
+            Ok(())
+        }
         NodeKind::Tensor => lower_matrix_geometry(
             ctx,
             scope,
@@ -1174,6 +1432,7 @@ pub(super) fn lower_control_node(
                     let index = u32::try_from(ctx.operations.len() - 1)
                         .map_err(|_| "too many GPU integer operations".to_owned())?;
                     ctx.producer.insert(remainder, vec![(ColumnRange { start: 0, end: 1 }, index)]);
+                    refine_nonnegative_division_ranges(ctx, quotient, remainder, &a, &b)?;
                     let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
                     if ty != ConcreteWireType::Int {
                         return Err("GPU integer division output has the wrong type".into());
@@ -1284,8 +1543,10 @@ pub(super) fn lower_control_node(
                     members.push(Arc::clone(owner));
                     member_producers.push(all_predecessors(ctx.producer, id));
                 }
-                let family_type =
-                    ConcreteWireType::IndexedFamily { element: Box::new(selected_type), count };
+                let family_type = ConcreteWireType::IndexedFamily {
+                    element: Box::new(selected_type),
+                    count: count as u128,
+                };
                 let family_owner = pack_resident_family(family_type, &members, ctx.device)?;
                 let family = value_id(ctx.values.len())?;
                 ctx.values.push(family_owner.physical().as_ref().clone());
@@ -1350,9 +1611,6 @@ pub(super) fn lower_control_node(
             Ok(())
         }
         NodeKind::BitExtract { bit } => {
-            if bit.contains_loop_index() {
-                return Err("GPU bit extraction position needs a device scalar expression".into());
-            }
             let arguments = scope
                 .arguments(node)
                 .ok_or_else(|| "GPU bit extraction arguments are outside their scope".to_owned())?;
@@ -1364,37 +1622,28 @@ pub(super) fn lower_control_node(
                 .get(wire)
                 .ok_or_else(|| "GPU bit extraction has no physical input".to_owned())?;
             integer_range(ctx, source)?;
-            let bit = bit
-                .evaluate(env)
-                .map_err(|error| error.to_string())?
-                .to_u64()
-                .ok_or_else(|| "GPU bit position is negative or exceeds u64".to_owned())?;
-            let magnitude_words = match ctx.values[source.0 as usize].encodings.first() {
-                Some(PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedWords(words))) => {
-                    *words
-                }
-                Some(PhysicalEncoding::Signed(
-                    GpuSignedValuesEncoding::SignedI64 | GpuSignedValuesEncoding::CanonicalU64,
-                )) => 1,
-                _ => return Err("GPU bit extraction input has no signed encoding".into()),
-            };
-            let maximum_bit = u64::try_from(magnitude_words)
-                .ok()
-                .and_then(|words| words.checked_mul(64))
-                .ok_or_else(|| "GPU integer bit width overflows".to_owned())?;
-            if bit >= maximum_bit {
-                return Err("GPU bit extraction exceeds proven finite-width candidate".into());
-            }
             let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
             let result = allocate_integer_value(ctx, ty, BigInt::from(0)..=BigInt::from(1), None)?;
+            // Dynamic positions are device operands, not a family of all possible
+            // bit candidates. The native operation sign-extends beyond storage.
+            let (position, argument) = if bit.contains_loop_index() {
+                (Some(lower_device_int_expr(ctx, bit, env)?), 0)
+            } else {
+                let position = bit
+                    .evaluate(env)
+                    .map_err(|error| error.to_string())?
+                    .to_u64()
+                    .ok_or("GPU bit position is negative or exceeds u64")?;
+                (None, position)
+            };
             emit_integer_operation(
                 ctx,
                 GpuIntegerOperation::BitExtract,
                 result,
                 source,
+                position,
                 None,
-                None,
-                bit,
+                argument,
             )?;
             ctx.wire_ids.insert(output, result);
             Ok(())
@@ -1411,6 +1660,21 @@ pub(super) fn lower_control_node(
                 .get(index_wire)
                 .ok_or_else(|| "GPU dynamic family index has no physical value".to_owned())?;
             integer_range(ctx, index)?;
+            if let Some((_, hashes)) =
+                crate::gpu_physical_lowering::selected_hash_family(graph, scope_id, node_id)
+            {
+                let expected = resolved_node_output_type(scope_id, node_id, node, env)?;
+                return crate::gpu_physical_lowering::lower_selected_hash(
+                    ctx, graph, scope_id, output, &hashes, index, expected, env,
+                );
+            }
+
+            if let Some(family) =
+                ctx.wire_ids.get(family_wire).and_then(|id| ctx.streaming.families.get(id)).cloned()
+            {
+                let expected = resolved_node_output_type(scope_id, node_id, node, env)?;
+                return lower_streamed_member(ctx, family, index, output, expected);
+            }
             if !ctx.wire_ids.contains_key(family_wire) {
                 let source = scope
                     .node(family_wire.node)
@@ -1454,6 +1718,85 @@ pub(super) fn lower_control_node(
                     name: artifact.artifact_name.clone(),
                     index: None,
                 };
+                // A member index that only the indices of the enclosing
+                // host-driven loops determine, and that selects a member in
+                // every iteration of them, is computed by the host, which
+                // reads it one iteration of the innermost loop ahead. Any
+                // other index, including one that fails in some iteration, is
+                // computed by the Graph.
+                let host_selected =
+                    match (scope.node(index_wire.node).map(NodeHandle::kind), &ctx.ahead_imports) {
+                        (Some(NodeKind::EvaluateInt(member)), Some((slot, iterations, _))) => {
+                            let loops = match &ctx.host_loops {
+                                Some(loops) if loops.last() == Some(&(*slot, *iterations)) => {
+                                    loops.clone()
+                                }
+                                _ => vec![(*slot, *iterations)],
+                            };
+                            let mut env = ParamEnv { loop_indices: BTreeMap::new(), ..env.clone() };
+                            let mut indices = vec![0u64; loops.len()];
+                            let mut selects = loops.iter().all(|(_, count)| *count > 0);
+                            while selects {
+                                for ((loop_slot, _), index) in loops.iter().zip(&indices) {
+                                    env.loop_indices.insert(*loop_slot, BigInt::from(*index));
+                                }
+                                selects = member
+                                    .evaluate(&env)
+                                    .ok()
+                                    .and_then(|index| index.to_u128())
+                                    .is_some_and(|index| index < count);
+                                // The next index tuple, innermost fastest.
+                                let Some(position) = (0..loops.len())
+                                    .rev()
+                                    .find(|&position| indices[position] + 1 < loops[position].1)
+                                else {
+                                    break;
+                                };
+                                indices[position] += 1;
+                                indices[position + 1..].fill(0);
+                            }
+                            env.loop_indices.clear();
+                            selects.then(|| (*slot, member.clone(), env))
+                        }
+                        _ => None,
+                    };
+                if let Some((slot, member, member_env)) = host_selected {
+                    let (destination, graph_value, upload_owner, before_operation) =
+                        crate::gpu_physical_lowering::allocate_typed_import_destination(
+                            ctx, &expected, &key, capacity,
+                        )?;
+                    let (upload_owner, staging) =
+                        crate::gpu_physical_lowering::twin_import_destination(
+                            ctx,
+                            destination,
+                            &upload_owner,
+                        )?
+                        .ok_or("GPU host-selected import has no staging owner")?;
+                    let (_, _, imports) =
+                        ctx.ahead_imports.as_mut().ok_or("GPU host-selected import has no loop")?;
+                    imports.push(AheadImport {
+                        template: ImportTemplate {
+                            window_start: None,
+                            before_operation,
+                            key,
+                            descriptor,
+                            expected_type,
+                            staged: false,
+                            destination,
+                            upload_owner,
+                            member: None,
+                            read_ahead: true,
+                            carry: None,
+                            base: None,
+                        },
+                        slot,
+                        member,
+                        env: member_env,
+                        staging,
+                    });
+                    ctx.wire_ids.insert(output, graph_value);
+                    return Ok(());
+                }
                 let request_operation = u32::try_from(ctx.operations.len())
                     .map_err(|_| "too many GPU operations".to_owned())?;
                 let request_slot = crate::gpu_physical_lowering::emit_import_request(ctx, index)?;
@@ -1487,6 +1830,7 @@ pub(super) fn lower_control_node(
                     destination,
                     upload_owner,
                     selector: index,
+                    carry: None,
                 });
                 ctx.wire_ids.insert(output, graph_value);
                 return Ok(());
@@ -1501,12 +1845,26 @@ pub(super) fn lower_control_node(
             };
             if matches!(element.as_ref(), ConcreteWireType::Matrix(_)) {
                 return lower_dynamic_matrix_member(
-                    ctx, scope_id, node_id, node, env, family, index, *count,
+                    ctx,
+                    scope_id,
+                    node_id,
+                    node,
+                    env,
+                    family,
+                    index,
+                    host_family_count(*count)?,
                 );
             }
             if matches!(element.as_ref(), ConcreteWireType::Trapdoor { .. }) {
                 return lower_dynamic_trapdoor_member(
-                    ctx, scope_id, node_id, node, env, family, index, *count,
+                    ctx,
+                    scope_id,
+                    node_id,
+                    node,
+                    env,
+                    family,
+                    index,
+                    host_family_count(*count)?,
                 );
             }
             if !matches!(element.as_ref(), ConcreteWireType::Int) || physical.parts.len() != 1 {
@@ -1549,7 +1907,7 @@ pub(super) fn lower_control_node(
             let index = index
                 .evaluate(env)
                 .map_err(|error| format!("GPU static family index: {error}"))?
-                .to_usize()
+                .to_u128()
                 .ok_or_else(|| "GPU static family index is negative or too large".to_owned())?;
             let declared = node
                 .output_types()
@@ -1557,6 +1915,15 @@ pub(super) fn lower_control_node(
                 .ok_or_else(|| "GPU static family selection has no output".to_owned())?;
             let expected = concretize_wire_type(declared, env, scope_id, node_id)
                 .map_err(|error| error.to_string())?;
+            if let Some(family) =
+                ctx.wire_ids.get(family).and_then(|id| ctx.streaming.families.get(id)).cloned()
+            {
+                if index >= family.carry.count {
+                    return Err("GPU streamed carry member is outside its family".into());
+                }
+                let selector = lower_device_int_expr(ctx, &IntExpr::constant(index), env)?;
+                return lower_streamed_member(ctx, family, selector, output, expected);
+            }
             if !ctx.wire_ids.contains_key(family) {
                 let source = scope
                     .node(family.node)
@@ -1585,7 +1952,7 @@ pub(super) fn lower_control_node(
                     return Err("GPU static artifact source is not an indexed family".into());
                 };
                 if descriptor.family_count != Some(count) ||
-                    index >= count ||
+                    index as u128 >= count ||
                     element.as_ref() != &expected
                 {
                     return Err(
@@ -1597,13 +1964,14 @@ pub(super) fn lower_control_node(
                 let key = ArtifactKey {
                     production: artifact.production_id.clone(),
                     name: artifact.artifact_name.clone(),
-                    index: Some(index),
+                    index: Some(index as u128),
                 };
                 let (destination, graph_value, upload_owner, before_operation) =
                     crate::gpu_physical_lowering::allocate_typed_import_destination(
                         ctx, &expected, &key, None,
                     )?;
                 ctx.import_templates.push(ImportTemplate {
+                    window_start: None,
                     before_operation,
                     key,
                     descriptor,
@@ -1613,6 +1981,8 @@ pub(super) fn lower_control_node(
                     upload_owner,
                     member: None,
                     read_ahead: false,
+                    carry: None,
+                    base: None,
                 });
                 ctx.wire_ids.insert(output, graph_value);
                 return Ok(());
@@ -1625,6 +1995,8 @@ pub(super) fn lower_control_node(
                 .owners
                 .get(&source_id)
                 .ok_or_else(|| "GPU static family source has no resident owner".to_owned())?;
+            let index =
+                usize::try_from(index).map_err(|_| "GPU resident family index exceeds usize")?;
             let selected = static_family_member(owner, index)?;
             if selected.wire_type() != &expected ||
                 selected.physical().parts.iter().any(|part| part.device != ctx.device)
@@ -1676,7 +2048,7 @@ pub(super) fn lower_control_node(
             else {
                 return Err("GPU family pack output is not a family".into());
             };
-            if *expected_count != count {
+            if *expected_count != count as u128 {
                 return Err("GPU family pack count differs from its declared type".into());
             }
             if element.as_ref() == &ConcreteWireType::Int {
@@ -1796,6 +2168,7 @@ pub(super) fn lower_control_node(
                         &ty,
                         encoding.clone(),
                         StorageRef::Input(0),
+                        Some(&mut ctx.owners.metadata),
                     )?;
                     if layout(physical) == layout(&scratch) {
                         continue;
@@ -1829,9 +2202,15 @@ pub(super) fn lower_control_node(
                 producers.extend(writers.iter().copied());
                 member_producers.push(writers);
             }
+            let trapdoor_leaves = match &expected {
+                ConcreteWireType::IndexedFamily { element, .. } => {
+                    trapdoor_leaf_types(element.as_ref()).ok().map(|leaves| leaves.len())
+                }
+                _ => None,
+            };
             let resident = pack_resident_family(expected, &members, ctx.device)?;
-            let secret_family =
-                paired_public_matrix.is_some() && resident.physical().encodings.len() == 6;
+            let secret_family = paired_public_matrix.is_some() &&
+                trapdoor_leaves == Some(resident.physical().encodings.len());
             let id = value_id(ctx.values.len())?;
             ctx.values.push(resident.physical().as_ref().clone());
             ctx.owners.insert(id, resident);
@@ -1860,8 +2239,10 @@ pub(super) fn lower_control_node(
                     let writers = ctx.producer.get(&public).cloned().unwrap_or_default();
                     public_producers.extend(writers.iter().copied());
                 }
-                let public_family_type =
-                    ConcreteWireType::IndexedFamily { element: Box::new(public_type), count };
+                let public_family_type = ConcreteWireType::IndexedFamily {
+                    element: Box::new(public_type),
+                    count: count as u128,
+                };
                 let public_owner =
                     pack_resident_family(public_family_type, &public_members, ctx.device)?;
                 let public_family = value_id(ctx.values.len())?;
@@ -1894,6 +2275,28 @@ pub(super) fn lower_control_node(
             )?;
             Ok(())
         }
+        NodeKind::Sha256BitColumns { seed, rows, columns, index_bits } => {
+            let (packed, counts) =
+                mxx_ir_core::hash_columns::sha256_bit_columns(seed, *rows, *columns, *index_bits);
+            for (port, constants) in [packed, counts].iter().enumerate() {
+                let ty = ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count: *columns as u128,
+                };
+                let maximum =
+                    constants.iter().max().cloned().ok_or("empty SHA-256 column family")?;
+                let id = allocate_integer_family_value_with_storage(
+                    ctx,
+                    ty,
+                    BigInt::from(0)..=maximum,
+                    false,
+                    false,
+                    Some(constants),
+                )?;
+                ctx.wire_ids.insert(WireRef { node: node_id, port: Port(port as u32) }, id);
+            }
+            Ok(())
+        }
         NodeKind::HashIntFamily { .. } => {
             lower_hash_int_family(ctx, scope, scope_id, node_id, node, env)
         }
@@ -1904,7 +2307,19 @@ pub(super) fn lower_control_node(
             lower_int_matrix_vector_product(ctx, scope, scope_id, node_id, node, env, *transpose)
         }
         NodeKind::ParallelLoop(loop_node) => {
-            lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
+            // A parallel loop in a device body replays its lanes in that body:
+            // none of them is the top level of a host-driven loop body.
+            let host_loops = ctx.host_loops.take();
+            let host_body_top = std::mem::replace(&mut ctx.host_body_top, false);
+            let device_body = ctx.device_body;
+            if host_body_top {
+                ctx.device_body = false;
+            }
+            let lowered = lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env);
+            ctx.device_body = device_body;
+            ctx.host_body_top = host_body_top;
+            ctx.host_loops = host_loops;
+            lowered
         }
         NodeKind::SequentialLoop(loop_node) => {
             lower_sequential_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
@@ -1982,6 +2397,39 @@ fn lower_hash_int_family(
 /// Conservative finite transfer shared by direct integer dispatch and loop
 /// carry reservation. Division and remainder include all signed operands; the
 /// native status reports an actual zero divisor at execution.
+/// Keep the native quotient/remainder widths, but record tighter semantic bounds
+/// when a nonnegative numerator is divided by a positive constant. This exposes
+/// singleton group indices without changing the division or its status checks.
+fn refine_nonnegative_division_ranges(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    quotient: PhysicalValueId,
+    remainder: PhysicalValueId,
+    numerator: &RangeInclusive<BigInt>,
+    denominator: &RangeInclusive<BigInt>,
+) -> Result<(), String> {
+    if numerator.start().is_negative() ||
+        !denominator.start().is_positive() ||
+        denominator.start() != denominator.end()
+    {
+        return Ok(());
+    }
+    let divisor = denominator.start();
+    let quotient_range = (numerator.start() / divisor)..=(numerator.end() / divisor);
+    let remainder_range = BigInt::from(0)..=(divisor - 1u8).min(numerator.end().clone());
+    for (id, range) in [(quotient, quotient_range), (remainder, remainder_range)] {
+        let physical = &mut ctx.values[id.0 as usize];
+        physical.integer_ranges.insert(0, range);
+        let owner = ctx
+            .owners
+            .get(&id)
+            .ok_or("GPU division result has no owner")?
+            .with_physical_view(Arc::new(physical.clone()))
+            .map_err(str::to_owned)?;
+        ctx.owners.insert(id, Arc::new(owner));
+    }
+    Ok(())
+}
+
 fn integer_binary_output_range(
     operation: mxx_ir_core::node::IntBinaryOp,
     a: &RangeInclusive<BigInt>,
@@ -2038,7 +2486,11 @@ fn lane_type<'c>(
 ) -> &'c ConcreteWireType {
     let ty = &ctx.values[id.0 as usize].ty;
     match ty {
-        ConcreteWireType::IndexedFamily { element, count } if ctx.lanes == Some(*count) => element,
+        ConcreteWireType::IndexedFamily { element, count }
+            if ctx.lanes.map(|lanes| lanes as u128) == Some(*count) =>
+        {
+            element
+        }
         _ => ty,
     }
 }
@@ -2216,9 +2668,12 @@ fn lower_device_int_expr_mode(
                 .ok_or_else(|| "GPU device divisor has no finite bounds".to_owned())?;
             // The same SignedWords width is required for both native outputs.
             // An actual zero divisor reports status; a conservative interval
-            // crossing zero must not reject a valid runtime binding.
+            // crossing zero must not reject a valid runtime binding. An
+            // operand in another encoding (a CanonicalU64 loop index) is
+            // widened below to the width its range needs.
             let magnitude = (numerator_magnitude + BigInt::from(1)).max(divisor_magnitude);
-            let words = signed_words(ctx, lhs)?.max(signed_words(ctx, rhs)?).max(
+            let operand_words = |id| signed_words(ctx, id).unwrap_or(1);
+            let words = operand_words(lhs).max(operand_words(rhs)).max(
                 usize::try_from(magnitude.bits().div_ceil(64))
                     .map_err(|_| "GPU division width exceeds host address space".to_owned())?
                     .max(1),
@@ -2237,6 +2692,7 @@ fn lower_device_int_expr_mode(
             let operation = u32::try_from(ctx.operations.len() - 1)
                 .map_err(|_| "too many GPU scalar division operations".to_owned())?;
             ctx.producer.insert(remainder, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
+            refine_nonnegative_division_ranges(ctx, quotient, remainder, &numerator, &denominator)?;
             Ok(if matches!(expression, IntExpr::Rem(_, _)) { remainder } else { quotient })
         }
         IntExpr::Log2Ceil(value) => {
@@ -2386,7 +2842,7 @@ fn lower_device_int_expr_mode(
                 ctx,
                 ConcreteWireType::IndexedFamily {
                     element: Box::new(ConcreteWireType::Int),
-                    count: basis.len(),
+                    count: basis.len() as u128,
                 },
                 range.clone(),
             )?;
@@ -2538,13 +2994,21 @@ fn lower_lazy_int_expr_select(
                 lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
+                active_parallel_occurrences: ctx.active_parallel_occurrences.clone(),
                 device_body: true,
+                host_body_top: false,
+                streaming: &mut *ctx.streaming,
+                host_loops: None,
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
                 waves: ctx.waves,
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                ahead_imports: ctx
+                    .ahead_imports
+                    .as_mut()
+                    .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
                 slots: ctx.slots,
                 export_templates: ctx.export_templates,
                 fused_nodes: ctx.fused_nodes,
@@ -2553,6 +3017,8 @@ fn lower_lazy_int_expr_select(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                static_constants: &mut *ctx.static_constants,
+                identity_small_rhs: ctx.identity_small_rhs,
                 subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
@@ -2604,13 +3070,21 @@ fn lower_lazy_int_expr_select(
                 lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
+                active_parallel_occurrences: ctx.active_parallel_occurrences.clone(),
                 device_body: true,
+                host_body_top: false,
+                streaming: &mut *ctx.streaming,
+                host_loops: None,
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
                 waves: ctx.waves,
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                ahead_imports: ctx
+                    .ahead_imports
+                    .as_mut()
+                    .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
                 slots: ctx.slots,
                 export_templates: ctx.export_templates,
                 fused_nodes: ctx.fused_nodes,
@@ -2619,6 +3093,8 @@ fn lower_lazy_int_expr_select(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                static_constants: &mut *ctx.static_constants,
+                identity_small_rhs: ctx.identity_small_rhs,
                 subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
@@ -2677,7 +3153,7 @@ fn lower_lazy_int_expr_select(
             block: [1; 3],
             shared_bytes: 0,
             predecessors: predecessors.into_boxed_slice(),
-            body: Some(operations.into_boxed_slice()),
+            body: Some(operations.into()),
         });
         ctx.producer
             .entry(result)
@@ -2717,10 +3193,10 @@ fn allocate_integer_table(
     let slot =
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU scalar storages".to_owned())?;
     let storage = StorageRef::Scratch(slot);
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::IndexedFamily {
             element: Box::new(ConcreteWireType::Int),
-            count: values.len(),
+            count: values.len() as u128,
         },
         encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedWords(
             words,
@@ -2729,16 +3205,16 @@ fn allocate_integer_table(
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0, 0, 0]),
                 extent: Box::new([values.len() as u64, 1, word_count as u64]),
                 byte_strides: Box::new([word_count as u64 * 8, word_count as u64 * 8, 8]),
                 element_bytes: 8,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::from([(0, lower.clone()..=upper.clone())]),
-    };
+    });
     let resident = GpuResidentValue::new(
         Arc::new(physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_signed_values(owner)?)]),
@@ -2836,14 +3312,11 @@ fn allocate_integer_value_with_storage(
         origin.insert(0, 0);
         extent.insert(0, lanes);
         byte_strides.insert(0, byte_strides[0]);
-        ConcreteWireType::IndexedFamily {
-            element: Box::new(ty),
-            count: usize::try_from(lanes).map_err(|_| "GPU lane count exceeds usize")?,
-        }
+        ConcreteWireType::IndexedFamily { element: Box::new(ty), count: u128::from(lanes) }
     } else {
         ty
     };
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty,
         encodings: Box::new([if boolean {
             PhysicalEncoding::BoolI64
@@ -2854,16 +3327,16 @@ fn allocate_integer_value_with_storage(
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: origin.into(),
                 extent: extent.into(),
                 byte_strides: byte_strides.into(),
                 element_bytes: 8,
-            },
+            }),
         }]),
         integer_ranges: if boolean { BTreeMap::new() } else { BTreeMap::from([(0, range)]) },
-    };
+    });
     let resident = GpuResidentValue::new(
         Arc::new(physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_signed_values(owner)?)]),
@@ -2916,7 +3389,7 @@ fn allocate_integer_family_value_with_storage(
     if canonical && (range.start().is_negative() || range.end().bits() > 64) {
         return Err("GPU canonical integer family range is outside u64".into());
     }
-    let count = *count;
+    let count = host_family_count(*count)?;
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
     let words = usize::try_from(range.start().bits().max(range.end().bits()).div_ceil(64))
         .map_err(|_| "GPU family integer width exceeds usize".to_owned())?
@@ -2946,23 +3419,23 @@ fn allocate_integer_family_value_with_storage(
     let slot =
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU family storages".to_owned())?;
     let storage = if returned { StorageRef::Output(slot) } else { StorageRef::Scratch(slot) };
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty,
         encodings: Box::new([PhysicalEncoding::Signed(encoding)]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0, 0, 0]),
                 extent: Box::new([count as u64, 1, element_words as u64]),
                 byte_strides: Box::new([stride, stride, 8]),
                 element_bytes: 8,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::from([(0, range)]),
-    };
+    });
     let resident = GpuResidentValue::new(
         Arc::new(physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_signed_values(owner)?)]),
@@ -3012,7 +3485,7 @@ fn lower_dynamic_matrix_member(
     else {
         return Err("GPU dynamic matrix source is not an indexed family".into());
     };
-    if count == 0 || *source_count != count || element.as_ref() != &expected {
+    if count == 0 || *source_count != count as u128 || element.as_ref() != &expected {
         return Err("GPU dynamic matrix family differs from its output type".into());
     }
     let [encoding @ (PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval)] =
@@ -3021,10 +3494,18 @@ fn lower_dynamic_matrix_member(
         return Err("GPU dynamic matrix family needs one full-CRT encoding".into());
     };
     let encoding = encoding.clone();
+    let key = (ctx.owners.lowered_body, family);
+    if let Some(choice) = ctx.owners.indexed_choices.get(&key).cloned() {
+        let output = emit_shared_indexed_matrix_choice(ctx, ty, encoding, index, &choice)?;
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+        return Ok(());
+    }
     let source = Arc::clone(source);
     let mut candidates = Vec::with_capacity(count);
-    for member_index in 0..count {
-        let selected = static_family_member(&source, member_index)?;
+    let members = static_family_physicals(source.physical(), 0..count)?;
+    for (member_index, member) in members.into_iter().enumerate() {
+        let selected =
+            source.with_physical_view(Arc::new(member)).map(Arc::new).map_err(str::to_owned)?;
         if selected.wire_type() != &expected ||
             selected.physical().encodings.as_ref() != [encoding.clone()]
         {
@@ -3041,9 +3522,33 @@ fn lower_dynamic_matrix_member(
         ctx.producer.insert(id, writers);
         candidates.push(id);
     }
-    let output = emit_indexed_matrix_choice(ctx, ty, encoding, index, &candidates)?;
+    let (output, choice) = emit_family_matrix_choice(ctx, ty, encoding, index, &candidates)?;
+    if let Some(choice) = choice {
+        ctx.owners.indexed_choices.insert(key, choice);
+    }
     ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
     Ok(())
+}
+
+/// Select a member of a family whose candidates and descriptor table an earlier read of the
+/// same body built: one output, one status and one device-indexed copy.
+fn emit_shared_indexed_matrix_choice(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    encoding: PhysicalEncoding,
+    index: PhysicalValueId,
+    choice: &crate::gpu_physical_lowering::IndexedFamilyChoice,
+) -> Result<PhysicalValueId, String> {
+    let range = integer_range(ctx, index)?;
+    if range.start() == range.end() {
+        let selected = range.start().to_usize().and_then(|member| choice.candidates.get(member));
+        return selected.copied().ok_or_else(|| "GPU constant family index is out of range".into());
+    }
+    let mut predecessors = all_predecessors(ctx.producer, index)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    predecessors.extend(choice.predecessors.iter().copied());
+    emit_indexed_matrix_copy(ctx, ty, encoding, index, choice.resource_id, predecessors)
 }
 
 fn emit_indexed_matrix_choice(
@@ -3053,15 +3558,25 @@ fn emit_indexed_matrix_choice(
     index: PhysicalValueId,
     candidates: &[PhysicalValueId],
 ) -> Result<PhysicalValueId, String> {
+    emit_family_matrix_choice(ctx, ty, encoding, index, candidates).map(|(output, _)| output)
+}
+
+/// Select `candidates[index]` with one device-indexed copy, returning the output and, unless the
+/// index is a proven constant, the choice later reads of the same family may share.
+fn emit_family_matrix_choice(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    encoding: PhysicalEncoding,
+    index: PhysicalValueId,
+    candidates: &[PhysicalValueId],
+) -> Result<(PhysicalValueId, Option<crate::gpu_physical_lowering::IndexedFamilyChoice>), String> {
     if candidates.is_empty() ||
         !matches!(encoding, PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval)
     {
         return Err("GPU indexed matrix choice has no full-CRT candidates".into());
     }
     integer_range(ctx, index)?;
-    let mut predecessors = all_predecessors(ctx.producer, index)
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut candidate_predecessors = std::collections::BTreeSet::new();
     for &candidate in candidates {
         let physical = ctx
             .values
@@ -3072,14 +3587,24 @@ fn emit_indexed_matrix_choice(
         {
             return Err("GPU indexed matrix candidate differs in ring, shape, or encoding".into());
         }
-        predecessors.extend(all_predecessors(ctx.producer, candidate));
+        candidate_predecessors.extend(all_predecessors(ctx.producer, candidate));
+    }
+    let range = integer_range(ctx, index)?;
+    if range.start() == range.end() {
+        // A proven singleton index selects an existing owner. In particular, a
+        // grouped loop with only one group need not copy a large trapdoor leaf.
+        let selected = range.start().to_usize().and_then(|member| candidates.get(member));
+        return selected
+            .copied()
+            .map(|selected| (selected, None))
+            .ok_or_else(|| "GPU constant family index is out of range".into());
     }
     let output = allocate_scratch_matrix(ctx, ty, encoding.clone())?;
-    let status = allocate_integer_status(ctx)?;
     let output_owner = ctx
         .owners
         .get(&output)
         .ok_or_else(|| "GPU dynamic matrix output owner is missing".to_owned())?;
+    // The table describes the candidates; the destination only fixes its shape and basis.
     let raw_destination = physical_raw_matrix_view(output_owner, 0, encoding.clone())
         .map_err(|error| error.to_string())?;
     let params = ctx.backend.physical_matrix_parameters(ty, ctx.device)?;
@@ -3093,9 +3618,44 @@ fn emit_indexed_matrix_choice(
     ctx.indexed_tables.push(IndexedMatrixTableReplay {
         resource_id,
         candidates: candidates.iter().copied().map(|id| (id, 0)).collect(),
-        encoding,
+        encoding: encoding.clone(),
         table,
     });
+    let choice = crate::gpu_physical_lowering::IndexedFamilyChoice {
+        candidates: candidates.to_vec(),
+        resource_id,
+        predecessors: candidate_predecessors.iter().copied().collect(),
+    };
+    let mut predecessors = all_predecessors(ctx.producer, index)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    predecessors.extend(candidate_predecessors);
+    let output = emit_indexed_matrix_copy_into(ctx, ty, index, resource_id, predecessors, output)?;
+    Ok((output, Some(choice)))
+}
+
+/// One device-indexed copy of a member of table `resource_id` into a new scratch matrix.
+fn emit_indexed_matrix_copy(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    encoding: PhysicalEncoding,
+    index: PhysicalValueId,
+    resource_id: u32,
+    predecessors: std::collections::BTreeSet<u32>,
+) -> Result<PhysicalValueId, String> {
+    let output = allocate_scratch_matrix(ctx, ty, encoding)?;
+    emit_indexed_matrix_copy_into(ctx, ty, index, resource_id, predecessors, output)
+}
+
+fn emit_indexed_matrix_copy_into(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    index: PhysicalValueId,
+    resource_id: u32,
+    predecessors: std::collections::BTreeSet<u32>,
+    output: PhysicalValueId,
+) -> Result<PhysicalValueId, String> {
+    let status = allocate_integer_status(ctx)?;
     let index_binding = scalar_binding(ctx, index)?;
     let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
     let status_binding = scalar_binding(ctx, status)?;
@@ -3220,8 +3780,9 @@ fn lower_subgraph_kernel(
                         "subgraph kernel {name} operand {position} needs evaluation-domain members"
                     ));
                 }
-                let mut members = Vec::with_capacity(*count);
-                for member_index in 0..*count {
+                let count = host_family_count(*count)?;
+                let mut members = Vec::with_capacity(count);
+                for member_index in 0..count {
                     let selected = static_family_member(&source, member_index)?;
                     let member = value_id(ctx.values.len())?;
                     ctx.values.push(selected.physical().as_ref().clone());
@@ -3360,12 +3921,12 @@ fn trapdoor_member_leaf(
     if parts.len() != ty.ring.crt_depth() {
         return Err("GPU selected trapdoor leaf has the wrong ordered CRT basis".into());
     }
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::Matrix(ty.clone()),
         encodings: Box::new([PhysicalEncoding::FullEval]),
         parts: parts.into_boxed_slice(),
         integer_ranges: BTreeMap::new(),
-    };
+    });
     let owner = GpuResidentValue::new(
         Arc::new(physical.clone()),
         storage,
@@ -3402,26 +3963,70 @@ fn lower_dynamic_trapdoor_member(
     else {
         return Err("GPU dynamic trapdoor source is not a family".into());
     };
-    if count == 0 || *source_count != count || element.as_ref() != &expected {
+    if count == 0 || *source_count != count as u128 || element.as_ref() != &expected {
         return Err("GPU dynamic trapdoor family differs from its declared type".into());
     }
     let public_gadget =
         family_owner.physical().encodings.as_ref() == [PhysicalEncoding::PublicGadgetEval];
-    let full_secret = family_owner.physical().encodings.as_ref() ==
-        [
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-        ];
-    if !public_gadget && !full_secret {
+    let full_secret = trapdoor_leaf_types(&expected).is_ok_and(|leaves| {
+        family_owner.physical().encodings.len() == leaves.len() &&
+            family_owner
+                .physical()
+                .encodings
+                .iter()
+                .all(|encoding| *encoding == PhysicalEncoding::FullEval)
+    });
+    let compact_secret = matches!(&expected, ConcreteWireType::Trapdoor { instantiation, .. }
+        if instantiation.is_computational()) &&
+        matches!(
+            family_owner.physical().encodings.first(),
+            Some(PhysicalEncoding::CompactCoeff { magnitude_bytes: 8 })
+        );
+    if !public_gadget && !full_secret && !compact_secret {
         return Err("GPU dynamic trapdoor family has an unknown physical provenance".into());
     }
     let family_owner = Arc::clone(family_owner);
+    // A singleton selection retains the compact owner instead of expanding
+    // a secret that may stay captured across unrelated decoder loops.
+    let range = integer_range(ctx, index)?;
+    if compact_secret && range.start() == range.end() {
+        let member_index = range
+            .start()
+            .to_usize()
+            .filter(|value| *value < count)
+            .ok_or("GPU compact trapdoor index is out of range")?;
+        let selected = static_family_member(&family_owner, member_index)?;
+        let id = value_id(ctx.values.len())?;
+        ctx.values.push(selected.physical().as_ref().clone());
+        ctx.owners.insert(id, selected);
+        let writers = ctx
+            .family_member_producers
+            .get(&(family, member_index))
+            .cloned()
+            .unwrap_or_else(|| ctx.producer.get(&family).cloned().unwrap_or_default());
+        ctx.producer.insert(id, writers);
+        let public_family = *ctx
+            .trapdoor_public_ids
+            .get(&family)
+            .ok_or("GPU compact trapdoor family has no paired public family")?;
+        let owner = ctx.owners.get(&public_family).ok_or("GPU public family owner is missing")?;
+        let selected_public = static_family_member(owner, member_index)?;
+        let public = value_id(ctx.values.len())?;
+        ctx.values.push(selected_public.physical().as_ref().clone());
+        ctx.owners.insert(public, selected_public);
+        let writers = ctx
+            .family_member_producers
+            .get(&(public_family, member_index))
+            .cloned()
+            .unwrap_or_else(|| ctx.producer.get(&public_family).cloned().unwrap_or_default());
+        ctx.producer.insert(public, writers);
+        ctx.trapdoor_public_ids.insert(id, public);
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, id);
+        return Ok(());
+    }
     let leaf_types = trapdoor_leaf_types(&expected)?;
-    let mut candidates = vec![Vec::with_capacity(count); if public_gadget { 1 } else { 6 }];
+    let mut candidates =
+        vec![Vec::with_capacity(count); if public_gadget { 1 } else { leaf_types.len() }];
     for member_index in 0..count {
         let selected = static_family_member(&family_owner, member_index)?;
         let writers = ctx
@@ -3429,10 +4034,25 @@ fn lower_dynamic_trapdoor_member(
             .get(&(family, member_index))
             .cloned()
             .unwrap_or_else(|| ctx.producer.get(&family).cloned().unwrap_or_default());
+        let (selected, writers) = if compact_secret {
+            let id = value_id(ctx.values.len())?;
+            ctx.values.push(selected.physical().as_ref().clone());
+            ctx.owners.insert(id, selected);
+            ctx.producer.insert(id, writers);
+            let expanded = crate::gpu_physical_lowering::expand_computational_trapdoor(ctx, id)?;
+            (
+                Arc::clone(
+                    ctx.owners.get(&expanded).ok_or("GPU expanded secret owner is missing")?,
+                ),
+                ctx.producer.get(&expanded).cloned().unwrap_or_default(),
+            )
+        } else {
+            (selected, writers)
+        };
         if public_gadget {
             candidates[0].push(trapdoor_member_leaf(ctx, &selected, &leaf_types[5], 5, &writers)?);
         } else {
-            for leaf in 0..6 {
+            for leaf in 0..leaf_types.len() {
                 candidates[leaf].push(trapdoor_member_leaf(
                     ctx,
                     &selected,
@@ -3471,20 +4091,47 @@ fn lower_dynamic_trapdoor_member(
         ctx.wire_ids.insert(output_wire, result);
         return Ok(());
     }
-    let leaf_ids = (0..6)
-        .map(|leaf| {
-            emit_indexed_matrix_choice(
+    // Computational R/E are the two halves of leaf 5. Select that allocation once;
+    // selecting all six leaves separately would undo the family's shared storage.
+    let mut leaf_ids = Vec::with_capacity(leaf_types.len());
+    if matches!(&expected, ConcreteWireType::Trapdoor { instantiation, .. }
+        if instantiation.is_computational())
+    {
+        let re = emit_indexed_matrix_choice(
+            ctx,
+            &leaf_types[5],
+            PhysicalEncoding::FullEval,
+            index,
+            &candidates[5],
+        )?;
+        leaf_ids.push(crate::gpu_physical_lowering::matrix_row_slice(ctx, re, 0, matrix.rows)?);
+        leaf_ids.push(crate::gpu_physical_lowering::matrix_row_slice(
+            ctx,
+            re,
+            matrix.rows,
+            matrix.rows,
+        )?);
+        for leaf in 2..5 {
+            leaf_ids.push(emit_indexed_matrix_choice(
                 ctx,
                 &leaf_types[leaf],
                 PhysicalEncoding::FullEval,
                 index,
                 &candidates[leaf],
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let leaf_ids: [PhysicalValueId; 6] = leaf_ids
-        .try_into()
-        .map_err(|_| "GPU selected trapdoor has the wrong leaf count".to_owned())?;
+            )?);
+        }
+        leaf_ids.push(re);
+    } else {
+        for leaf in 0..leaf_types.len() {
+            leaf_ids.push(emit_indexed_matrix_choice(
+                ctx,
+                &leaf_types[leaf],
+                PhysicalEncoding::FullEval,
+                index,
+                &candidates[leaf],
+            )?);
+        }
+    }
     let result = pack_trapdoor_leaves(ctx, expected, leaf_ids, PhysicalEncoding::FullEval)?;
     let public_family = *ctx
         .trapdoor_public_ids
@@ -3536,23 +4183,23 @@ fn allocate_integer_status(
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU status storages".to_owned())?,
     );
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::Bytes { length: 4 },
         encodings: Box::new([PhysicalEncoding::Bytes]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0]),
                 extent: Box::new([4]),
                 byte_strides: Box::new([1]),
                 element_bytes: 1,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::new(),
-    };
+    });
     let owner = Arc::new(
         GpuResidentValue::new(
             Arc::new(physical.clone()),
@@ -3643,23 +4290,23 @@ pub(super) fn allocate_real_value(
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU real storages".to_owned())?,
     );
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty,
         encodings: Box::new([PhysicalEncoding::RealF64]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0]),
                 extent: Box::new([1]),
                 byte_strides: Box::new([8]),
                 element_bytes: 8,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::new(),
-    };
+    });
     let owner = GpuResidentValue::new(
         Arc::new(physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_device_real(Arc::clone(&native))?)]),
@@ -3887,9 +4534,27 @@ fn lower_matrix_mul_small_rhs(
     let [left_wire, right_wire] = arguments.as_slice() else {
         return Err("GPU small-RHS multiply needs two inputs".into());
     };
+    let output_wire = WireRef { node: node_id, port: Port(0) };
+    if ctx.identity_small_rhs.expands(scope_id, output_wire) {
+        let right = ctx.wire_ids[right_wire];
+        let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+        let output =
+            allocate_scratch_matrix(ctx, ty.matrix_type().unwrap(), PhysicalEncoding::FullCoeff)?;
+        emit_expand_compact(ctx, right, output)?;
+        ctx.wire_ids.insert(output_wire, output);
+        return Ok(());
+    }
     let left = *ctx.wire_ids.get(left_wire).ok_or("GPU small-RHS left input is missing")?;
     let left = full_eval_value(ctx, left)?;
     let right = *ctx.wire_ids.get(right_wire).ok_or("GPU small-RHS right input is missing")?;
+    if ctx.values[right.0 as usize].encodings.as_ref() == [PhysicalEncoding::FullEval] {
+        let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+        let output =
+            allocate_scratch_matrix(ctx, ty.matrix_type().unwrap(), PhysicalEncoding::FullEval)?;
+        emit_matrix_operation(ctx, GpuImplementation::matrix_mul(false), &[left, right], output)?;
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+        return Ok(());
+    }
     let left_value = &ctx.values[left.0 as usize];
     let right_value = &ctx.values[right.0 as usize];
     let ConcreteWireType::Matrix(left_ty) = &left_value.ty else {
@@ -4390,7 +5055,21 @@ fn lower_gadget_decompose(
         }
     }
     ctx.producer.insert(output, producers);
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    let wire = WireRef { node: node_id, port: Port(0) };
+    let output = if crate::gpu_cost_model::hoist_small_rhs(
+        &ctx.validated.source,
+        scope_id,
+        wire,
+        ctx.identity_small_rhs,
+    ) {
+        let coefficient =
+            allocate_scratch_matrix(ctx, &output_matrix, PhysicalEncoding::FullCoeff)?;
+        emit_expand_compact(ctx, output, coefficient)?;
+        full_eval_value(ctx, coefficient)?
+    } else {
+        output
+    };
+    ctx.wire_ids.insert(wire, output);
     Ok(())
 }
 
@@ -4626,6 +5305,7 @@ fn lower_int_matrix_vector_product(
     Ok(())
 }
 
+/// Bind a DSL integer lift to the shared resident polynomial constructor.
 fn lower_lift_integer_constant(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &GraphScope,
@@ -4647,7 +5327,21 @@ fn lower_lift_integer_constant(
     if ty.rows != 1 || ty.columns != 1 {
         return Err("GPU polynomial lift requires a 1x1 matrix".into());
     }
-    let coefficient = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
+    let coefficient = lift_resident_integer(ctx, integer, &ty, false)?;
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
+    Ok(())
+}
+
+/// Lift a resident scalar without freezing a replayed loop index at plan time: into a constant
+/// polynomial, or with `unit` into the unit row or column of `ty` whose entry of that index is
+/// one.
+fn lift_resident_integer(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    integer: PhysicalValueId,
+    ty: &ConcreteMatrixType,
+    unit: bool,
+) -> Result<PhysicalValueId, String> {
+    let coefficient = allocate_scratch_matrix(ctx, ty, PhysicalEncoding::FullCoeff)?;
     let status = allocate_integer_status(ctx)?;
     let integer_binding = scalar_binding(ctx, integer)?;
     let output_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
@@ -4670,6 +5364,7 @@ fn lower_lift_integer_constant(
             KernelArg::U32(integer_binding),
             KernelArg::U32(output_binding),
             KernelArg::U32(status_binding),
+            KernelArg::U32(u32::from(unit)),
         ]),
         outputs: Box::new([coefficient]),
         device: ctx.device,
@@ -4679,9 +5374,198 @@ fn lower_lift_integer_constant(
         predecessors: all_predecessors(ctx.producer, integer),
         body: None,
     });
-    ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
-    Ok(())
+    ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
+    Ok(coefficient)
+}
+
+/// Materialize unit vectors and loop-dependent polynomial constants with resident integer kernels,
+/// and scalar powers with a loop-dependent exponent by an indexed copy
+/// ([`lower_loop_power_of_base`]). Other loop-dependent matrix layouts fail rather than silently
+/// using iteration zero.
+pub(super) fn lower_resident_matrix_constant(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    value: &ConstantMatrix,
+    env: &ParamEnv,
+) -> Result<Option<PhysicalValueId>, String> {
+    let expressions = match value {
+        ConstantMatrix::Zero | ConstantMatrix::Identity => return Ok(None),
+        ConstantMatrix::Polynomial { coefficients } => coefficients.iter().collect::<Vec<_>>(),
+        ConstantMatrix::UnitRow { index } | ConstantMatrix::UnitColumn { index } => vec![index],
+        ConstantMatrix::Gadget { base, .. } => vec![base],
+        ConstantMatrix::PowerOfBase { base, exponent } => vec![base, exponent],
+        ConstantMatrix::Rotation { exponent } => vec![exponent],
+        ConstantMatrix::AllCoefficients { value } => vec![value],
+    };
+    // Unit vectors use one resident integer kernel even for static positions;
+    // uploading a dense constant would retain its full CRT payload for the plan.
+    if let ConstantMatrix::UnitRow { index } | ConstantMatrix::UnitColumn { index } = value {
+        let row = matches!(value, ConstantMatrix::UnitRow { .. });
+        if (row && ty.rows != 1) || (!row && ty.columns != 1) {
+            return Err(format!("GPU loop-dependent unit vector has the wrong shape: {value:?}"));
+        }
+        if !index.contains_loop_index() {
+            let position = index
+                .evaluate(env)
+                .map_err(|error| error.to_string())?
+                .to_usize()
+                .ok_or("GPU static unit-vector index is invalid")?;
+            if position >= if row { ty.columns } else { ty.rows } {
+                return Err("GPU static unit-vector index is out of range".into());
+            }
+        }
+        let device = lower_device_int_expr(ctx, index, env)?;
+        return lift_resident_integer(ctx, device, ty, true).map(Some);
+    }
+    if !expressions.iter().any(|expression| expression.contains_loop_index()) {
+        // A scalar constant polynomial `c` (a single coefficient or a power of a base) is lifted
+        // from its integer where it is read, like a loop-dependent one: a host-driven loop
+        // resolves its index, so uploading it would keep one resident ring-sized constant per
+        // iteration (for example every digit weight) for the whole plan.
+        let scalar = match value {
+            ConstantMatrix::Polynomial { coefficients } if coefficients.len() == 1 => {
+                Some(coefficients[0].evaluate(env).map_err(|error| error.to_string())?)
+            }
+            ConstantMatrix::PowerOfBase { base, exponent } => {
+                let base = base.evaluate(env).map_err(|error| error.to_string())?;
+                let exponent = exponent
+                    .evaluate(env)
+                    .map_err(|error| error.to_string())?
+                    .to_u32()
+                    .ok_or("GPU scalar power exponent exceeds u32")?;
+                Some(base.pow(exponent))
+            }
+            _ => None,
+        };
+        let Some(scalar) = scalar.filter(|_| ty.rows == 1 && ty.columns == 1) else {
+            return Ok(None);
+        };
+        let modulus = ty
+            .ring
+            .crt_moduli()
+            .iter()
+            .fold(BigInt::from(1), |product, prime| product * BigInt::from(*prime));
+        let residue = ((scalar % &modulus) + &modulus) % &modulus;
+        let integer = allocate_integer_value(
+            ctx,
+            ConcreteWireType::Int,
+            residue.clone()..=residue.clone(),
+            Some(&residue),
+        )?;
+        return lift_resident_integer(ctx, integer, ty, false).map(Some);
+    }
+    if ty.rows != 1 || ty.columns != 1 {
+        return Err(format!(
+            "GPU loop-dependent matrix constant requires a scalar polynomial: {value:?} of {} x {}",
+            ty.rows, ty.columns
+        ));
+    }
+    // A scalar power with a loop-dependent exponent: the power of every exponent reached.
+    if let ConstantMatrix::PowerOfBase { base, exponent } = value &&
+        !base.contains_loop_index()
+    {
+        return lower_loop_power_of_base(ctx, ty, base, exponent, env).map(Some);
+    }
+    let degree = usize::try_from(ty.ring.ring_dimension())
+        .map_err(|_| "GPU polynomial ring dimension exceeds usize")?;
+    let broadcast = matches!(value, ConstantMatrix::AllCoefficients { .. });
+    if !broadcast && !matches!(value, ConstantMatrix::Polynomial { .. }) {
+        return Err(format!("GPU loop-dependent matrix constant layout is unsupported: {value:?}"));
+    }
+    if expressions.len() > degree {
+        return Err("GPU loop-dependent polynomial exceeds its ring dimension".into());
+    }
+    let integers = expressions
+        .into_iter()
+        .map(|expression| lower_device_int_expr(ctx, expression, env))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !broadcast && integers.len() == 1 {
+        return lift_resident_integer(ctx, integers[0], ty, false).map(Some);
+    }
+    let mut minimum = BigInt::from(0);
+    let mut maximum = BigInt::from(0);
+    for integer in &integers {
+        let range = integer_range(ctx, *integer)?;
+        minimum = minimum.min(range.start().clone());
+        maximum = maximum.max(range.end().clone());
+    }
+    let coefficients = allocate_integer_family_value_with_storage(
+        ctx,
+        ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: degree as u128,
+        },
+        minimum..=maximum,
+        false,
+        false,
+        Some(&vec![BigInt::from(0); degree]),
+    )?;
+    for index in 0..if broadcast { degree } else { integers.len() } {
+        emit_integer_operation(
+            ctx,
+            GpuIntegerOperation::Pack,
+            coefficients,
+            integers[if broadcast { 0 } else { index }],
+            None,
+            None,
+            u64::try_from(index).map_err(|_| "GPU coefficient index exceeds u64")?,
+        )?;
+    }
+    resident_polynomial_from_values(ctx, coefficients, ty, false).map(Some)
+}
+
+/// The scalar `base^exponent` for a loop-dependent `exponent`: the power of every exponent of its
+/// proven range is a planned scalar constant, and one indexed copy selects the current one, so the
+/// exponent is not frozen at its plan-time value and no power is computed in a machine integer.
+/// The range is an interval bound, so it may include negative exponents no instance reaches; their
+/// candidates are zero.
+fn lower_loop_power_of_base(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    base: &IntExpr,
+    exponent: &IntExpr,
+    env: &ParamEnv,
+) -> Result<PhysicalValueId, String> {
+    let device = lower_device_int_expr(ctx, exponent, env)?;
+    let range = integer_range(ctx, device)?;
+    let (Some(first), Some(last)) = (range.start().to_i64(), range.end().to_i64()) else {
+        return Err(format!("GPU loop-dependent power {exponent:?} has no finite range"));
+    };
+    let index = if first == 0 {
+        device
+    } else {
+        let shifted = IntExpr::Sub(Box::new(exponent.clone()), Box::new(IntExpr::constant(first)));
+        lower_device_int_expr(ctx, &shifted, env)?
+    };
+    // The powers reached are one resident integer table, read by the exponent and lifted where
+    // the power is used: a table of ring-sized constants would keep every power resident for the
+    // whole plan (for example every digit weight).
+    let base = base.evaluate(env).map_err(|error| error.to_string())?;
+    let modulus = ty
+        .ring
+        .crt_moduli()
+        .iter()
+        .fold(BigInt::from(1), |product, prime| product * BigInt::from(*prime));
+    let powers = (first..=last)
+        .map(|reached| match u32::try_from(reached) {
+            Ok(reached) => ((base.pow(reached) % &modulus) + &modulus) % &modulus,
+            Err(_) => BigInt::from(0),
+        })
+        .collect::<Vec<_>>();
+    let table = allocate_integer_table(ctx, &powers)?;
+    let range = powers.iter().min().cloned().unwrap_or_default()..=
+        powers.iter().max().cloned().unwrap_or_default();
+    let power = allocate_integer_value(ctx, ConcreteWireType::Int, range, None)?;
+    emit_integer_operation(
+        ctx,
+        GpuIntegerOperation::Gather,
+        power,
+        table,
+        Some(index),
+        None,
+        u64::try_from(powers.len()).map_err(|_| "GPU power table exceeds u64".to_owned())?,
+    )?;
+    lift_resident_integer(ctx, power, ty, false)
 }
 
 fn polynomial_source_in_domain(
@@ -4730,7 +5614,7 @@ fn lower_polynomial_values(
     let ConcreteWireType::IndexedFamily { element, count } = &expected else {
         return Err("GPU polynomial values output is not a family".into());
     };
-    if element.as_ref() != &ConcreteWireType::Int || *count != ty.ring.ring_dimension() as usize {
+    if element.as_ref() != &ConcreteWireType::Int || *count != ty.ring.ring_dimension() as u128 {
         return Err("GPU polynomial values output has the wrong cardinality".into());
     }
     let bound = ty.ring.modulus() - BigInt::from(1u8);
@@ -4864,7 +5748,7 @@ fn lower_pack_polynomial_coefficients(
     if element.as_ref() != &ConcreteWireType::Bool || *count == 0 {
         return Err("GPU polynomial pack needs a nonempty Boolean family".into());
     }
-    let count = *count;
+    let count = host_family_count(*count)?;
     let ConcreteWireType::Matrix(ty) = resolved_node_output_type(scope_id, node_id, node, env)?
     else {
         return Err("GPU polynomial pack output is not a matrix".into());
@@ -4876,7 +5760,10 @@ fn lower_pack_polynomial_coefficients(
     integer_range(ctx, width)?;
     let packed_bits = allocate_integer_family_value(
         ctx,
-        ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
+        ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: count as u128,
+        },
         BigInt::from(0u8)..=BigInt::from(1u8),
     )?;
     let family_owner =
@@ -4967,6 +5854,7 @@ fn lower_threshold_decode(
     plaintext_modulus: &IntExpr,
     length_expr: &IntExpr,
     output_bool: bool,
+    family: bool,
 ) -> Result<(), String> {
     let arguments = scope.arguments(node).ok_or("GPU threshold input is out of scope")?;
     let [source_wire] = arguments.as_slice() else {
@@ -4985,17 +5873,33 @@ fn lower_threshold_decode(
     let t_range = integer_range(ctx, t)?;
     let length = lower_device_int_expr(ctx, length_expr, env)?;
     integer_range(ctx, length)?;
-    let count = node.output_types().len();
+    let element = if output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
+    // A family decoder returns the decoded family itself; otherwise every
+    // member is its own port.
+    let count = if family {
+        let [declared] = node.output_types() else {
+            return Err("GPU threshold family decode needs one output".into());
+        };
+        match concretize_wire_type(declared, env, scope_id, node_id)
+            .map_err(|error| error.to_string())?
+        {
+            ConcreteWireType::IndexedFamily { element: actual, count } if *actual == element => {
+                host_family_count(count)?
+            }
+            _ => return Err("GPU threshold family has the wrong output type".into()),
+        }
+    } else {
+        for (port, declared) in node.output_types().iter().enumerate() {
+            let actual = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
+            if actual != element {
+                return Err(format!("GPU threshold port {port} has the wrong output type"));
+            }
+        }
+        node.output_types().len()
+    };
     if count == 0 || count > ty.ring.ring_dimension() as usize {
         return Err("GPU threshold decode has an invalid output count".into());
-    }
-    let element = if output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
-    for (port, declared) in node.output_types().iter().enumerate() {
-        let actual = concretize_wire_type(declared, env, scope_id, node_id)
-            .map_err(|error| error.to_string())?;
-        if actual != element {
-            return Err(format!("GPU threshold port {port} has the wrong output type"));
-        }
     }
     let t_magnitude = t_range.start().abs().max(t_range.end().abs());
     let t_words = usize::try_from(t_magnitude.bits().div_ceil(64))
@@ -5018,7 +5922,10 @@ fn lower_threshold_decode(
     let output_range = BigInt::from(0u8)..=t_magnitude.max(BigInt::from(1u8));
     let decoded = allocate_integer_family_value(
         ctx,
-        ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
+        ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: count as u128,
+        },
         output_range,
     )?;
     let status = allocate_integer_status(ctx)?;
@@ -5073,6 +5980,10 @@ fn lower_threshold_decode(
         body: None,
     });
     ctx.producer.insert(decoded, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
+    if family {
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, decoded);
+        return Ok(());
+    }
     let owner =
         Arc::clone(ctx.owners.get(&decoded).ok_or("GPU threshold output owner is missing")?);
     for port in 0..count {
@@ -5129,23 +6040,23 @@ fn allocate_byte_workspace(
     );
     let id = value_id(ctx.values.len())?;
     let storage = StorageRef::Scratch(id.0);
-    let physical = PhysicalValue {
+    let physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty: ConcreteWireType::Bytes { length: bytes },
         encodings: Box::new([PhysicalEncoding::Bytes]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0]),
                 extent: Box::new([u64::try_from(bytes).map_err(|_| "GPU workspace exceeds u64")?]),
                 byte_strides: Box::new([1]),
                 element_bytes: 1,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::new(),
-    };
+    });
     let resident = GpuResidentValue::new(
         Arc::new(physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_signed_values(native)?)]),
@@ -5502,6 +6413,79 @@ fn lower_centered_round_divide(
     Ok(())
 }
 
+/// Add one polynomial to a device-selected column. Carry placement can alias
+/// the output with `sum`; the native kernel then touches only that column.
+pub(super) fn lower_unit_row_add(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    wire: WireRef,
+    sum_wire: WireRef,
+    term_wire: WireRef,
+    column: &IntExpr,
+    env: &ParamEnv,
+) -> Result<(), String> {
+    let sum = full_eval_value(ctx, ctx.wire_ids[&sum_wire])?;
+    let term = full_eval_value(ctx, ctx.wire_ids[&term_wire])?;
+    let column = lower_device_int_expr(ctx, column, env)?;
+    let ty = ctx.values[sum.0 as usize].ty.matrix_type().unwrap().clone();
+    let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
+    emit_column_add(ctx, sum, term, column, output)?;
+    ctx.wire_ids.insert(wire, output);
+    Ok(())
+}
+
+/// `output = sum + term e_column` for a `1 x 1` `term` and a device scalar `column`; `output`
+/// may be `sum` itself, which the native kernel then updates in that column only.
+pub(super) fn emit_column_add(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    sum: PhysicalValueId,
+    term: PhysicalValueId,
+    column: PhysicalValueId,
+    output: PhysicalValueId,
+) -> Result<(), String> {
+    let ty = ctx.values[output.0 as usize].ty.matrix_type().unwrap().clone();
+    let sum_binding = register_bindings(ctx.bindings, ctx.values, sum)?;
+    let term_binding = register_bindings(ctx.bindings, ctx.values, term)?;
+    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    let column_binding = scalar_binding(ctx, column)?;
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::matrix_column_add())
+        .map_err(str::to_owned)?;
+    let operation = ctx.operations.len() as u32;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::Value(sum),
+            KernelArg::U32(0),
+            KernelArg::Value(term),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::Value(column),
+            KernelArg::U32(0),
+            KernelArg::U32(sum_binding),
+            KernelArg::U32(term_binding),
+            KernelArg::U32(output_binding),
+            KernelArg::U32(column_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors: [sum, term, column]
+            .into_iter()
+            .flat_map(|id| all_predecessors(ctx.producer, id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        body: None,
+    });
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
+    Ok(())
+}
+
 /// Copy a validated static matrix window through owner-derived physical views.
 fn lower_matrix_slice(
     ctx: &mut PhysicalLoweringContext<'_>,
@@ -5513,6 +6497,13 @@ fn lower_matrix_slice(
     rows: Option<&mxx_ir_core::node::IndexRange>,
     columns: Option<&mxx_ir_core::node::IndexRange>,
 ) -> Result<(), String> {
+    if crate::gpu_cost_model::unit_row_intermediate(
+        scope,
+        WireRef { node: node_id, port: Port(0) },
+        env,
+    ) {
+        return Ok(());
+    }
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU matrix slice argument is outside its scope".to_owned())?;
@@ -5658,6 +6649,7 @@ fn lower_matrix_slice(
         &output_ty,
         PhysicalEncoding::FullEval,
         storage,
+        Some(&mut ctx.owners.metadata),
     )?;
     let output = value_id(ctx.values.len())?;
     ctx.values.push(physical);
@@ -5814,6 +6806,7 @@ fn lower_dynamic_matrix_slice(
 /// Convert a resident signed integer family to one canonical CRT polynomial.
 /// The native scatter reduces arbitrary signed values modulo each ordered
 /// prime and reports malformed physical integer encodings through status.
+/// Bind an integer-family polynomial import to the shared resident constructor.
 fn lower_polynomial_from_values(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &GraphScope,
@@ -5829,10 +6822,26 @@ fn lower_polynomial_from_values(
     let [family_wire] = arguments.as_slice() else {
         return Err("GPU polynomial import needs one integer family".into());
     };
-    let mut source = *ctx
+    let source = *ctx
         .wire_ids
         .get(family_wire)
         .ok_or_else(|| "GPU polynomial import family has no physical value".to_owned())?;
+    let ConcreteWireType::Matrix(ty) = resolved_node_output_type(scope_id, node_id, node, env)?
+    else {
+        return Err("GPU polynomial import output is not a matrix".into());
+    };
+    let coefficient = resident_polynomial_from_values(ctx, source, &ty, evaluation)?;
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
+    Ok(())
+}
+
+/// Construct a scalar polynomial from a bounded resident family in canonical order.
+fn resident_polynomial_from_values(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    mut source: PhysicalValueId,
+    ty: &ConcreteMatrixType,
+    evaluation: bool,
+) -> Result<PhysicalValueId, String> {
     // The import kernel reads SignedWords; a canonical family is widened.
     if let [PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)] =
         ctx.values[source.0 as usize].encodings.as_ref()
@@ -5851,10 +6860,6 @@ fn lower_polynomial_from_values(
         .values
         .get(source.0 as usize)
         .ok_or_else(|| "GPU polynomial import family metadata is missing".to_owned())?;
-    let ConcreteWireType::Matrix(ty) = resolved_node_output_type(scope_id, node_id, node, env)?
-    else {
-        return Err("GPU polynomial import output is not a matrix".into());
-    };
     if ty.rows != 1 || ty.columns != 1 || ty.ring.ring_dimension() < 2 {
         return Err("GPU polynomial import requires a scalar negacyclic ring".into());
     }
@@ -5862,7 +6867,7 @@ fn lower_polynomial_from_values(
         return Err("GPU polynomial import input is not an integer family".into());
     };
     if element.as_ref() != &ConcreteWireType::Int ||
-        *count != ty.ring.ring_dimension() as usize ||
+        *count != ty.ring.ring_dimension() as u128 ||
         physical.parts.len() != 1 ||
         !matches!(
             physical.encodings.as_ref(),
@@ -5876,7 +6881,7 @@ fn lower_polynomial_from_values(
     // evaluations are stored directly without a transform.
     let encoding =
         if evaluation { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
-    let coefficient = allocate_scratch_matrix(ctx, &ty, encoding)?;
+    let coefficient = allocate_scratch_matrix(ctx, ty, encoding)?;
     let status = allocate_integer_status(ctx)?;
     let source_binding = scalar_binding(ctx, source)?;
     let destination_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
@@ -5909,8 +6914,7 @@ fn lower_polynomial_from_values(
         body: None,
     });
     ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: 1 }, index)]);
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
-    Ok(())
+    Ok(coefficient)
 }
 
 /// Exact CRT tower projection, with no rescaling or host reconstruction.
@@ -5945,6 +6949,9 @@ fn lower_modulus_conversion(
     env: &ParamEnv,
     round_scale: bool,
 ) -> Result<(), String> {
+    if ctx.wire_ids.contains_key(&WireRef { node: node_id, port: Port(0) }) {
+        return Ok(());
+    }
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU modulus reduction argument is outside its scope".to_owned())?;
@@ -6004,6 +7011,7 @@ fn lower_modulus_conversion(
             KernelArg::U32(u32::from(round_scale)),
             KernelArg::U32(source_binding),
             KernelArg::U32(destination_binding),
+            KernelArg::U64List(Box::new([])),
         ]),
         outputs: Box::new([destination_coeff]),
         device: ctx.device,
@@ -6035,6 +7043,15 @@ fn lower_concat(
     let arguments = scope
         .arguments(node)
         .ok_or_else(|| "GPU concat arguments are outside their scope".to_owned())?;
+    let arguments = match node.kind() {
+        NodeKind::BlockDiagonal { count } if arguments.len() == 1 && *count > 0 => {
+            vec![arguments[0]; *count]
+        }
+        NodeKind::BlockDiagonal { .. } => {
+            return Err("GPU block diagonal requires one input and a positive count".into())
+        }
+        _ => arguments,
+    };
     if arguments.is_empty() || node.output_types().len() != 1 {
         return Err("GPU concat requires inputs and one output".into());
     }
@@ -6109,6 +7126,7 @@ fn lower_concat(
         &output_ty,
         PhysicalEncoding::FullEval,
         storage,
+        Some(&mut ctx.owners.metadata),
     )?;
     let output_id = value_id(ctx.values.len())?;
     ctx.values.push(physical);
@@ -6159,8 +7177,13 @@ fn lower_concat(
     if let Some(index) = zero {
         written.push((ColumnRange { start: 0, end: output_ty.columns }, index));
     }
+    // The reads of every wire of the scope, counted once for all pieces.
+    let mut readers = BTreeMap::<WireRef, usize>::new();
+    for argument in scope.nodes().iter().filter_map(|node| scope.arguments(node)).flatten() {
+        *readers.entry(argument).or_default() += 1;
+    }
     for (wire, source, rows, columns) in inputs {
-        let writers = concat_piece_writers(ctx, scope, scope_id, &arguments, wire, source);
+        let writers = concat_piece_writers(ctx, scope_id, (&arguments, &readers), wire, source);
         let owner = Arc::clone(
             ctx.owners
                 .get(&output_id)
@@ -6298,12 +7321,12 @@ fn lower_concat(
 /// piece can be written straight into its output window: elementwise or
 /// product operations of this scope that write only views of the piece's own
 /// unshared scratch allocations, which nothing but this concat reads.
-/// Returns every value viewing the piece's allocations with the writers.
+/// Returns every value viewing the piece's allocations with the writers. `readers` counts the
+/// reads of every wire of the scope.
 fn concat_piece_writers(
     ctx: &PhysicalLoweringContext<'_>,
-    scope: &GraphScope,
     scope_id: &FrozenGraphScopeId,
-    concat_arguments: &[WireRef],
+    (concat_arguments, readers): (&[WireRef], &BTreeMap<WireRef, usize>),
     wire: WireRef,
     source: PhysicalValueId,
 ) -> Option<(Vec<PhysicalValueId>, Vec<(ColumnRange, u32)>)> {
@@ -6315,14 +7338,7 @@ fn concat_piece_writers(
     {
         return None;
     }
-    let readers = scope
-        .nodes()
-        .iter()
-        .filter_map(|node| scope.arguments(node))
-        .flatten()
-        .filter(|argument| *argument == wire)
-        .count();
-    if readers != 1 {
+    if readers.get(&wire) != Some(&1) {
         return None;
     }
     let value = ctx.values.get(source.0 as usize)?;
@@ -6332,19 +7348,15 @@ fn concat_piece_writers(
     if storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_))) {
         return None;
     }
-    let allocations = storages
+    let own = storages
         .iter()
         .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
         .collect::<Vec<_>>();
-    let aliases = ctx
-        .owners
+    let aliases = own
         .iter()
-        .filter(|(_, other)| {
-            other
-                .storages()
-                .any(|(_, bound)| allocations.contains(&Arc::as_ptr(&bound.owner).cast::<()>()))
-        })
-        .map(|(id, _)| *id)
+        .flat_map(|allocation| ctx.owners.viewing(*allocation))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     // Every aliasing value is a view within the piece with its strides; a
     // piece that is itself a view into a larger value (one row of a product)
@@ -6379,6 +7391,7 @@ fn concat_piece_writers(
                 P::MatrixAdd |
                     P::MatrixSub |
                     P::MatrixMul |
+                    P::MatrixColumnBinary |
                     P::MatrixTensor |
                     P::MatrixScale |
                     P::MultiplyMonomial |
@@ -6495,26 +7508,36 @@ fn write_carry_in_place(
     if new.bytes != old.bytes || new.device != old.device {
         return Ok(false);
     }
-    // Every value viewing one allocation.
+    // The owner index includes every view of this allocation and is maintained
+    // on insert, rebind, and rollback. Avoid rescanning all unrelated owners
+    // for each carry in an expanded loop body.
     let viewing = |bound: &BoundStorage| {
-        ctx.owners
-            .iter()
-            .filter(|(_, owner)| {
-                owner.storages().any(|(_, other)| Arc::ptr_eq(&other.owner, &bound.owner))
-            })
-            .map(|(id, _)| *id)
-            .collect::<BTreeSet<_>>()
+        ctx.owners.viewing(Arc::as_ptr(&bound.owner).cast::<()>()).collect::<BTreeSet<_>>()
     };
     let (output_views, carried_views) = (viewing(&new), viewing(&old));
-    fn reads(op: &CompiledGpuOp, values: &BTreeSet<PhysicalValueId>) -> bool {
-        op.arguments.iter().any(|argument| {
-            matches!(argument, KernelArg::Value(id) | KernelArg::OptionalValue(Some(id))
-                if values.contains(id))
-        }) || op.body.iter().flatten().any(|inner| reads(inner, values))
+    fn reads(
+        ctx: &PhysicalLoweringContext<'_>,
+        op: &CompiledGpuOp,
+        values: &BTreeSet<PhysicalValueId>,
+    ) -> Result<bool, String> {
+        // Pointer-table and hash operands also borrow the old carry. Retargeting
+        // its storage must not overwrite them before those indirect readers run.
+        let mut found = false;
+        crate::gpu_graph_memory::visit_operation(
+            ctx.implementations,
+            ctx.indexed_tables,
+            ctx.hash_resources,
+            op,
+            &mut |id, written| found |= !written && values.contains(&id),
+        )?;
+        for inner in op.body.as_deref().into_iter().flatten() {
+            found |= reads(ctx, inner, values)?;
+        }
+        Ok(found)
     }
     fn writes(op: &CompiledGpuOp, values: &BTreeSet<PhysicalValueId>) -> bool {
         op.outputs.iter().any(|id| values.contains(id)) ||
-            op.body.iter().flatten().any(|inner| writes(inner, values))
+            op.body.as_deref().into_iter().flatten().any(|inner| writes(inner, values))
     }
     let mut ancestors = BTreeSet::new();
     let mut pending = ctx.operations[writer].predecessors.to_vec();
@@ -6528,17 +7551,18 @@ fn write_carry_in_place(
             continue;
         }
         if writes(op, &output_views) ||
-            (!ancestors.contains(&(index as u32)) && reads(op, &carried_views))
+            (!ancestors.contains(&(index as u32)) && reads(ctx, op, &carried_views)?)
         {
             return Ok(false);
         }
     }
     let writer_op = &ctx.operations[writer];
-    if reads(writer_op, &carried_views) &&
+    if reads(ctx, writer_op, &carried_views)? &&
         !matches!(
             ctx.implementations.resolve(writer_op.implementation).map(|kind| &kind.primitive),
             Ok(crate::gpu_execution_plan::GpuNativePrimitive::MatrixAdd |
-                crate::gpu_execution_plan::GpuNativePrimitive::MatrixSub)
+                crate::gpu_execution_plan::GpuNativePrimitive::MatrixSub |
+                crate::gpu_execution_plan::GpuNativePrimitive::MatrixColumnAdd)
         )
     {
         return Ok(false);
@@ -6613,23 +7637,16 @@ fn allocate_sequential_carry(
         if planned.encodings.as_ref() != [PhysicalEncoding::FullEval] {
             return Err("GPU matrix carry needs full-Eval encoding".into());
         }
-        let slot = StorageRef::Scratch(
-            u32::try_from(ctx.values.len())
-                .map_err(|_| "too many GPU carry storages".to_owned())?,
-        );
-        let native =
-            ctx.backend.allocate_physical_matrix(ty, ctx.device, PhysicalEncoding::FullEval)?;
-        let (physical, owner) = physical_matrix(ty, PhysicalEncoding::FullEval, slot, native)?;
-        let id = value_id(ctx.values.len())?;
-        ctx.values.push(physical);
-        ctx.owners.insert(id, owner);
-        return Ok(id);
+        // Initialization is an explicit graph copy, so the carry is scratch
+        // written before use. Let the generic liveness planner place it across
+        // the whole loop instead of retaining one eager allocation per loop.
+        return allocate_scratch_matrix(ctx, ty, PhysicalEncoding::FullEval);
     }
     if matches!(
         planned.ty,
         ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. }
     ) {
-        return allocate_compact_value(ctx, planned.ty, false).map(|(id, _)| id);
+        return allocate_compact_value(ctx, planned.ty.clone(), false).map(|(id, _)| id);
     }
     if matches!(planned.ty, ConcreteWireType::Real | ConcreteWireType::ConstantReal) {
         return allocate_real_value(ctx, target.clone());
@@ -6663,7 +7680,11 @@ fn allocate_sequential_carry(
         physical.ty = target.clone();
         physical.parts = Box::new([PhysicalPart {
             storage: slot,
-            view: PhysicalView { byte_offset: 0, ..part.view.clone() },
+            view: {
+                let mut view = part.view.clone();
+                view.byte_offset = 0;
+                view
+            },
             ..part.clone()
         }]);
         let resident = GpuResidentValue::new(
@@ -6805,6 +7826,12 @@ fn copy_carry_to(
     Ok(vec![operation])
 }
 
+/// Lowers sequential carries, streaming matrix families through host-replayed waves.
+///
+/// Native reset ownership is assigned only after the final replay classification,
+/// because fixed artifact imports need not make a loop host-driven.
+/// In mixed carries, structurally unchanged ports borrow their original owners;
+/// simultaneous updates stage only changed ports, preserving swaps without copying captures.
 fn lower_sequential_loop(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -6814,15 +7841,46 @@ fn lower_sequential_loop(
     loop_node: &mxx_ir_core::node::SequentialLoop,
     env: &ParamEnv,
 ) -> Result<(), String> {
-    let count = finite_loop_count(scope_id, node_id, node.kind(), env)?;
+    let count = u64::try_from(finite_loop_count(scope_id, node_id, node.kind(), env)?)
+        .map_err(|_| "GPU native sequential loop count exceeds u64")?;
     let child_id = graph
         .child_scope_id(scope_id, node_id)
         .ok_or_else(|| "GPU sequential loop has no child scope".to_owned())?;
+    let has_streamed_carries = node
+        .output_types()
+        .iter()
+        .map(|ty| {
+            concretize_wire_type(ty, env, scope_id, node_id).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(crate::gpu_streamed_carry::is_streamed_carry);
     let has_scoped_artifacts = contains_scoped_artifact_input(graph, &child_id)?;
-    if has_scoped_artifacts && ctx.device_body {
-        // Per-iteration artifact reads are host-driven region boundaries.
+    let has_parallel_sum =
+        mxx_ir_core::parallel_reduction::contains_parallel_member_sum(graph, &child_id, env);
+    // A previously streamed root family is captured as metadata too. Its
+    // selected member reads need the same host I/O boundaries as artifact inputs.
+    let has_streamed_inputs =
+        graph.scope(scope_id).and_then(|scope| scope.arguments(node)).is_some_and(|arguments| {
+            arguments.iter().any(|wire| {
+                ctx.wire_ids.get(wire).is_some_and(|id| ctx.streaming.families.contains_key(id))
+            })
+        });
+    let host_driven =
+        has_scoped_artifacts || has_streamed_carries || has_parallel_sum || has_streamed_inputs;
+    if host_driven && ctx.device_body && ctx.host_loops.is_none() {
+        // Per-iteration artifact reads are host-driven region boundaries,
+        // which only the host's replay of a host-driven loop body can nest.
         return Err("GPU artifact-reading sequential loop cannot run inside a device body".into());
     }
+    // A loop that reads artifacts, directly or in a nested loop, is
+    // host-driven: the host replays its body, and so drives the loops in it
+    // that read artifacts too.
+    let body_host_loops = host_driven.then(|| {
+        let mut loops = ctx.host_loops.clone().unwrap_or_default();
+        loops.push((loop_node.index_slot, count));
+        loops
+    });
     let child =
         graph.scope(&child_id).ok_or_else(|| "GPU sequential body is missing".to_owned())?;
     let scope =
@@ -6838,8 +7896,41 @@ fn lower_sequential_loop(
     {
         return Err("GPU sequential loop has unsupported carry arity".into());
     }
+    // Keep the existing identity-only loop path. In a mixed carry, an exact
+    // input/output wire identity proves that this port is never overwritten.
+    let mixed = child.outputs().iter().zip(child.inputs()).any(|(out, input)| out != input);
+    let passthrough = child
+        .outputs()
+        .iter()
+        .zip(child.inputs())
+        .map(|(out, input)| mixed && out == input)
+        .collect::<Vec<_>>();
+    let mut streamed_inputs = Vec::with_capacity(loop_node.carried_count);
+    for (position, &argument) in arguments.iter().take(loop_node.carried_count).enumerate() {
+        let ty = concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
+            .map_err(|error| error.to_string())?;
+        streamed_inputs.push(crate::gpu_streamed_carry::prepare_carry(
+            ctx,
+            graph,
+            scope_id,
+            node_id,
+            argument,
+            &child_id,
+            position,
+            loop_node.index_slot,
+            &ty,
+        )?);
+    }
     if count == 0 {
         for (position, wire) in arguments.iter().take(loop_node.carried_count).enumerate() {
+            if let Some((id, family)) = &streamed_inputs[position] {
+                let mut family = family.clone();
+                family.iteration = IntExpr::constant(0);
+                let ty = ctx.values[id.0 as usize].ty.clone();
+                let output = crate::gpu_streamed_carry::bind_family(ctx, ty, family)?;
+                ctx.wire_ids.insert(WireRef { node: node_id, port: Port(position as u32) }, output);
+                continue;
+            }
             let source = *ctx
                 .wire_ids
                 .get(wire)
@@ -6863,10 +7954,15 @@ fn lower_sequential_loop(
     let mut child_env =
         fixed_child_env(scope_id, node_id, env, &loop_node.bindings, Some(loop_node.index_slot))?;
     let first_types = resolved_scope_types(child, &child_id, &child_env)?;
-    for index in 1..count {
-        child_env.loop_indices.insert(loop_node.index_slot, BigInt::from(index));
-        if resolved_scope_types(child, &child_id, &child_env)? != first_types {
-            return Err("GPU sequential loop has instance-dependent physical types".into());
+    // Test the structural dependency once. Filtering the iteration range still
+    // walks every index when the predicate is false, which makes planning a
+    // constant-shape loop proportional to its (potentially enormous) count.
+    if types_depend_on_loop_index(child) {
+        for index in 1..count {
+            child_env.loop_indices.insert(loop_node.index_slot, BigInt::from(index));
+            if resolved_scope_types(child, &child_id, &child_env)? != first_types {
+                return Err("GPU sequential loop has instance-dependent physical types".into());
+            }
         }
     }
     child_env.loop_indices.insert(loop_node.index_slot, BigInt::from(0));
@@ -6876,6 +7972,9 @@ fn lower_sequential_loop(
     // trials are rolled back so only the final lowering remains.
     let mut carry_ranges = (0..loop_node.carried_count)
         .map(|position| {
+            if streamed_inputs[position].is_some() {
+                return Ok(None);
+            }
             let source = *ctx
                 .wire_ids
                 .get(&arguments[position])
@@ -6888,16 +7987,23 @@ fn lower_sequential_loop(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut widenings = 0u64;
+    let body_parallel_lanes_start = ctx.parallel_lanes.len();
+    let spills_before = ctx.streaming.body_spills;
     let (
         input_ids,
         outer_dependencies,
         control_ids,
         external_index_owner,
+        control_reset,
         body_operations,
         mut body_imports,
+        mut body_ahead,
         body_static_imports,
         outputs,
         carry_copy_ops,
+        nested_loops,
+        body_waves_start,
+        mut body_node_operations,
     ) = loop {
         let mark = (
             ctx.values.len(),
@@ -6912,11 +8018,18 @@ fn lower_sequential_loop(
             ctx.import_templates.len(),
             ctx.external_io_loops.len(),
             *ctx.crt_resource_next,
+            ctx.slots.len(),
+            ctx.export_templates.len(),
+            ctx.parallel_lanes.len(),
         );
         let resource_keys = ctx.hash_resources.keys().copied().collect::<BTreeSet<_>>();
         let mut input_ids = Vec::with_capacity(arguments.len());
         let mut outer_dependencies = std::collections::BTreeSet::new();
         for (position, wire) in arguments.iter().enumerate() {
+            if let Some(Some((id, _))) = streamed_inputs.get(position) {
+                input_ids.push(*id);
+                continue;
+            }
             if position >= loop_node.carried_count &&
                 matches!(
                     child.node(child.inputs()[position].node).map(NodeHandle::kind),
@@ -6942,6 +8055,10 @@ fn lower_sequential_loop(
                 .get(&child.inputs()[position])
                 .ok_or_else(|| "GPU sequential child carry type is absent".to_owned())?
                 .clone();
+            if passthrough[position] && ctx.values[source.0 as usize].ty == target {
+                input_ids.push(source);
+                continue;
+            }
             let carried =
                 allocate_sequential_carry(ctx, source, &target, carry_ranges[position].clone())?;
             outer_dependencies.extend(copy_carry_to(ctx, source, carried, &[])?);
@@ -6972,7 +8089,6 @@ fn lower_sequential_loop(
                 return Err("GPU sequential loop has no typed index owner".into());
             }
         };
-        ctx.control_resets.push(reset);
         if ctx.device_body {
             // The host resets loop control only before a root region or wave
             // replay. An enclosing device body replays this loop without the
@@ -6993,10 +8109,14 @@ fn lower_sequential_loop(
             );
         }
         let mut body_operations = Vec::new();
+        // Node attribution of the body's operations, body-relative until the body is placed.
+        let mut body_node_operations = Vec::new();
+        let attribute_body = ctx.node_operations.is_some();
         let mut body_wires = BTreeMap::new();
         let mut body_producers = BTreeMap::new();
         let mut body_family_producers = BTreeMap::new();
         let mut body_imports = Vec::new();
+        let mut body_ahead = Vec::new();
         let mut body_static_imports = Vec::new();
         let loop_site = GpuLoopSiteKey {
             site: node_id.0,
@@ -7031,21 +8151,28 @@ fn lower_sequential_loop(
                 lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
+                active_parallel_occurrences: ctx.active_parallel_occurrences.clone(),
                 device_body: true,
+                host_body_top: host_driven,
+                streaming: &mut *ctx.streaming,
+                host_loops: body_host_loops.clone(),
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
                 waves: ctx.waves,
                 import_templates: &mut body_static_imports,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
+                ahead_imports: Some((loop_node.index_slot, count, &mut body_ahead)),
                 slots: &mut *ctx.slots,
                 export_templates: &mut *ctx.export_templates,
                 fused_nodes: &mut *ctx.fused_nodes,
                 parallel_lanes: ctx.parallel_lanes,
-                node_operations: None,
+                node_operations: attribute_body.then_some(&mut body_node_operations),
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                static_constants: &mut *ctx.static_constants,
+                identity_small_rhs: ctx.identity_small_rhs,
                 subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
@@ -7070,9 +8197,14 @@ fn lower_sequential_loop(
                 .collect::<Result<Vec<_>, _>>()?;
             let mut copy_sources = outputs.clone();
             let mut carry_copy_ops = Vec::new();
-            if outputs.iter().any(|output| input_ids[..loop_node.carried_count].contains(output)) {
+            if outputs.iter().enumerate().any(|(position, output)| {
+                !passthrough[position] && input_ids[..loop_node.carried_count].contains(output)
+            }) {
                 let mut stage_copies = Vec::new();
                 for (position, output) in outputs.iter().copied().enumerate() {
+                    if streamed_inputs[position].is_some() || passthrough[position] {
+                        continue;
+                    }
                     let target = body_ctx.values[output.0 as usize].ty.clone();
                     let staged = allocate_sequential_carry(&mut body_ctx, output, &target, None)?;
                     stage_copies.extend(copy_carry_to(
@@ -7084,6 +8216,9 @@ fn lower_sequential_loop(
                     copy_sources[position] = staged;
                 }
                 for (position, source) in copy_sources.iter().copied().enumerate() {
+                    if streamed_inputs[position].is_some() || passthrough[position] {
+                        continue;
+                    }
                     carry_copy_ops.extend(copy_carry_to(
                         &mut body_ctx,
                         source,
@@ -7093,9 +8228,17 @@ fn lower_sequential_loop(
                 }
             } else {
                 for (position, output) in outputs.iter().copied().enumerate() {
+                    if streamed_inputs[position].is_some() || passthrough[position] {
+                        continue;
+                    }
                     // An external-I/O body keeps its carried-state copy tail,
                     // which the host relaunches around each selected import.
-                    if body_ctx.external_io_imports.is_empty() &&
+                    if body_ctx.external_io_loops.len() == mark.10 &&
+                        body_ctx.external_io_imports.is_empty() &&
+                        body_ctx
+                            .ahead_imports
+                            .as_ref()
+                            .is_none_or(|(_, _, imports)| imports.is_empty()) &&
                         write_carry_in_place(&mut body_ctx, output, input_ids[position])?
                     {
                         continue;
@@ -7124,16 +8267,21 @@ fn lower_sequential_loop(
                 outer_dependencies,
                 control_ids,
                 external_index_owner,
+                reset,
                 body_operations,
                 body_imports,
+                body_ahead,
                 body_static_imports,
                 outputs,
                 carry_copy_ops,
+                mark.10,
+                mark.8,
+                body_node_operations,
             );
         }
         let first_new = mark.0;
         ctx.values.truncate(first_new);
-        ctx.owners.retain(|id, _| (id.0 as usize) < first_new);
+        ctx.owners.truncate(first_new);
         ctx.producer.retain(|id, _| (id.0 as usize) < first_new);
         ctx.family_member_producers.retain(|(id, _), _| (id.0 as usize) < first_new);
         ctx.trapdoor_public_ids.retain(|id, _| (id.0 as usize) < first_new);
@@ -7148,24 +8296,65 @@ fn lower_sequential_loop(
         ctx.import_templates.truncate(mark.9);
         ctx.external_io_loops.truncate(mark.10);
         *ctx.crt_resource_next = mark.11;
+        ctx.slots.truncate(mark.12);
+        ctx.export_templates.truncate(mark.13);
+        ctx.parallel_lanes.truncate(mark.14);
+        ctx.streaming.families.retain(|id, _| (id.0 as usize) < first_new);
+        ctx.streaming.member_overrides.retain(|_, id| (id.0 as usize) < first_new);
         ctx.hash_resources.retain(|id, _| resource_keys.contains(id));
         ctx.integer_status.retain(|_, id| (id.0 as usize) < first_new);
+        ctx.static_constants.retain(|_, id| (id.0 as usize) < first_new);
         carry_ranges = widened;
         widenings += 1;
     };
+    if body_operations.is_empty() &&
+        streamed_inputs
+            .iter()
+            .all(|input| input.as_ref().is_some_and(|(_, family)| !family.carry.updated))
+    {
+        for (position, input) in streamed_inputs.iter().enumerate() {
+            let (id, family) = input.as_ref().expect("alias-only streamed carry");
+            let mut family = family.clone();
+            family.iteration = IntExpr::constant(0);
+            let ty = ctx.values[id.0 as usize].ty.clone();
+            let output = crate::gpu_streamed_carry::bind_family(ctx, ty, family)?;
+            ctx.wire_ids.insert(WireRef { node: node_id, port: Port(position as u32) }, output);
+        }
+        return Ok(());
+    }
     if outputs.len() != loop_node.carried_count || body_operations.is_empty() {
         return Err("GPU sequential body has no valid carried computation".into());
     }
-    if has_scoped_artifacts && body_imports.is_empty() && body_static_imports.is_empty() {
+    // Host-driven loops lowered in the body, in body-relative operations.
+    let nested = nested_loops..ctx.external_io_loops.len();
+    if has_scoped_artifacts &&
+        body_imports.is_empty() &&
+        body_ahead.is_empty() &&
+        body_static_imports.is_empty() &&
+        nested.is_empty()
+    {
         return Err("GPU scoped artifact has no selected import boundary".into());
     }
-    let external_io = !body_imports.is_empty();
+    let external_io = has_parallel_sum ||
+        has_streamed_carries ||
+        ctx.streaming.body_spills > spills_before ||
+        !body_imports.is_empty() ||
+        !body_ahead.is_empty() ||
+        !nested.is_empty();
     if external_io {
-        if carry_copy_ops.is_empty() {
+        if carry_copy_ops.is_empty() &&
+            !has_streamed_carries &&
+            ctx.streaming.body_spills == spills_before
+        {
             return Err("GPU external-I/O loop has no selected import or carry copy".into());
         }
         let body_start = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU operations before external-I/O loop".to_owned())?;
+        if let Some(spans) = ctx.node_operations.as_deref_mut() {
+            spans.extend(body_node_operations.drain(..).map(|(scope, node, range)| {
+                (scope, node, range.start + body_start..range.end + body_start)
+            }));
+        }
         for mut operation in body_operations {
             let mut predecessors = operation
                 .predecessors
@@ -7184,20 +8373,89 @@ fn lower_sequential_loop(
         }
         let body_end = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU external-I/O body operations".to_owned())?;
-        for mut import in body_static_imports {
+        for lanes in &mut ctx.parallel_lanes[body_parallel_lanes_start..] {
+            for lane in lanes {
+                lane.start += body_start;
+                lane.end += body_start;
+            }
+        }
+        let first_import = ctx.import_templates.len();
+        let wave_imports = ctx.waves[body_waves_start..]
+            .iter()
+            .flat_map(|wave| {
+                wave.import_template_indices
+                    .iter()
+                    .chain(wave.invocation_imports.values().flatten())
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
+        for wave in &mut ctx.waves[body_waves_start..] {
+            wave.body_start += body_start;
+            wave.body_end += body_start;
+            for index in wave
+                .import_template_indices
+                .iter_mut()
+                .chain(wave.invocation_imports.values_mut().flatten())
+            {
+                *index += first_import;
+            }
+            // Membership must use the relocated template IDs too: runtime Zip
+            // imports consult this set before adding the current wave offset.
+            wave.indexed_imports = std::mem::take(&mut wave.indexed_imports)
+                .into_iter()
+                .map(|index| index + first_import)
+                .collect();
+        }
+        for (position, mut import) in body_static_imports.into_iter().enumerate() {
+            if wave_imports.contains(&position) {
+                import.before_operation += body_start;
+                ctx.import_templates.push(import);
+                continue;
+            }
             // A fixed member is read once at loop entry, while its NTT may
             // remain in the repeated body. It never reads the full family.
             import.before_operation = body_start;
             ctx.import_templates.push(import);
         }
-        for import in &mut body_imports {
-            import.before_operation = import
-                .before_operation
+        let rebase_nested = |operation: u32| {
+            operation
                 .checked_add(body_start)
-                .ok_or_else(|| "GPU external-I/O import index overflows".to_owned())?;
+                .filter(|operation| *operation <= body_end)
+                .ok_or_else(|| "GPU nested host-driven loop is outside its body".to_owned())
+        };
+        for inner in &mut ctx.external_io_loops[nested] {
+            inner.body_start = rebase_nested(inner.body_start)?;
+            inner.body_end = rebase_nested(inner.body_end)?;
+            for copy in &mut inner.carry_copy_ops {
+                *copy = rebase_nested(*copy)?;
+            }
+            for import in &mut inner.imports {
+                import.before_operation = rebase_nested(import.before_operation)?;
+                import.request_operation = rebase_nested(import.request_operation)?;
+            }
+            for import in &mut inner.ahead {
+                import.template.before_operation = rebase_nested(import.template.before_operation)?;
+            }
+        }
+        for import in &mut body_imports {
+            let rebase = |operation: u32| {
+                operation
+                    .checked_add(body_start)
+                    .ok_or_else(|| "GPU external-I/O import index overflows".to_owned())
+            };
+            import.before_operation = rebase(import.before_operation)?;
+            import.request_operation = rebase(import.request_operation)?;
             if import.before_operation >= body_end {
                 return Err("GPU external-I/O import is outside its body".into());
             }
+        }
+        for import in &mut body_ahead {
+            import.template.before_operation = import
+                .template
+                .before_operation
+                .checked_add(body_start)
+                .filter(|operation| *operation < body_end)
+                .ok_or_else(|| "GPU external-I/O import is outside its body".to_owned())?;
         }
         let carry_copy_ops = carry_copy_ops
             .into_iter()
@@ -7212,12 +8470,31 @@ fn lower_sequential_loop(
             body_start,
             body_end,
             count,
+            index_slot: loop_node.index_slot,
             index_owner: external_index_owner,
-            carried_ids: carried_ids.clone(),
+            carried_ids: carried_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(position, id)| streamed_inputs[position].is_none().then_some(*id))
+                .collect(),
             carry_copy_ops: carry_copy_ops.clone(),
             imports: body_imports,
+            ahead: body_ahead,
+            streamed_carries: streamed_inputs
+                .iter()
+                .flatten()
+                .map(|(_, family)| family.carry.clone())
+                .collect(),
         });
         for (position, carried) in carried_ids.into_iter().enumerate() {
+            if let Some((_, family)) = &streamed_inputs[position] {
+                let mut family = family.clone();
+                family.iteration = IntExpr::constant(count);
+                let ty = ctx.values[carried.0 as usize].ty.clone();
+                let output = crate::gpu_streamed_carry::bind_family(ctx, ty, family)?;
+                ctx.wire_ids.insert(WireRef { node: node_id, port: Port(position as u32) }, output);
+                continue;
+            }
             let declared =
                 concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
                     .map_err(|error| error.to_string())?;
@@ -7225,22 +8502,25 @@ fn lower_sequential_loop(
                 return Err("GPU external-I/O loop output differs from its carry".into());
             }
             let columns = declared.matrix_type().map_or(1, |matrix| matrix.columns);
-            ctx.producer.insert(
-                carried,
-                carry_copy_ops
-                    .iter()
-                    .map(|index| (ColumnRange { start: 0, end: columns }, *index))
-                    .collect(),
-            );
+            if !passthrough[position] {
+                ctx.producer.insert(
+                    carried,
+                    carry_copy_ops
+                        .iter()
+                        .map(|index| (ColumnRange { start: 0, end: columns }, *index))
+                        .collect(),
+                );
+            }
             let port =
                 Port(u32::try_from(position).map_err(|_| "too many GPU loop outputs".to_owned())?);
             ctx.wire_ids.insert(WireRef { node: node_id, port }, carried);
         }
         return Ok(());
     }
-    if !body_imports.is_empty() {
+    if !body_imports.is_empty() || !body_ahead.is_empty() {
         return Err("GPU native loop has an uncommitted artifact import".into());
     }
+    ctx.control_resets.push(control_reset);
     let scalar_binding = |bindings: &mut Vec<GpuBindingSource>, id| -> Result<u32, String> {
         let index = u32::try_from(bindings.len())
             .map_err(|_| "too many GPU control bindings".to_owned())?;
@@ -7280,7 +8560,7 @@ fn lower_sequential_loop(
         block: [1; 3],
         shared_bytes: 0,
         predecessors: outer_dependencies.into_iter().collect(),
-        body: Some(body_operations.into_boxed_slice()),
+        body: Some(body_operations.into()),
     });
     for (position, carried) in input_ids.into_iter().take(loop_node.carried_count).enumerate() {
         let port =
@@ -7292,78 +8572,167 @@ fn lower_sequential_loop(
             return Err("GPU sequential output differs from carried value type".into());
         }
         let columns = declared.matrix_type().map_or(1, |matrix| matrix.columns);
-        ctx.producer.insert(carried, vec![(ColumnRange { start: 0, end: columns }, operation)]);
+        if !passthrough[position] {
+            ctx.producer.insert(carried, vec![(ColumnRange { start: 0, end: columns }, operation)]);
+        }
         ctx.wire_ids.insert(wire, carried);
     }
     Ok(())
 }
 
-fn replay_matrix_owner(
+/// Byte alignment of every later-wave member in its loop's member arena.
+const REPLAY_ALIGNMENT: u64 = 256;
+
+/// The storages of loop member `id` by slot: one for a matrix, one per leaf for a trapdoor.
+fn replay_layout(
     ctx: &PhysicalLoweringContext<'_>,
     id: PhysicalValueId,
-) -> Result<Arc<GpuResidentValue>, String> {
+) -> Result<Vec<(crate::gpu_execution_plan::StorageRef, BoundStorage)>, String> {
     let planned = ctx
         .values
         .get(id.0 as usize)
         .ok_or_else(|| "GPU loop member has no physical metadata".to_owned())?;
-    if planned.parts.is_empty() {
+    let owner =
+        ctx.owners.get(&id).ok_or_else(|| "GPU loop member has no planned owner".to_owned())?;
+    let slots = planned.parts.iter().map(|part| part.storage).collect::<BTreeSet<_>>();
+    if slots.is_empty() {
         return Err("GPU loop member has no physical part".into());
     }
-    let template = ctx.owners.get(&id).ok_or("GPU loop member has no planned owner")?;
-    // Packed family members name each CRT part with its own storage slot.
-    // Several slots may still view one allocation. Preserve those aliases and
-    // every relative address while giving the replay its own allocations.
-    let mut spans = BTreeMap::<usize, (u64, u64)>::new();
-    let mut slots = BTreeMap::new();
-    for part in planned.parts.iter() {
-        let bound = template.storage(part.storage).ok_or("GPU loop member lost a storage slot")?;
-        if bound.device != ctx.device || part.device != ctx.device {
-            return Err("GPU loop member replay crosses devices".into());
+    slots
+        .into_iter()
+        .map(|slot| {
+            owner
+                .storage(slot)
+                .map(|storage| (slot, storage.clone()))
+                .ok_or_else(|| "GPU loop member has no planned storage".to_owned())
+        })
+        .collect()
+}
+
+/// A planned allocation of a loop member: members of one lane viewing it (outputs sliced from one
+/// matrix, say) share its later-wave copy.
+type ReplayAllocation = (*const (), u64, u64);
+
+fn replay_allocation(storage: &BoundStorage) -> ReplayAllocation {
+    (Arc::as_ptr(&storage.owner).cast::<()>(), storage.address, storage.bytes)
+}
+
+/// The bytes a later wave's loop members `ids` (one lane's) take in their loop's member arena:
+/// each planned allocation once.
+fn replay_bytes(
+    ctx: &PhysicalLoweringContext<'_>,
+    ids: impl IntoIterator<Item = PhysicalValueId>,
+) -> Result<u64, String> {
+    let mut allocations = BTreeSet::new();
+    for id in ids {
+        for (_, storage) in replay_layout(ctx, id)? {
+            allocations.insert(replay_allocation(&storage));
         }
-        let end = bound
-            .address
-            .checked_add(bound.bytes)
-            .ok_or("GPU loop member storage address overflows")?;
-        let key = Arc::as_ptr(&bound.owner).cast::<()>() as usize;
-        let span = spans.entry(key).or_insert((bound.address, end));
-        span.0 = span.0.min(bound.address);
-        span.1 = span.1.max(end);
-        slots.insert(part.storage, (key, bound.clone()));
     }
-    let stream = ctx
-        .backend
-        .parameters_on_device(ctx.device)?
-        .native_launch_stream(ctx.device)
-        .map_err(|error| error.to_string())?;
-    let mut buffers = BTreeMap::new();
-    for (&key, &(start, end)) in &spans {
-        let bytes =
-            usize::try_from(end - start).map_err(|_| "GPU loop member size exceeds usize")?;
-        let buffer = Arc::new(
-            crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(&stream, bytes)
-                .map_err(|error| error.to_string())?,
+    Ok(allocations
+        .iter()
+        .map(|(_, _, bytes)| bytes.div_ceil(REPLAY_ALIGNMENT) * REPLAY_ALIGNMENT)
+        .sum())
+}
+
+fn replay_matrix_owner(
+    ctx: &PhysicalLoweringContext<'_>,
+    id: PhysicalValueId,
+    replacements: &mut std::collections::HashMap<*const (), BoundStorage>,
+) -> Result<Arc<GpuResidentValue>, String> {
+    let template = ctx.owners.get(&id).ok_or("GPU loop member has no planned owner")?;
+    // Different output ports can be views of the same produced allocation.
+    // One wave must replay that allocation once, preserving all port aliases.
+    for (_, bound) in template.storages() {
+        let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+        if replacements.contains_key(&pointer) {
+            continue;
+        }
+        let mut start = bound.address;
+        let mut end =
+            bound.address.checked_add(bound.bytes).ok_or("GPU replay allocation span overflows")?;
+        for alias in ctx.owners.viewing(pointer) {
+            for (_, other) in ctx.owners[&alias].storages() {
+                if Arc::ptr_eq(&bound.owner, &other.owner) {
+                    if other.device != ctx.device {
+                        return Err("GPU loop member replay crosses devices".into());
+                    }
+                    start = start.min(other.address);
+                    end = end.max(
+                        other
+                            .address
+                            .checked_add(other.bytes)
+                            .ok_or("GPU replay allocation span overflows")?,
+                    );
+                }
+            }
+        }
+        replacements.insert(
+            pointer,
+            crate::gpu_graph_memory::deferred_replay_storage(
+                ctx.device,
+                template.wire_type().clone(),
+                end - start,
+            )?,
         );
-        buffers.insert(key, buffer);
     }
-    let mut storage = BTreeMap::new();
-    for (slot, (key, bound)) in slots {
-        let buffer = Arc::clone(&buffers[&key]);
-        let address = (buffer.as_ptr() as u64)
-            .checked_add(bound.address - spans[&key].0)
-            .ok_or("GPU replay member storage address overflows")?;
-        storage.insert(
-            slot,
-            BoundStorage { device: ctx.device, address, bytes: bound.bytes, owner: buffer },
-        );
-    }
-    GpuResidentValue::new(Arc::new(planned.clone()), storage, Box::new([]))
+    template
+        .rebound(replacements, &[])
+        .map_err(str::to_owned)?
         .map(Arc::new)
-        .map_err(str::to_owned)
+        .ok_or_else(|| "GPU replay member has no storage".to_owned())
 }
 
 /// A parallel loop whose body is only scalar Int/Bool arithmetic and family
 /// selection lowers to one elementwise operation per body node over all lanes
 /// (`PhysicalLoweringContext::lanes`), instead of W-lane replayed waves.
+/// Leaf parallel bodies do not need a list of every enclosing occurrence.
+fn has_nested_parallel(graph: &Graph, scope_id: &FrozenGraphScopeId) -> bool {
+    let Some(scope) = graph.scope(scope_id) else { return true };
+    scope.nodes().iter().enumerate().any(|(index, node)| {
+        matches!(node.kind(), NodeKind::ParallelLoop(_)) ||
+            graph
+                .child_scope_id(scope_id, NodeId(index as u64))
+                .is_some_and(|child| has_nested_parallel(graph, &child))
+    })
+}
+
+/// A conservative proof that descendant counts and types do not change with
+/// a parent index. Index-dependent parameter bindings are retained explicitly;
+/// evaluating one environment is safe only after this structural check.
+fn nested_shapes_are_index_invariant(graph: &Graph, scope_id: &FrozenGraphScopeId) -> bool {
+    let Some(scope) = graph.scope(scope_id) else { return false };
+    if types_depend_on_loop_index(scope) {
+        return false;
+    }
+    scope.nodes().iter().enumerate().all(|(index, node)| {
+        let bindings = match node.kind() {
+            NodeKind::ParallelLoop(loop_node) => {
+                if loop_node.count.contains_loop_index() {
+                    return false;
+                }
+                &loop_node.bindings
+            }
+            NodeKind::SequentialLoop(loop_node) => {
+                if loop_node.count.contains_loop_index() {
+                    return false;
+                }
+                &loop_node.bindings
+            }
+            NodeKind::SubgraphCall(call) => &call.bindings,
+            _ => {
+                return graph
+                    .child_scope_id(scope_id, NodeId(index as u64))
+                    .is_none_or(|child| nested_shapes_are_index_invariant(graph, &child))
+            }
+        };
+        !bindings.iter().any(|(_, value)| value.contains_loop_index()) &&
+            graph
+                .child_scope_id(scope_id, NodeId(index as u64))
+                .is_none_or(|child| nested_shapes_are_index_invariant(graph, &child))
+    })
+}
+
 pub(super) fn is_vectorized_scalar_loop(
     graph: &Graph,
     scope_id: &FrozenGraphScopeId,
@@ -7393,7 +8762,7 @@ pub(super) fn is_vectorized_scalar_loop(
                     input_node.output_types().first().is_some_and(|ty| match mode {
                         LoopInputMode::Broadcast => scalar_or_family(ty),
                         LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => scalar(ty),
-                        LoopInputMode::Gather { .. } => false,
+                        LoopInputMode::ZipQuotient { .. } | LoopInputMode::Gather { .. } => false,
                     })
             })
         }) &&
@@ -7449,25 +8818,27 @@ fn lower_vectorized_parallel_loop(
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU loop indices".to_owned())?,
     );
-    let lane_family =
-        |element| ConcreteWireType::IndexedFamily { element: Box::new(element), count };
-    let index_physical = PhysicalValue {
+    let lane_family = |element| ConcreteWireType::IndexedFamily {
+        element: Box::new(element),
+        count: count as u128,
+    };
+    let index_physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
         ty: lane_family(ConcreteWireType::Int),
         encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
             device: ctx.device,
-            view: PhysicalView {
+            view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                 byte_offset: 0,
                 origin: Box::new([0, 0, 0]),
                 extent: Box::new([lanes, 1, 1]),
                 byte_strides: Box::new([8, 8, 8]),
                 element_bytes: 8,
-            },
+            }),
         }]),
         integer_ranges: BTreeMap::from([(0, BigInt::from(0)..=BigInt::from(lanes - 1))]),
-    };
+    });
     let index_owner = GpuResidentValue::new(
         Arc::new(index_physical.clone()),
         BTreeMap::from([(storage, BoundStorage::from_signed_values(iota)?)]),
@@ -7493,6 +8864,9 @@ fn lower_vectorized_parallel_loop(
             LoopInputMode::Gather { .. } => {
                 return Err("GPU vectorized loop cannot gather an artifact family".into());
             }
+            LoopInputMode::ZipQuotient { .. } => {
+                return Err("GPU vectorized loop cannot read a quotient-zipped family".into());
+            }
         };
         // Lane `i` reads member `offset + i` of the source family.
         let family = ctx.values[source.0 as usize].clone();
@@ -7502,7 +8876,7 @@ fn lower_vectorized_parallel_loop(
         let [part] = family.parts.as_ref() else {
             return Err("GPU vectorized Zip source needs one contiguous part".into());
         };
-        if offset.checked_add(count).is_none_or(|end| end > *members) ||
+        if offset.checked_add(count).is_none_or(|end| end as u128 > *members) ||
             part.view.origin.iter().any(|&origin| origin != 0)
         {
             return Err("GPU vectorized Zip source does not cover every lane".into());
@@ -7514,11 +8888,11 @@ fn lower_vectorized_parallel_loop(
             .and_then(|offset| offset.checked_add(part.view.byte_offset))
             .ok_or("GPU vectorized Zip offset overflows")?;
         view.extent[0] = lanes;
-        let lane_physical = PhysicalValue {
+        let lane_physical = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
             ty: lane_family(element.as_ref().clone()),
             parts: Box::new([PhysicalPart { view, ..part.clone() }]),
-            ..family.clone()
-        };
+            ..family.to_data()
+        });
         let owner = ctx.owners.get(&source).ok_or("GPU vectorized Zip source has no owner")?;
         let lane_owner =
             owner.with_physical_view(Arc::new(lane_physical.clone())).map_err(str::to_owned)?;
@@ -7554,7 +8928,7 @@ fn lower_vectorized_parallel_loop(
             .into_iter()
             .map(|id| {
                 if matches!(&ctx.values[id.0 as usize].ty,
-                    ConcreteWireType::IndexedFamily { count: members, .. } if *members == count)
+                    ConcreteWireType::IndexedFamily { count: members, .. } if *members == count as u128)
                 {
                     return Ok(id);
                 }
@@ -7581,7 +8955,10 @@ fn lower_vectorized_parallel_loop(
         let output = if ctx.values[id.0 as usize].ty == declared {
             id
         } else {
-            let family = PhysicalValue { ty: declared, ..ctx.values[id.0 as usize].clone() };
+            let family = ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
+                ty: declared,
+                ..ctx.values[id.0 as usize].to_data()
+            });
             let owner = ctx.owners.get(&id).ok_or("GPU vectorized output has no owner")?;
             let family_owner =
                 owner.with_physical_view(Arc::new(family.clone())).map_err(str::to_owned)?;
@@ -7598,173 +8975,13 @@ fn lower_vectorized_parallel_loop(
     Ok(())
 }
 
+/// A constant identity whose readers expand compact operands without reading it.
+pub(super) const UNMATERIALIZED_IDENTITY: PhysicalValueId = PhysicalValueId(u32::MAX - 1);
+
 /// The argument position of a root artifact family that a parallel loop
 /// broadcasts without loading it: the body's family reads import the members
 /// they reach. It never names a physical value.
 const UNLOADED_FAMILY: PhysicalValueId = PhysicalValueId(u32::MAX);
-
-/// The root sum of every member of some output ports of the root parallel
-/// loop `loop_id`, in the form a member-by-member sum lowers to: members 0 and
-/// 1 read (`FamilyGetStatic`) and added (`MatrixBinary(Add)`), then a
-/// sequential loop over the other `count - 2` members whose body adds member
-/// `index + 2` (`FamilyGetDynamic`) to its carried state. Returns that
-/// sequential loop and, per output port it sums, the two member reads, their
-/// sum, and its carried position. Every argument of the sequential loop must
-/// be one of these sums or a summed port, and its body may hold nothing else.
-fn fused_member_sums(
-    graph: &Graph,
-    loop_id: NodeId,
-    ports: usize,
-    count: usize,
-    env: &ParamEnv,
-) -> Option<(NodeId, Vec<Option<(NodeId, NodeId, NodeId, usize)>>)> {
-    if count < 3 {
-        return None;
-    }
-    let root = graph.root_scope();
-    let nodes = root.nodes();
-    let node = |id: NodeId| nodes.get(id.0 as usize);
-    let output = |id: NodeId| WireRef { node: id, port: Port(0) };
-    let consumers = |wire: WireRef| {
-        nodes
-            .iter()
-            .enumerate()
-            .flat_map(|(index, consumer)| {
-                root.arguments(consumer)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                    .filter(move |(_, argument)| *argument == wire)
-                    .map(move |(position, _)| (NodeId(index as u64), position))
-            })
-            .collect::<Vec<_>>()
-    };
-    let returned = |wire: WireRef| graph.outputs().values().any(|output| output.value == wire);
-    let evaluates_to = |expression: &IntExpr, value: usize| {
-        expression.evaluate(env).is_ok_and(|actual| actual == BigInt::from(value))
-    };
-    let mut sequential = None;
-    let mut summed = vec![None; ports];
-    for (port, summed_port) in summed.iter_mut().enumerate() {
-        let wire = WireRef { node: loop_id, port: Port(u32::try_from(port).ok()?) };
-        let uses = consumers(wire);
-        if returned(wire) || uses.len() != 3 {
-            continue;
-        }
-        let member_read = |member: usize| {
-            uses.iter().map(|(id, _)| *id).find(|id| {
-                node(*id).is_some_and(|read| {
-                    matches!(read.kind(), NodeKind::FamilyGetStatic { index } if evaluates_to(index, member))
-                })
-            })
-        };
-        let (Some(first), Some(second)) = (member_read(0), member_read(1)) else { continue };
-        let Some(&(loop_node, capture)) = uses.iter().find(|(id, _)| {
-            node(*id).is_some_and(|use_| matches!(use_.kind(), NodeKind::SequentialLoop(_)))
-        }) else {
-            continue;
-        };
-        let (first_uses, second_uses) = (consumers(output(first)), consumers(output(second)));
-        let ([(add, _)], [(other, _)]) = (first_uses.as_slice(), second_uses.as_slice()) else {
-            continue;
-        };
-        if add != other ||
-            !node(*add).is_some_and(|add| {
-                matches!(add.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add))
-            }) ||
-            [first, second, *add].into_iter().any(|id| returned(output(id)))
-        {
-            continue;
-        }
-        let [(carrier, carried)] = consumers(output(*add))[..] else { continue };
-        let Some(NodeKind::SequentialLoop(spec)) = node(loop_node).map(|node| node.kind()) else {
-            continue;
-        };
-        if carrier != loop_node ||
-            carried >= spec.carried_count ||
-            capture < spec.carried_count ||
-            !evaluates_to(&spec.count, count - 2)
-        {
-            continue;
-        }
-        // The body adds member `index + 2` of the captured family to the state.
-        let child_id = graph.child_scope_id(&FrozenGraphScopeId::Root, loop_node)?;
-        let child = graph.scope(&child_id)?;
-        let (state, family) = (*child.inputs().get(carried)?, *child.inputs().get(capture)?);
-        let result = *child.outputs().get(carried)?;
-        let child_node = |wire: WireRef| child.nodes().get(wire.node.0 as usize);
-        let body_add = child_node(result)?;
-        let arguments = child.arguments(body_add)?;
-        let read = match (body_add.kind(), arguments.as_slice()) {
-            (NodeKind::MatrixBinary(MatrixBinaryOp::Add), [left, right]) if *left == state => {
-                *right
-            }
-            (NodeKind::MatrixBinary(MatrixBinaryOp::Add), [left, right]) if *right == state => {
-                *left
-            }
-            _ => continue,
-        };
-        let read_node = child_node(read)?;
-        let [source, index] = child.arguments(read_node)?[..] else { continue };
-        let plus_two = IntExpr::Add(
-            Box::new(IntExpr::LoopIndex(spec.index_slot)),
-            Box::new(IntExpr::constant(2)),
-        )
-        .canonicalize();
-        let index_node = child_node(index)?;
-        let loop_index_plus_two = match index_node.kind() {
-            NodeKind::EvaluateInt(expression) => expression.clone().canonicalize() == plus_two,
-            NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add) => {
-                let operands = child.arguments(index_node)?;
-                let kinds = operands
-                    .iter()
-                    .map(|operand| child_node(*operand).map(|node| node.kind().clone()))
-                    .collect::<Option<Vec<_>>>()?;
-                let is_index = |kind: &NodeKind| matches!(kind, NodeKind::EvaluateInt(IntExpr::LoopIndex(slot)) if *slot == spec.index_slot);
-                let is_two = |kind: &NodeKind| matches!(kind, NodeKind::ConstantInt(value) if *value == BigInt::from(2));
-                matches!(kinds.as_slice(), [a, b] if (is_index(a) && is_two(b)) || (is_two(a) && is_index(b)))
-            }
-            _ => false,
-        };
-        if !matches!(read_node.kind(), NodeKind::FamilyGetDynamic) ||
-            source != family ||
-            !loop_index_plus_two
-        {
-            continue;
-        }
-        if *sequential.get_or_insert(loop_node) != loop_node {
-            return None;
-        }
-        *summed_port = Some((first, second, *add, carried));
-    }
-    let sequential = sequential?;
-    let loop_node = node(sequential)?;
-    let NodeKind::SequentialLoop(spec) = loop_node.kind() else { return None };
-    let accounted = root.arguments(loop_node)?.iter().enumerate().all(|(position, argument)| {
-        if position < spec.carried_count {
-            summed
-                .iter()
-                .flatten()
-                .any(|(_, _, add, carried)| *carried == position && argument.node == *add)
-        } else {
-            argument.node == loop_id &&
-                summed.get(argument.port.0 as usize).is_some_and(Option::is_some)
-        }
-    });
-    let child = graph.scope(&graph.child_scope_id(&FrozenGraphScopeId::Root, sequential)?)?;
-    let plain_body = child.nodes().iter().all(|node| {
-        matches!(
-            node.kind(),
-            NodeKind::Input { .. } |
-                NodeKind::EvaluateInt(_) |
-                NodeKind::ConstantInt(_) |
-                NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add) |
-                NodeKind::FamilyGetDynamic |
-                NodeKind::MatrixBinary(MatrixBinaryOp::Add)
-        )
-    });
-    (accounted && plain_body).then_some((sequential, summed))
-}
 
 fn lower_parallel_loop(
     ctx: &mut PhysicalLoweringContext<'_>,
@@ -7775,8 +8992,7 @@ fn lower_parallel_loop(
     loop_node: &mxx_ir_core::node::ParallelLoop,
     env: &ParamEnv,
 ) -> Result<(), String> {
-    let count = usize::try_from(finite_loop_count(scope_id, node_id, node.kind(), env)?)
-        .map_err(|_| "GPU parallel loop count exceeds host address space".to_owned())?;
+    let count = finite_loop_count(scope_id, node_id, node.kind(), env)?;
     if count == 0 {
         for (port, declared) in node.output_types().iter().enumerate() {
             let port = Port(
@@ -7798,7 +9014,15 @@ fn lower_parallel_loop(
     }
     if is_vectorized_scalar_loop(graph, scope_id, node_id, node) {
         return lower_vectorized_parallel_loop(
-            ctx, graph, scope_id, node_id, node, loop_node, env, count,
+            ctx,
+            graph,
+            scope_id,
+            node_id,
+            node,
+            loop_node,
+            env,
+            usize::try_from(count)
+                .map_err(|_| "GPU resident scalar loop exceeds host address space")?,
         );
     }
     // The frozen choice is shared by every invocation of this lexical site; a
@@ -7810,10 +9034,30 @@ fn lower_parallel_loop(
             .map_err(|error| error.to_string())?,
         instance_class: 0,
     };
+    let fused_sum =
+        (!ctx.device_body).then(|| usize::try_from(count).ok()).flatten().and_then(|count| {
+            mxx_ir_core::parallel_reduction::parallel_member_sums(
+                graph,
+                scope_id,
+                node_id,
+                node.output_types().len(),
+                count,
+                env,
+            )
+        });
     let width = if ctx.device_body {
-        count
+        usize::try_from(count).map_err(|_| "GPU device body exceeds host address space")?
     } else {
-        parallel_wave_geometry(ctx.logical, choice_site, count as u64)?.0.min(count)
+        let maximum = parallel_wave_geometry(ctx.logical, choice_site, count)?.0;
+
+        if fused_sum.is_some() {
+            // W is a cap shared across loop sites. Use the largest admissible
+            // divisor at this site instead of rejecting the whole candidate
+            // because another site's count needs a different width.
+            (1..=maximum).rev().find(|width| count % *width as u128 == 0).unwrap_or(1)
+        } else {
+            maximum
+        }
     };
     let parent_template = ctx.active_parallel_template;
     // Occurrences of the enclosing template lane that reach this loop. Every
@@ -7823,14 +9067,14 @@ fn lower_parallel_loop(
         let mut occurrences = Vec::with_capacity(ctx.active_parallel_instances.len());
         for (occurrence, parent_env) in &ctx.active_parallel_instances {
             let parent_count = finite_loop_count(scope_id, node_id, node.kind(), parent_env)?;
-            if parent_count != count as u64 {
+            if parent_count != count {
                 return Err("GPU nested parallel loop count depends on its enclosing index".into());
             }
             occurrences.push(*occurrence);
         }
-        occurrences
+        ctx.active_parallel_occurrences.clone().unwrap_or(ParentOccurrences::Explicit(occurrences))
     } else {
-        Vec::new()
+        ParentOccurrences::Explicit(Vec::new())
     };
     let child_id = graph
         .child_scope_id(scope_id, node_id)
@@ -7838,6 +9082,7 @@ fn lower_parallel_loop(
     reject_scoped_artifacts_in_device_body(graph, &child_id)?;
     let child =
         graph.scope(&child_id).ok_or_else(|| "GPU parallel loop body is missing".to_owned())?;
+    let uniform_nested_shapes = nested_shapes_are_index_invariant(graph, &child_id);
     let parent =
         graph.scope(scope_id).ok_or_else(|| "GPU parallel loop scope is missing".to_owned())?;
     let is_root = matches!(scope_id, FrozenGraphScopeId::Root);
@@ -7850,8 +9095,29 @@ fn lower_parallel_loop(
     {
         return Err("GPU parallel loop boundary has the wrong arity".into());
     }
+    let mut carry_exports = Vec::with_capacity(node.output_types().len());
+    // Per port, the flattening a spilled flattened export binds, with its type.
+    let mut spilled_flattenings = Vec::with_capacity(node.output_types().len());
+    // Per port, the scratch of a root flattening this nested loop's lanes also write.
+    let mut inherited_scratch = Vec::with_capacity(node.output_types().len());
+    // Per port, the member count of the families it flattens into its export.
+    let mut flattened_ports = Vec::with_capacity(node.output_types().len());
+    // Per port, the parent stride of the members it exports for a root template's lane.
+    let mut nested_strides = Vec::with_capacity(node.output_types().len());
+    let mut dropped_ports = Vec::with_capacity(node.output_types().len());
     let mut outputs_by_port = Vec::with_capacity(node.output_types().len());
     let mut names_by_port = Vec::with_capacity(node.output_types().len());
+    // A trapdoor family stays resident with its public matrices, another output of the same
+    // lanes, so a loop with a trapdoor output keeps every output resident.
+    let mut has_trapdoor_output = false;
+    for declared in node.output_types() {
+        if let ConcreteWireType::IndexedFamily { element, .. } =
+            concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?
+        {
+            has_trapdoor_output |= matches!(element.as_ref(), ConcreteWireType::Trapdoor { .. });
+        }
+    }
     for (port, declared) in node.output_types().iter().enumerate() {
         let port_id = Port(
             u32::try_from(port).map_err(|_| "GPU parallel loop has too many outputs".to_owned())?,
@@ -7862,54 +9128,230 @@ fn lower_parallel_loop(
         let ConcreteWireType::IndexedFamily { element, count: declared_count } = &ty else {
             return Err("GPU parallel loop output is not an indexed family".into());
         };
-        if *declared_count != count || !matches!(element.as_ref(), ConcreteWireType::Matrix(_)) {
-            return Err("GPU parallel loop needs a homogeneous matrix family".into());
+        // A family of families is exported member by member under its flattening's name.
+        let flattened = (is_root && !ctx.device_body && ctx.active_parallel_template.is_none())
+            .then(|| crate::gpu_streamed_carry::flattened_family_reader(graph, wire, &ty, env))
+            .flatten();
+        let read_flattening =
+            flattened.and_then(|(reader, inner, read)| read.then_some((reader, inner)));
+        let flattened = flattened.map(|(reader, inner, _)| (reader, inner));
+        let member = match (flattened, element.as_ref()) {
+            (Some(_), ConcreteWireType::IndexedFamily { element, .. }) => element.as_ref(),
+            _ => element.as_ref(),
+        };
+        // Members are full or bounded compact matrices or preimages, or (not flattened) trapdoors
+        // that stay resident; only summed ports (below) need full matrices.
+        if *declared_count != count as u128 ||
+            !(matches!(
+                member,
+                ConcreteWireType::Matrix(_) |
+                    ConcreteWireType::SmallMatrix { .. } |
+                    ConcreteWireType::Preimage { .. }
+            ) || flattened.is_none() &&
+                matches!(member, ConcreteWireType::Trapdoor { .. } | ConcreteWireType::Int))
+        {
+            return Err(format!(
+                "GPU parallel loop output {port} of node {node_id:?} is not a family of {count} \
+                 matrices, preimages, trapdoors or scalars, or of flattened matrix families: {ty:?}"
+            ));
         }
-        // Root outputs of this family name its export sites. Later root
+        // Root outputs of this family (or of its flattening) name its export sites. Later root
         // consumers read the plan-owned family after the wave region ends.
-        let names = if is_root {
+        let exported =
+            flattened.map_or(wire, |(reader, _)| WireRef { node: reader, port: Port(0) });
+        // A family that a root wave template's lane returns as its share of a flattened export
+        // is exported here, member by member, at the lane's block. If the lane also reads it,
+        // it is spilled: written to scratch too and read back member by member
+        // ([`crate::gpu_streamed_carry::spilled_family_export`]).
+        let read_in_lane = parent.nodes().iter().any(|consumer| {
+            parent.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
+        });
+        // Explicit host-stored outputs can be published wave by wave even
+        // when subsequent nodes read them: private scratch supplies those
+        // reads without retaining every produced member on the device. Any
+        // ordinary resident alias, or a device artifact store, keeps the
+        // original resident-family path.
+        let root_artifacts = is_root &&
+            !has_trapdoor_output &&
+            !ctx.device_body &&
+            !ctx.device_artifact_exports &&
+            flattened.is_none() &&
+            read_in_lane &&
+            graph.outputs().values().any(|output| output.value == wire) &&
+            graph
+                .outputs()
+                .values()
+                .filter(|output| output.value == wire)
+                .all(|output| output.availability.is_some());
+        let lane_export = (!is_root && !ctx.device_body && ctx.active_parallel_template.is_some())
+            .then(|| ctx.streaming.nested_exports.get(&(scope_id.clone(), wire)))
+            .flatten()
+            .map(|export| (export.names.clone(), export.stride, export.parent_count));
+        // The root flattening's scratch, which this loop writes for its root lane but which the
+        // root loop binds.
+        inherited_scratch.push(
+            (!is_root && !ctx.device_body && ctx.active_parallel_template.is_some())
+                .then(|| ctx.streaming.nested_exports.get(&(scope_id.clone(), wire)))
+                .flatten()
+                .and_then(|export| export.scratch.clone()),
+        );
+        let spill = match (&lane_export, read_in_lane) {
+            (Some((_, _, parent_count)), true) => {
+                let spill = crate::gpu_streamed_carry::spilled_family_export(
+                    ctx,
+                    scope_id,
+                    wire,
+                    &ty,
+                    *parent_count,
+                )?;
+                if spill.is_none() {
+                    return Err(format!(
+                        "GPU nested loop output {port} of node {node_id:?} is exported and read in its lane, \
+                         but its members are not matrices"
+                    ));
+                }
+                spill
+            }
+            _ if root_artifacts => {
+                crate::gpu_streamed_carry::spilled_family_export(ctx, scope_id, wire, &ty, 1)?
+            }
+            // A flattening that later root nodes read is spilled: each lane writes its share to
+            // scratch too, which the flattening's readers read member by member.
+            _ if read_flattening.is_some() &&
+                !has_trapdoor_output &&
+                !ctx.device_artifact_exports =>
+            {
+                let (reader, inner) = read_flattening.expect("a read flattening");
+                let flat = ConcreteWireType::IndexedFamily {
+                    element: Box::new(member.clone()),
+                    count: declared_count
+                        .checked_mul(inner)
+                        .ok_or("GPU flattened family count exceeds u128")?,
+                };
+                let output = WireRef { node: reader, port: Port(0) };
+                let spill = crate::gpu_streamed_carry::spilled_family_export(
+                    ctx, scope_id, output, &flat, 1,
+                )?;
+                if spill.is_none() {
+                    return Err(format!(
+                        "GPU flattening of output {port} of node {node_id:?} is read, but its \
+                         members are not matrices"
+                    ));
+                }
+                spilled_flattenings.push(Some((output, flat)));
+                spill
+            }
+            // A top-level family of a host-driven loop body that later loops of the body read is
+            // spilled to scratch (every iteration overwrites it), unless it is a carry's new
+            // value, whose export the carry registered.
+            (None, true)
+                if crate::env::gpu_body_spill() &&
+                    !is_root &&
+                    !ctx.device_body &&
+                    ctx.active_parallel_template.is_none() &&
+                    !has_trapdoor_output &&
+                    !ctx.streaming.exports.contains_key(&(scope_id.clone(), wire)) &&
+                    crate::gpu_streamed_carry::body_spill(parent, wire, &ty) =>
+            {
+                let spill =
+                    crate::gpu_streamed_carry::spilled_family_export(ctx, scope_id, wire, &ty, 1)?;
+                if spill.is_some() {
+                    ctx.streaming.body_spills += 1;
+                }
+                spill
+            }
+            _ => None,
+        };
+        spilled_flattenings.resize(port + 1, None);
+        let nested = lane_export.map(|(names, stride, _)| {
+            if let Some(export) = ctx.streaming.nested_exports.get_mut(&(scope_id.clone(), wire)) {
+                export.exported = true;
+            }
+            (names, stride)
+        });
+        let names = if let Some((names, _)) = &nested {
+            names.clone()
+        } else if is_root {
             graph
                 .outputs()
                 .iter()
-                .filter(|(_, output)| output.value == wire)
+                .filter(|(_, output)| output.value == exported)
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        outputs_by_port.push((ty, Vec::<Arc<GpuResidentValue>>::with_capacity(count)));
+        if let Some((reader, _)) = flattened {
+            ctx.fused_nodes.insert(reader);
+        }
+        flattened_ports.push(flattened.map(|(_, inner)| inner));
+        nested_strides.push(nested.as_ref().map(|(_, stride)| *stride));
+        // A nested loop's port that nothing reads (not even its scope's outputs) is dropped:
+        // no member of it is kept.
+        dropped_ports.push(
+            !is_root &&
+                !parent.outputs().contains(&wire) &&
+                !parent.nodes().iter().any(|consumer| {
+                    parent.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
+                }),
+        );
+        let carry_export = match spill {
+            Some(spill) => Some(spill),
+            None => {
+                crate::gpu_streamed_carry::initial_parallel_export(ctx, graph, scope_id, wire, &ty)?
+            }
+        };
+        carry_exports.push(carry_export);
+        outputs_by_port.push((ty, Vec::<Arc<GpuResidentValue>>::new()));
         names_by_port.push(names);
     }
     // Root output ports that no node reads after the loop: at most their
     // artifact exports do. Each wave writes their members as soon as it has
     // produced them, from slots its lanes reuse, so the loop keeps no member
     // of them resident.
+    // A trapdoor family is never exported: its members stay resident for the loop's consumers.
+    let trapdoor_ports = outputs_by_port
+        .iter()
+        .map(|(ty, _)| {
+            matches!(ty, ConcreteWireType::IndexedFamily { element, .. }
+                if matches!(element.as_ref(), ConcreteWireType::Trapdoor { .. }))
+        })
+        .collect::<Vec<_>>();
+    if trapdoor_ports
+        .iter()
+        .zip(&names_by_port)
+        .any(|(trapdoor, names)| *trapdoor && !names.is_empty())
+    {
+        return Err("GPU parallel loop cannot export a trapdoor family".into());
+    }
     let streamed_ports = names_by_port
         .iter()
         .enumerate()
         .map(|(port, names)| {
             let wire = WireRef { node: node_id, port: Port(port as u32) };
             let root = graph.root_scope();
-            is_root &&
-                !ctx.device_body &&
-                ctx.active_parallel_template.is_none() &&
-                names.iter().all(|name| {
-                    graph.outputs().get(name).is_some_and(|output| output.availability.is_some())
-                }) &&
-                !root.nodes().iter().any(|consumer| {
-                    root.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
-                })
+            !trapdoor_ports[port] &&
+                (carry_exports[port].is_some() ||
+                    flattened_ports[port].is_some() ||
+                    nested_strides[port].is_some() ||
+                    dropped_ports[port] ||
+                    is_root &&
+                        !ctx.device_body &&
+                        ctx.active_parallel_template.is_none() &&
+                        names.iter().all(|name| {
+                            graph
+                                .outputs()
+                                .get(name)
+                                .is_some_and(|output| output.availability.is_some())
+                        }) &&
+                        !root.nodes().iter().any(|consumer| {
+                            root.arguments(consumer)
+                                .is_some_and(|arguments| arguments.contains(&wire))
+                        }))
         })
         .collect::<Vec<_>>();
-    // Output ports whose only reads sum their members: each wave adds its
-    // lanes' members to a running sum, so no member stays resident. A tail
-    // wave's inactive lanes would add again, so the width divides the count.
-    let fused_sum = (is_root && !ctx.device_body && ctx.active_parallel_template.is_none())
-        .then(|| fused_member_sums(graph, node_id, node.output_types().len(), count, env))
-        .flatten();
-    if fused_sum.is_some() && count % width != 0 {
-        return Err("GPU summed parallel loop needs a wave width dividing its count".into());
-    }
+    // Each wave adds exactly its active members. The selected width below
+    // divides the count, so no inactive tail lane enters this reduction.
     let summed_ports = (0..node.output_types().len())
         .map(|port| fused_sum.as_ref().is_some_and(|(_, ports)| ports[port].is_some()))
         .collect::<Vec<_>>();
@@ -7924,9 +9366,11 @@ fn lower_parallel_loop(
         };
         accumulators.insert(port, crate::gpu_physical_lowering::emit_zero_matrix(ctx, ty)?);
     }
+    // Per trapdoor port, the port of its public matrices (the same in every lane).
+    let mut trapdoor_publics = vec![None::<Option<usize>>; node.output_types().len()];
     // Per lane, the export templates of its streamed members.
-    let mut streamed_templates = Vec::<Vec<usize>>::with_capacity(width);
-    let child_environment = |index: usize| -> Result<ParamEnv, String> {
+    let mut streamed_templates = Vec::<Vec<(usize, u128, u128)>>::with_capacity(width);
+    let child_environment = |index: u128| -> Result<ParamEnv, String> {
         let mut child_env = fixed_child_env(
             scope_id,
             node_id,
@@ -7938,14 +9382,21 @@ fn lower_parallel_loop(
         Ok(child_env)
     };
     let first_types = resolved_scope_types(child, &child_id, &child_environment(0)?)?;
-    for index in 1..count {
+    let indexed_types = types_depend_on_loop_index(child);
+    for index in 1..if indexed_types { count } else { 1 } {
         let types = resolved_scope_types(child, &child_id, &child_environment(index)?)?;
-        if types != first_types {
-            return Err("GPU parallel loop has instance-dependent physical types".into());
+        if let Some((wire, ty)) = types.iter().find(|(wire, ty)| first_types.get(wire) != Some(ty))
+        {
+            let kind = child.node(wire.node).map(|node| format!("{:?}", node.kind()));
+            return Err(format!(
+                "GPU parallel loop has instance-dependent physical types: {wire:?} ({}) is {ty:?} at instance {index}, {:?} at 0",
+                kind.unwrap_or_default().chars().take(120).collect::<String>(),
+                first_types.get(wire)
+            ));
         }
     }
     for (_, parent_env) in &ctx.active_parallel_instances {
-        if parent_template.is_none() {
+        if parent_template.is_none() || !indexed_types {
             break;
         }
         let mut instance_env = fixed_child_env(
@@ -7984,10 +9435,43 @@ fn lower_parallel_loop(
         for (argument, (source, mode)) in source_ids.iter().zip(&loop_node.input_modes).enumerate()
         {
             if let (LoopInputMode::Broadcast, Some(source)) = (mode, source) {
+                if *source == UNMATERIALIZED_IDENTITY || ctx.streaming.families.contains_key(source)
+                {
+                    continue;
+                }
                 let replica =
                     crate::gpu_physical_lowering::replicate_to_device(ctx, *source, device)?;
                 broadcast_replicas.insert((argument, device), replica);
             }
+        }
+    }
+    // Runtime-base reads import members of an artifact family or streamed carry; a resident
+    // family is read in the body by its own dynamic selection.
+    let runtime_reads = if ctx.device_body {
+        BTreeMap::new()
+    } else {
+        let mut reads = crate::gpu_streamed_carry::runtime_base_reads(child, loop_node);
+        reads.retain(|argument, _| {
+            let artifact = matches!(
+                parent.node(arguments[*argument].node).map(NodeHandle::kind),
+                Some(NodeKind::Input { artifact: Some(_), .. })
+            );
+            let carry =
+                source_ids[*argument].is_some_and(|id| ctx.streaming.families.contains_key(&id));
+            artifact || carry
+        });
+        reads
+    };
+    let mut base_slots = BTreeMap::new();
+    for (base_argument, _) in runtime_reads.values() {
+        let base = source_ids
+            .get(*base_argument)
+            .copied()
+            .flatten()
+            .ok_or("GPU runtime Zip base has no scalar owner")?;
+        if !base_slots.contains_key(&base) {
+            let slot = crate::gpu_physical_lowering::emit_import_request(ctx, base)?;
+            base_slots.insert(base, slot);
         }
     }
     let body_start = u32::try_from(ctx.operations.len())
@@ -8001,6 +9485,56 @@ fn lower_parallel_loop(
     // execute rebinds for root inputs before the first wave.
     let mut zip_lanes = Vec::<(usize, usize, PhysicalValueId, PhysicalValueId)>::new();
     let mut artifact_zip_lanes = Vec::<ArtifactZipLane>::new();
+    // One lane per wave reading many artifact members, as a chain of products reads its
+    // leaves: each member is imported in a window of the body rather than for the whole wave.
+    let windowed_lanes = width == 1 &&
+        crate::env::gpu_import_window() > 0 &&
+        loop_node
+            .input_modes
+            .iter()
+            .filter(|mode| {
+                matches!(
+                    mode,
+                    LoopInputMode::Zip |
+                        LoopInputMode::ZipOffset { .. } |
+                        LoopInputMode::Gather { .. }
+                )
+            })
+            .count() >=
+            crate::env::IMPORT_WINDOW_MIN_LANES;
+    // A summed member placed in one column of the running sum: each lane returns the entry and
+    // its column, so neither the placed row nor its unit row is materialized.
+    let mut placed_ports = vec![false; node.output_types().len()];
+    if let Some((_, ports)) = &fused_sum {
+        let placed_env = child_environment(0)?;
+        let mut units = BTreeMap::<NodeId, bool>::new();
+        for (port, placed) in placed_ports.iter_mut().enumerate() {
+            let Some((tensor, unit, column)) = ports[port]
+                .as_ref()
+                .and_then(|_| crate::gpu_cost_model::placed_member(child, port, &placed_env))
+            else {
+                continue;
+            };
+            *placed = true;
+            ctx.streaming.placed_tensors.insert((child_id.clone(), tensor), column);
+            units.insert(unit, true);
+        }
+        for (unit, only_placed) in &mut units {
+            let wire = WireRef { node: *unit, port: Port(0) };
+            *only_placed = !child.outputs().contains(&wire) &&
+                child.nodes().iter().enumerate().all(|(index, reader)| {
+                    !child.arguments(reader).is_some_and(|arguments| arguments.contains(&wire)) ||
+                        ctx.streaming
+                            .placed_tensors
+                            .contains_key(&(child_id.clone(), NodeId(index as u64)))
+                });
+        }
+        ctx.streaming.placed_units.extend(
+            units.into_iter().filter(|(_, only)| *only).map(|(unit, _)| (child_id.clone(), unit)),
+        );
+    }
+    // Per lane, the device column of each placed member.
+    let mut placed_columns = Vec::<Vec<Option<PhysicalValueId>>>::with_capacity(width);
     let mut result_ids = Vec::<Vec<PhysicalValueId>>::with_capacity(width);
     let mut borrowed_outputs = BTreeMap::<PhysicalValueId, BorrowedWaveOutput>::new();
     let mut index_lanes = Vec::with_capacity(width);
@@ -8008,42 +9542,79 @@ fn lower_parallel_loop(
     let body_imports_start = ctx.import_templates.len();
     let body_waves_start = ctx.waves.len();
     let mut lane_operations = Vec::with_capacity(width);
+    // A flattened port's lane family produced by a wave loop of the body is exported by that
+    // loop ([`crate::gpu_streamed_carry::NestedExport`]).
+    for (port, inner) in flattened_ports.iter().enumerate() {
+        let (Some(inner), Some(output)) = (inner, child.outputs().get(port)) else { continue };
+        if matches!(child.node(output.node).map(NodeHandle::kind), Some(NodeKind::ParallelLoop(_)))
+        {
+            ctx.streaming.nested_exports.insert(
+                (child_id.clone(), *output),
+                crate::gpu_streamed_carry::NestedExport {
+                    names: names_by_port[port].clone(),
+                    stride: *inner,
+                    parent_count: count,
+                    exported: false,
+                    scratch: spilled_flattenings[port]
+                        .is_some()
+                        .then(|| carry_exports[port].clone())
+                        .flatten(),
+                },
+            );
+        }
+    }
+    // Per port, whether a wave loop of the body exports its lanes' families.
+    let mut nested_ports = vec![None::<bool>; node.output_types().len()];
     for lane in 0..width {
         let lane_start = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU parallel body operations".to_owned())?;
+        let lane_values_start = ctx.values.len();
         let lane_device = lane_devices[lane % lane_devices.len()];
         ctx.device = lane_device;
         let outer_indices = ctx.device_loop_indices.clone();
         if lane_device != home {
             for (slot, index) in &outer_indices {
-                let replica =
-                    crate::gpu_physical_lowering::replicate_to_device(ctx, *index, lane_device)?;
+                // A captured index and the active outer index must name the
+                // same replica, preserving its loop-index provenance in the
+                // child scope instead of making an unrelated second Int copy.
+                let broadcast = source_ids.iter().enumerate().find_map(|(argument, source)| {
+                    (*source == Some(*index))
+                        .then(|| broadcast_replicas.get(&(argument, lane_device)).copied())
+                        .flatten()
+                });
+                let replica = match broadcast {
+                    Some(replica) => replica,
+                    None => {
+                        crate::gpu_physical_lowering::replicate_to_device(ctx, *index, lane_device)?
+                    }
+                };
                 ctx.device_loop_indices.insert(*slot, replica);
             }
         }
-        let initial =
-            u64::try_from(lane).map_err(|_| "GPU parallel lane index exceeds u64".to_owned())?;
-        let maximum = u64::try_from(count - 1)
-            .map_err(|_| "GPU parallel loop count exceeds u64".to_owned())?;
+        let initial = lane as u128;
+        let maximum = (count - 1) as u128;
         let (device_index, index_owner) = allocate_wave_occurrence(ctx, initial, maximum)?;
         index_lanes.push((device_index, index_owner));
         let mut input_ids = Vec::with_capacity(source_ids.len());
         for (argument, ((source, wire), mode)) in
             source_ids.iter().zip(arguments.iter()).zip(&loop_node.input_modes).enumerate()
         {
+            let dynamic = runtime_reads.get(&argument);
             let offset = match mode {
+                LoopInputMode::Broadcast if dynamic.is_some() => 0,
                 LoopInputMode::Broadcast => {
                     // A root artifact family is never loaded whole: the body's
                     // family reads import the members they reach, so this
                     // position only keeps the arguments aligned.
                     let unloaded_family = source.is_none() &&
-                        is_root &&
                         matches!(
                             parent.node(wire.node).map(NodeHandle::kind),
                             Some(NodeKind::Input { artifact: Some(_), .. })
                         ) &&
                         matches!(
-                            ctx.validated.root_scope().wire_types.get(wire),
+                            ctx.validated
+                                .scope(scope_id)
+                                .and_then(|scope| scope.wire_types.get(wire)),
                             Some(ConcreteWireType::IndexedFamily { .. })
                         );
                     if unloaded_family {
@@ -8060,6 +9631,9 @@ fn lower_parallel_loop(
                 LoopInputMode::Zip => 0,
                 LoopInputMode::ZipOffset { offset } => *offset,
                 LoopInputMode::Gather { .. } => 0,
+                LoopInputMode::ZipQuotient { .. } => {
+                    return Err("GPU parallel loops do not read quotient-zipped families".into());
+                }
             };
             // A gathered member's index is its lane's entry of a resident
             // integer family, known only when the loop starts.
@@ -8091,28 +9665,54 @@ fn lower_parallel_loop(
             // Only root artifact inputs are imported per lane; a nested loop's
             // Zip source is a family already resident in its template.
             let artifact = match source_node.kind() {
-                NodeKind::Input { artifact, .. } if is_root => artifact.as_ref(),
+                NodeKind::Input { artifact, .. } => artifact.as_ref(),
                 _ => None,
             };
+            let carry = source.and_then(|id| ctx.streaming.families.get(&id)).cloned();
             let index = lane
                 .checked_add(offset)
                 .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
-            if let Some(artifact) = artifact {
-                if source.is_some() {
+            if artifact.is_some() || carry.is_some() {
+                if source.is_some() && carry.is_none() {
                     return Err("GPU artifact family was unexpectedly materialized".into());
                 }
-                let descriptor = ctx
-                    .validated
-                    .root_scope()
-                    .artifact_inputs
-                    .get(wire)
-                    .ok_or_else(|| "GPU Zip artifact lacks a validated descriptor".to_owned())?
-                    .clone();
-                let family_ty =
-                    ctx.validated.root_scope().wire_types.get(wire).ok_or_else(|| {
-                        "GPU Zip artifact lacks a concrete family type".to_owned()
-                    })?;
-                let ConcreteWireType::IndexedFamily { element, count: family_count } = family_ty
+                let family_ty = match source {
+                    Some(id) => ctx.values[id.0 as usize].ty.clone(),
+                    None => ctx
+                        .validated
+                        .scope(scope_id)
+                        .and_then(|scope| scope.wire_types.get(wire))
+                        .cloned()
+                        .ok_or("GPU Zip artifact lacks a concrete family type")?,
+                };
+                let (key, descriptor) = if let Some(family) = &carry {
+                    (
+                        crate::gpu_streamed_carry::scratch_key(&family.carry.name),
+                        ManifestArtifact {
+                            artifact_type: family.carry.element.clone(),
+                            availability: family.carry.availability,
+                            family_count: Some(family.carry.count as u128),
+                            layout: family.carry.layout.clone(),
+                        },
+                    )
+                } else {
+                    let artifact = artifact.expect("artifact Zip source");
+                    let descriptor = ctx
+                        .validated
+                        .scope(scope_id)
+                        .and_then(|scope| scope.artifact_inputs.get(wire))
+                        .cloned()
+                        .ok_or("GPU Zip artifact lacks a validated descriptor")?;
+                    (
+                        ArtifactKey {
+                            production: artifact.production_id.clone(),
+                            name: artifact.artifact_name.clone(),
+                            index: None,
+                        },
+                        descriptor,
+                    )
+                };
+                let ConcreteWireType::IndexedFamily { element, count: family_count } = &family_ty
                 else {
                     return Err("GPU Zip artifact is not an indexed family".into());
                 };
@@ -8120,30 +9720,28 @@ fn lower_parallel_loop(
                 let expected_type = ArtifactType::from_wire_type(element)
                     .ok_or("GPU Zip artifact member has no artifact type")?;
                 if descriptor.family_count != Some(*family_count) ||
-                    (gather.is_none() && index >= *family_count)
+                    (gather.is_none() && index as u128 >= *family_count)
                 {
                     return Err("GPU Zip artifact member is outside its validated family".into());
                 }
-                let selected_indexes = if gather.is_some() {
-                    (0..*family_count).collect::<Vec<_>>()
+                // Keep the candidate set lazy: a family capacity bound resolves
+                // it in O(1), even for parameter-sized gathered families.
+                let selected_indexes: Box<dyn Iterator<Item = u128>> = if gather.is_some() {
+                    Box::new(0..*family_count)
                 } else {
-                    (0..count)
-                        .step_by(width)
-                        .filter_map(|start| (start + lane < count).then_some(start + lane + offset))
-                        .collect()
+                    Box::new((0..count).step_by(width).filter_map(|start| {
+                        (start + (lane as u128) < count)
+                            .then_some(start + lane as u128 + offset as u128)
+                    }))
                 };
                 let capacity = selected_import_capacity(
                     ctx,
                     &element_type,
-                    &artifact.production_id,
-                    &artifact.artifact_name,
+                    &key.production,
+                    &key.name,
                     selected_indexes,
                 )?;
-                let key = ArtifactKey {
-                    production: artifact.production_id.clone(),
-                    name: artifact.artifact_name.clone(),
-                    index: gather.is_none().then_some(index),
-                };
+                let key = ArtifactKey { index: gather.is_none().then_some(index as u128), ..key };
                 // A matrix member lives in plan scratch placed for its wave
                 // loop, from the loop's first reads to its last wave.
                 let (destination, graph_value, upload_owner, before_operation) =
@@ -8167,12 +9765,27 @@ fn lower_parallel_loop(
                             capacity,
                         )?,
                     };
-                input_ids.push(graph_value);
+                if let Some((_, reads)) = dynamic {
+                    input_ids.push(source.unwrap_or(UNLOADED_FAMILY));
+                    for read in reads {
+                        ctx.streaming
+                            .member_overrides
+                            .insert((child_id.clone(), *read), graph_value);
+                    }
+                } else {
+                    input_ids.push(graph_value);
+                }
+                let base = dynamic.and_then(|(argument, _)| source_ids[*argument]);
                 // With more than one wave, odd waves read into a second owner
                 // so that each wave's members are read during the previous
                 // wave. A nested template replays per parent occurrence and
                 // reads in place.
-                let twin = if count > width && parent_template.is_none() {
+                let windowed = windowed_lanes &&
+                    matches!(
+                        upload_owner,
+                        crate::gpu_physical_lowering::ImportDestination::Placed { .. }
+                    );
+                let twin = if count > width as u128 && parent_template.is_none() && !windowed {
                     crate::gpu_physical_lowering::twin_import_destination(
                         ctx,
                         destination,
@@ -8182,9 +9795,10 @@ fn lower_parallel_loop(
                     None
                 };
                 artifact_zip_lanes.push(ArtifactZipLane {
+                    windowed,
                     argument,
-                    name: artifact.artifact_name.clone(),
-                    production: artifact.production_id.clone(),
+                    name: key.name.clone(),
+                    production: key.production.clone(),
                     descriptor,
                     expected_type,
                     offset,
@@ -8193,6 +9807,9 @@ fn lower_parallel_loop(
                     upload_owner,
                     before_operation,
                     gather,
+                    base,
+                    base_slot: base.and_then(|base| base_slots.get(&base).copied()),
+                    carry,
                     twin,
                 });
             } else {
@@ -8227,11 +9844,24 @@ fn lower_parallel_loop(
                 zip_lanes.push((offset, lane, id, source));
             }
         }
-        let child_env = child_environment(lane)?;
+        let child_env = child_environment(lane as u128)?;
         let previous_template = ctx.active_parallel_template;
+        let uniform_parent = uniform_nested_shapes;
+        let previous_occurrences = std::mem::replace(
+            &mut ctx.active_parallel_occurrences,
+            uniform_parent.then_some(ParentOccurrences::Strided {
+                start: lane as u128,
+                end: count,
+                step: width,
+            }),
+        );
         let previous_instances = std::mem::replace(
             &mut ctx.active_parallel_instances,
-            (lane..count)
+            (lane as u128..if !uniform_parent && has_nested_parallel(graph, &child_id) {
+                count
+            } else {
+                lane as u128 + 1
+            })
                 .step_by(width)
                 .map(|index| Ok((index, child_environment(index)?)))
                 .collect::<Result<Vec<_>, String>>()?,
@@ -8253,17 +9883,101 @@ fn lower_parallel_loop(
         );
         ctx.active_parallel_template = previous_template;
         ctx.active_parallel_instances = previous_instances;
+        ctx.active_parallel_occurrences = previous_occurrences;
         ctx.device_loop_indices = outer_indices;
         let mut outputs = lowered?;
+        placed_columns.push(
+            placed_ports
+                .iter()
+                .enumerate()
+                .map(|(port, placed)| {
+                    placed
+                        .then(|| {
+                            ctx.streaming
+                                .placed_columns
+                                .remove(&(child_id.clone(), child.outputs()[port]))
+                                .ok_or("GPU placed member has no column")
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        // A lane that returns an input or imported matrix itself (a gathered member) has no
+        // operation writing its output, so a wave could not bind the member it returns:
+        // copy it into lane storage, which also gives the import its consuming operation.
+        for output in outputs.iter_mut() {
+            let value = &ctx.values[output.0 as usize];
+            let (ConcreteWireType::Matrix(ty), [encoding]) = (&value.ty, value.encodings.as_ref())
+            else {
+                continue;
+            };
+            if ctx.producer.contains_key(output) ||
+                !value.parts.iter().all(|part| matches!(part.storage, StorageRef::Input(_)))
+            {
+                continue;
+            }
+            let (ty, encoding) = (ty.clone(), encoding.clone());
+            let copy = crate::gpu_physical_lowering::allocate_scratch_matrix(ctx, &ty, encoding)?;
+            let operation =
+                crate::gpu_physical_lowering::copy_matrix_view(ctx, *output, copy, Box::new([]))?;
+            ctx.producer.insert(copy, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
+            *output = copy;
+        }
+        for (port, nested) in nested_ports.iter_mut().enumerate() {
+            let exported = child.outputs().get(port).and_then(|output| {
+                ctx.streaming
+                    .nested_exports
+                    .get_mut(&(child_id.clone(), *output))
+                    .map(|export| std::mem::replace(&mut export.exported, false))
+            });
+            if *nested.get_or_insert(exported.unwrap_or(false)) != exported.unwrap_or(false) {
+                return Err("GPU parallel lanes disagree on their nested exports".into());
+            }
+        }
+        // A trapdoor output's public matrix is another output of the lane: the families pair.
+        for (port, id) in outputs.iter().enumerate().filter(|(port, _)| trapdoor_ports[*port]) {
+            let public = ctx
+                .trapdoor_public_ids
+                .get(id)
+                .and_then(|public| outputs.iter().position(|output| output == public));
+            match (public, *trapdoor_publics[port].get_or_insert(public)) {
+                (Some(public), Some(paired)) if public == paired => {}
+                _ => {
+                    return Err(
+                        "GPU parallel trapdoor output needs its public matrix as an output \
+                                of the same lane"
+                            .into(),
+                    );
+                }
+            }
+        }
         if lane_device != home {
-            for id in &mut outputs {
+            for (port, id) in outputs.iter_mut().enumerate() {
+                // A family its body's loop exported has no members to copy.
+                if nested_ports[port] != Some(true) {
+                    *id = crate::gpu_physical_lowering::replicate_to_device(ctx, *id, home)?;
+                }
+            }
+        }
+        // Scalar families use a single contiguous destination. A forwarded scalar
+        // must have a writer in this lane so rebinding writes that destination,
+        // rather than keeping a borrowed input outside the packed family.
+        for id in &mut outputs {
+            if ctx.values[id.0 as usize].ty == ConcreteWireType::Int &&
+                !ctx.producer.get(id).is_some_and(|writers| {
+                    writers.iter().any(|(_, operation)| *operation >= lane_start)
+                })
+            {
                 *id = crate::gpu_physical_lowering::replicate_to_device(ctx, *id, home)?;
             }
         }
         // An input, uploaded immutable constant, or view is a read-only result. Prove
         // allocation provenance rather than mistaking an absent writer for an
         // uninitialized output, or manufacturing a same-device copy.
-        for &id in &outputs {
+        for (port, &id) in outputs.iter().enumerate() {
+            if nested_ports[port] == Some(true) {
+                continue;
+            }
             let output = ctx.owners.get(&id).ok_or("GPU parallel result owner is absent")?;
             let immutable = ctx
                 .producer
@@ -8293,11 +10007,17 @@ fn lower_parallel_loop(
             let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
                 return Err("GPU parallel output is not a family".into());
             };
-            if &ctx.values[id.0 as usize].ty != element.as_ref() {
+            // A placed member is its `1 x 1` entry.
+            if !placed_ports[port] && &ctx.values[id.0 as usize].ty != element.as_ref() {
                 return Err("GPU parallel child output has the wrong family element type".into());
             }
+            // A streamed member is exported from its first-wave owner after every wave, so any
+            // value of the lane (a nested loop's family, a constant) is valid; a resident member
+            // is replayed into a later wave's owner, so the body must write it.
+            let lane_value = id.0 as usize >= lane_values_start && !input_ids.contains(&id);
             if ctx.producer.get(&id).is_none_or(Vec::is_empty) &&
-                !borrowed_outputs.contains_key(&id)
+                !borrowed_outputs.contains_key(&id) &&
+                !(streamed_ports[port] && lane_value)
             {
                 return Err(format!(
                     "GPU parallel child output must be produced inside its body: output {port} \
@@ -8309,35 +10029,86 @@ fn lower_parallel_loop(
         }
         let mut lane_templates = Vec::new();
         for (port, id) in outputs.iter().copied().enumerate() {
-            if !streamed_ports[port] {
+            if !streamed_ports[port] || nested_ports[port] == Some(true) {
                 continue;
             }
             let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
                 return Err("GPU parallel output is not a family".into());
             };
+            // The lane's member, or, flattened, each member `j` of its family as member
+            // `lane k + j` of the export.
+            let (element, sources) = match (flattened_ports[port], element.as_ref()) {
+                (Some(inner), ConcreteWireType::IndexedFamily { element, .. }) => {
+                    let family = Arc::clone(ctx.owners.get(&id).ok_or_else(|| {
+                        "GPU flattened parallel output owner is missing".to_owned()
+                    })?);
+                    let writers = ctx.producer.get(&id).cloned().unwrap_or_default();
+                    let resident_count = usize::try_from(inner)
+                        .map_err(|_| "GPU resident flattened family exceeds usize")?;
+                    let mut sources = Vec::with_capacity(resident_count);
+                    for (offset, selected) in
+                        wave_family_members(&family, 0..resident_count)?.into_iter().enumerate()
+                    {
+                        let member = value_id(ctx.values.len())?;
+                        ctx.values.push(selected.physical().as_ref().clone());
+                        ctx.owners.insert(member, selected);
+                        ctx.producer.insert(member, writers.clone());
+                        sources.push(((inner, offset as u128), member));
+                    }
+                    (element.as_ref(), sources)
+                }
+                (_, element) => (element, vec![((1, 0), id)]),
+            };
             let artifact_type = ArtifactType::from_wire_type(element)
                 .ok_or_else(|| "GPU streamed family member has no artifact type".to_owned())?;
-            let source = crate::gpu_physical_lowering::full_eval_value(ctx, id)?;
-            for name in &names_by_port[port] {
-                let availability = graph
-                    .outputs()
-                    .get(name)
-                    .and_then(|output| output.availability)
-                    .ok_or_else(|| "GPU streamed export has no availability".to_owned())?;
+            // The artifact names of the port's members: its public exports, and its scratch
+            // generation (a carry's, or a spilled family's).
+            let scratch_export = carry_exports[port].as_ref().or(inherited_scratch[port].as_ref());
+            let export_names = names_by_port[port]
+                .iter()
+                .map(|name| (name.clone(), None))
+                .chain(
+                    scratch_export.map(|export| (export.family.carry.name.clone(), Some(export))),
+                )
+                .collect::<Vec<_>>();
+            for ((name, scratch), ((stride, offset), source)) in export_names
+                .iter()
+                .flat_map(|name| sources.iter().map(move |source| (name, *source)))
+            {
+                let scratch = *scratch;
+                let source = crate::gpu_physical_lowering::full_eval_value(ctx, source)?;
+                let availability = if scratch.is_some() {
+                    mxx_ir_core::artifact::ArtifactAvailability::Cached
+                } else {
+                    graph
+                        .outputs()
+                        .get(name)
+                        .and_then(|output| output.availability)
+                        .ok_or_else(|| "GPU streamed export has no availability".to_owned())?
+                };
                 let (first, first_operation) = (ctx.export_templates.len(), ctx.operations.len());
-                crate::gpu_physical_lowering::emit_artifact_export(
+                let device_exports = ctx.device_artifact_exports;
+                if scratch.is_some() {
+                    ctx.device_artifact_exports = false;
+                }
+                let exported = crate::gpu_physical_lowering::emit_artifact_export(
                     ctx,
                     name,
-                    &[(Some(lane), source)],
+                    &[(Some(lane as u128 * stride + offset), source)],
                     artifact_type.clone(),
                     availability,
                     None,
-                )?;
+                );
+                ctx.device_artifact_exports = device_exports;
+                exported?;
                 // Each lane's export is a site of its own, reused by every
                 // wave: its slot is the site's first, whichever member it
                 // names.
                 for template in &mut ctx.export_templates[first..] {
                     template.streamed = true;
+                    template.scratch = scratch.is_some();
+                    template.member_base = scratch.and_then(|export| export.member_base.clone());
+                    template.parent_stride = nested_strides[port];
                     template.occurrence = 0;
                 }
                 let publish = ctx
@@ -8349,7 +10120,9 @@ fn lower_parallel_loop(
                         operation.arguments[1] = KernelArg::U64(0);
                     }
                 }
-                lane_templates.extend(first..ctx.export_templates.len());
+                lane_templates.extend(
+                    (first..ctx.export_templates.len()).map(|template| (template, stride, offset)),
+                );
             }
         }
         streamed_templates.push(lane_templates);
@@ -8360,15 +10133,62 @@ fn lower_parallel_loop(
                     .map_err(|_| "too many GPU parallel body operations".to_owned())?,
         );
     }
+    // Another lowering of this body (another candidate, or a device body) decides afresh.
+    ctx.streaming.placed_tensors.retain(|(scope, _), _| *scope != child_id);
+    ctx.streaming.placed_units.retain(|(scope, _)| *scope != child_id);
     // After its lanes, each wave adds their members to the running sum of a
     // summed port, with the frozen choice of the sum's first addition; the
     // sequential loop's result is that running sum.
     if let Some((sequential, ports)) = &fused_sum {
-        let validated = ctx.validated;
-        let root = validated.source.root_scope();
-        let wire_types = &validated.root_scope().wire_types;
+        let root = graph.scope(scope_id).ok_or("GPU member sum scope is missing")?;
         for (port, fused) in ports.iter().enumerate() {
-            let Some((first, second, add, carried)) = *fused else { continue };
+            let Some(fused) = fused else { continue };
+            let add = fused.addition;
+            let carried = fused.carried;
+            let carried_wire = WireRef {
+                node: *sequential,
+                port: Port(
+                    u32::try_from(carried)
+                        .map_err(|_| "GPU member sum port exceeds u32".to_owned())?,
+                ),
+            };
+            if placed_ports[port] {
+                // Each lane adds its entry to its column of the running sum in place.
+                let accumulator = accumulators[&port];
+                for (ids, columns) in result_ids.iter().zip(&placed_columns) {
+                    let column = columns[port].ok_or("GPU placed member has no column")?;
+                    emit_column_add(ctx, accumulator, ids[port], column, accumulator)?;
+                }
+                ctx.wire_ids.insert(carried_wire, accumulator);
+                ctx.fused_nodes.extend(fused.reads.iter().copied());
+                if fused.addition_scope == *scope_id {
+                    ctx.fused_nodes.insert(add);
+                }
+                continue;
+            }
+            let addition_scope = graph
+                .scope(&fused.addition_scope)
+                .ok_or("GPU member sum addition scope is missing")?;
+            let mut addition_env = env.clone();
+            if fused.addition_scope != *scope_id {
+                let NodeKind::SequentialLoop(spec) = root.nodes()[sequential.0 as usize].kind()
+                else {
+                    return Err("GPU member sum sequential loop is missing".into());
+                };
+                addition_env = fixed_child_env(
+                    scope_id,
+                    *sequential,
+                    env,
+                    &spec.bindings,
+                    Some(spec.index_slot),
+                )?;
+                addition_env.loop_indices.insert(spec.index_slot, BigInt::from(0));
+            }
+            let wire_types =
+                resolved_scope_types(addition_scope, &fused.addition_scope, &addition_env)?;
+            let shape_class =
+                crate::gpu_execution_plan::scope_shape_class(ctx.validated, &fused.addition_scope)
+                    .map_err(|error| error.to_string())?;
             let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
                 return Err("GPU summed parallel output is not a family".into());
             };
@@ -8376,40 +10196,58 @@ fn lower_parallel_loop(
                 return Err("GPU summed parallel output has no matrix members".into());
             };
             let accumulator = accumulators[&port];
-            let choice = ctx
+            let choices = ctx
                 .logical
                 .nodes
                 .iter()
-                .find(|choice| {
+                .filter(|choice| {
                     choice.key.site == add.0 &&
-                        choice.key.shape_class == 0 &&
-                        choice.key.instance_class == 0 &&
-                        choice.loop_site.is_none()
+                        choice.key.shape_class == shape_class &&
+                        choice.key.instance_class == 0
                 })
                 .cloned()
-                .ok_or_else(|| "GPU member sum has no frozen root choice".to_owned())?;
-            let add_node = &root.nodes()[add.0 as usize];
-            let [left, right] = root
+                .collect::<Vec<_>>();
+            let [choice] = choices.as_slice() else {
+                return Err("GPU member sum has no unique frozen scoped choice".into());
+            };
+            let add_node = &addition_scope.nodes()[add.0 as usize];
+            let [left, right] = addition_scope
                 .arguments(add_node)
                 .ok_or_else(|| "GPU member sum has no arguments".to_owned())?[..]
             else {
                 return Err("GPU member sum is not binary".into());
             };
             let sum = WireRef { node: add, port: Port(0) };
+            // A body's local wire numbers can coincide with unrelated parent wires.
+            // Restore those bindings after emitting the frozen addition in this scope.
+            let saved = [left, right, sum]
+                .into_iter()
+                .map(|wire| (wire, ctx.wire_ids.get(&wire).copied()))
+                .collect::<BTreeMap<_, _>>();
             let mut total = accumulator;
             for ids in &result_ids {
                 ctx.wire_ids.insert(left, total);
                 ctx.wire_ids.insert(right, ids[port]);
                 crate::gpu_physical_lowering::lower_matrix_node(
-                    ctx, root, add, add_node, wire_types, &choice,
+                    ctx,
+                    addition_scope,
+                    add,
+                    add_node,
+                    &wire_types,
+                    choice,
+                    &addition_env,
                 )?;
                 total = *ctx
                     .wire_ids
                     .get(&sum)
                     .ok_or_else(|| "GPU member sum produced no value".to_owned())?;
             }
-            for wire in [left, right, sum] {
-                ctx.wire_ids.remove(&wire);
+            for (wire, previous) in saved {
+                if let Some(id) = previous {
+                    ctx.wire_ids.insert(wire, id);
+                } else {
+                    ctx.wire_ids.remove(&wire);
+                }
             }
             let predecessors = all_predecessors(ctx.producer, total);
             let copy = crate::gpu_physical_lowering::copy_matrix_view(
@@ -8420,22 +10258,70 @@ fn lower_parallel_loop(
             )?;
             ctx.producer
                 .insert(accumulator, vec![(ColumnRange { start: 0, end: ty.columns }, copy)]);
-            ctx.wire_ids.insert(
-                WireRef {
-                    node: *sequential,
-                    port: Port(
-                        u32::try_from(carried)
-                            .map_err(|_| "GPU member sum port exceeds u32".to_owned())?,
-                    ),
-                },
-                accumulator,
-            );
-            ctx.fused_nodes.extend([first, second, add]);
+            ctx.wire_ids.insert(carried_wire, accumulator);
+            ctx.fused_nodes.extend(fused.reads.iter().copied());
+            if fused.addition_scope == *scope_id {
+                ctx.fused_nodes.insert(add);
+            }
         }
         ctx.fused_nodes.insert(*sequential);
     }
     let body_end = u32::try_from(ctx.operations.len())
         .map_err(|_| "too many GPU parallel body operations".to_owned())?;
+    // Scalar families need contiguous storage for dynamic gathers and loop carries.
+    // Bind each lane's result directly to its member view, rather than appending one
+    // packing kernel per family member after the loop.
+    let mut scalar_families = BTreeMap::new();
+    let mut scalar_members = BTreeMap::new();
+    for (port, (ty, _)) in outputs_by_port.iter().enumerate() {
+        if streamed_ports[port] ||
+            !matches!(ty, ConcreteWireType::IndexedFamily { element, .. } if **element == ConcreteWireType::Int)
+        {
+            continue;
+        }
+        let ranges = result_ids
+            .iter()
+            .map(|ids| integer_range(ctx, ids[port]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lower =
+            ranges.iter().map(|range| range.start()).min().ok_or("empty scalar loop")?.clone();
+        let upper =
+            ranges.iter().map(|range| range.end()).max().ok_or("empty scalar loop")?.clone();
+        let family = allocate_integer_family_value(ctx, ty.clone(), lower..=upper)?;
+        let owner = ctx.owners.get(&family).ok_or("scalar family has no owner")?;
+        let members = wave_family_members(
+            owner,
+            0..usize::try_from(count)
+                .map_err(|_| "GPU resident scalar family exceeds host address space")?,
+        )?;
+        for (lane, ids) in result_ids.iter().enumerate() {
+            let id = ids[port];
+            if ctx.values[id.0 as usize].encodings != members[lane].physical().encodings {
+                return Err("scalar wave result has a different encoding from its family".into());
+            }
+            if ctx.device_body {
+                let original = ctx.owners.get(&id).ok_or("scalar result has no owner")?;
+                let old = original.storages().next().ok_or("scalar result has no storage")?.1;
+                let mut replacement = members[lane]
+                    .storages()
+                    .next()
+                    .ok_or("scalar member has no storage")?
+                    .1
+                    .clone();
+                // Preserve aliases relative to this scalar, not the whole family's tail.
+                replacement.bytes = old.bytes;
+                let replacements = std::collections::HashMap::from([(
+                    Arc::as_ptr(&old.owner).cast::<()>(),
+                    replacement,
+                )]);
+                ctx.owners.rebind(|_, value| {
+                    value.rebound(&replacements, value.ready_events()).map_err(str::to_owned)
+                })?;
+            }
+        }
+        scalar_families.insert(port, family);
+        scalar_members.insert(port, members);
+    }
     // A device body is one top-level operation; its lanes share no memory node.
     if !ctx.device_body && width > 1 {
         ctx.parallel_lanes.push(lane_operations);
@@ -8471,8 +10357,107 @@ fn lower_parallel_loop(
     if ctx.device_body && !body_imports.is_empty() {
         return Err("GPU device body artifact import needs an on-demand region boundary".into());
     }
-    for wave_start in (0..count).step_by(width).filter(|_| !ctx.device_body) {
-        let active_lanes = (count - wave_start).min(width);
+    // Account for the independently deferred storage of later-wave members.
+    let later_waves =
+        if ctx.device_body { 0 } else { count.div_ceil(width as u128).saturating_sub(1) };
+    let mut wave_bytes = 0u64;
+    for ids in &result_ids {
+        wave_bytes += replay_bytes(
+            ctx,
+            ids.iter()
+                .enumerate()
+                .filter(|(port, _)| {
+                    !(streamed_ports[*port] ||
+                        summed_ports[*port] ||
+                        scalar_families.contains_key(port))
+                })
+                .map(|(_, id)| *id),
+        )?;
+    }
+    // The loop's resident members: every later wave's in the member arena, for VRAM audits.
+    tracing::debug!(
+        scope = ?scope_id,
+        node = node_id.0,
+        count,
+        width,
+        resident_bytes_per_wave = wave_bytes,
+        member_arena_bytes = ?(wave_bytes as u128).checked_mul(later_waves),
+        streamed = ?streamed_ports,
+        summed = ?summed_ports,
+        dropped = ?dropped_ports,
+        nested_wave_count = ctx.waves.len() - body_waves_start,
+        resident_zip_lanes = zip_lanes.len(),
+        artifact_zip_lanes = artifact_zip_lanes.len(),
+        "planned GPU parallel loop members"
+    );
+    // A leaf streamed/summed loop reuses the same owners and import sites.
+    // Represent all full waves once and, if needed, one tail; do not allocate
+    // exports or wave metadata proportional to its total occurrence count. A
+    // repeated wave's Zip lanes select the members of its first occurrence;
+    // each repetition advances them by its occurrence offset at run time.
+    let repeated = !ctx.device_body &&
+        (ctx.waves.len() == body_waves_start || uniform_nested_shapes) &&
+        artifact_zip_lanes.iter().all(|lane| lane.twin.is_none()) &&
+        (0..outputs_by_port.len()).all(|port| streamed_ports[port] || summed_ports[port]);
+    let full_count = count / width as u128 * width as u128;
+    tracing::debug!(
+        scope = ?scope_id,
+        node = node_id.0,
+        count,
+        repeated,
+        uniform_nested_shapes,
+        nested_wave_count = ctx.waves.len() - body_waves_start,
+        "GPU parallel loop wave replay"
+    );
+    let wave_starts: Box<dyn Iterator<Item = u128>> = if ctx.device_body {
+        Box::new(std::iter::empty())
+    } else if repeated {
+        Box::new(std::iter::once(0).chain((full_count < count).then_some(full_count)))
+    } else {
+        Box::new((0..count).step_by(width))
+    };
+    // The members a Zip lane selects in the waves represented here, by position
+    // `0..count` (of its source, `offset + position`): every wave's, or, for repeated
+    // waves, the first wave's and the tail's, whose repetitions advance them at run time.
+    let zip_positions: Vec<std::ops::Range<usize>> = if zip_lanes.is_empty() || ctx.device_body {
+        Vec::new()
+    } else {
+        let count = usize::try_from(count)
+            .map_err(|_| "GPU resident Zip family exceeds host address space")?;
+        let full_count = usize::try_from(full_count)
+            .map_err(|_| "GPU resident Zip family exceeds host address space")?;
+        if repeated {
+            [0..width.min(count), full_count..count].into_iter().filter(|r| !r.is_empty()).collect()
+        } else {
+            vec![0..count]
+        }
+    };
+    let zip_members = if ctx.device_body {
+        Vec::new()
+    } else {
+        zip_lanes
+            .iter()
+            .map(|(offset, _, _, source_id)| {
+                let source = ctx
+                    .owners
+                    .get(source_id)
+                    .ok_or_else(|| "GPU Zip root family owner is missing".to_owned())?;
+                let mut members = BTreeMap::new();
+                for range in &zip_positions {
+                    let start = offset
+                        .checked_add(range.start)
+                        .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+                    let end = offset
+                        .checked_add(range.end)
+                        .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+                    members.extend(range.clone().zip(wave_family_members(source, start..end)?));
+                }
+                Ok(members)
+            })
+            .collect::<Result<Vec<BTreeMap<usize, Arc<GpuResidentValue>>>, String>>()?
+    };
+    for wave_start in wave_starts {
+        let active_lanes = (count - wave_start).min(width as u128) as usize;
         let mut wave = PhysicalWave {
             loop_site,
             parent_template,
@@ -8487,42 +10472,50 @@ fn lower_parallel_loop(
             nested_owner_bindings: Vec::new(),
             start_index: wave_start,
             active_lanes,
+            repetitions: if repeated && wave_start == 0 { count / width as u128 } else { 1 },
+            streamed_export_strides: BTreeMap::new(),
             export_occurrences: Vec::new(),
             import_template_indices: body_imports.clone(),
+            indexed_imports: BTreeSet::new(),
             invocation_imports: BTreeMap::new(),
             family_members: BTreeMap::new(),
             streamed_exports: Vec::new(),
         };
         for (lane, (_, owner)) in index_lanes.iter().enumerate() {
             let actual = wave_start
-                .checked_add(lane)
+                .checked_add(lane as u128)
                 .map(|index| index.min(count - 1))
                 .ok_or_else(|| "GPU parallel device index overflows".to_owned())?;
-            wave.export_occurrences.push((
-                Arc::clone(owner),
-                u64::try_from(actual)
-                    .map_err(|_| "GPU parallel device index exceeds u64".to_owned())?,
-            ));
+            wave.export_occurrences.push((Arc::clone(owner), actual));
         }
-        for (offset, lane, id, source_id) in &zip_lanes {
-            let source = ctx
-                .owners
-                .get(source_id)
-                .ok_or_else(|| "GPU Zip root family owner is missing".to_owned())?;
-            let member_index = wave_start
-                .checked_add(*lane)
+        for ((offset, lane, id, source_id), members) in zip_lanes.iter().zip(&zip_members) {
+            let position = wave_start
+                .checked_add(*lane as u128)
                 .map(|index| index.min(count - 1))
-                .and_then(|index| index.checked_add(*offset))
                 .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
-            let selected = wave_family_member(source, member_index)?;
+            let member_index = position
+                .checked_add(*offset as u128)
+                .ok_or_else(|| "GPU Zip family index overflows".to_owned())?;
+            let selected = Arc::clone(
+                members
+                    .get(
+                        &usize::try_from(position)
+                            .map_err(|_| "resident Zip position exceeds usize")?,
+                    )
+                    .ok_or_else(|| "GPU Zip member was not selected for its wave".to_owned())?,
+            );
             if selected.physical().as_ref() != &ctx.values[id.0 as usize] {
                 return Err("GPU Zip member layout changes between waves".into());
             }
             wave.owner_bindings.insert(*id, selected);
-            wave.zip_sources.push((*source_id, member_index, *id));
+            wave.zip_sources.push((
+                *source_id,
+                usize::try_from(member_index).map_err(|_| "resident Zip member exceeds usize")?,
+                *id,
+            ));
         }
         // Waves alternate between each lane's two owners, when it has two.
-        let odd_wave = (wave_start / width) % 2 == 1;
+        let odd_wave = (wave_start / width as u128) % 2 == 1;
         let buffer = |lane: &ArtifactZipLane| -> Result<_, String> {
             match (&lane.twin, odd_wave) {
                 (Some((upload_owner, owner)), true) => {
@@ -8556,17 +10549,28 @@ fn lower_parallel_loop(
             let (index, member) = match lane.gather {
                 Some((indices, index_offset)) => {
                     let position = wave_start
-                        .checked_add(lane.lane)
-                        .and_then(|index| index.checked_add(index_offset))
+                        .checked_add(lane.lane as u128)
+                        .and_then(|index| index.checked_add(index_offset as u128))
                         .ok_or_else(|| "GPU artifact Gather index overflows".to_owned())?;
-                    (None, Some((indices, position)))
+                    (
+                        None,
+                        Some((
+                            indices,
+                            usize::try_from(position)
+                                .map_err(|_| "resident Gather position exceeds usize")?,
+                        )),
+                    )
                 }
                 None => {
                     let member_index = wave_start
-                        .checked_add(lane.lane)
-                        .and_then(|index| index.checked_add(lane.offset))
+                        .checked_add(lane.lane as u128)
+                        .and_then(|index| index.checked_add(lane.offset as u128))
                         .ok_or_else(|| "GPU artifact Zip index overflows".to_owned())?;
-                    if lane.descriptor.family_count.is_none_or(|count| member_index >= count) {
+                    if lane
+                        .descriptor
+                        .family_count
+                        .is_none_or(|count| member_index as u128 >= count)
+                    {
                         return Err("GPU artifact Zip member is outside its validated family".into());
                     }
                     (Some(member_index), None)
@@ -8579,6 +10583,9 @@ fn lower_parallel_loop(
             wave.owner_bindings.insert(lane.destination, owner);
             let template_index = ctx.import_templates.len();
             ctx.import_templates.push(ImportTemplate {
+                // The window starts are set once the first consumers are known
+                // (`assign_import_windows`).
+                window_start: lane.windowed.then_some(u32::MAX),
                 before_operation: lane.before_operation,
                 key: ArtifactKey {
                     production: lane.production.clone(),
@@ -8592,11 +10599,18 @@ fn lower_parallel_loop(
                 upload_owner,
                 member,
                 read_ahead: lane.twin.is_some(),
+                carry: lane.carry.clone(),
+                base: lane.base_slot.zip(lane.base),
             });
             wave.import_template_indices.push(template_index);
+            wave.indexed_imports.insert(template_index);
         }
+        let mut replay_allocations = std::collections::HashMap::new();
         for (lane, ids) in result_ids.iter().enumerate() {
             for (port, id) in ids.iter().copied().enumerate() {
+                if nested_ports[port] == Some(true) {
+                    continue;
+                }
                 // A streamed member lives only until its wave's export, so
                 // every wave reuses the lane's first-wave owner.
                 let owner = if let Some(borrowed) = borrowed_outputs.get(&id) {
@@ -8607,6 +10621,35 @@ fn lower_parallel_loop(
                     let owner = borrowed.resolve(source)?;
                     wave.borrowed_outputs.push(borrowed.clone());
                     owner
+                } else if let Some(members) = scalar_members.get(&port) {
+                    // Inactive tail lanes still have a valid binding; the wave does not launch
+                    // them.
+                    let member =
+                        &members[usize::try_from((wave_start + lane as u128).min(count - 1))
+                            .map_err(|_| "resident scalar member exceeds usize")?];
+                    let physical = ctx.values[id.0 as usize].clone();
+                    let slot = physical.parts.first().ok_or("scalar template has no part")?.storage;
+                    let mut bound =
+                        member.storages().next().ok_or("scalar member has no storage")?.1.clone();
+                    bound.bytes = ctx
+                        .owners
+                        .get(&id)
+                        .and_then(|owner| owner.storage(slot))
+                        .ok_or("scalar template has no storage")?
+                        .bytes;
+                    Arc::new(
+                        GpuResidentValue::new(
+                            Arc::new(physical),
+                            BTreeMap::from([(slot, bound)]),
+                            member
+                                .ready_events()
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
+                        )
+                        .map_err(str::to_owned)?,
+                    )
                 } else if wave_start == 0 || streamed_ports[port] || summed_ports[port] {
                     Arc::clone(
                         ctx.owners
@@ -8614,7 +10657,7 @@ fn lower_parallel_loop(
                             .ok_or_else(|| "GPU first-wave output owner is missing".to_owned())?,
                     )
                 } else {
-                    replay_matrix_owner(ctx, id)?
+                    replay_matrix_owner(ctx, id, &mut replay_allocations)?
                 };
                 // A streamed or summed member keeps its owner in every wave,
                 // so no wave rebinds it and its memory stays plan scratch.
@@ -8624,9 +10667,13 @@ fn lower_parallel_loop(
                     wave.owner_bindings.insert(id, Arc::clone(&owner));
                 }
                 if lane < active_lanes {
-                    let index = wave_start + lane;
-                    outputs_by_port[port].1.push(owner);
-                    for name in &names_by_port[port] {
+                    let index = wave_start + lane as u128;
+                    if !(streamed_ports[port] || summed_ports[port]) {
+                        outputs_by_port[port].1.push(owner);
+                    }
+                    for name in
+                        names_by_port[port].iter().filter(|_| flattened_ports[port].is_none())
+                    {
                         wave.family_members.entry(name.clone()).or_default().push((index, id));
                     }
                 }
@@ -8635,16 +10682,17 @@ fn lower_parallel_loop(
         // The first wave writes the lanes' own templates; a later one writes
         // copies naming its members, from the same slots and sites.
         for (lane, templates) in streamed_templates.iter().enumerate().take(active_lanes) {
-            for &template in templates {
+            for &(template, stride, offset) in templates {
                 let index = if wave_start == 0 {
                     template
                 } else {
                     let mut member = ctx.export_templates[template].clone();
-                    member.index = Some(wave_start + lane);
+                    member.index = Some((wave_start + lane as u128) * stride + offset);
                     ctx.export_templates.push(member);
                     ctx.export_templates.len() - 1
                 };
                 wave.streamed_exports.push(index);
+                wave.streamed_export_strides.insert(index, stride);
             }
         }
         bind_template_aliases(ctx, &mut wave, template_values.clone())?;
@@ -8676,46 +10724,106 @@ fn lower_parallel_loop(
         }
         ctx.waves.push(wave);
     }
+    ctx.streaming.nested_exports.retain(|(scope, _), _| *scope != child_id);
+    let mut family_ids = BTreeMap::new();
     for (port, (ty, members)) in outputs_by_port.into_iter().enumerate() {
-        // Nothing reads a streamed or summed port as a family.
+        // Nothing reads a streamed or summed port as a family; a spilled one is read member by
+        // member.
+        if let Some(export) = &carry_exports[port] {
+            // A spilled flattening binds the flattening's output, which its readers read.
+            let (wire, ty) = match &spilled_flattenings[port] {
+                Some((output, flat)) => (*output, flat.clone()),
+                None => (WireRef { node: node_id, port: Port(port as u32) }, ty),
+            };
+            let id = crate::gpu_streamed_carry::bind_family(ctx, ty, export.family.clone())?;
+            ctx.wire_ids.insert(wire, id);
+            continue;
+        }
+        // A family exported for a root template's lane, or dropped, is returned as metadata
+        // only.
+        if nested_strides[port].is_some() || dropped_ports[port] {
+            let id = value_id(ctx.values.len())?;
+            ctx.values.push(ctx.owners.physical(crate::gpu_execution_plan::PhysicalValueData {
+                ty,
+                encodings: Box::new([]),
+                parts: Box::new([]),
+                integer_ranges: BTreeMap::new(),
+            }));
+            ctx.wire_ids.insert(WireRef { node: node_id, port: Port(port as u32) }, id);
+            continue;
+        }
         if streamed_ports[port] || summed_ports[port] {
             continue;
         }
-        let family = pack_resident_family(ty, &members, ctx.device)?;
-        let id = value_id(ctx.values.len())?;
-        ctx.values.push(family.physical().as_ref().clone());
-        ctx.owners.insert(id, family);
-        for wave in &mut ctx.waves[body_waves_start..] {
-            for borrowed in &mut wave.borrowed_outputs {
-                for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
-                    if ids[port] == borrowed.value {
-                        borrowed.family_members.push((id, wave.start_index + lane));
+        let id = if let Some(id) = scalar_families.get(&port) {
+            *id
+        } else {
+            let family = pack_resident_family(ty, &members, ctx.device)?;
+            let id = value_id(ctx.values.len())?;
+            ctx.values.push(family.physical().as_ref().clone());
+            ctx.owners.insert(id, family);
+            id
+        };
+
+        // Packed scalar lanes already write their final offsets. Their family
+        // has one physical part spanning all members, so publishing an individual
+        // member would replace that whole allocation with a scalar-sized binding.
+        if !scalar_families.contains_key(&port) {
+            for wave in &mut ctx.waves[body_waves_start..] {
+                for borrowed in &mut wave.borrowed_outputs {
+                    for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
+                        if ids[port] == borrowed.value {
+                            borrowed.family_members.push((
+                                id,
+                                usize::try_from(wave.start_index + lane as u128)
+                                    .map_err(|_| "resident family member exceeds usize")?,
+                            ));
+                        }
                     }
                 }
             }
         }
         let mut all_writers = Vec::new();
         for member in 0..count {
-            let lane = member % width;
+            let lane = (member % width as u128) as usize;
             let writers = ctx.producer.get(&result_ids[lane][port]).cloned().unwrap_or_default();
             all_writers.extend(writers.iter().copied());
-            ctx.family_member_producers.insert((id, member), writers);
+            ctx.family_member_producers.insert(
+                (id, usize::try_from(member).map_err(|_| "resident family member exceeds usize")?),
+                writers,
+            );
         }
         all_writers.sort_unstable_by_key(|(range, writer)| (*writer, range.start, range.end));
         all_writers.dedup();
         ctx.producer.insert(id, all_writers);
-        for wave in &mut ctx.waves[body_waves_start..] {
-            if wave.loop_site != loop_site {
-                continue;
-            }
-            for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
-                if !borrowed_outputs.contains_key(&ids[port]) {
-                    wave.produced_family_members.push((id, wave.start_index + lane, ids[port]));
+        if !scalar_families.contains_key(&port) {
+            for wave in &mut ctx.waves[body_waves_start..] {
+                if wave.loop_site != loop_site {
+                    continue;
+                }
+                for (lane, ids) in result_ids.iter().enumerate().take(wave.active_lanes) {
+                    if !borrowed_outputs.contains_key(&ids[port]) {
+                        wave.produced_family_members.push((
+                            id,
+                            usize::try_from(wave.start_index + lane as u128)
+                                .map_err(|_| "resident family member exceeds usize")?,
+                            ids[port],
+                        ));
+                    }
                 }
             }
         }
         let wire = WireRef { node: node_id, port: Port(port as u32) };
         ctx.wire_ids.insert(wire, id);
+        family_ids.insert(port, id);
+    }
+    for (port, public) in trapdoor_publics.into_iter().enumerate() {
+        let Some(Some(public)) = public else { continue };
+        let (Some(&secret), Some(&public)) = (family_ids.get(&port), family_ids.get(&public))
+        else {
+            return Err("GPU parallel trapdoor family needs its public matrices resident".into());
+        };
+        ctx.trapdoor_public_ids.insert(secret, public);
     }
     Ok(())
 }
@@ -8751,8 +10859,14 @@ fn bind_template_aliases(
     if replaced.is_empty() {
         return Ok(());
     }
-    for index in template_values {
-        let id = value_id(index)?;
+    // Only a template value viewing a replaced allocation can be rebound: the owners' view index
+    // gives them without scanning the template.
+    let candidates = replaced
+        .keys()
+        .flat_map(|allocation| ctx.owners.viewing(*allocation))
+        .filter(|id| template_values.contains(&(id.0 as usize)))
+        .collect::<BTreeSet<_>>();
+    for id in candidates {
         if wave.owner_bindings.contains_key(&id) {
             continue;
         }
@@ -8769,6 +10883,232 @@ fn bind_template_aliases(
         }
     }
     Ok(())
+}
+
+/// Whether a declared output type in `scope` names a loop index; otherwise its
+/// types are the same for every loop instance.
+pub(super) fn types_depend_on_loop_index(scope: &GraphScope) -> bool {
+    scope.nodes().iter().any(|node| node.output_types().iter().any(|ty| ty.contains_loop_index()))
+}
+
+/// Finish ready pure consumers of a loop before entering an unrelated loop.
+/// Stateful operations retain their original order. A consumer may move only
+/// when all stateful ancestors have already been emitted; pure dependencies
+/// are emitted once, in topological order. Family member selections are demand-driven:
+/// a metadata-only family can import a large matrix, so eagerly draining its selections
+/// would retain every selected member across unrelated loops. Independent pure branches
+/// are delayed until a consumer needs them. This shortens loop-output lifetimes
+/// without replaying sampling, I/O, or any loop body.
+fn scope_consumer_order(scope: &GraphScope) -> Result<Vec<usize>, String> {
+    let nodes = scope.nodes();
+    let mut arguments = Vec::with_capacity(nodes.len());
+    let mut children = vec![Vec::new(); nodes.len()];
+    let mut fence = vec![None; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        let pure = matches!(
+            node.kind(),
+            NodeKind::Input { .. } |
+                NodeKind::ConstantInt(_) |
+                NodeKind::EvaluateInt(_) |
+                NodeKind::ConstantReal(_) |
+                NodeKind::ConstantBool(_) |
+                NodeKind::ConstantMatrix { .. } |
+                NodeKind::IntBinary(_) |
+                NodeKind::IntCompare(_) |
+                NodeKind::BitExtract { .. } |
+                NodeKind::BoolToInt |
+                NodeKind::IntToReal |
+                NodeKind::RealBinary(_) |
+                NodeKind::RealSqrt |
+                NodeKind::MatrixBinary(_) |
+                NodeKind::MatrixMulSmallRhs |
+                NodeKind::MatrixNegate |
+                NodeKind::MatrixScale { .. } |
+                NodeKind::MultiplyMonomial |
+                NodeKind::ModulusReduce { .. } |
+                NodeKind::CenteredRebase { .. } |
+                NodeKind::GadgetDecompose { .. } |
+                NodeKind::Transpose |
+                NodeKind::Slice { .. } |
+                NodeKind::Tensor |
+                NodeKind::Concat { .. } |
+                NodeKind::HashSample { .. } |
+                NodeKind::FamilyPack { .. } |
+                NodeKind::FamilyGetStatic { .. } |
+                NodeKind::FamilyGetDynamic |
+                NodeKind::Select { .. }
+        );
+        let inputs = scope
+            .arguments(node)
+            .ok_or("GPU node has no arguments")?
+            .iter()
+            .map(|wire| {
+                usize::try_from(wire.node.0)
+                    .map_err(|_| "GPU argument index exceeds usize".to_owned())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for &input in &inputs {
+            if input >= index {
+                return Err("GPU scope is not topological".into());
+            }
+            children[input].push(index);
+            fence[index] = fence[index].max(fence[input]);
+        }
+        if !pure {
+            fence[index] = Some(index);
+        }
+        arguments.push(inputs);
+    }
+    let mut emitted = vec![false; nodes.len()];
+    let mut order = Vec::with_capacity(nodes.len());
+    fn emit(
+        root: usize,
+        arguments: &[BTreeSet<usize>],
+        emitted: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        let mut stack = vec![(root, false)];
+        while let Some((index, ready)) = stack.pop() {
+            if emitted[index] {
+                continue;
+            }
+            if ready {
+                emitted[index] = true;
+                order.push(index);
+            } else {
+                stack.push((index, true));
+                stack.extend(arguments[index].iter().rev().map(|&input| (input, false)));
+            }
+        }
+    }
+    // Materialize independent pure branches only when a stateful operation
+    // or a ready loop consumer needs them. Preserve the original no-loop
+    // ordering, where there is no unrelated loop workspace to avoid.
+    let has_loops = nodes
+        .iter()
+        .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)));
+    let roots = (0..nodes.len())
+        .filter(|&index| has_loops && fence[index] == Some(index))
+        .chain(0..nodes.len());
+    for index in roots {
+        if emitted[index] {
+            continue;
+        }
+        emit(index, &arguments, &mut emitted, &mut order);
+        if !matches!(nodes[index].kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)) {
+            continue;
+        }
+        let mut descendants = BTreeSet::new();
+        let mut pending = children[index].clone();
+        while let Some(child) = pending.pop() {
+            // A family is potentially metadata-only. Selecting a member may perform
+            // artifact I/O and allocate its complete matrix, rather than release
+            // storage owned by this loop. Leave that branch for its real consumer.
+            if matches!(
+                nodes[child].kind(),
+                NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
+            ) {
+                continue;
+            }
+            if fence[child].is_some_and(|last| last > index) || !descendants.insert(child) {
+                continue;
+            }
+            pending.extend(children[child].iter().copied());
+        }
+        for child in descendants {
+            emit(child, &arguments, &mut emitted, &mut order);
+        }
+    }
+    Ok(order)
+}
+
+/// Rematerialize pure expanded matrices at each consumer in this scope.
+/// Other nodes execute once in consumer order; fresh random sampling, I/O, and loops
+/// retain their original relative order. Retain the smaller SSA operand instead of the expanded
+/// matrix between consumers; already lowered consumers keep their own physical value IDs.
+/// Deterministic hash and concat preparations feeding an expansion are also produced
+/// at its consumer, so delaying decomposition does not retain their full matrices.
+/// Family selections feeding these preparations are delayed to their first consumer,
+/// but execute once: imported carry values must not be reloaded across later mutations.
+/// Each consumer emits a shared pure operand only once, even with repeated edges.
+pub(super) fn scope_lowering_order(scope: &GraphScope) -> Result<Vec<usize>, String> {
+    let mut deferred = scope
+        .nodes()
+        .iter()
+        .map(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::GadgetDecompose { .. } | NodeKind::CenteredRebase { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut delayed = deferred.clone();
+    // Preparing a decomposition early defeats its deferred materialization:
+    // concat allocates a full copy and deterministic hashes can be equally large.
+    // Pull only these pure preparations into the same consumer-local expansion.
+    // Sampling, artifact reads, selection and loop outputs still execute once.
+    for index in (0..deferred.len()).rev() {
+        if !delayed[index] {
+            continue;
+        }
+        for argument in scope.arguments(&scope.nodes()[index]).ok_or("GPU node has no arguments")? {
+            let input =
+                usize::try_from(argument.node.0).map_err(|_| "GPU argument index exceeds usize")?;
+            if input >= index {
+                return Err("GPU scope is not topological".into());
+            }
+            if matches!(
+                scope.nodes()[input].kind(),
+                NodeKind::HashSample { .. } | NodeKind::Concat { .. }
+            ) {
+                deferred[input] = true;
+                delayed[input] = true;
+            } else if matches!(
+                scope.nodes()[input].kind(),
+                NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
+            ) {
+                delayed[input] = true;
+            }
+        }
+    }
+    let mut emitted = vec![false; scope.nodes().len()];
+    let mut order = Vec::with_capacity(emitted.len());
+    for root in scope_consumer_order(scope)?
+        .into_iter()
+        .filter(|&index| !delayed[index])
+        .chain(0..emitted.len())
+    {
+        if emitted[root] {
+            continue;
+        }
+        let mut local = BTreeSet::new();
+        let mut stack = vec![(root, false)];
+        while let Some((index, ready)) = stack.pop() {
+            if local.contains(&index) || (emitted[index] && !deferred[index]) {
+                continue;
+            }
+            if ready {
+                emitted[index] = true;
+                local.insert(index);
+                order.push(index);
+                continue;
+            }
+            stack.push((index, true));
+            let arguments =
+                scope.arguments(&scope.nodes()[index]).ok_or("GPU node has no arguments")?;
+            for argument in arguments.iter().rev() {
+                let input = usize::try_from(argument.node.0)
+                    .map_err(|_| "GPU argument index exceeds usize")?;
+                if input >= index {
+                    return Err("GPU scope is not topological".into());
+                }
+                if !emitted[input] || deferred[input] {
+                    stack.push((input, false));
+                }
+            }
+        }
+    }
+    Ok(order)
 }
 
 fn resolved_scope_types(
@@ -8867,6 +11207,9 @@ fn reject_scoped_artifacts_in_device_body(
     Ok(())
 }
 
+/// Lower a child scope as its own body: values it creates (such as dynamic-read candidates) are
+/// not shared with another body's lowering.
+#[allow(clippy::too_many_arguments)]
 fn lower_inlined_child(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -8881,6 +11224,43 @@ fn lower_inlined_child(
     wrap_parent_outputs: bool,
     device_loop_index: Option<(u32, PhysicalValueId)>,
 ) -> Result<Vec<PhysicalValueId>, String> {
+    let enclosing = ctx.owners.lowered_body;
+    ctx.owners.last_body += 1;
+    ctx.owners.lowered_body = ctx.owners.last_body;
+    let lowered = lower_child_body(
+        ctx,
+        graph,
+        parent_scope_id,
+        parent_node_id,
+        parent_node,
+        parent_env,
+        child_scope_id,
+        child_env,
+        loop_site,
+        input_overrides,
+        wrap_parent_outputs,
+        device_loop_index,
+    );
+    ctx.owners.lowered_body = enclosing;
+    lowered
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_child_body(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    graph: &Graph,
+    parent_scope_id: &FrozenGraphScopeId,
+    parent_node_id: NodeId,
+    parent_node: &NodeHandle,
+    parent_env: &ParamEnv,
+    child_scope_id: &FrozenGraphScopeId,
+    child_env: &ParamEnv,
+    loop_site: Option<crate::gpu_execution_plan::GpuLoopSiteKey>,
+    input_overrides: Option<&[PhysicalValueId]>,
+    wrap_parent_outputs: bool,
+    device_loop_index: Option<(u32, PhysicalValueId)>,
+) -> Result<Vec<PhysicalValueId>, String> {
+    ctx.owners.check_host_budget()?;
     let parent =
         graph.scope(parent_scope_id).ok_or_else(|| "GPU parent scope is missing".to_owned())?;
     let child =
@@ -8937,8 +11317,18 @@ fn lower_inlined_child(
             return Err("GPU nested child reuses an active device loop index".into());
         }
     }
+    // A conversion first produced in a parallel body belongs to that body's
+    // lifetime. Keep reuse within the body and inherited conversions, without
+    // retaining a new coefficient twin across unrelated subsequent loops.
+    let outer_converted =
+        matches!(parent_node.kind(), NodeKind::ParallelLoop(_)).then(|| ctx.converted.clone());
+    let outer_fused = std::mem::take(ctx.fused_nodes);
     let body = (|| {
         for (position, (argument, input)) in arguments.iter().zip(child.inputs()).enumerate() {
+            if ctx.identity_small_rhs.omits(child_scope_id, *input) {
+                ctx.wire_ids.insert(*input, UNMATERIALIZED_IDENTITY);
+                continue;
+            }
             if let Some(NodeKind::Input { artifact: Some(artifact), .. }) =
                 child.node(input.node).map(NodeHandle::kind)
             {
@@ -8993,6 +11383,7 @@ fn lower_inlined_child(
                         None,
                     )?;
                 ctx.import_templates.push(ImportTemplate {
+                    window_start: None,
                     before_operation,
                     key,
                     descriptor,
@@ -9002,6 +11393,8 @@ fn lower_inlined_child(
                     upload_owner,
                     member: None,
                     read_ahead: false,
+                    carry: None,
+                    base: None,
                 });
                 ctx.wire_ids.insert(*input, graph_value);
                 continue;
@@ -9027,19 +11420,37 @@ fn lower_inlined_child(
             let device_index = types[input] == ConcreteWireType::ConstantInt &&
                 lane_type(ctx, id) == &ConcreteWireType::Int &&
                 ctx.device_loop_indices.values().any(|active| *active == id);
+            // An exclusively small-RHS loop capture may have been expanded
+            // before the loop while its IR type still carries the digit bound.
+            let expanded_digits = matches!(types[input], ConcreteWireType::Preimage { .. }) &&
+                ctx.values[id.0 as usize].encodings.as_ref() == [PhysicalEncoding::FullEval] &&
+                ctx.values[id.0 as usize].ty.matrix_type() == types[input].matrix_type();
             if ctx.values[id.0 as usize].ty != types[input] &&
                 lane_type(ctx, id) != &types[input] &&
+                !expanded_digits &&
                 !device_index
             {
-                return Err("GPU subgraph input has the wrong concrete type".into());
+                return Err(format!(
+                    "GPU subgraph input {position} of {child_scope_id:?} has the wrong concrete \
+                     type: {:?}, expected {:?}",
+                    ctx.values[id.0 as usize].ty, types[input]
+                ));
             }
             ctx.wire_ids.insert(*input, id);
         }
-        for (index, child_node) in child.nodes().iter().enumerate() {
+        let selected_sources =
+            crate::gpu_physical_lowering::selected_hash_sources(graph, child_scope_id);
+        for index in scope_lowering_order(child)? {
+            ctx.owners.check_host_budget()?;
+            let child_node = &child.nodes()[index];
             let child_node_id = NodeId(
                 u64::try_from(index).map_err(|_| "GPU subgraph has too many nodes".to_owned())?,
             );
-            if matches!(child_node.kind(), NodeKind::Input { .. }) {
+            if ctx.fused_nodes.contains(&child_node_id) ||
+                ctx.streaming.placed_units.contains(&(child_scope_id.clone(), child_node_id)) ||
+                selected_sources.contains(&child_node_id) ||
+                matches!(child_node.kind(), NodeKind::Input { .. })
+            {
                 continue;
             }
             if let (Some((slot, id)), NodeKind::EvaluateInt(IntExpr::LoopIndex(actual))) =
@@ -9059,6 +11470,13 @@ fn lower_inlined_child(
                     ctx.wire_ids.insert(wire, id);
                     continue;
                 }
+            }
+            let output = WireRef { node: child_node_id, port: Port(0) };
+            if let Some(id) =
+                ctx.streaming.member_overrides.get(&(child_scope_id.clone(), output)).copied()
+            {
+                ctx.wire_ids.insert(output, id);
+                continue;
             }
             let first_operation = ctx.operations.len();
             if matches!(child_node.kind(), NodeKind::MatrixBinary(_)) {
@@ -9101,7 +11519,15 @@ fn lower_inlined_child(
                 if choice.operation_identity != identity {
                     return Err("GPU child matrix operation differs from its frozen choice".into());
                 }
-                lower_matrix_node(ctx, child, child_node_id, child_node, &types, choice)?;
+                lower_matrix_node(
+                    ctx,
+                    child,
+                    child_node_id,
+                    child_node,
+                    &types,
+                    choice,
+                    child_env,
+                )?;
             } else if matches!(child_node.kind(), NodeKind::ConstantMatrix { .. }) {
                 lower_static_matrix_node(ctx, child, child_node_id, child_node, child_env, &types)?;
             } else if matches!(
@@ -9192,6 +11618,10 @@ fn lower_inlined_child(
     })();
     *ctx.wire_ids = outer;
     ctx.device_loop_indices = outer_device_indices;
+    *ctx.fused_nodes = outer_fused;
+    if let Some(converted) = outer_converted {
+        *ctx.converted = converted;
+    }
     if let Some(instances) = outer_active_instances {
         ctx.active_parallel_instances = instances;
     }
@@ -9219,15 +11649,29 @@ fn lower_inlined_child(
 }
 
 fn static_family_physical(physical: &PhysicalValue, index: usize) -> Result<PhysicalValue, String> {
+    static_family_physicals(physical, index..index + 1)?
+        .pop()
+        .ok_or_else(|| "GPU static family index is out of range".to_owned())
+}
+
+/// The members `indices` of a resident family, as views of its parts. One pass over the parts
+/// selects every member, so selecting all the members of a family of `m` members split into `p`
+/// parts costs `O(p + m)` rather than `O(p m)`.
+fn static_family_physicals(
+    physical: &PhysicalValue,
+    indices: std::ops::Range<usize>,
+) -> Result<Vec<PhysicalValue>, String> {
     let ConcreteWireType::IndexedFamily { element, count } = &physical.ty else {
         return Err("GPU static family selection requires a resident family".into());
     };
-    if index >= *count {
+    if indices.end as u128 > *count {
         return Err("GPU static family index is out of range".into());
     }
-    let index = u64::try_from(index)
+    let first = u64::try_from(indices.start)
         .map_err(|_| "GPU static family index exceeds physical coordinates".to_owned())?;
-    let mut parts = Vec::new();
+    let last = u64::try_from(indices.end)
+        .map_err(|_| "GPU static family index exceeds physical coordinates".to_owned())?;
+    let mut members = vec![Vec::new(); indices.len()];
     for part in physical.parts.iter() {
         let start = *part
             .view
@@ -9242,37 +11686,42 @@ fn static_family_physical(physical: &PhysicalValue, index: usize) -> Result<Phys
         let end = start
             .checked_add(extent)
             .ok_or_else(|| "GPU family view range overflows".to_owned())?;
-        if index < start || index >= end {
-            continue;
-        }
         let stride = *part
             .view
             .byte_strides
             .first()
             .ok_or_else(|| "GPU family part has no family stride".to_owned())?;
-        let displacement = (index - start)
-            .checked_mul(stride)
-            .ok_or_else(|| "GPU family member offset overflows".to_owned())?;
-        let mut selected = part.clone();
-        selected.view.byte_offset = selected
-            .view
-            .byte_offset
-            .checked_add(displacement)
-            .ok_or_else(|| "GPU family member address overflows".to_owned())?;
-        selected.view.origin = selected.view.origin[1..].to_vec().into_boxed_slice();
-        selected.view.extent = selected.view.extent[1..].to_vec().into_boxed_slice();
-        selected.view.byte_strides = selected.view.byte_strides[1..].to_vec().into_boxed_slice();
-        parts.push(selected);
+        for index in start.max(first)..end.min(last) {
+            let displacement = (index - start)
+                .checked_mul(stride)
+                .ok_or_else(|| "GPU family member offset overflows".to_owned())?;
+            let mut selected = part.clone();
+            selected.view.byte_offset = selected
+                .view
+                .byte_offset
+                .checked_add(displacement)
+                .ok_or_else(|| "GPU family member address overflows".to_owned())?;
+            selected.view.origin = selected.view.origin[1..].to_vec().into_boxed_slice();
+            selected.view.extent = selected.view.extent[1..].to_vec().into_boxed_slice();
+            selected.view.byte_strides =
+                selected.view.byte_strides[1..].to_vec().into_boxed_slice();
+            members[(index - first) as usize].push(selected);
+        }
     }
-    if parts.is_empty() {
-        return Err("GPU family member has no resident physical part".into());
-    }
-    Ok(PhysicalValue {
-        ty: element.as_ref().clone(),
-        encodings: physical.encodings.clone(),
-        parts: parts.into_boxed_slice(),
-        integer_ranges: physical.integer_ranges.clone(),
-    })
+    members
+        .into_iter()
+        .map(|parts| {
+            if parts.is_empty() {
+                return Err("GPU family member has no resident physical part".to_owned());
+            }
+            Ok(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
+                ty: element.as_ref().clone(),
+                encodings: physical.encodings.clone(),
+                parts: parts.into_boxed_slice(),
+                integer_ranges: physical.integer_ranges.clone(),
+            }))
+        })
+        .collect()
 }
 
 /// Resolve a child scope's bindings without mutating the enclosing scope.
@@ -9311,6 +11760,10 @@ pub(super) fn fixed_child_env(
 }
 
 #[cfg(test)]
+#[path = "gpu_physical_control/wave_output_tests.rs"]
+mod wave_output_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -9320,6 +11773,7 @@ mod tests {
             GpuLoopChoice, GpuLoopSiteKey, GpuPlanContract, PhysicalEncoding, PhysicalPart,
             PhysicalView, StorageRef,
         },
+        gpu_physical_lowering::physical_matrix,
         gpu_runtime::GpuRuntime,
         matrix::{
             PolyMatrix as PrimitivePolyMatrix, dcrt_poly::DCRTPolyMatrix,
@@ -9338,6 +11792,1403 @@ mod tests {
     use mxx_dsl::{DslContext, Ring, parallel};
     use mxx_ir_core::node::{IndexRange, ParallelLoop, SequentialLoop};
     use std::collections::BTreeMap;
+
+    /// Finish a completed loop's pure consumers before unrelated later loops,
+    /// while preserving every dependency and the ordering of the loops themselves.
+    #[test]
+    fn test_scope_consumers_release_loop_outputs_before_unrelated_loops() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let first =
+            mxx_dsl::iterate(2usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let second =
+            mxx_dsl::iterate(3usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let consumed = first.clone() + first.clone();
+        let graph = DslContext::new("loop-consumer-order")
+            .output("a-first", first)
+            .unwrap()
+            .output("b-second", second.clone())
+            .unwrap()
+            .output("out", consumed + second)
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let order = scope_consumer_order(scope).unwrap();
+        let loops = scope
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| matches!(n.kind(), NodeKind::SequentialLoop(_)).then_some(i))
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 2);
+        let consumer = scope
+            .nodes()
+            .iter()
+            .enumerate()
+            .find_map(|(i, n)| {
+                (matches!(n.kind(), NodeKind::MatrixBinary(_)) &&
+                    scope.arguments(n).unwrap().iter().all(|a| a.node.0 as usize == loops[0]))
+                .then_some(i)
+            })
+            .unwrap();
+        assert!(consumer > loops[1], "fixture starts with a late consumer");
+        let position = |i| order.iter().position(|&j| i == j).unwrap();
+        assert!(position(loops[0]) < position(consumer));
+        assert!(position(consumer) < position(loops[1]));
+        let mut seen = BTreeSet::new();
+        for &i in &order {
+            assert!(
+                scope
+                    .arguments(&scope.nodes()[i])
+                    .unwrap()
+                    .iter()
+                    .all(|a| seen.contains(&(a.node.0 as usize)))
+            );
+            assert!(seen.insert(i), "ordinary nodes execute once");
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+    }
+
+    /// Selecting a streamed family member allocates it; it must not be prefetched
+    /// merely because the producer loop has finished.
+    #[test]
+    fn test_scope_consumers_delay_family_selections_until_needed() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let first = parallel(3usize, |_| Ok(ring.identity(1))).unwrap();
+        let second =
+            mxx_dsl::iterate(2usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let selected = first.at(1usize);
+        let consumed = selected.clone() + selected;
+        let graph = DslContext::new("demand-driven-family-selection")
+            .output("a-first", first)
+            .unwrap()
+            .output("b-second", second.clone())
+            .unwrap()
+            .output("out", consumed + second)
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let order = scope_consumer_order(scope).unwrap();
+        let selected = scope
+            .nodes()
+            .iter()
+            .position(|node| {
+                matches!(node.kind(), NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic)
+            })
+            .unwrap();
+        let second = scope
+            .nodes()
+            .iter()
+            .position(|node| matches!(node.kind(), NodeKind::SequentialLoop(_)))
+            .unwrap();
+        let position = |node| order.iter().position(|&index| index == node).unwrap();
+        assert!(position(second) < position(selected));
+        let mut seen = BTreeSet::new();
+        for index in order {
+            assert!(
+                scope
+                    .arguments(&scope.nodes()[index])
+                    .unwrap()
+                    .iter()
+                    .all(|wire| seen.contains(&(wire.node.0 as usize)))
+            );
+            assert!(seen.insert(index));
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+    }
+
+    /// A pure output unrelated to a loop need not occupy memory while the loop runs.
+    #[test]
+    fn test_scope_consumers_delay_independent_pure_outputs() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let value =
+            ring.constant((1, 4), ConstantMatrix::AllCoefficients { value: IntExpr::from(3) });
+        let early = value.clone() + value;
+        let loop_value =
+            mxx_dsl::iterate(2usize, ring.identity(1), |_, value| Ok(value.clone() + value))
+                .unwrap();
+        let graph = DslContext::new("deferred-independent-pure-output")
+            .output("a-early", early)
+            .unwrap()
+            .output("b-loop", loop_value)
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let early = scope
+            .nodes()
+            .iter()
+            .position(|node| matches!(node.kind(), NodeKind::MatrixBinary(_)))
+            .unwrap();
+        let loop_node = scope
+            .nodes()
+            .iter()
+            .position(|node| matches!(node.kind(), NodeKind::SequentialLoop(_)))
+            .unwrap();
+        assert!(early < loop_node, "fixture materializes the independent output early");
+        let order = scope_consumer_order(scope).unwrap();
+        assert!(
+            order.iter().position(|&i| i == loop_node).unwrap() <
+                order.iter().position(|&i| i == early).unwrap()
+        );
+        let mut seen = BTreeSet::new();
+        for i in order {
+            assert!(
+                scope
+                    .arguments(&scope.nodes()[i])
+                    .unwrap()
+                    .iter()
+                    .all(|a| seen.contains(&(a.node.0 as usize)))
+            );
+            assert!(seen.insert(i));
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+    }
+
+    /// Single-use expansions move without changing unrelated node order.
+    #[test]
+    fn test_scope_lowering_delays_expansions_until_their_consumer() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let decomposed = ring.identity(1).decompose(4, 4);
+        let other =
+            ring.constant((1, 4), ConstantMatrix::AllCoefficients { value: IntExpr::from(3) });
+        let other = other.clone() + other;
+        let graph = DslContext::new("late-expansion-order")
+            .output("a-decomposed", decomposed.clone())
+            .unwrap()
+            .output("b-other", other.clone())
+            .unwrap()
+            .output("c-product", other.mul_small_rhs(decomposed))
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let order = scope_lowering_order(scope).unwrap();
+        let mut seen = BTreeSet::new();
+        for &index in &order {
+            for argument in scope.arguments(&scope.nodes()[index]).unwrap() {
+                assert!(
+                    seen.contains(&(argument.node.0 as usize)),
+                    "every operand precedes its consumer"
+                );
+            }
+            assert!(seen.insert(index), "each node is lowered once");
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+        let deferred = scope
+            .nodes()
+            .iter()
+            .position(|n| matches!(n.kind(), NodeKind::GadgetDecompose { .. }))
+            .unwrap();
+        let consumer = scope
+            .nodes()
+            .iter()
+            .position(|n| matches!(n.kind(), NodeKind::MatrixMulSmallRhs))
+            .unwrap();
+        let position = |node| order.iter().position(|&index| index == node).unwrap();
+        assert!(deferred + 1 < consumer, "fixture has unrelated work between expansion and use");
+        assert_eq!(position(deferred) + 1, position(consumer));
+        let ordinary = order.iter().copied().filter(|&index| index != deferred).collect::<Vec<_>>();
+        assert!(
+            ordinary.windows(2).all(|pair| pair[0] < pair[1]),
+            "other nodes keep their relative order"
+        );
+    }
+
+    /// Selected family members are loaded at their first expanded consumer,
+    /// once even when the expansion is rematerialized for another consumer.
+    #[test]
+    fn test_scope_lowering_delays_family_selection_once() {
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(97u64)], 8);
+        let members = parallel(2usize, |_| Ok(ring.identity(1))).unwrap();
+        let selected = members.at(0usize);
+        let expanded = selected.decompose(4, 4);
+        let left =
+            ring.constant((1, 4), ConstantMatrix::AllCoefficients { value: IntExpr::from(3) });
+        let other = left.clone() + left.clone();
+        let graph = DslContext::new("late-family-selection")
+            .output("a-expanded", expanded.clone())
+            .unwrap()
+            .output("b-other", other.clone())
+            .unwrap()
+            .output("c-first", other.mul_small_rhs(expanded.clone()))
+            .unwrap()
+            .output("d-second", left.mul_small_rhs(expanded))
+            .unwrap()
+            .build()
+            .unwrap();
+        let scope = graph.graph.root_scope();
+        let selection = scope
+            .nodes()
+            .iter()
+            .position(|node| {
+                matches!(node.kind(), NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic)
+            })
+            .unwrap();
+        let expansion = scope
+            .nodes()
+            .iter()
+            .position(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
+            .unwrap();
+        let order = scope_lowering_order(scope).unwrap();
+        assert_eq!(order.iter().filter(|&&node| node == selection).count(), 1);
+        assert!(order.iter().filter(|&&node| node == expansion).count() >= 2);
+        let first_expansion = order.iter().position(|&node| node == expansion).unwrap();
+        assert_eq!(order[first_expansion - 1], selection);
+        let mut seen = BTreeSet::new();
+        for index in order {
+            assert!(
+                scope
+                    .arguments(&scope.nodes()[index])
+                    .unwrap()
+                    .iter()
+                    .all(|argument| seen.contains(&(argument.node.0 as usize)))
+            );
+            seen.insert(index);
+        }
+        assert_eq!(seen.len(), scope.nodes().len());
+    }
+
+    /// Shared decompositions are recomputed from the unchanged input, both at
+    /// the root and inside a native loop; sampling and carried values are not replayed.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_shared_expansions_rematerialize_at_consumers() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let digits = cpu.modulus_digits();
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for nested in [false, true] {
+            let source = ring.polynomial([IntExpr::constant(u32::from(rand::random::<u16>()) + 1)]);
+            let left = ring.constant(
+                (1, digits),
+                ConstantMatrix::AllCoefficients { value: IntExpr::constant(3) },
+            );
+            let compute = |source: mxx_dsl::Mat| {
+                let decomposed = source.decompose(256, digits).centered_rebase(&ring);
+                let early = left.clone().mul_small_rhs(decomposed.clone());
+                let later = (left.clone() + left.clone()).mul_small_rhs(decomposed);
+                Ok(early + later)
+            };
+            let output = if nested {
+                mxx_dsl::iterate(2usize, source, |_, value| compute(value)).unwrap()
+            } else {
+                compute(source).unwrap()
+            };
+            let graph = DslContext::new("rematerialized-expansions")
+                .output("out", output)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            fn decompositions(
+                frame: &crate::gpu_physical_lowering::PhysicalFrame,
+                ops: &[CompiledGpuOp],
+            ) -> usize {
+                ops.iter()
+                    .map(|op| {
+                        usize::from(matches!(
+                            frame
+                                .program
+                                .implementations
+                                .resolve(op.implementation)
+                                .unwrap()
+                                .primitive,
+                            crate::gpu_execution_plan::GpuNativePrimitive::GadgetDecomposeCompact
+                        )) + op.body.as_deref().map_or(0, |body| decompositions(frame, body))
+                    })
+                    .sum()
+            }
+            let frame = plan.physical_frame_for_test();
+            assert!(
+                decompositions(frame, &frame.program.operations) >= 2,
+                "each distinct consumer receives a fresh expanded value"
+            );
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+    }
+
+    /// Shared decompositions are recomputed from the unchanged input, both at
+    /// the root and inside a native loop; sampling and carried values are not replayed.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_hash_concat_preparations_rematerialize_at_consumers() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let digits = cpu.modulus_digits();
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for nested in [false, true] {
+            let source = ring.polynomial([IntExpr::constant(u32::from(rand::random::<u16>()) + 1)]);
+            let left = ring.constant(
+                (1, 2 * digits),
+                ConstantMatrix::AllCoefficients { value: IntExpr::constant(3) },
+            );
+            let key = ring.bytes_input("key", 32);
+            let inputs = BTreeMap::from([(
+                "key".to_owned(),
+                RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>())),
+            )]);
+            let compute = |source: mxx_dsl::Mat| {
+                let hashed =
+                    ring.hash_matrix(key.clone(), b"deferred-preparation".as_slice(), (1, 1));
+                let source = mxx_dsl::Mat::concat(ConcatAxis::Rows, vec![hashed, source]);
+                let decomposed = source.decompose(256, digits).centered_rebase(&ring);
+                let early = left.clone().mul_small_rhs(decomposed.clone());
+                let later = (left.clone() + left.clone()).mul_small_rhs(decomposed);
+                Ok(early + later)
+            };
+            let output = if nested {
+                mxx_dsl::iterate(2usize, source, |_, value| compute(value)).unwrap()
+            } else {
+                compute(source).unwrap()
+            };
+            let graph = DslContext::new("rematerialized-expansions")
+                .output("out", output)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut plan = runtime.plan_with_fixed_geometry_for_test(graph, &inputs, 1, 1).unwrap();
+            fn decompositions(
+                frame: &crate::gpu_physical_lowering::PhysicalFrame,
+                ops: &[CompiledGpuOp],
+            ) -> usize {
+                ops.iter()
+                    .map(|op| {
+                        usize::from(matches!(
+                            frame
+                                .program
+                                .implementations
+                                .resolve(op.implementation)
+                                .unwrap()
+                                .primitive,
+                            crate::gpu_execution_plan::GpuNativePrimitive::GadgetDecomposeCompact
+                        )) + op.body.as_deref().map_or(0, |body| decompositions(frame, body))
+                    })
+                    .sum()
+            }
+            let frame = plan.physical_frame_for_test();
+            assert!(
+                decompositions(frame, &frame.program.operations) >= 2,
+                "each distinct consumer receives a fresh expanded value"
+            );
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, inputs.clone()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+    }
+
+    /// Shared decompositions are recomputed from the unchanged input, both at
+    /// the root and inside a native loop; sampling and carried values are not replayed.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_family_preparations_delay_imports_until_consumers() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let digits = cpu.modulus_digits();
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for nested in [false, true] {
+            let source = ring.polynomial([IntExpr::constant(u32::from(rand::random::<u16>()) + 1)]);
+            let left = ring.constant(
+                (1, 2 * digits),
+                ConstantMatrix::AllCoefficients { value: IntExpr::constant(3) },
+            );
+            let key = ring.bytes_input("key", 32);
+            let inputs = BTreeMap::from([(
+                "key".to_owned(),
+                RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>())),
+            )]);
+            let compute = |source: mxx_dsl::Mat| {
+                let members = parallel(2usize, |_| Ok(source.clone() + source.clone())).unwrap();
+                let source = members.at(0usize);
+                let hashed =
+                    ring.hash_matrix(key.clone(), b"deferred-preparation".as_slice(), (1, 1));
+                let source = mxx_dsl::Mat::concat(ConcatAxis::Rows, vec![hashed, source]);
+                let decomposed = source.decompose(256, digits).centered_rebase(&ring);
+                let early = left.clone().mul_small_rhs(decomposed.clone());
+                let later = (left.clone() + left.clone()).mul_small_rhs(decomposed);
+                Ok(early + later)
+            };
+            let output = if nested {
+                mxx_dsl::iterate(2usize, source, |_, value| compute(value)).unwrap()
+            } else {
+                compute(source).unwrap()
+            };
+            let graph = DslContext::new("rematerialized-expansions")
+                .output("out", output)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut plan = runtime.plan_with_fixed_geometry_for_test(graph, &inputs, 1, 1).unwrap();
+            fn decompositions(
+                frame: &crate::gpu_physical_lowering::PhysicalFrame,
+                ops: &[CompiledGpuOp],
+            ) -> usize {
+                ops.iter()
+                    .map(|op| {
+                        usize::from(matches!(
+                            frame
+                                .program
+                                .implementations
+                                .resolve(op.implementation)
+                                .unwrap()
+                                .primitive,
+                            crate::gpu_execution_plan::GpuNativePrimitive::GadgetDecomposeCompact
+                        )) + op.body.as_deref().map_or(0, |body| decompositions(frame, body))
+                    })
+                    .sum()
+            }
+            let frame = plan.physical_frame_for_test();
+            assert!(
+                decompositions(frame, &frame.program.operations) >= 2,
+                "each distinct consumer receives a fresh expanded value"
+            );
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, inputs.clone()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+    }
+
+    /// Selected transcripts preserve the eager CPU hash, replay bindings and
+    /// exported alternatives; an invalid unused U64 tag must still fail.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_selected_hash_transcripts_replay_and_preserve_exports() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        use mxx_dsl::{Family, HashTag, Int, IntType};
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), BigInt::from(0)..=BigInt::from(3));
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("value".into(), BigInt::from(-1)..=BigInt::from(300));
+        for exported in [false, true] {
+            let context = DslContext::new("selected-hash-transcripts");
+            let selector: Int = context.input("selector", IntType).unwrap();
+            let value: Int = context.input("value", IntType).unwrap();
+            let key = ring.bytes_input("key", 32);
+            let mut tag = HashTag::from(b"short".as_slice());
+            tag.push_integer(value.clone());
+            let first = ring.hash_matrix(key.clone(), tag, (1, 2));
+            let second =
+                ring.hash_matrix(key.clone(), b"longer-alternative-prefix".as_slice(), (1, 2));
+            let mut tag = HashTag::from(b"u64-alternative".as_slice());
+            tag.push("member");
+            tag.push_u64_le(value);
+            let third = ring.hash_matrix(key, tag, (1, 2));
+            let family = Family::pack(vec![first.clone(), second, third]).unwrap();
+            let context = context.output("out", family.at(selector)).unwrap();
+            let context = if exported { context.output("first", first).unwrap() } else { context };
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let bind = |selector: usize, value: i64| {
+                BTreeMap::from([
+                    ("selector".into(), RuntimeValue::Int(BigInt::from(selector))),
+                    ("value".into(), RuntimeValue::Int(BigInt::from(value))),
+                    ("key".into(), RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()))),
+                ])
+            };
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph.clone(), &bind(0, 258), 1, 1)
+                .unwrap();
+            assert_eq!(
+                plan.physical_frame_for_test().hash_resources.len(),
+                if exported { 3 } else { 1 }
+            );
+            for selector in [0, 2, 1, 0] {
+                let inputs = bind(selector, rand::random_range(0..=300));
+                let expected = execute(
+                    &graph,
+                    &mut cpu_backend([cpu.clone()]),
+                    inputs.clone(),
+                    &mut MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let result = runtime.execute(&mut plan, inputs).unwrap();
+                for name in if exported { vec!["out", "first"] } else { vec!["out"] } {
+                    let actual =
+                        runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+                    let RuntimeValue::Matrix(expected) = &expected.outputs[name] else {
+                        panic!("CPU matrix")
+                    };
+                    assert_eq!(&actual, expected.as_cpu_full().unwrap());
+                }
+            }
+            assert!(runtime.execute(&mut plan, bind(0, -1)).is_err(), "invalid unselected U64 tag");
+            assert!(runtime.execute(&mut plan, bind(3, 1)).is_err(), "out-of-range selector");
+        }
+    }
+
+    /// Nested wave and sequential indices remain resident operands of the
+    /// selected transcript, and are read again on each iteration and replay.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_selected_hash_transcripts_follow_nested_indices() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        use mxx_dsl::{Family, HashTag, Int, IntType};
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let context = DslContext::new("selected-hash-nested-indices");
+        let selector: Int = context.input("selector", IntType).unwrap();
+        let key = ring.bytes_input("key", 32);
+        let lanes = parallel(3usize, |lane| {
+            mxx_dsl::iterate(2usize, ring.zero((1, 2)), |step, state| {
+                let mut left = HashTag::from(b"nested-left".as_slice());
+                left.push_integer(lane.clone());
+                left.push_u64_le(step.clone());
+                let mut middle = HashTag::from(b"nested-middle-long".as_slice());
+                middle.push_u64_le(lane.clone());
+                middle.push_decimal(step.clone())?;
+                let mut right = HashTag::from(b"right".as_slice());
+                right.push_integer(step.clone().add(lane.clone()));
+                let candidates = Family::pack(vec![
+                    ring.hash_matrix(key.clone(), left, (1, 2)),
+                    ring.hash_matrix(key.clone(), middle, (1, 2)),
+                    ring.hash_matrix(key.clone(), right, (1, 2)),
+                ])?;
+                Ok(state + candidates.at(selector.clone().add(lane.clone()).add(step).rem(3usize)))
+            })
+        })
+        .unwrap();
+        let graph = context
+            .output("out", lanes.at(0usize) + lanes.at(1usize) + lanes.at(2usize))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("selector".into(), BigInt::from(0)..=BigInt::from(2));
+        let bind = |selector: usize| {
+            BTreeMap::from([
+                ("selector".into(), RuntimeValue::Int(BigInt::from(selector))),
+                ("key".into(), RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>()))),
+            ])
+        };
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph.clone(), &bind(0), 1, 3).unwrap();
+        assert!(
+            plan.physical_frame_for_test().hash_resources.values().any(|spec| {
+                spec.parts.iter().any(|part| {
+                    matches!(part, crate::poly::dcrt::gpu::GpuHashTagPart::Select { .. })
+                })
+            }),
+            "nested hash selection must use the fused transcript"
+        );
+        for selector in [0, 2, 1] {
+            let inputs = bind(selector);
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let result = runtime.execute(&mut plan, inputs).unwrap();
+            let actual = runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            assert_eq!(&actual, expected.as_cpu_full().unwrap());
+        }
+    }
+
+    /// A hash used both as initial carry and immutable loop input is regenerated
+    /// from the same key inside the body. Rebinding that key on replay changes both.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_sequential_hash_captures_match_rebound_keys() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let key = ring.bytes_input("key", 32);
+        let sample = ring.hash_matrix(key.clone(), b"initial-and-captured".as_slice(), (1, 2));
+        let other = ring.hash_matrix(key, b"distinct-domain".as_slice(), (1, 2));
+        let output = mxx_dsl::iterate(2usize, sample.clone(), |_, state| {
+            Ok(state + sample.clone() + other.clone())
+        })
+        .unwrap();
+        let graph = DslContext::new("sequential-hash-capture-replay")
+            .output("out", output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let body = graph
+            .source
+            .scopes()
+            .values()
+            .find(|scope| matches!(scope.id(), FrozenGraphScopeId::SequentialBody { .. }))
+            .unwrap();
+        assert_eq!(
+            body.nodes().iter().filter(|n| matches!(n.kind(), NodeKind::HashSample { .. })).count(),
+            2
+        );
+        let inputs = || {
+            BTreeMap::from([(
+                "key".into(),
+                RuntimeValue::Bytes(Arc::from(rand::random::<[u8; 32]>())),
+            )])
+        };
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph.clone(), &inputs(), 1, 1).unwrap();
+        for _ in 0..2 {
+            let inputs = inputs();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let result = runtime.execute(&mut plan, inputs).unwrap();
+            let actual = runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            assert_eq!(&actual, expected.as_cpu_full().unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_dynamic_bit_positions_match_bigint_without_candidate_expansion() {
+        use mxx_dsl::{Int, IntType};
+        let cpu = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let gpu = GpuDCRTPolyParams::new(8, cpu.to_crt().0, 4, None);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let bound = BigInt::from(1) << 130usize;
+        runtime.options_mut().integer_input_ranges.insert("value".into(), -&bound..=bound.clone());
+        let count = crate::env::test_streamed_members();
+        let mut sizes = Vec::new();
+        for offset in [63usize, 114695] {
+            let context = DslContext::new("dynamic-bit-positions");
+            let value: Int = context.input("value", IntType).unwrap();
+            let bits = parallel(count, |index| Ok(value.clone().bit(index.add(offset))?.to_int()))
+                .unwrap();
+            let graph = context
+                .output("bits", bits)
+                .unwrap()
+                .output("high", value.clone().bit(114701usize).unwrap().to_int())
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let bind = |value: BigInt| BTreeMap::from([("value".into(), RuntimeValue::Int(value))]);
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &bind(0.into()), 1, 2).unwrap();
+            sizes.push((
+                plan.physical_frame_for_test().program.operations.len(),
+                plan.physical_frame_for_test().program.values.len(),
+            ));
+            for value in [
+                BigInt::from(0),
+                BigInt::from(1),
+                BigInt::from(-1),
+                BigInt::from(1) << 80usize,
+                -(BigInt::from(1) << 80usize),
+                BigInt::from(rand::random::<u128>()),
+            ] {
+                let result = runtime
+                    .execute_with_artifacts(
+                        &mut plan,
+                        bind(value.clone()),
+                        &mut MemoryArtifactStore::default(),
+                        rand::random(),
+                    )
+                    .unwrap();
+                let actual = runtime
+                    .download_integer_family_output(&result.output("bits").unwrap())
+                    .unwrap();
+                let expected = (0..count)
+                    .map(|index| BigInt::from(value.bit((offset + index) as u64) as u8))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    runtime
+                        .download_integer_family_output(&result.output("high").unwrap())
+                        .unwrap(),
+                    vec![BigInt::from(value.bit(114701) as u8)]
+                );
+            }
+        }
+        assert_eq!(sizes[0], sizes[1], "position range must not expand the plan");
+    }
+
+    /// A read-only carry borrows its owner while other ports update or swap simultaneously.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_mixed_carries_borrow_passthrough_and_preserve_swaps() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = crate::env::test_streamed_columns().max(2);
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for swap in [false, true] {
+            let capture = ring.constant(
+                (1, columns),
+                ConstantMatrix::AllCoefficients {
+                    value: IntExpr::constant(rand::random_range(1..=7)),
+                },
+            );
+            let left = ring.polynomial([IntExpr::constant(rand::random_range(1..=7))]);
+            let right = left.clone() + left.clone();
+            let (after, left, right) = mxx_dsl::iterate(
+                3usize,
+                (capture.clone(), left, right),
+                |_, (capture, left, right)| {
+                    Ok(if swap {
+                        (capture, right, left)
+                    } else {
+                        (capture, left.clone() + right.clone(), right + left)
+                    })
+                },
+            )
+            .unwrap();
+            let graph = DslContext::new("mixed-carry-passthrough")
+                .output("before", capture)
+                .unwrap()
+                .output("after", after)
+                .unwrap()
+                .output("left", left)
+                .unwrap()
+                .output("right", right)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            let frame = plan.physical_frame_for_test();
+            let body = frame.program.operations.iter().find_map(|op| op.body.as_deref()).unwrap();
+            assert!(
+                body.iter().flat_map(|op| &op.outputs).all(|id| {
+                    frame.program.values[id.0 as usize]
+                        .ty
+                        .matrix_type()
+                        .is_none_or(|ty| ty.columns != columns)
+                }),
+                "unchanged wide capture must have no copy or staging writer inside the loop"
+            );
+            let actual = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+            for name in ["before", "after", "left", "right"] {
+                let downloaded =
+                    runtime.download_matrix_output(&actual.output(name).unwrap()).unwrap();
+                let RuntimeValue::Matrix(reference) = &expected.outputs[name] else {
+                    panic!("matrix output")
+                };
+                assert_eq!(&downloaded, reference.as_cpu_full().unwrap(), "{name}, swap={swap}");
+            }
+        }
+    }
+
+    /// Nonoverlapping sequential carries share scratch instead of all staying resident.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_sequential_carry_memory_tracks_liveness() {
+        sequential_carry_memory_tracks_liveness(false);
+    }
+
+    /// A native outer loop must not retain every inner stage's temporary rows.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_native_body_scratch_tracks_liveness() {
+        sequential_carry_memory_tracks_liveness(true);
+    }
+
+    fn sequential_carry_memory_tracks_liveness(nested: bool) {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let stages = 2 + 10 * crate::env::test_streamed_steps();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut footprints = Vec::new();
+        for stages in [2, stages] {
+            let increment = ring.constant(
+                (1, columns),
+                ConstantMatrix::AllCoefficients {
+                    value: IntExpr::constant(rand::random_range(1..=7)),
+                },
+            );
+            let lanes = parallel(2usize, |_| {
+                let compute = |mut state| {
+                    for _ in 0..stages {
+                        state = mxx_dsl::iterate(2usize, state, |_, carried| {
+                            Ok(carried + increment.clone())
+                        })?;
+                    }
+                    Ok(state)
+                };
+                if nested {
+                    mxx_dsl::iterate(2usize, increment.clone(), |_, state| compute(state))
+                } else {
+                    compute(increment.clone())
+                }
+            })
+            .unwrap();
+            let state = lanes.at(mxx_dsl::Int::constant(0)) + lanes.at(mxx_dsl::Int::constant(1));
+            let graph = DslContext::new("sequential-carry-liveness")
+                .output("out", state)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = (degree as usize * 2 * columns * 8) as u64;
+        assert!(footprints[1] <= footprints[0] + 4 * row_bytes, "{footprints:?}");
+    }
+
+    /// Later-wave members stay distinct through a dynamic read, but a consumed
+    /// family does not retain its allocation across every subsequent wave loop.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_wave_member_storage_tracks_last_consumer() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let stages = 2 + 10 * crate::env::test_streamed_steps();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut footprints = Vec::new();
+        for stages in [2, stages] {
+            let increment = ring.constant(
+                (1, columns),
+                ConstantMatrix::AllCoefficients {
+                    value: IntExpr::constant(rand::random_range(1..=7)),
+                },
+            );
+            let selector =
+                mxx_dsl::int_family_input("select-last", 1usize).at(0usize).rem(2usize).mul(2usize);
+            let mut state = increment.clone();
+            for _ in 0..stages {
+                let members = parallel(3usize, |lane| {
+                    Ok((state.clone() + increment.clone()).multiply_monomial(lane))
+                })
+                .unwrap();
+                state = members.at(selector.clone());
+            }
+            let graph = DslContext::new("wave-member-last-consumer")
+                .output("out", state)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let inputs = |selected: bool| {
+                BTreeMap::from([(
+                    "select-last".into(),
+                    RuntimeValue::integer_values(vec![BigInt::from(u8::from(selected))]),
+                )])
+            };
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph.clone(), &inputs(false), 1, 1)
+                .unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for selected in [false, true, false] {
+                let expected = execute(
+                    &graph,
+                    &mut cpu_backend([cpu.clone()]),
+                    inputs(selected),
+                    &mut MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                let result = runtime.execute(&mut plan, inputs(selected)).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = u64::from(degree) * 2 * columns as u64 * 8;
+        assert!(footprints[1] <= footprints[0] + 6 * row_bytes, "{footprints:?}");
+    }
+
+    /// Indexed pointer-table candidates remain live through selection, then release their arena
+    /// span.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_indexed_candidates_memory_tracks_reads() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let stages = 2 + 10 * crate::env::test_streamed_steps();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids()))
+            .unwrap()
+            .with_multi_lane_test_planning();
+        let mut footprints = Vec::new();
+        for stages in [2, stages] {
+            let increment = ring.constant(
+                (1, columns),
+                ConstantMatrix::AllCoefficients {
+                    value: IntExpr::constant(rand::random_range(1..=7)),
+                },
+            );
+            let lanes = parallel(2usize, |_| {
+                let mut state = increment.clone();
+                for _ in 0..stages {
+                    state = mxx_dsl::iterate(2usize, state, |index, carried| {
+                        let candidates = mxx_dsl::Family::pack(vec![
+                            carried.clone() + increment.clone(),
+                            carried - increment.clone(),
+                        ])?;
+                        Ok(candidates.at(index))
+                    })?;
+                }
+                Ok(state)
+            })
+            .unwrap();
+            let state = lanes.at(mxx_dsl::Int::constant(0)) + lanes.at(mxx_dsl::Int::constant(1));
+            let graph = DslContext::new("sequential-carry-liveness")
+                .output("out", state)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = (degree as usize * 2 * columns * 8) as u64;
+        assert!(footprints[1] <= footprints[0] + 4 * row_bytes, "{footprints:?}");
+    }
+
+    /// Composite matrix views retain every source until its last reader, then reuse storage.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_composite_scratch_memory_tracks_all_sources() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let stages = 2 + 10 * crate::env::test_streamed_steps();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut footprints = Vec::new();
+        for stages in [2, stages] {
+            let increment = ring.constant(
+                (1, columns),
+                ConstantMatrix::AllCoefficients {
+                    value: IntExpr::constant(rand::random_range(1..=7)),
+                },
+            );
+            let lanes = parallel(2usize, |_| {
+                let mut state = increment.clone();
+                for _ in 0..stages {
+                    state = mxx_dsl::iterate(2usize, state, |_, carried| {
+                        let joined = mxx_dsl::Mat::concat(
+                            ConcatAxis::Rows,
+                            vec![carried.clone() + increment.clone(), carried],
+                        );
+                        let projection = ring.constant(
+                            (2, 1),
+                            ConstantMatrix::AllCoefficients { value: IntExpr::constant(1) },
+                        );
+                        Ok((joined.transpose() * projection).transpose())
+                    })?;
+                }
+                Ok(state)
+            })
+            .unwrap();
+            let state = lanes.at(mxx_dsl::Int::constant(0)) + lanes.at(mxx_dsl::Int::constant(1));
+            let graph = DslContext::new("sequential-carry-liveness")
+                .output("out", state)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let expected = execute(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for _ in 0..2 {
+                let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = (degree as usize * 2 * columns * 8) as u64;
+        assert!(footprints[1] <= footprints[0] + 4 * row_bytes, "{footprints:?}");
+    }
+
+    /// Replayed imports whose complete lifetime lies in one body may reuse arena bytes.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_nested_import_arena_tracks_liveness() {
+        nested_import_arena_tracks_liveness(false);
+    }
+
+    /// Nested host-I/O loops in one wave reuse device-only carry scratch,
+    /// while the host import destinations keep their read-ahead lifetimes.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_wave_nested_import_arena_tracks_liveness() {
+        nested_import_arena_tracks_liveness(true);
+    }
+
+    fn nested_import_arena_tracks_liveness(in_wave: bool) {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        use mxx_ir_core::artifact::ArtifactAvailability;
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let stages = 2 + 10 * crate::env::test_streamed_steps();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut store = MemoryArtifactStore::default();
+        let producer = DslContext::new("arena-member-producer")
+            .cached_output(
+                "members",
+                parallel(2usize, |index| {
+                    Ok(ring.constant(
+                        (1, columns),
+                        ConstantMatrix::AllCoefficients {
+                            value: index.expression()? +
+                                IntExpr::constant(rand::random_range(1..=7)),
+                        },
+                    ))
+                })
+                .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let production = execute_in_session(
+            &producer,
+            &mut cpu_backend([cpu.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap()
+        .production_id
+        .unwrap();
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut footprints = Vec::new();
+        for stages in [2, stages] {
+            let members = ring.family_artifact_input(
+                production.clone(),
+                "members",
+                2usize,
+                (1, columns),
+                ArtifactAvailability::Cached,
+            );
+            let compute = || {
+                mxx_dsl::iterate(2usize, ring.zero((1, columns)), |_, mut state| {
+                    for _ in 0..stages {
+                        state = mxx_dsl::iterate(2usize, state, |index, state| {
+                            Ok(state + members.at(index))
+                        })?;
+                    }
+                    Ok(state)
+                })
+            };
+            let result = if in_wave {
+                let lanes = parallel(2usize, |_| compute()).unwrap();
+                lanes.at(mxx_dsl::Int::constant(0)) + lanes.at(mxx_dsl::Int::constant(1))
+            } else {
+                compute().unwrap()
+            };
+            let graph = DslContext::new("nested-import-arena")
+                .output("out", result)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production.clone(), manifest.clone())]),
+                )
+                .unwrap();
+            let expected = execute_in_session(
+                &graph,
+                &mut cpu_backend([cpu.clone()]),
+                BTreeMap::new(),
+                &mut store,
+                rand::random(),
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                panic!("CPU matrix")
+            };
+            let mut plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1).unwrap();
+            footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+            for _ in 0..2 {
+                let result = runtime
+                    .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                    .unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                assert_eq!(&actual, expected.as_cpu_full().unwrap());
+            }
+        }
+        let row_bytes = degree as u64 * 2 * columns as u64 * 8;
+        assert!(footprints[1] <= footprints[0] + 4 * row_bytes, "{footprints:?}");
+    }
 
     #[test]
     fn finite_loop_count_uses_actual_binding_and_requires_bound_index() {
@@ -9628,7 +13479,8 @@ mod tests {
         let ring =
             Ring::from_crt_moduli(params.to_crt().0.into_iter().map(IntExpr::from).collect(), 32);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
-        let family_type = FamilyType { element: matrix_type.clone(), count: 3.into() };
+        let family_type =
+            FamilyType { element: matrix_type.clone(), count: 3.into(), member_slot: None };
         let named = Subgraph::<Family<Mat>, (Mat, Mat)>::define(
             "borrowed-family-member",
             family_type.clone(),
@@ -9829,7 +13681,9 @@ mod tests {
             .unwrap()
             .validate(&ParamEnv::default())
             .unwrap();
-        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device]))
+            .unwrap()
+            .with_multi_lane_test_planning();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
         for _ in 0..2 {
@@ -10009,11 +13863,19 @@ mod tests {
         assert_eq!(parallel_wave_geometry(&plan, key, 10).unwrap(), (4, 2));
         assert!(parallel_wave_geometry(&plan, key, 9).is_err());
         assert!(parallel_wave_geometry(&plan, GpuLoopSiteKey { site: 6, ..key }, 10,).is_err());
+        // Logical cardinality must not be narrowed to the host's address size.
+        let mut plan = plan;
+        let count = u128::from(u64::MAX) + 3;
+        plan.loops[0].loop_count = count;
+        assert_eq!(parallel_wave_geometry(&plan, key, count).unwrap(), (4, 2));
+        assert!(parallel_wave_geometry(&plan, key, 2).is_err());
+        plan.loops[0].tail_instances = 0;
+        assert!(parallel_wave_geometry(&plan, key, count).is_err());
     }
 
     #[test]
     fn static_family_member_changes_only_the_view() {
-        let family = PhysicalValue {
+        let family = PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty: ConcreteWireType::IndexedFamily {
                 element: Box::new(ConcreteWireType::Int),
                 count: 3,
@@ -10023,16 +13885,16 @@ mod tests {
                 leaf: 0,
                 storage: StorageRef::Input(0),
                 device: 0,
-                view: PhysicalView {
+                view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 0,
                     origin: Box::new([0, 0, 0]),
                     extent: Box::new([3, 1, 1]),
                     byte_strides: Box::new([8, 8, 8]),
                     element_bytes: 8,
-                },
+                }),
             }]),
             integer_ranges: Default::default(),
-        };
+        });
         family.validate(|_| Some((0, 24))).unwrap();
         let selected = static_family_physical(&family, 2).unwrap();
         selected.validate(|_| Some((0, 24))).unwrap();
@@ -10040,11 +13902,66 @@ mod tests {
         assert_eq!(selected.parts[0].view.byte_offset, 16);
         assert_eq!(selected.parts[0].view.extent.as_ref(), &[1, 1]);
         assert!(static_family_physical(&family, 3).is_err());
-        let (first_wave, first_bindings) = wave_member_layout(&family, 0).unwrap();
-        let (last_wave, last_bindings) = wave_member_layout(&family, 2).unwrap();
+        let (first_wave, first_bindings) =
+            wave_member_layout(static_family_physical(&family, 0).unwrap()).unwrap();
+        let (last_wave, last_bindings) =
+            wave_member_layout(static_family_physical(&family, 2).unwrap()).unwrap();
         assert_eq!(first_wave, last_wave);
         assert_eq!(first_bindings[0].2, 0);
         assert_eq!(last_bindings[0].2, 16);
+    }
+
+    /// Two dynamic reads of one family in one loop body share its candidates and descriptor
+    /// table (one table, not one per read), and each still selects its own member.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_dynamic_reads_of_one_family_share_one_table() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu_params = DCRTPolyParams::new(32, 2, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, cpu_params.to_crt().0, 8, None);
+        let ring = Ring::from_crt_moduli(
+            gpu_params.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            gpu_params.ring_dimension(),
+        );
+        let member_ring = ring.clone();
+        let family = parallel(6, move |index| {
+            Ok(index.add(1).lift_to_constant_polynomial(member_ring.matrix_type((1, 1))))
+        })
+        .unwrap();
+        let sums = parallel(4, move |index| {
+            Ok(family.at(index.clone().mul(2).add(1).rem(6)) + family.at(index.add(3).rem(6)))
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-shared-dynamic-reads")
+            .output("sums", sums)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.frame().indexed_tables.len(), 1, "both reads share one table");
+        let result = runtime
+            .execute_with_artifacts(
+                &mut plan,
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                rand::random(),
+            )
+            .unwrap();
+        for index in 0..4usize {
+            let actual = runtime
+                .download_matrix_member_output(&result.output("sums").unwrap(), index)
+                .unwrap();
+            let expected = (index * 2 + 1) % 6 + 1 + (index + 3) % 6 + 1;
+            assert_eq!(
+                actual.entry(0, 0).to_bytes(),
+                DCRTPoly::from_usize_to_constant(&cpu_params, expected).to_bytes(),
+                "member {index}"
+            );
+        }
     }
 
     /// A loop index selects a different row and column on each replay. The
@@ -10190,6 +14107,7 @@ mod tests {
                 PhysicalEncoding::FullEval,
                 StorageRef::Input(0),
                 Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &matrix(value))),
+                None,
             )
             .unwrap();
             BTreeMap::from([("source".to_owned(), RuntimeValue::Resident(owner))])
@@ -10323,6 +14241,7 @@ mod tests {
                 PhysicalEncoding::FullEval,
                 StorageRef::Input(position as u32),
                 native,
+                None,
             )
             .unwrap();
             inputs.insert(name.clone(), RuntimeValue::Resident(resident));
@@ -10428,6 +14347,7 @@ mod tests {
                 PhysicalEncoding::FullEval,
                 StorageRef::Input(position as u32),
                 native,
+                None,
             )
             .unwrap();
             inputs.insert(name.to_owned(), RuntimeValue::Resident(resident));
@@ -10460,6 +14380,151 @@ mod tests {
                     assert_eq!(
                         actual.entry(row, column).to_bytes(),
                         expected.entry(row, column).to_bytes()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A produced matrix and its slices share one allocation across output ports.
+    /// Later waves must preserve those aliases without overwriting earlier members.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_parallel_output_slices_preserve_replay_aliases() {
+        let dimension = std::env::var("MXX_TEST_SCRATCH_RING_DIMENSION")
+            .map_or(16, |v| v.parse::<u32>().unwrap());
+        let count =
+            std::env::var("MXX_TEST_SCRATCH_MEMBERS").map_or(3, |v| v.parse::<usize>().unwrap());
+        assert!(count >= 2);
+        let params = DCRTPolyParams::new(dimension, 2, 20, 4, None, None);
+        let gpu = GpuDCRTPolyParams::new(dimension, params.to_crt().0, 4, None);
+        let ring = Ring::from_crt_moduli(
+            gpu.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            dimension,
+        );
+        let key = ring.bytes_input("key", 32);
+        let members = parallel(count, |index| {
+            let mut tag = mxx_dsl::HashTag::from(b"replayed-output-slices".as_slice());
+            tag.push(index);
+            let full = ring.hash_matrix(key.clone(), tag, (1, 2));
+            let slice = |start| {
+                full.clone().slice(
+                    None,
+                    Some(mxx_ir_core::node::IndexRange {
+                        start: IntExpr::constant(start),
+                        end: IntExpr::constant(start + 1),
+                    }),
+                )
+            };
+            Ok((full.clone(), slice(0), slice(1)))
+        })
+        .unwrap();
+        let validated = DslContext::new("replayed-output-slices")
+            .output("full", members.field(|(full, _, _)| full).unwrap())
+            .unwrap()
+            .output("left", members.field(|(_, left, _)| left).unwrap())
+            .unwrap()
+            .output("right", members.field(|(_, _, right)| right).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = BTreeMap::from([(
+            "key".into(),
+            RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec().into()),
+        )]);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(1).unwrap();
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let result = runtime
+            .execute_with_artifacts(
+                &mut plan,
+                inputs,
+                &mut MemoryArtifactStore::default(),
+                rand::random(),
+            )
+            .unwrap();
+        let full = result.output("full").unwrap();
+        for member in 0..count {
+            let expected = runtime.download_matrix_member_output(&full, member).unwrap();
+            for (column, name) in ["left", "right"].into_iter().enumerate() {
+                let actual = runtime
+                    .download_matrix_member_output(&result.output(name).unwrap(), member)
+                    .unwrap();
+                assert_eq!(actual.entry(0, 0).to_bytes(), expected.entry(0, column).to_bytes());
+            }
+        }
+    }
+
+    /// Matrix-bearing waves take the general lowerer even when an output is an
+    /// integer. Packed integer outputs keep one contiguous allocation across waves.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_parallel_scalar_outputs_keep_contiguous_family_storage() {
+        use rand::Rng;
+        let count = std::env::var("MXX_TEST_SCALAR_WAVE_MEMBERS")
+            .map_or(5, |value| value.parse::<usize>().unwrap());
+        assert!(count >= 3);
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(17u64)], 8);
+        let context = DslContext::new("parallel-packed-scalars");
+        let values = context.int_family_input("values", count);
+        let members = parallel(count, |index| {
+            let input = values.at(index);
+            let matrix = input.clone().lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+            Ok((matrix.clone(), (matrix.coefficients().at(0), input)))
+        })
+        .unwrap();
+        let computed = members.field(|(_, (computed, _))| computed).unwrap();
+        let forwarded = members.field(|(_, (_, forwarded))| forwarded).unwrap();
+        let graph = context
+            .output("computed", computed)
+            .unwrap()
+            .output("forwarded", forwarded)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        for width in [1, 2] {
+            let gpu = GpuDCRTPolyParams::new(8, vec![17], 2, None);
+            let mut runtime =
+                GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+            runtime
+                .options_mut()
+                .integer_input_ranges
+                .insert("values".into(), 0.into()..=16.into());
+            let draw = || {
+                (0..count)
+                    .map(|_| BigInt::from(rand::rng().random_range(0u64..17)))
+                    .collect::<Vec<_>>()
+            };
+            let input = |values: Vec<BigInt>| {
+                BTreeMap::from([("values".to_owned(), RuntimeValue::integer_values(values))])
+            };
+            let first = draw();
+            let mut plan = runtime
+                .plan_with_fixed_geometry_for_test(graph.clone(), &input(first.clone()), 1, width)
+                .unwrap();
+            let held = runtime.execute(&mut plan, input(first.clone())).unwrap();
+            for _ in 0..2 {
+                let expected = draw();
+                let result = runtime.execute(&mut plan, input(expected.clone())).unwrap();
+                for name in ["computed", "forwarded"] {
+                    assert_eq!(
+                        runtime
+                            .download_integer_family_output(&result.output(name).unwrap())
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        runtime
+                            .download_integer_family_output(&held.output(name).unwrap())
+                            .unwrap(),
+                        first
                     );
                 }
             }
@@ -10593,7 +14658,7 @@ mod tests {
             plan.physical_frame_for_test().program.operations.iter().collect::<Vec<_>>();
         while let Some(operation) = pending.pop() {
             used.insert(operation.device);
-            pending.extend(operation.body.iter().flatten());
+            pending.extend(operation.body.as_deref().into_iter().flatten());
         }
         assert_eq!(used, devices.iter().copied().collect::<BTreeSet<_>>());
         let expected = (left.clone() * &right) + &(left * &right);
@@ -10630,7 +14695,7 @@ mod tests {
         );
         let left = ring.input("left", (1, 2));
         let right = ring.input("right", (1, 2));
-        let family = parallel(3, move |_| Ok(left.clone() + right.clone())).unwrap();
+        let family = parallel(7, move |_| Ok(left.clone() + right.clone())).unwrap();
         let validated = DslContext::new("direct-parallel-artifact-waves")
             .cached_output("sum", family)
             .unwrap()
@@ -10662,6 +14727,7 @@ mod tests {
                 PhysicalEncoding::FullEval,
                 StorageRef::Input(position as u32),
                 native,
+                None,
             )
             .unwrap();
             inputs.insert(name.to_owned(), RuntimeValue::Resident(resident));
@@ -10669,27 +14735,136 @@ mod tests {
         let mut runtime = GpuRuntime::new(backend).unwrap();
         runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
         // Two lanes, each streaming its members from a slot of its own, over
-        // a full wave and a partial one.
+        // three full waves and a partial one.
         let mut plan = runtime.plan_with_fixed_geometry_for_test(validated, &inputs, 2, 2).unwrap();
         assert_eq!(plan.report().stages[0].wave_instances, 2);
+        assert_eq!(plan.physical_frame_for_test().waves.len(), 2);
+        assert_eq!(plan.physical_frame_for_test().waves[0].repetitions, 3);
         let mut store = MemoryArtifactStore::default();
         let result =
             runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0x73; 32]).unwrap();
         let production = result.production_id.expect("family production identity");
-        assert_eq!(result.artifact_handles["sum"].len(), 3);
+        assert_eq!(result.artifact_handles["sum"].len(), 7);
         let manifest = store.load_finalized_manifest(&production).unwrap();
-        assert_eq!(manifest.artifacts["sum"].family_count, Some(3));
-        for index in 0..3 {
+        assert_eq!(manifest.artifacts["sum"].family_count, Some(7));
+        for index in 0..7 {
             let key = ArtifactKey {
                 production: production.clone(),
                 name: "sum".into(),
-                index: Some(index),
+                index: Some(index as u128),
             };
             assert!(
                 store.load(&key, &manifest.artifacts["sum"]).is_ok(),
                 "missing family artifact member {index}"
             );
         }
+    }
+
+    #[test]
+    fn test_gpu_parent_occurrence_range_preserves_wide_membership() {
+        let end = (1u128 << 100) + 7;
+        let mut range = ParentOccurrences::Strided { start: 1, end, step: 3 };
+        range.normalize().unwrap();
+        assert_eq!(range.len(), (end - 1).div_ceil(3));
+        assert!(range.contains(1));
+        assert!(range.contains(1 + ((1u128 << 80) / 3) * 3));
+        assert!(!range.contains(0));
+        assert!(!range.contains(2));
+        assert!(!range.contains(end));
+        assert!(range.valid_for_lane(end, 3, 1));
+        assert!(!range.valid_for_lane(end, 3, 0));
+        assert!(!range.valid_for_lane(end - 1, 3, 1));
+        assert!(ParentOccurrences::Explicit(vec![3, 3]).normalize().is_err());
+        assert!(ParentOccurrences::Strided { start: 0, end, step: 0 }.normalize().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_nested_streamed_plan_is_bounded_for_wide_parent_count() {
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let cpu = DCRTPolyParams::new(degree, 1, 30, 4, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 4, None);
+        let ring =
+            Ring::from_crt_moduli(cpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut sizes = Vec::new();
+        for count in [7u128, (1u128 << 64) + 7] {
+            let family = parallel(count, |outer| {
+                let inner = parallel(3usize, |inner| {
+                    Ok(outer
+                        .clone()
+                        .add(inner)
+                        .lift_to_constant_polynomial(ring.matrix_type((1, 1))))
+                })?;
+                Ok(inner.at(mxx_dsl::Int::constant(0)) +
+                    inner.at(mxx_dsl::Int::constant(1)) +
+                    inner.at(mxx_dsl::Int::constant(2)))
+            })
+            .unwrap();
+            let graph = DslContext::new("bounded-nested-streamed-plan")
+                .cached_output("members", family)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 2).unwrap();
+            let frame = plan.physical_frame_for_test();
+            assert!(frame.waves.iter().any(|wave| matches!(
+                wave.active_parent_occurrences,
+                ParentOccurrences::Strided { .. }
+            )));
+            sizes.push((
+                frame.waves.len(),
+                frame.program.operations.len(),
+                frame.program.values.len(),
+                frame.export_templates.len(),
+            ));
+        }
+        assert_eq!(sizes[0], sizes[1]);
+    }
+
+    /// The planner retains two wave shapes, not a million export descriptors.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_streamed_wave_plan_size_is_independent_of_member_count() {
+        let cpu = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let gpu = GpuDCRTPolyParams::new(8, cpu.to_crt().0, 4, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), 8);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut sizes = Vec::new();
+        for count in [7u128, 1_000_003, (1u128 << 64) + 7] {
+            let ring = ring.clone();
+            let family = parallel(count, move |index| {
+                Ok(index.add(3).lift_to_constant_polynomial(ring.matrix_type((1, 1))))
+            })
+            .unwrap();
+            let graph = DslContext::new("bounded-streamed-wave-plan")
+                .cached_output("members", family)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let plan =
+                runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 2).unwrap();
+            let frame = plan.physical_frame_for_test();
+            assert_eq!(frame.waves.len(), 2);
+            assert_eq!(frame.waves[0].repetitions, count / 2);
+            sizes.push((
+                frame.export_templates.len(),
+                frame.program.operations.len(),
+                frame.program.values.len(),
+            ));
+        }
+        assert!(sizes.windows(2).all(|pair| pair[0] == pair[1]), "{sizes:?}");
     }
 
     /// A family that only a member-by-member sum reads is summed wave by
@@ -10738,6 +14913,186 @@ mod tests {
                 sum.entry(0, 0).coeffs_biguints()[0],
                 num_bigint::BigUint::from((0..8u32).map(|index| index + 3).sum::<u32>())
             );
+        }
+    }
+
+    /// Nested parallel reductions reuse one wave of members and reset each parent's sum.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_nested_parallel_member_sum_tracks_wave_memory() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        for prefix in [1usize, 2] {
+            let mut footprints = Vec::new();
+            for count in [4, 4 + 16 * crate::env::test_streamed_steps()] {
+                let constant = mxx_dsl::Int::constant(rand::random_range(1..=7))
+                    .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                    .tensor(ring.constant(
+                        (1, columns),
+                        ConstantMatrix::UnitRow { index: IntExpr::constant(0) },
+                    ));
+                let outer = parallel(3usize, |parent| {
+                    let members = parallel(count, |member| {
+                        let first =
+                            constant.clone().multiply_monomial(member.clone().add(parent.clone()));
+                        let second =
+                            constant.clone().multiply_monomial(member.add(parent).add(1usize));
+                        Ok(vec![first, second])
+                    })?;
+                    let add = |left: Vec<mxx_dsl::Mat>, right: Vec<mxx_dsl::Mat>| {
+                        left.into_iter().zip(right).map(|(a, b)| a + b).collect::<Vec<_>>()
+                    };
+                    let initial = if prefix == 1 {
+                        members.at(0usize)
+                    } else {
+                        add(members.at(0usize), members.at(1usize))
+                    };
+                    mxx_dsl::iterate(count - prefix, initial, |index, total| {
+                        Ok(add(total, members.at(index.add(prefix))))
+                    })
+                })
+                .unwrap();
+                let first = outer.at(0usize);
+                let last = outer.at(2usize);
+                let graph = DslContext::new("nested-parallel-member-sum")
+                    .output("out0", first[0].clone() + last[0].clone())
+                    .unwrap()
+                    .output("out1", first[1].clone() + last[1].clone())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate(&ParamEnv::default())
+                    .unwrap();
+                let expected = execute(
+                    &graph,
+                    &mut cpu_backend([cpu.clone()]),
+                    BTreeMap::new(),
+                    &mut MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let mut plan = runtime
+                    .plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 1)
+                    .unwrap();
+                footprints.push(plan.planned_device_bytes().unwrap().values().sum::<u64>());
+                for _ in 0..3 {
+                    let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+                    for name in ["out0", "out1"] {
+                        let actual =
+                            runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+                        let RuntimeValue::Matrix(expected) = &expected.outputs[name] else {
+                            panic!("CPU matrix")
+                        };
+                        assert_eq!(&actual, expected.as_cpu_full().unwrap());
+                    }
+                }
+            }
+            let row_bytes = u64::from(degree) * 2 * columns as u64 * 8;
+            assert!(
+                footprints[1] <= footprints[0] + 2 * row_bytes,
+                "prefix={prefix} {footprints:?}"
+            );
+        }
+    }
+
+    /// Sequential ancestors replay parallel sums with site-local admissible wave widths.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_sequential_parallel_member_sum_replays_admissible_waves() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute},
+            transcript::SamplingMode,
+        };
+        let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
+        let columns = 16 * crate::env::test_streamed_columns();
+        let cpu = DCRTPolyParams::new(degree, 2, 50, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids()))
+            .unwrap()
+            .with_multi_lane_test_planning();
+        for (count, width) in [(2, 1), (6, 2), (6, 3), (5, 3)] {
+            for prefix in 1..=2.min(count - 1) {
+                let constant = mxx_dsl::Int::constant(rand::random_range(1..=7))
+                    .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                    .tensor(ring.constant(
+                        (1, columns),
+                        ConstantMatrix::UnitRow { index: IntExpr::constant(0) },
+                    ));
+                let output = mxx_dsl::iterate(3usize, constant.clone(), |step, state| {
+                    let members = parallel(count, |member| {
+                        Ok(state.clone().multiply_monomial(member.add(step.clone())))
+                    })?;
+                    let initial = if prefix == 1 {
+                        members.at(0usize)
+                    } else {
+                        members.at(0usize) + members.at(1usize)
+                    };
+                    mxx_dsl::iterate(count - prefix, initial, |index, total| {
+                        Ok(total + members.at(index.add(prefix)))
+                    })
+                })
+                .unwrap();
+                let graph = DslContext::new("sequential-parallel-member-sum")
+                    .output("out", output)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate(&ParamEnv::default())
+                    .unwrap();
+                let expected = execute(
+                    &graph,
+                    &mut cpu_backend([cpu.clone()]),
+                    BTreeMap::new(),
+                    &mut MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    ExecutionConfig::default(),
+                )
+                .unwrap();
+                let RuntimeValue::Matrix(expected) = &expected.outputs["out"] else {
+                    panic!("CPU matrix")
+                };
+                let mut plan = runtime
+                    .plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, width)
+                    .unwrap();
+                let admitted_width = (1..=width).rev().find(|w| count % w == 0).unwrap();
+                assert!(
+                    plan.physical_frame_for_test().waves.iter().any(|wave| {
+                        wave.active_lanes == admitted_width &&
+                            wave.active_lanes as u128 * wave.repetitions == count as u128
+                    }),
+                    "the reduction must exercise its admitted wave width"
+                );
+                for _ in 0..3 {
+                    let result = runtime
+                        .execute_with_artifacts(
+                            &mut plan,
+                            BTreeMap::new(),
+                            &mut MemoryArtifactStore::default(),
+                            rand::random(),
+                        )
+                        .unwrap();
+                    let actual =
+                        runtime.download_matrix_output(&result.output("out").unwrap()).unwrap();
+                    assert_eq!(&actual, expected.as_cpu_full().unwrap());
+                }
+            }
         }
     }
 
@@ -10845,7 +15200,7 @@ mod tests {
             .map(|index| ArtifactKey {
                 production: production.clone(),
                 name: "members".into(),
-                index: Some(index),
+                index: Some(index as u128),
             })
             .collect::<Vec<_>>();
         assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0; 3]);
@@ -10924,6 +15279,102 @@ mod tests {
         assert_eq!(after[2], before[2] + 2);
     }
 
+    /// A nested streamed Zip reuses imports, but advances both input and export keys.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_repeated_nested_zip_exports_every_member() {
+        use mxx_ir_core::artifact::ArtifactAvailability;
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        let mut store = MemoryArtifactStore::default();
+        let (_, gpu, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let source = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let nested = parallel(2usize, |outer| {
+            parallel(count, |inner| {
+                Ok(source.at(inner) +
+                    outer
+                        .clone()
+                        .add(10usize)
+                        .lift_to_constant_polynomial(ring.matrix_type((1, 1))))
+            })
+        })
+        .unwrap();
+        let flat = parallel(2 * count, |index| {
+            Ok(nested.at(index.clone().div(count)).at(index.rem(count)))
+        })
+        .unwrap();
+        let graph = DslContext::new("repeated-nested-zip")
+            .cached_output("rows", flat)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 2).unwrap();
+        assert!(
+            plan.physical_frame_for_test()
+                .waves
+                .iter()
+                .any(|wave| wave.repetitions > 1 && !wave.indexed_imports.is_empty())
+        );
+        for _ in 0..2 {
+            let produced = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            assert_eq!(produced.artifact_handles["rows"].len(), 2 * count);
+            let production = produced.production_id.unwrap();
+            let manifest = store.load_finalized_manifest(&production).unwrap();
+            let rows = ring.family_artifact_input(
+                production.clone(),
+                "rows",
+                2 * count,
+                (1, 1),
+                ArtifactAvailability::Cached,
+            );
+            let consumer = DslContext::new("check-repeated-nested-zip")
+                .output(
+                    "rows",
+                    parallel(2 * count, |index| Ok(rows.at(index) + ring.zero((1, 1)))).unwrap(),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production, manifest)]),
+                )
+                .unwrap();
+            let mut consumer =
+                runtime.plan_with_store(consumer, &BTreeMap::new(), &mut store).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut consumer, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            for index in 0..2 * count {
+                let actual = runtime
+                    .download_matrix_member_output(&result.output("rows").unwrap(), index)
+                    .unwrap();
+                assert_eq!(
+                    actual.entry(0, 0).coeffs_biguints()[0],
+                    num_bigint::BigUint::from(index % count + 1 + index / count + 10)
+                );
+            }
+        }
+    }
+
     /// Parameters, ring, and an artifact family of `count` constant members
     /// `1..=count` produced on the CPU into `store`.
     fn constant_member_family(
@@ -10971,12 +15422,67 @@ mod tests {
         (cpu_params, gpu_params, ring, production)
     }
 
+    /// Forwarded artifact members must follow both read-ahead lanes on every wave.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_streamed_artifact_identity_preserves_every_member() {
+        use mxx_ir_core::artifact::ArtifactAvailability;
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        assert!(count >= 4);
+        let mut store = MemoryArtifactStore::default();
+        let (_, gpu, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let expected = member_keys(&production, count)
+            .iter()
+            .map(|key| store.load(key, &manifest.artifacts["members"]).unwrap())
+            .collect::<Vec<_>>();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let graph = DslContext::new("streamed-artifact-identity")
+            .transferred_output("forwarded", parallel(count, |i| Ok(members.at(i))).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 2).unwrap();
+        for replay in 0..2 {
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let production = result.production_id.unwrap();
+            let manifest = store.load_finalized_manifest(&production).unwrap();
+            for member in 0..count {
+                let key = ArtifactKey {
+                    production: production.clone(),
+                    name: "forwarded".into(),
+                    index: Some(member as u128),
+                };
+                let actual = store.load(&key, &manifest.artifacts["forwarded"]).unwrap();
+                assert_eq!(actual, expected[member], "replay {replay}, member {member}");
+            }
+        }
+    }
+
     fn member_keys(production: &ProductionId, count: usize) -> Vec<ArtifactKey> {
         (0..count)
             .map(|index| ArtifactKey {
                 production: production.clone(),
                 name: "members".into(),
-                index: Some(index),
+                index: Some(index as u128),
             })
             .collect()
     }
@@ -11087,6 +15593,394 @@ mod tests {
         }
     }
 
+    /// A parallel loop reads `members.at(x.at(i))`, where a scalar parallel
+    /// loop of the same graph computes `x_i = i / 2`, over several waves. The
+    /// computed index family is resident before the first wave's members are
+    /// read; each member is loaded once per read and the result matches.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_parallel_waves_gather_by_computed_index_family() {
+        use mxx_dsl::Int;
+        use mxx_ir_core::{artifact::ArtifactAvailability, node::LoopInputMode};
+
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        let lanes = 2 * count;
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let context = DslContext::new("direct-computed-gather-consumer");
+        let x = parallel(lanes, |i| {
+            Ok(Int::evaluate(
+                IntExpr::FloorDiv(Box::new(i.expression()?), Box::new(2.into())).canonicalize(),
+            ))
+        })
+        .unwrap();
+        let out = parallel(lanes, move |i| Ok(members.at(x.at(i)))).unwrap();
+        let validated = context
+            .output("out", out)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let modes = validated
+            .source
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(modes.iter().any(|mode| matches!(mode, LoopInputMode::Gather { .. })), "{modes:?}");
+
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let frame = plan.physical_frame_for_test();
+        assert!(frame.import_templates.iter().any(|template| template.member.is_some()));
+        let keys = member_keys(&production, count);
+        for replay in 0..2 {
+            let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            for (member, key) in keys.iter().enumerate() {
+                assert_eq!(after[member] - before[member], 2, "replay {replay}: {key:?}");
+            }
+            // Member `j` is the constant `j + 1`.
+            for index in 0..lanes {
+                let expected = DCRTPoly::from_biguint_to_constant(
+                    &cpu_params,
+                    num_bigint::BigUint::from(index / 2 + 1),
+                );
+                let actual = runtime
+                    .download_matrix_member_output(&result.output("out").unwrap(), index)
+                    .unwrap();
+                assert_eq!(
+                    actual.entry(0, 0).to_bytes(),
+                    expected.to_bytes(),
+                    "replay {replay}, member {index}"
+                );
+            }
+        }
+    }
+
+    /// A parallel loop whose lanes each read three members of an artifact family at indices
+    /// computed from the loop index through a constant table (`Select`), as a round of a hash
+    /// split into its own graph reads the previous round's state. With each index computed into
+    /// an outer integer family, every read is a Gather read ahead into alternating owners, the
+    /// planned device memory grows only by the index families, each member is loaded once per
+    /// read, and the result matches.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_parallel_waves_gather_table_indices_ahead() {
+        use mxx_dsl::Int;
+        use mxx_ir_core::{artifact::ArtifactAvailability, node::LoopInputMode};
+
+        let offsets = [0usize, 3, 5];
+        let table = [2usize, 0, 1, 3];
+        // A streamed (transferred) output is written out per wave, so only a resident output
+        // family grows with the lane count.
+        let plan_for = |count: usize, streamed: bool| {
+            let mut store = MemoryArtifactStore::default();
+            let (cpu_params, gpu_params, ring, production) =
+                constant_member_family(&mut store, count);
+            let manifest = store.load_finalized_manifest(&production).unwrap();
+            let members = ring.family_artifact_input(
+                production.clone(),
+                "members",
+                count,
+                (1, 1),
+                ArtifactAvailability::Cached,
+            );
+            let context = DslContext::new("direct-table-gather-consumer");
+            // One outer index family per read, as the read's index is a function of the lane.
+            let indices = offsets.map(|offset| {
+                parallel(count, move |i| {
+                    let i = i.expression()?;
+                    let selected = IntExpr::Select {
+                        selector: Box::new(i.clone() % 4usize),
+                        branches: table.iter().map(|value| IntExpr::constant(*value)).collect(),
+                    };
+                    Ok(Int::evaluate(((i + offset + selected) % count).canonicalize()))
+                })
+                .unwrap()
+            });
+            let out = parallel(count, move |i| {
+                let read = |indices: &mxx_dsl::Family<Int>| members.at(indices.at(i.clone()));
+                Ok(read(&indices[0]) + read(&indices[1]) + read(&indices[2]))
+            })
+            .unwrap();
+            let context = if streamed {
+                context.transferred_output("out", out)
+            } else {
+                context.output("out", out)
+            };
+            let validated = context
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production.clone(), manifest)]),
+                )
+                .unwrap();
+            let modes = validated
+                .source
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter_map(|node| match node.kind() {
+                    NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                modes.iter().filter(|mode| matches!(mode, LoopInputMode::Gather { .. })).count(),
+                offsets.len(),
+                "{modes:?}"
+            );
+            let mut runtime =
+                GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]]))
+                    .unwrap();
+            runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+            let plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+            (runtime, plan, store, cpu_params, production)
+        };
+        let small = test_count("MXX_TEST_GATHER_COUNT", 7);
+        let large = 8 * small;
+        let device_bytes = |count: usize| {
+            let (_, plan, ..) = plan_for(count, true);
+            plan.planned_device_bytes().unwrap().values().sum::<u64>()
+        };
+        // Only the integer index families grow with the lanes (under 256 bytes per lane and
+        // family); the member matrices a lane reads are not held per lane.
+        let growth = device_bytes(large) - device_bytes(small);
+        assert!(
+            growth < (large - small) as u64 * offsets.len() as u64 * 256,
+            "device bytes grow by {growth} over {} lanes",
+            large - small
+        );
+        let (_, plan, ..) = plan_for(large, true);
+        let frame = plan.physical_frame_for_test();
+        assert!(frame.import_templates.iter().all(|template| template.read_ahead));
+        let (mut runtime, mut plan, mut store, cpu_params, production) = plan_for(large, false);
+        let frame = plan.physical_frame_for_test();
+        assert!(frame.import_templates.iter().all(|template| template.read_ahead));
+        assert!(frame.import_templates.iter().any(|template| template.member.is_some()));
+        let keys = member_keys(&production, large);
+        let lane_index = |lane: usize, offset: usize| (lane + offset + table[lane % 4]) % large;
+        let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
+        let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+        for (member, key) in keys.iter().enumerate() {
+            let reads = (0..large)
+                .flat_map(|lane| offsets.map(|offset| lane_index(lane, offset)))
+                .filter(|index| *index == member)
+                .count();
+            assert_eq!(after[member] - before[member], reads, "{key:?}");
+        }
+        // Member `j` is the constant `j + 1`.
+        for lane in 0..large {
+            let sum: usize = offsets.iter().map(|offset| lane_index(lane, *offset) + 1).sum();
+            let expected =
+                DCRTPoly::from_biguint_to_constant(&cpu_params, num_bigint::BigUint::from(sum));
+            let actual = runtime
+                .download_matrix_member_output(&result.output("out").unwrap(), lane)
+                .unwrap();
+            assert_eq!(actual.entry(0, 0).to_bytes(), expected.to_bytes(), "lane {lane}");
+        }
+    }
+
+    /// One lane per wave multiplies eight gathered members in a chain, as a hash round's lane
+    /// multiplies its leaves. Windowed imports (each started two first consumers ahead and freed
+    /// after its last use) give the same result as imports held for the whole wave and need
+    /// less plan scratch.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_windowed_gather_imports_share_storage() {
+        use mxx_dsl::Int;
+        use mxx_ir_core::artifact::ArtifactAvailability;
+
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        let reads = 8usize;
+        // Also nested: an outer loop of two instances, each of whose lanes is a wave of the
+        // inner loop (as a hash part's key graph loops over a composition's instances).
+        // Shape 0: one loop; 1: nested, index families outside; 2: nested, each instance's
+        // index families (with the instance as base) computed in its body, as a hash part's
+        // key graph computes its gather indices per instance.
+        for shape in [0usize, 1, 2] {
+            let nested = shape > 0;
+            let run = |window: &str| {
+                // SAFETY: GPU tests run serially (`gpu_context`); nothing else reads the variable.
+                unsafe { std::env::set_var("MXX_GPU_IMPORT_WINDOW", window) };
+                let mut store = MemoryArtifactStore::default();
+                let (cpu_params, gpu_params, ring, production) =
+                    constant_member_family(&mut store, count);
+                let manifest = store.load_finalized_manifest(&production).unwrap();
+                let members = ring.family_artifact_input(
+                    production.clone(),
+                    "members",
+                    count,
+                    (1, 1),
+                    ArtifactAvailability::Cached,
+                );
+                let context = DslContext::new("windowed-gather-consumer");
+                let indices = (0..reads)
+                    .map(|read| {
+                        parallel(count, move |i| {
+                            Ok(Int::evaluate(
+                                ((i.expression()? + read * 3usize) % count).canonicalize(),
+                            ))
+                        })
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let lanes = move |indices: Vec<mxx_dsl::Family<Int>>| {
+                    let members = members.clone();
+                    parallel(count, move |i| {
+                        let mut product = members.at(indices[0].at(i.clone()));
+                        for family in &indices[1..] {
+                            product = product * members.at(family.at(i.clone()));
+                        }
+                        Ok(product)
+                    })
+                };
+                // Nested, each instance returns its first and last lanes' sum.
+                let out = if shape == 2 {
+                    parallel(2usize, move |instance| {
+                        let indices = (0..reads)
+                            .map(|read| {
+                                let instance = instance.clone();
+                                parallel(count, move |i| {
+                                    Ok(instance
+                                        .clone()
+                                        .add(Int::evaluate(
+                                            (i.expression()? + read * 3usize).canonicalize(),
+                                        ))
+                                        .rem(count))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let family = lanes(indices)?;
+                        Ok(family.at(0usize) + family.at(count - 1))
+                    })
+                    .unwrap()
+                } else if nested {
+                    parallel(2usize, move |_| {
+                        let family = lanes(indices.clone())?;
+                        Ok(family.at(0usize) + family.at(count - 1))
+                    })
+                    .unwrap()
+                } else {
+                    lanes(indices).unwrap()
+                };
+                let validated = context
+                    .output("out", out)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([(production.clone(), manifest)]),
+                    )
+                    .unwrap();
+                let mut runtime =
+                    GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]]))
+                        .unwrap();
+                let mut plan = runtime
+                    .plan_with_fixed_geometry_for_test(validated, &BTreeMap::new(), 1, 1)
+                    .unwrap();
+                let windowed = plan
+                    .physical_frame_for_test()
+                    .import_templates
+                    .iter()
+                    .filter(|template| template.window_start.is_some())
+                    .count();
+                if std::env::var("MXX_TEST_WINDOW_DEBUG").is_ok() {
+                    let frame = plan.physical_frame_for_test();
+                    for wave in &frame.waves {
+                        let imports = wave
+                            .import_template_indices
+                            .iter()
+                            .map(|&index| {
+                                let template = &frame.import_templates[index];
+                                (template.before_operation, template.window_start)
+                            })
+                            .collect::<Vec<_>>();
+                        eprintln!(
+                            "shape={shape} wave body {}..{} nested wave {} imports {imports:?}",
+                            wave.body_start,
+                            wave.body_end,
+                            wave.parent_template.is_some()
+                        );
+                    }
+                }
+                let bytes = plan.planned_device_bytes().unwrap().values().sum::<u64>();
+                let result = runtime
+                    .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                    .unwrap();
+                // Member `j` is the constant `j + 1`.
+                let lane_value = |base: usize, lane: usize| {
+                    (0..reads)
+                        .map(|read| num_bigint::BigUint::from((base + lane + read * 3) % count + 1))
+                        .product::<num_bigint::BigUint>()
+                };
+                let expected = |member: usize| {
+                    let base = if shape == 2 { member } else { 0 };
+                    let value = if nested {
+                        lane_value(base, 0) + lane_value(base, count - 1)
+                    } else {
+                        lane_value(0, member)
+                    };
+                    DCRTPoly::from_biguint_to_constant(&cpu_params, value)
+                };
+                for member in 0..if nested { 2 } else { count } {
+                    let actual = runtime
+                        .download_matrix_member_output(&result.output("out").unwrap(), member)
+                        .unwrap();
+                    assert_eq!(
+                        actual.entry(0, 0).to_bytes(),
+                        expected(member).to_bytes(),
+                        "member {member}"
+                    );
+                }
+                (windowed, bytes)
+            };
+            let (held, held_bytes) = run("0");
+            let (windowed, windowed_bytes) = run("2");
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("MXX_GPU_IMPORT_WINDOW") };
+            assert_eq!(held, 0);
+            assert!(windowed >= reads, "every wave's reads are windowed: {windowed}");
+            assert!(
+                windowed_bytes < held_bytes,
+                "windowed imports share storage (shape {shape}): {windowed_bytes} vs {held_bytes} bytes"
+            );
+        }
+    }
+
     /// A sequential loop whose iteration `k` loads member `k + 1` at the start
     /// of its body and carries it, adding the member loaded one iteration
     /// earlier: the multi-stage form of a streamed read. The load starts at
@@ -11162,6 +16056,208 @@ mod tests {
         }
     }
 
+    /// Nested host-driven loops: an outer loop over `o` whose body runs an
+    /// inner loop over `i` that reads member `o I + i`, a member index of
+    /// both loop indices, folding it into the order-sensitive state `2 x + m`.
+    /// The outer body doubles its state before the inner loop in one case and
+    /// after it in the other. Both loops are host-driven, the inner one read
+    /// ahead by the host; the result matches the CPU and every member is
+    /// loaded once per execution.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_nested_sequential_loops_read_members_of_both_indices() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        use mxx_dsl::{Int, iterate};
+        use mxx_ir_core::artifact::ArtifactAvailability;
+
+        let outer = test_count("MXX_TEST_NESTED_OUTER_COUNT", 3);
+        let inner = test_count("MXX_TEST_NESTED_INNER_COUNT", 4);
+        let count = outer * inner;
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        let keys = member_keys(&production, count);
+        for work_before_inner in [true, false] {
+            let members = ring.family_artifact_input(
+                production.clone(),
+                "members",
+                count,
+                (1, 1),
+                ArtifactAvailability::Cached,
+            );
+            let sum = iterate(outer, ring.zero((1, 1)), move |o, sum| {
+                let o = o.expression()?;
+                let sum = if work_before_inner { sum.clone() + sum } else { sum };
+                let members = members.clone();
+                let sum = iterate(inner, sum, move |i, sum| {
+                    let member = IntExpr::Add(
+                        Box::new(IntExpr::Mul(
+                            Box::new(o.clone()),
+                            Box::new(IntExpr::constant(inner)),
+                        )),
+                        Box::new(i.expression()?),
+                    );
+                    Ok(sum.clone() + sum + members.at(Int::evaluate(member.canonicalize())))
+                })?;
+                Ok(if work_before_inner { sum } else { sum.clone() + sum })
+            })
+            .unwrap();
+            let validated = DslContext::new("direct-nested-sequential-consumer")
+                .output("sum", sum)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production.clone(), manifest.clone())]),
+                )
+                .unwrap();
+            let expected = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu_params.clone()]),
+                BTreeMap::new(),
+                &mut store,
+                rand::random(),
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+                panic!("CPU sum is a matrix");
+            };
+            let expected = expected.as_cpu_full().expect("CPU matrix").clone();
+            let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+            // Both loops are host-driven, the inner body nested in the outer
+            // one, and the host reads the inner loop's members ahead.
+            let [outer_loop, inner_loop] = &plan.frame().external_io_loops[..] else {
+                panic!("two host-driven loops");
+            };
+            assert!(
+                outer_loop.body_start <= inner_loop.body_start &&
+                    inner_loop.body_end < outer_loop.body_end,
+                "work before inner {work_before_inner}"
+            );
+            assert!(outer_loop.ahead.is_empty() && inner_loop.ahead.len() == 1);
+            for replay in 0..2 {
+                let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+                let result = runtime
+                    .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                    .unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("sum").unwrap()).unwrap();
+                assert_eq!(
+                    actual.entry(0, 0).to_bytes(),
+                    expected.entry(0, 0).to_bytes(),
+                    "work before inner {work_before_inner}, replay {replay}"
+                );
+                let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+                for (member, key) in keys.iter().enumerate() {
+                    assert_eq!(
+                        after[member] - before[member],
+                        1,
+                        "work before inner {work_before_inner}, replay {replay}: {key:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A host-driven loop whose body reads member `k` at a carried index `k`
+    /// (selected by the Graph), then runs a native loop whose only artifact
+    /// read is the fixed member 0, and then a host-driven loop that reads
+    /// member `o I + i` and the outer member `k`, whose load boundary is that
+    /// nested loop's start. Every outer iteration restarts the native loop,
+    /// and the outer member is waited for once per outer iteration; the
+    /// result matches the CPU.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_nested_loops_restart_native_loops_and_keep_outer_imports() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        use mxx_dsl::{Int, iterate};
+        use mxx_ir_core::artifact::ArtifactAvailability;
+
+        let outer = test_count("MXX_TEST_NESTED_OUTER_COUNT", 3);
+        let inner = test_count("MXX_TEST_NESTED_INNER_COUNT", 4);
+        let count = outer * inner;
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let initial = (ring.zero((1, 1)), Int::constant(0));
+        let (sum, _) = iterate(outer, initial, move |o, (sum, k)| {
+            let o = o.expression()?;
+            let selected = members.at(k.clone());
+            let fixed = members.clone();
+            let sum = iterate(inner, sum, move |_, sum| {
+                Ok(sum.clone() + sum + fixed.at(Int::constant(0)))
+            })?;
+            let streamed = members.clone();
+            let sum = iterate(inner, sum, move |i, sum| {
+                let member = IntExpr::Add(
+                    Box::new(IntExpr::Mul(Box::new(o.clone()), Box::new(IntExpr::constant(inner)))),
+                    Box::new(i.expression()?),
+                );
+                Ok(sum.clone() +
+                    sum +
+                    streamed.at(Int::evaluate(member.canonicalize())) +
+                    selected.clone())
+            })?;
+            Ok((sum, k.add(1usize)))
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-nested-native-and-outer-import")
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let expected = execute_in_session(
+            &validated,
+            &mut cpu_backend([cpu_params]),
+            BTreeMap::new(),
+            &mut store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+            panic!("CPU sum is a matrix");
+        };
+        let expected = expected.as_cpu_full().expect("CPU matrix").clone();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]]))
+                .unwrap()
+                .with_multi_lane_test_planning();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.frame().external_io_loops.len(), 2);
+        for replay in 0..2 {
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let actual = runtime.download_matrix_output(&result.output("sum").unwrap()).unwrap();
+            assert_eq!(actual.entry(0, 0).to_bytes(), expected.entry(0, 0).to_bytes(), "{replay}");
+        }
+    }
+
     /// A producer whose device work fails after its export was published
     /// leaves no artifact, encoded or raw, in a file store.
     #[test]
@@ -11228,5 +16324,273 @@ mod tests {
             }),
             "{files:?}"
         );
+    }
+
+    /// An indexed-table read of the old carry must precede an independent
+    /// update that would otherwise be eligible to overwrite that carry.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_loop_carry_waits_for_indexed_reads() {
+        use mxx_dsl::{Int, iterate, select};
+        let degree = test_count("MXX_TEST_CARRY_N", 32) as u32;
+        let columns = test_count("MXX_TEST_CARRY_COLUMNS", 4);
+        let parameters = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, parameters.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let graph = DslContext::new("carry-indirect-reader");
+        let choice = graph.input::<Int>("choice", mxx_dsl::IntType).unwrap();
+        let matrix = |value| ring.all_coefficients((1, columns), value);
+        let (actual, observed) =
+            iterate(3usize, (matrix(2usize), matrix(0usize)), |_, (old, _)| {
+                let selected = select(choice.clone(), vec![old.clone(), matrix(100usize)])?;
+                Ok((old + matrix(1usize), selected + matrix(7usize)))
+            })
+            .unwrap();
+        let graph = graph
+            .output("updated", actual - matrix(5usize))
+            .unwrap()
+            .output("observed", observed - matrix(11usize))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = BTreeMap::from([("choice".into(), RuntimeValue::Int(0.into()))]);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut plan = runtime.plan(graph, &inputs).unwrap();
+        let result = runtime.execute(&mut plan, inputs).unwrap();
+        for name in ["updated", "observed"] {
+            let value = runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+            assert!(
+                (0..columns).all(|column| value
+                    .entry(0, column)
+                    .coeffs_biguints()
+                    .iter()
+                    .all(|coefficient| *coefficient == 0u8.into())),
+                "{name} differs from the pre-update carry contract"
+            );
+        }
+    }
+    /// A next-iteration staging upload survives nested work after the current read.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_ahead_staging_survives_nested_arena_reuse() {
+        use mxx_dsl::Int;
+        use mxx_ir_core::artifact::ArtifactAvailability;
+        let degree = test_count("MXX_TEST_AHEAD_N", 4) as u32;
+        let columns = test_count("MXX_TEST_AHEAD_COLUMNS", 16);
+        let steps = test_count("MXX_TEST_AHEAD_STEPS", 4).max(2);
+        let cpu = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let producer = DslContext::new("ahead-staging-producer")
+            .transferred_output(
+                "a",
+                parallel(steps, |_| Ok(ring.uniform_residue((1, columns)))).unwrap(),
+            )
+            .unwrap()
+            .transferred_output(
+                "b",
+                parallel(steps * 2, |_| Ok(ring.uniform_residue((1, columns)))).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut plan = runtime.plan_with_store(producer, &BTreeMap::new(), &mut store).unwrap();
+        let production = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap()
+            .production_id
+            .unwrap();
+        drop(plan);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let a = ring.family_artifact_input(
+            production.clone(),
+            "a",
+            steps,
+            (1, columns),
+            ArtifactAvailability::Transferred,
+        );
+        let b = ring.family_artifact_input(
+            production.clone(),
+            "b",
+            steps * 2,
+            (1, columns),
+            ArtifactAvailability::Transferred,
+        );
+        let mut footprints = Vec::new();
+        for stages in [1, test_count("MXX_TEST_AHEAD_STAGES", 4).max(2)] {
+            let mut expected = None;
+            for repeated in [false, true] {
+                let initial = (ring.zero((1, columns)), ring.zero((1, columns)));
+                let branch = |index: Int, (left, right): (mxx_dsl::Mat, mxx_dsl::Mat)| {
+                    let left = left + a.at(index.clone());
+                    let right = mxx_dsl::iterate(2usize, right + left.clone(), |inner, sum| {
+                        Ok(sum + b.at(index.clone().mul(2usize).add(inner)))
+                    })?;
+                    Ok::<_, mxx_dsl::DslError>((left, right))
+                };
+                let mut result = initial;
+                for _ in 0..stages {
+                    result = if repeated {
+                        mxx_dsl::iterate(steps, result, &branch).unwrap()
+                    } else {
+                        let mut value = result;
+                        for index in 0..steps {
+                            value = branch(Int::constant(index), value).unwrap();
+                        }
+                        value
+                    };
+                }
+                let graph = DslContext::new("ahead-staging-consumer")
+                    .output("left", result.0)
+                    .unwrap()
+                    .output("right", result.1)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([(production.clone(), manifest.clone())]),
+                    )
+                    .unwrap();
+                let mut plan =
+                    runtime.plan_with_store(graph, &BTreeMap::new(), &mut store).unwrap();
+                let bytes = plan.planned_device_bytes().unwrap().values().sum::<u64>();
+                eprintln!(
+                    "ahead staging stages={stages} repeated={repeated} planned bytes={bytes}"
+                );
+                if repeated {
+                    footprints.push(bytes);
+                }
+                let result = runtime
+                    .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                    .unwrap();
+                let actual = ["left", "right"].map(|name| {
+                    runtime.download_matrix_output(&result.output(name).unwrap()).unwrap()
+                });
+                if let Some(expected) = &expected {
+                    assert_eq!(&actual, expected, "later iterations must retain prefetched values");
+                } else {
+                    expected = Some(actual);
+                }
+            }
+        }
+        let row_bytes = u64::from(degree) * 2 * columns as u64 * 8;
+        assert!(
+            footprints[1] <= footprints[0] + 4 * row_bytes,
+            "independent loops must reuse their staging arena: {footprints:?}"
+        );
+    }
+
+    /// A captured runtime base advances independently of every inner wave's lane offset.
+    #[test]
+    #[ignore = "requires a supported GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_nested_zip_captured_base_tracks_each_wave() {
+        use mxx_dsl::{Family, Mat, iterate};
+        use mxx_ir_core::artifact::ArtifactAvailability;
+        let degree = test_count("MXX_TEST_CAPTURED_ZIP_N", 4) as u32;
+        let columns = test_count("MXX_TEST_CAPTURED_ZIP_COLUMNS", 4);
+        let parameters = DCRTPolyParams::new(degree, 2, 28, 8, None, None);
+        let gpu = GpuDCRTPolyParams::new(degree, parameters.to_crt().0, 8, None);
+        let ring =
+            Ring::from_crt_moduli(gpu.to_crt().0.into_iter().map(IntExpr::from).collect(), degree);
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let producer = DslContext::new("captured-zip-producer")
+            .cached_output(
+                "members",
+                parallel(32usize, |index| {
+                    Ok(ring.all_coefficients((1, columns), 1usize) *
+                        ring.polynomial([index.add(1usize).expression()?]))
+                })
+                .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(producer, &BTreeMap::new(), 1, 4).unwrap();
+        let production = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap()
+            .production_id
+            .unwrap();
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            32usize,
+            (1, columns),
+            ArtifactAvailability::Cached,
+        );
+        // A root import precedes the host loop, so its nested template indices
+        // must be relocated rather than retaining their body-local numbering.
+        let prefix = members.at(31usize) - ring.all_coefficients((1, columns), 32usize);
+        let initial = parallel(4usize, |_| Ok(prefix.clone() + ring.zero((1, columns)))).unwrap();
+        let actual = iterate(2usize, initial, |step, previous: Family<Mat>| {
+            parallel(4usize, |part| {
+                let base = step.clone().mul(16usize).add(part.clone().mul(4usize));
+                let terms = parallel(4usize, |prime| {
+                    Ok(members.at(base.clone().add(prime)) + ring.zero((1, columns)))
+                })
+                .unwrap();
+                let sum = iterate(2usize, terms.at(0usize) + terms.at(1usize), |index, sum| {
+                    Ok(sum + terms.at(index.add(2usize)))
+                })
+                .unwrap();
+                Ok(previous.at(part) + sum)
+            })
+        })
+        .unwrap();
+        let mut graph = DslContext::new("captured-zip-consumer");
+        for part in 0..4usize {
+            graph = graph
+                .output(
+                    format!("difference-{part}"),
+                    actual.at(part) - ring.all_coefficients((1, columns), 84 + 32 * part),
+                )
+                .unwrap();
+        }
+        let graph = graph
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let mut plan =
+            runtime.plan_with_fixed_geometry_for_test(graph, &BTreeMap::new(), 1, 4).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
+        for part in 0..4usize {
+            let value = runtime
+                .download_matrix_output(&result.output(&format!("difference-{part}")).unwrap())
+                .unwrap();
+            assert!(
+                (0..columns).all(|column| value
+                    .entry(0, column)
+                    .coeffs_biguints()
+                    .iter()
+                    .all(|coefficient| *coefficient == 0u8.into())),
+                "captured base selected wrong members for part {part}"
+            );
+        }
     }
 }

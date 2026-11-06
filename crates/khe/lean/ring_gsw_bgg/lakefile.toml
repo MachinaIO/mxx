@@ -1,0 +1,28 @@
+name = "MxxKheRingGswBgg"
+version = "0.1.0"
+defaultTargets = ["RingGswBggLayers"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../../ir-core/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../../ir-core/lean"
+
+[[require]]
+name = "MxxKhe"
+path = ".."
+
+[[require]]
+name = "MxxExponentLut"
+path = "../../../exponent-lut/lean"
+
+# Lemmas that hold for every parameter set of the layered Boolean BGG+ protocol.
+[[lean_lib]]
+name = "RingGswBggLayers"
+roots = ["RingGswBggLayers"]

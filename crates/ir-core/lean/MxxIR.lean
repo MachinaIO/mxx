@@ -1,5 +1,6 @@
 import IRRel
 import IRIterRuns
+import IRCost
 import IRScopeSpec
 import IRExpr
 import IRRegression

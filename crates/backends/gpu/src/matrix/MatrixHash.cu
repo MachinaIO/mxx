@@ -34,6 +34,8 @@ struct GpuRawHashPlan
     MxxRawHashTagSegment *device_segments = nullptr;
     uint8_t *device_static = nullptr;
     MxxRawHashTagOperand *device_operands = nullptr;
+    // Set when a Graph submission could not be ordered before the frees.
+    bool release_blocked = false;
     uint64_t *device_tag_length = nullptr;
     uint8_t *device_tag = nullptr;
     uint64_t *device_decimal_scratch = nullptr;
@@ -176,6 +178,29 @@ namespace
         if (blockIdx.x != 0 || threadIdx.x != 0) return;
         *tag_length = 0;
         size_t cursor = 0;
+        // Selection must not suppress invalid operands of an eager hash family.
+        // Validate every U64 component and every selector before skipping any
+        // branch; no device-to-host read is needed to choose the transcript.
+        bool has_selection = false;
+        for (size_t part = 0; part < segment_count; ++part)
+            has_selection |= segments[part].kind == 5;
+        if (has_selection)
+        {
+            for (size_t part = 0; part < segment_count; ++part)
+            {
+                const auto segment = segments[part];
+                if (segment.kind == 0 || segment.kind == 4) continue;
+                if (segment.operand_index >= operand_count) goto invalid;
+                size_t words = 0;
+                bool negative = false;
+                if (!hash_operand_magnitude(operands[segment.operand_index], scratch,
+                        scratch_words, words, negative)) goto invalid;
+                if ((segment.kind == 3 || segment.kind == 5) && (negative || words > 1))
+                    goto invalid;
+                if (segment.kind == 5 &&
+                    (words ? scratch[0] : 0) >= segment.static_offset) goto invalid;
+            }
+        }
         for (size_t part = 0; part < segment_count; ++part)
         {
             const auto segment = segments[part];
@@ -192,6 +217,14 @@ namespace
             bool negative = false;
             if (!hash_operand_magnitude(operand, scratch, scratch_words, words, negative))
                 goto invalid;
+            if (segment.kind == 5) continue; // Selector validated above.
+            if (segment.kind == 4)
+            {
+                if (negative || words > 1) goto invalid;
+                if ((words ? scratch[0] : 0) != segment.static_offset)
+                    part += static_cast<size_t>(segment.static_length);
+                continue;
+            }
             if (segment.kind == 3)
             {
                 if (negative || words > 1 || tag_capacity - cursor < 9) goto invalid;
@@ -206,7 +239,9 @@ namespace
                 const uint64_t highest = words ? scratch[words - 1] : 0;
                 size_t high_bytes = 0;
                 for (uint64_t remaining = highest; remaining; remaining >>= 8) ++high_bytes;
-                const size_t magnitude_bytes = words ? (words - 1) * 8 + high_bytes : 0;
+                // Match BigInt::to_bytes_be: zero has one zero magnitude byte.
+                // hash_operand_magnitude initializes scratch[0] even for zero.
+                const size_t magnitude_bytes = words ? (words - 1) * 8 + high_bytes : 1;
                 if (magnitude_bytes > tag_capacity - cursor ||
                     tag_capacity - cursor - magnitude_bytes < 10) goto invalid;
                 tag[cursor++] = 1;
@@ -371,9 +406,38 @@ namespace
     }
 }
 
+// Order the plan's frees, queued on its stream, after one compiled-Graph
+// submission that reads its tables.
+extern "C" int gpu_raw_hash_plan_protect_compiled_submission(
+    GpuRawHashPlan *plan, int physical_device, void *completion_event)
+{
+    if (!plan || !completion_event)
+        return set_error("invalid raw hash plan protection arguments");
+    if (physical_device != plan->device)
+    {
+        plan->release_blocked = true;
+        return set_error("raw hash plan protection device mismatch");
+    }
+    gpuError_t error = mxx_set_device(physical_device);
+    if (error == gpuSuccess)
+        error = gpuStreamWaitEvent(plan->stream, reinterpret_cast<gpuEvent_t>(completion_event), 0);
+    if (error != gpuSuccess)
+    {
+        plan->release_blocked = true;
+        return set_error(error);
+    }
+    return 0;
+}
+
 extern "C" void gpu_raw_hash_plan_destroy(GpuRawHashPlan *plan)
 {
     if (!plan) return;
+    if (plan->release_blocked)
+    {
+        // A Graph may still read the tables: keep them.
+        delete plan;
+        return;
+    }
     if (plan->allocation)
     {
         matrix_report_cleanup_error(mxx_set_device(plan->device));
@@ -430,8 +494,12 @@ extern "C" int gpu_raw_hash_plan_create(
         }
         else
         {
-            if (segment.kind > 3 || segment.operand_index >= operand_count)
+            if (segment.kind > 5 || segment.operand_index >= operand_count)
                 return set_error("invalid raw hash dynamic tag segment");
+            if (segment.kind == 4 && segment.static_length > segment_count - part - 1)
+                return set_error("raw hash branch exceeds its segment list");
+            if (segment.kind == 5 && (!segment.static_offset || segment.static_length))
+                return set_error("invalid raw hash selector range");
             const int32_t encoding = operand_encodings[segment.operand_index];
             if (encoding < 0 || encoding == 2)
                 return set_error("invalid raw hash signed integer encoding");

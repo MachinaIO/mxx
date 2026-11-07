@@ -411,8 +411,20 @@ impl FileArtifactStore {
             let mut committed = session.committed_artifacts.into_iter().collect::<BTreeMap<_, _>>();
             let path = self.commits_path(production);
             if path.exists() {
-                let bytes = fs::read(&path)
+                let mut bytes = fs::read(&path)
                     .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+                // A record is complete once its newline is written; an interrupted append
+                // leaves an unterminated tail, which is dropped so later appends stay parseable.
+                let complete =
+                    bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |end| end + 1);
+                if complete < bytes.len() {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|file| file.set_len(complete as u64))
+                        .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+                    bytes.truncate(complete);
+                }
                 for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
                     let (key, expected): (ArtifactKey, CommittedDescriptor) =
                         serde_json::from_slice(line).map_err(|source| {
@@ -1415,7 +1427,6 @@ impl SessionStore for FileArtifactStore {
             Some(_) => return Err(FileArtifactError::DescriptorMismatch(handle.key.clone())),
             None => {}
         }
-        committed.insert(handle.key.clone(), expected.clone());
         let path = self.commits_path(&handle.key.production);
         let mut line = serde_json::to_vec(&(&handle.key, &expected))
             .map_err(|error| FileArtifactError::Encode(error.to_string()))?;
@@ -1425,9 +1436,17 @@ impl SessionStore for FileArtifactStore {
             .append(true)
             .open(&path)
             .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-        log.write_all(&line)
-            .and_then(|()| log.sync_data())
-            .map_err(|source| FileArtifactError::Io { path, source })
+        let length = log
+            .metadata()
+            .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?
+            .len();
+        // A failed append is rolled back, so the record is cached only once it is durable.
+        if let Err(source) = log.write_all(&line).and_then(|()| log.sync_data()) {
+            let _ = log.set_len(length);
+            return Err(FileArtifactError::Io { path, source });
+        }
+        self.committed_artifacts(&handle.key.production)?.insert(handle.key.clone(), expected);
+        Ok(())
     }
 
     fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
@@ -3188,6 +3207,59 @@ mod tests {
         assert!(store.raw_stages.is_empty());
         store.open_session(&descriptor).expect("reopen after failed cleanup");
         store.release_session(&key.production).expect("release reopened session");
+    }
+
+    /// An append interrupted mid-record leaves an unterminated tail; reopening the session
+    /// drops it, keeps the complete records, and accepts further commits.
+    #[test]
+    fn test_commit_log_drops_an_interrupted_record() {
+        let directory = tempdir().expect("temp directory");
+        let production = production(72);
+        let session = SessionDescriptor::new(production.clone(), "torn", [73; 32]);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let handle = |name: &str| ArtifactHandle {
+            key: ArtifactKey { production: production.clone(), name: name.into(), index: None },
+            artifact_type: artifact_type.clone(),
+            availability: ArtifactAvailability::Cached,
+            layout: None,
+        };
+        let mut store = FileArtifactStore::new(directory.path()).expect("file store");
+        store.open_session(&session).expect("open session");
+        for name in ["a", "b"] {
+            store
+                .store(
+                    handle(name).key,
+                    &artifact_type,
+                    ArtifactAvailability::Cached,
+                    None,
+                    ArtifactPayload::Bytes(vec![1]),
+                )
+                .expect("store payload");
+        }
+        store.commit_artifact(&handle("a")).expect("commit a");
+        store.release_session(&production).expect("release session");
+        let log = store.commits_path(&production);
+        let mut file = fs::OpenOptions::new().append(true).open(&log).expect("open log");
+        file.write_all(b"[{\"production\"").expect("write torn record");
+        drop(file);
+        store.open_session(&session).expect("reopen session");
+        store.commit_artifact(&handle("b")).expect("commit b after the torn record");
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Cached,
+            layout: None,
+        };
+        store
+            .finalize_session(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::from([
+                    ("a".into(), descriptor.clone()),
+                    ("b".into(), descriptor),
+                ]),
+            })
+            .expect("finalize with both commits");
     }
 
     /// A store that resumes a session sees the commits another store made

@@ -41,7 +41,9 @@ jobs:
       - run: cargo +nightly-2026-07-25 fmt --all --check
 
   run:
-    runs-on: ubuntu-latest
+    # GCC 15 on ubuntu-26.04 rejects OpenFHE headers under -Werror
+    # (-Wuninitialized in shared_ptr_base.h); keep the last passing image.
+    runs-on: ubuntu-24.04
     strategy:
         fail-fast: false
     steps:

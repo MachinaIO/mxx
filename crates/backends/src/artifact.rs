@@ -1317,6 +1317,8 @@ impl SessionStore for FileArtifactStore {
                 cleanup = Err(FileArtifactError::Io { path: stage.temporary.clone(), source });
             }
         }
+        // Another store may extend the commit log once the lock is released.
+        self.committed.remove(production);
         self.locks.remove(production);
         self.active_sessions.remove(production);
         cleanup
@@ -3186,6 +3188,60 @@ mod tests {
         assert!(store.raw_stages.is_empty());
         store.open_session(&descriptor).expect("reopen after failed cleanup");
         store.release_session(&key.production).expect("release reopened session");
+    }
+
+    /// A store that resumes a session sees the commits another store made
+    /// while it had released the session.
+    #[test]
+    fn test_resumed_session_reloads_commits_of_another_store() {
+        let directory = tempdir().expect("temp directory");
+        let production = production(70);
+        let session = SessionDescriptor::new(production.clone(), "resume", [71; 32]);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let commit = |store: &mut FileArtifactStore, name: &str| {
+            let key =
+                ArtifactKey { production: production.clone(), name: name.into(), index: None };
+            store.open_session(&session).expect("open session");
+            store
+                .store(
+                    key.clone(),
+                    &artifact_type,
+                    ArtifactAvailability::Cached,
+                    None,
+                    ArtifactPayload::Bytes(vec![1]),
+                )
+                .expect("store payload");
+            store
+                .commit_artifact(&ArtifactHandle {
+                    key,
+                    artifact_type: artifact_type.clone(),
+                    availability: ArtifactAvailability::Cached,
+                    layout: None,
+                })
+                .expect("commit payload");
+            store.release_session(&production).expect("release session");
+        };
+        let mut first = FileArtifactStore::new(directory.path()).expect("first store");
+        let mut second = FileArtifactStore::new(directory.path()).expect("second store");
+        commit(&mut first, "a");
+        commit(&mut second, "b");
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Cached,
+            layout: None,
+        };
+        first.open_session(&session).expect("reopen session");
+        first
+            .finalize_session(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::from([
+                    ("a".into(), descriptor.clone()),
+                    ("b".into(), descriptor),
+                ]),
+            })
+            .expect("finalize with both commits");
     }
 
     #[test]

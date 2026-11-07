@@ -2140,7 +2140,8 @@ impl<S: SessionStore> Executor<'_, S> {
                 usize::try_from(descriptor.family_count.ok_or(ExecutionError::ValueKind(wire))?)
                     .map_err(|_| ExecutionError::ValueKind(wire))
             }
-            RuntimeValue::IndexedFamily { values, .. } => Ok(values.len()),
+            RuntimeValue::IndexedFamily { values, .. } |
+            RuntimeValue::DependentFamily { values } => Ok(values.len()),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -2191,7 +2192,8 @@ impl<S: SessionStore> Executor<'_, S> {
                     descriptor: descriptor.clone(),
                 })
             }
-            RuntimeValue::IndexedFamily { values, .. } => {
+            RuntimeValue::IndexedFamily { values, .. } |
+            RuntimeValue::DependentFamily { values } => {
                 values.get(index).cloned().ok_or(ExecutionError::ValueKind(wire))
             }
             _ => Err(ExecutionError::ValueKind(wire)),

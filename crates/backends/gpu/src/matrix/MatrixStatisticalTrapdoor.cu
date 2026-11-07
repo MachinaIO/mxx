@@ -473,7 +473,8 @@ extern "C" int gpu_raw_statistical_factor(GpuContext *ctx, void *stream_raw, int
 
 // The perturbation `[p_1; p_2]` (`m_bar + digits` rows) of one tile into `output`, every limb.
 // `centers` holds `digits x columns` vectors of `n` complex values, `buffer` `m_bar x columns`,
-// and `p2` the integers of `p_2`.
+// and `p2` the integers of `p_2`. The output kernels store `kRawNttLimbs` limbs per launch; their
+// samples are counter-derived from the entry, so every limb batch stores the same integers.
 extern "C" int gpu_raw_statistical_perturbation(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *output, const void *seed_raw, const uint8_t *precomputation,
     size_t precomputation_bytes, double2 *centers, size_t centers_bytes, double2 *buffer,
@@ -485,7 +486,6 @@ extern "C" int gpu_raw_statistical_perturbation(GpuContext *ctx, void *stream_ra
     const auto *seed = static_cast<const GpuRngSeed *>(seed_raw);
     if (validate_raw_view(ctx, output, stream_raw) != 0 || !seed || !precomputation ||
         !centers || !buffer || !p2 || output->rows <= m_bar || m_bar == 0 ||
-        output->limb_count > kRawNttLimbs ||
         output_binding_base > UINT32_MAX - output->limb_count)
         return set_error("invalid statistical perturbation arguments");
     const size_t digits = output->rows - m_bar;
@@ -501,30 +501,32 @@ extern "C" int gpu_raw_statistical_perturbation(GpuContext *ctx, void *stream_ra
     if (mxx_set_device(output->physical_device) != gpuSuccess)
         return set_error(gpuGetLastError());
     const auto stream = reinterpret_cast<gpuStream_t>(stream_raw);
-    const uint32_t limbs = static_cast<uint32_t>(output->limb_count);
     const auto *spectra =
         reinterpret_cast<const double2 *>(precomputation + kStatisticalHeaderBytes);
     const auto *factor = reinterpret_cast<const double2 *>(
         precomputation + kStatisticalHeaderBytes + 16 * points * m_bar * digits);
     // p_2 and the transformed centers `center_scale p_2`.
+    for (size_t first = 0; first < output->limb_count; first += kRawNttLimbs)
     {
+        const size_t limbs = std::min(kRawNttLimbs, output->limb_count - first);
         RawLimbSet outputs{};
         std::vector<MxxGraphPatch> patches;
-        raw_limb_set(output, 0, output->limb_count, 0, output_binding_base, outputs, patches);
+        raw_limb_set(output, first, limbs, 0, output_binding_base, outputs, patches);
         patches.push_back(stat_patch(2, seed_binding));
         patches.push_back(stat_patch(8, p2_binding));
         patches.push_back(stat_patch(9, centers_binding));
-        int status = mxx_gpu_launch_kernel(ctx, stream, stat_sample_p2_kernel, stat_grid(block),
-            dim3(kStatisticalThreads), 0, patches.data(), patches.size(), outputs, limbs, seed,
-            m_bar, digits, columns, n, p2_sigma, p2, centers, center_scale);
-        if (status != 0) return status;
-        status = stat_fft(ctx, stream, centers, centers_binding, digits * columns, n, 1.0);
+        const int status = mxx_gpu_launch_kernel(ctx, stream, stat_sample_p2_kernel,
+            stat_grid(block), dim3(kStatisticalThreads), 0, patches.data(), patches.size(),
+            outputs, static_cast<uint32_t>(limbs), seed, m_bar, digits, columns, n, p2_sigma, p2,
+            centers, center_scale);
         if (status != 0) return status;
     }
+    int status = stat_fft(ctx, stream, centers, centers_binding, digits * columns, n, 1.0);
+    if (status != 0) return status;
     const size_t entries = m_bar * columns;
     {
         const MxxGraphPatch patches[] = {stat_patch(0, seed_binding), stat_patch(3, buffer_binding)};
-        const int status = mxx_gpu_launch_kernel(ctx, stream, stat_normal_kernel,
+        status = mxx_gpu_launch_kernel(ctx, stream, stat_normal_kernel,
             stat_grid(entries * points), dim3(kStatisticalThreads), 0, patches,
             std::size(patches), seed, entries, n, buffer);
         if (status != 0) return status;
@@ -533,20 +535,26 @@ extern "C" int gpu_raw_statistical_perturbation(GpuContext *ctx, void *stream_ra
         const MxxGraphPatch patches[] = {stat_patch(0, precomputation_binding),
             stat_patch(1, precomputation_binding), stat_patch(2, centers_binding),
             stat_patch(7, buffer_binding)};
-        const int status = mxx_gpu_launch_kernel(ctx, stream, stat_combine_kernel,
+        status = mxx_gpu_launch_kernel(ctx, stream, stat_combine_kernel,
             stat_grid(columns * points), dim3(kStatisticalThreads), 0, patches,
             std::size(patches), spectra, factor, static_cast<const double2 *>(centers), m_bar,
             digits, columns, n, buffer);
         if (status != 0) return status;
     }
-    int status = stat_fft(ctx, stream, buffer, buffer_binding, entries, n, -1.0);
+    status = stat_fft(ctx, stream, buffer, buffer_binding, entries, n, -1.0);
     if (status != 0) return status;
-    RawLimbSet outputs{};
-    std::vector<MxxGraphPatch> patches = {stat_patch(0, buffer_binding),
-        stat_patch(1, seed_binding)};
-    raw_limb_set(output, 0, output->limb_count, 5, output_binding_base, outputs, patches);
-    return mxx_gpu_launch_kernel(ctx, stream, stat_round_rows_kernel,
-        stat_grid(entries * n), dim3(kStatisticalThreads), 0, patches.data(), patches.size(),
-        static_cast<const double2 *>(buffer), seed, entries, n, rounding, outputs, limbs,
-        columns);
+    for (size_t first = 0; first < output->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, output->limb_count - first);
+        RawLimbSet outputs{};
+        std::vector<MxxGraphPatch> patches = {stat_patch(0, buffer_binding),
+            stat_patch(1, seed_binding)};
+        raw_limb_set(output, first, limbs, 5, output_binding_base, outputs, patches);
+        status = mxx_gpu_launch_kernel(ctx, stream, stat_round_rows_kernel,
+            stat_grid(entries * n), dim3(kStatisticalThreads), 0, patches.data(),
+            patches.size(), static_cast<const double2 *>(buffer), seed, entries, n, rounding,
+            outputs, static_cast<uint32_t>(limbs), columns);
+        if (status != 0) return status;
+    }
+    return 0;
 }

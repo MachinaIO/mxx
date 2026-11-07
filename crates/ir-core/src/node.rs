@@ -4,12 +4,12 @@
 //!
 //! | Category | Variants |
 //! | --- | --- |
-//! | Inputs and constants | `Input`, `ConstantInt`, `EvaluateInt`, `ConstantReal`, `ConstantBool`, `ConstantMatrix` |
+//! | Inputs and constants | `Input`, `ConstantInt`, `EvaluateInt`, `Sha256BitColumns`, `ConstantReal`, `ConstantBool`, `ConstantMatrix` |
 //! | Trapdoor structure | `GadgetTrapdoor`, `TrapdoorPublic` |
 //! | Scalar arithmetic | `IntBinary`, `IntCompare`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt`, `IntMatrixVectorProduct` |
 //! | Matrix arithmetic | `MatrixBinary`, `MatrixMulAccumulate`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism`, `MultiplyMonomial` |
 //! | Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase`, `CenteredRoundDivide`, `RnsModUp`, `RnsModDown`, `BlockModSwitch` |
-//! | Shape | `Transpose`, `Slice`, `Tensor`, `Concat` |
+//! | Shape | `Transpose`, `Slice`, `Tensor`, `BlockDiagonal`, `Concat` |
 //! | Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample`, `HashSample`, `HashIntFamily`, `TrapdoorSample`, `PreimageSample` |
 //! | Decomposition and coefficients | `GadgetDecompose`, `ExtractCoefficient`, `LiftIntegerToConstantPolynomial`, `PackPolynomialCoefficients`, `PolynomialFromValues`, `PolynomialValues` |
 //! | Decoding and CRT | `ThresholdDecode`, `CrtRecompose` |
@@ -26,11 +26,11 @@
 //! for a runtime `k` of any sign taken modulo `2n`.
 //!
 //! Control nodes carry their own metadata. A [`ParallelLoop`] runs independent instances over
-//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`, or
-//! `Gather` by another argument's instance value), and returns indexed families. In a
-//! [`SequentialLoop`] the first `carried_count` arguments are the carried state and the rest are
-//! captures. `Select` eagerly selects one candidate by a runtime selector; both candidates are part
-//! of the graph, so selection is not lazy branching.
+//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`,
+//! `ZipQuotient`, or `Gather` by another argument's instance value), and returns indexed families.
+//! In a [`SequentialLoop`] the first `carried_count` arguments are the carried state and the rest
+//! are captures. `Select` eagerly selects one candidate by a runtime selector; both candidates are
+//! part of the graph, so selection is not lazy branching.
 
 use crate::{
     artifact::{ArtifactAvailability, ProductionId},
@@ -51,6 +51,10 @@ pub enum HashTagComponent {
     U64Le(IntExpr),
     /// Index into hash sampler arguments, including the key at index zero.
     Operand(usize),
+    /// Index into hash sampler arguments of a runtime integer scalar, encoded like
+    /// [`HashTagComponent::U64Le`] of its value (`[3]` followed by the value as eight
+    /// little-endian bytes); the value must lie in `[0, 2^64)` at run time.
+    OperandU64Le(usize),
 }
 
 /// Executable operation represented by a declarative graph node.
@@ -67,6 +71,14 @@ pub enum NodeKind {
     },
     ConstantInt(#[serde(with = "crate::serde_support::bigint")] BigInt),
     EvaluateInt(IntExpr),
+    /// Public SHA-256 bit-matrix columns, packed ascending row indices and counts.
+    /// See [`crate::hash_columns::sha256_bit_columns`] for the exact stream convention.
+    Sha256BitColumns {
+        seed: [u8; 32],
+        rows: usize,
+        columns: usize,
+        index_bits: usize,
+    },
     ConstantReal(RealExpr),
     ConstantBool(bool),
     ConstantMatrix {
@@ -150,6 +162,11 @@ pub enum NodeKind {
         columns: Option<IndexRange>,
     },
     Tensor,
+    /// The Kronecker product `I_count ⊗ input`, with a positive repetition count.
+    /// One source and one result represent all blocks without concat intermediates.
+    BlockDiagonal {
+        count: usize,
+    },
     Concat {
         axis: ConcatAxis,
     },
@@ -165,10 +182,15 @@ pub enum NodeKind {
         matrix_type: crate::types::MatrixType,
         range: SampleRange,
     },
+    /// Samples a discrete Gaussian of width `sigma` truncated at `max_coefficient_bound`. With
+    /// `compact`, the output is a globally bounded `SmallMatrix` whose bound is the cutoff, so an
+    /// export stores it as compact signed coefficients; otherwise it is a `Matrix`.
     GaussianSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
         max_coefficient_bound: IntExpr,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
     HashSample {
         matrix_type: crate::types::MatrixType,
@@ -195,6 +217,13 @@ pub enum NodeKind {
         gadget_base: IntExpr,
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::TrapdoorInstantiation::is_computational"
+        )]
+        instantiation: crate::types::TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<RealExpr>,
     },
     PreimageSample {
         matrix_type: crate::types::MatrixType,
@@ -214,10 +243,15 @@ pub enum NodeKind {
     LiftIntegerToConstantPolynomial {
         matrix_type: crate::types::MatrixType,
     },
+    /// Decodes coefficients `0..length` of a scalar polynomial to
+    /// `round(t x / q) mod t`: `length` ports, or with `family` one integer
+    /// family of `length` members.
     ThresholdDecode {
         plaintext_modulus: IntExpr,
         length: IntExpr,
         output_bool: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        family: bool,
     },
     CrtRecompose {
         modulus: IntExpr,
@@ -270,6 +304,9 @@ pub struct ArtifactInput {
     pub availability: ArtifactAvailability,
 }
 
+/// A constant matrix payload. `AllCoefficients` makes every entry the
+/// polynomial whose `ring_dimension` coefficients all equal `value`, so the
+/// graph stays independent of the ring dimension.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum ConstantMatrix {
@@ -281,6 +318,7 @@ pub enum ConstantMatrix {
     PowerOfBase { base: IntExpr, exponent: IntExpr },
     Rotation { exponent: IntExpr },
     Polynomial { coefficients: Vec<IntExpr> },
+    AllCoefficients { value: IntExpr },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -392,4 +430,27 @@ pub enum LoopInputMode {
     Gather {
         index_argument: usize,
     },
+    /// Instance `i` receives member `floor(i / divisor)` (`divisor >= 1`): consecutive groups of
+    /// `divisor` instances share one member, e.g. the parts of one chain reading the chain's
+    /// value.
+    ZipQuotient {
+        divisor: usize,
+    },
+}
+
+impl LoopInputMode {
+    /// The member a zipped mode (`Zip`, `ZipOffset`, `ZipQuotient`) gives instance `instance`;
+    /// `None` for `Broadcast` and `Gather` (or a zero divisor). The index type can be `usize`
+    /// for execution or `u128` for symbolic cardinality validation; arithmetic stays checked.
+    pub fn zipped_member<Index>(self, instance: Index) -> Option<Index>
+    where
+        Index: num_traits::CheckedAdd + num_traits::CheckedDiv + TryFrom<usize>,
+    {
+        match self {
+            Self::Zip => Some(instance),
+            Self::ZipOffset { offset } => instance.checked_add(&Index::try_from(offset).ok()?),
+            Self::ZipQuotient { divisor } => instance.checked_div(&Index::try_from(divisor).ok()?),
+            Self::Broadcast | Self::Gather { .. } => None,
+        }
+    }
 }

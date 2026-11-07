@@ -46,8 +46,10 @@ use crate::{
                 GpuRawControlStatusView, GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb,
                 GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
                 GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
-                GpuRawSmallMatrixView, GpuSignedValuesEncoding, GpuStridedCopy,
-                gpu_device_identity, gpu_device_memory_usage,
+                GpuRawSmallMatrixView, GpuRawStatisticalWorkspace, GpuSignedValuesEncoding,
+                GpuStatisticalBindings, GpuStatisticalFactor, GpuStatisticalPerturbation,
+                GpuStatisticalTrapGenOperands, GpuStridedCopy, gpu_device_identity,
+                gpu_device_memory_usage,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -61,7 +63,7 @@ use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -104,23 +106,14 @@ fn compiled_raw_matrix_part_inner(
         {
             matrix.clone()
         }
-        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
-            let secret_columns = matrix
-                .rows
-                .checked_mul(*digit_count)
-                .ok_or_else(|| invalid("trapdoor secret column count overflows"))?;
-            let (rows, columns) = match part.leaf {
-                0 | 1 => (matrix.rows, secret_columns),
-                2..=4 => (matrix.rows, matrix.rows),
-                5 => (
-                    matrix
-                        .rows
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("trapdoor stacked row count overflows"))?,
-                    secret_columns,
-                ),
-                _ => return Err(invalid("raw trapdoor part references an unknown leaf")),
-            };
+        ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
+            let (rows, columns) = crate::sampler::trapdoor::trapdoor_component_shapes(
+                matrix.rows,
+                *digit_count,
+                *instantiation,
+            )
+            .and_then(|shapes| shapes.get(part.leaf as usize).copied())
+            .ok_or_else(|| invalid("raw trapdoor part references an unknown leaf"))?;
             ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns }
         }
         _ => return Err(invalid("raw matrix operation requires a matrix or trapdoor leaf")),
@@ -439,6 +432,23 @@ fn compiled_bytes_part(
     compiled_contiguous_part(owner, part_index, bytes, device)
 }
 
+/// The owner and `(address, bytes)` of a whole Bytes operand of a statistical trapdoor
+/// operation: the precomputation or a scratch.
+fn statistical_bytes_operand<'a>(
+    owners: &'a BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    id: &PhysicalValueId,
+    part: u32,
+    device: i32,
+) -> Result<(&'a Arc<GpuResidentValue>, (u64, usize)), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let owner = owners.get(id).ok_or_else(|| invalid("statistical bytes operand is missing"))?;
+    let ConcreteWireType::Bytes { length } = owner.wire_type() else {
+        return Err(invalid("statistical bytes operand is not a Bytes value"));
+    };
+    let address = compiled_bytes_part(owner, part, *length as u64, device)?;
+    Ok((owner, (address, *length)))
+}
+
 fn compiled_raw_integer_part(
     owner: &GpuResidentValue,
     part_index: u32,
@@ -651,6 +661,68 @@ fn compiled_raw_small_matrix_part(
     ))
 }
 
+impl GpuResidentValue {
+    /// Allocate a private template, retaining aliases between CRT limbs and trapdoor leaves.
+    /// The host binds its real member before every launch. Overlapping views of one owner
+    /// need one placeholder range, not a separate copy of each view's remaining buffer tail.
+    pub(crate) fn private_placeholder(&self, backend: &GpuDcrtBackend) -> Result<Self, String> {
+        let mut groups = BTreeMap::<(i32, *const ()), Vec<(u64, u64)>>::new();
+        for (_, bound) in self.storages() {
+            let end = bound
+                .address
+                .checked_add(bound.bytes)
+                .ok_or("GPU placeholder address range overflows")?;
+            groups
+                .entry((bound.device, Arc::as_ptr(&bound.owner).cast::<()>()))
+                .or_default()
+                .push((bound.address, end));
+        }
+        let mut replacements = BTreeMap::new();
+        for (key, mut ranges) in groups {
+            ranges.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+            for (start, end) in ranges {
+                if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            }
+            let parameters = backend.control_parameters_on_device(key.0)?;
+            let mut buffers = Vec::new();
+            for (start, end) in merged {
+                let bytes = usize::try_from(end - start)
+                    .map_err(|_| "GPU resident placeholder exceeds host address space")?;
+                let allocation = Arc::new(
+                    crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, key.0, bytes)
+                        .map_err(|error| error.to_string())?,
+                );
+                buffers.push((start, end, BoundStorage::from_device_bytes(allocation)?));
+            }
+            replacements.insert(key, buffers);
+        }
+        let mut storage = BTreeMap::new();
+        for (&slot, bound) in self.storages() {
+            let key = (bound.device, Arc::as_ptr(&bound.owner).cast::<()>());
+            let (start, _, allocation) = replacements[&key]
+                .iter()
+                .find(|(start, end, _)| {
+                    *start <= bound.address && bound.address + bound.bytes <= *end
+                })
+                .ok_or("GPU placeholder storage has no allocation")?;
+            storage.insert(
+                slot,
+                BoundStorage {
+                    address: allocation.address + (bound.address - start),
+                    bytes: bound.bytes,
+                    ..allocation.clone()
+                },
+            );
+        }
+        Self::new(Arc::clone(self.physical()), storage, Box::new([])).map_err(str::to_owned)
+    }
+}
+
 /// Emit one operation from the process-local implementation registry directly
 /// into the explicit native Graph. All addresses come from validated physical
 /// owners; a missing owner or unsupported primitive is a preparation error.
@@ -658,19 +730,27 @@ fn compiled_raw_small_matrix_part(
 /// compiled executable. Indexes refer to the immutable operation sequence.
 #[derive(Clone)]
 pub(crate) struct GpuPreparedNativeResources {
-    modulus_conversions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
+    /// Keyed by the address of the operation in the prepared program, which
+    /// is unique across loop bodies, whose indices are body-local.
+    modulus_conversions: BTreeMap<usize, (i32, Arc<GpuModulusConversionPlan>)>,
     rns_conversions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     crt_recompositions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     compact_packs: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     hash_samples: BTreeMap<u32, (i32, Arc<GpuHashSamplePlan>, Box<[(PhysicalValueId, u32, u32)]>)>,
     dynamic_round_divides: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     p1: BTreeMap<u32, (i32, Arc<GpuRawP1Workspace>)>,
+    statistical: BTreeMap<u32, (i32, Arc<GpuRawStatisticalWorkspace>)>,
     gq: BTreeMap<u32, (i32, Arc<GpuRawGqWorkspace>)>,
     cutoff: BTreeMap<u32, (i32, Arc<GpuRawPreimageCutoffPlan>)>,
     indexed_matrices: BTreeMap<u32, Arc<GpuIndexedMatrixTable>>,
 }
 
 impl GpuPreparedNativeResources {
+    /// Whether this program's indexed matrix copies read the table `resource_id`.
+    pub(crate) fn uses_indexed_matrix(&self, resource_id: u32) -> bool {
+        self.indexed_matrices.contains_key(&resource_id)
+    }
+
     pub(crate) fn allocation_ranges(&self) -> Result<Vec<(i32, u64, usize)>, GpuNativeGraphError> {
         let mut ranges = Vec::new();
         for (device, plan) in self.modulus_conversions.values() {
@@ -698,6 +778,14 @@ impl GpuPreparedNativeResources {
             ranges.push((*device, address, bytes));
         }
         for (device, workspace) in self.p1.values() {
+            ranges.extend(
+                workspace
+                    .binding_ranges()
+                    .into_iter()
+                    .map(|(address, bytes)| (*device, address, bytes)),
+            );
+        }
+        for (device, workspace) in self.statistical.values() {
             ranges.extend(
                 workspace
                     .binding_ranges()
@@ -735,6 +823,11 @@ impl GpuPreparedNativeResources {
                 let (address, bytes) = *workspace.binding_ranges().get(component as usize)?;
                 Some((*device, address, bytes))
             }
+            GpuPreparedWorkspaceKind::Statistical => {
+                let (device, workspace) = self.statistical.get(&resource_id)?;
+                let (address, bytes) = *workspace.binding_ranges().get(component as usize)?;
+                Some((*device, address, bytes))
+            }
             GpuPreparedWorkspaceKind::Gq if component == 0 => {
                 let (device, workspace) = self.gq.get(&resource_id)?;
                 Some((*device, workspace.sampled_address(), workspace.sampled_bytes()))
@@ -752,7 +845,10 @@ impl GpuPreparedNativeResources {
         physical_device: i32,
         stream: &GpuNativeLaunchStream,
     ) -> Result<(), GpuNativeGraphError> {
-        for (device, plan) in self.rns_conversions.values() {
+        // Static CRT conversions upload metadata asynchronously too; their
+        // consumers must wait for allocation and upload before graph launch.
+        for (device, plan) in self.modulus_conversions.values().chain(self.rns_conversions.values())
+        {
             if *device == physical_device {
                 plan.prepare_graph_launch(stream)?;
             }
@@ -773,6 +869,11 @@ impl GpuPreparedNativeResources {
             }
         }
         for (device, workspace) in self.p1.values() {
+            if *device == physical_device {
+                workspace.prepare_graph_launch(stream)?;
+            }
+        }
+        for (device, workspace) in self.statistical.values() {
             if *device == physical_device {
                 workspace.prepare_graph_launch(stream)?;
             }
@@ -847,8 +948,44 @@ impl GpuPreparedNativeResources {
                 plan.protect_compiled_submission(physical_device, stream, completion)?;
             }
         }
+        for (device, plan, _) in self.hash_samples.values() {
+            if *device == physical_device {
+                plan.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, plan) in self.cutoff.values() {
+            if *device == physical_device {
+                plan.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, workspace) in self.p1.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, workspace) in self.statistical.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, workspace) in self.gq.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
+        for table in self.indexed_matrices.values() {
+            if table.physical_device() == physical_device {
+                table.protect_compiled_submission(completion)?;
+            }
+        }
         Ok(())
     }
+}
+
+/// The key of `operation` in [`GpuPreparedNativeResources`] maps that cover
+/// loop bodies: its address in the program that is both prepared and emitted.
+fn operation_key(operation: &CompiledGpuOp) -> usize {
+    std::ptr::from_ref(operation) as usize
 }
 
 pub(crate) fn prepare_compiled_gpu_program(
@@ -860,11 +997,27 @@ pub(crate) fn prepare_compiled_gpu_program(
 ) -> Result<GpuPreparedNativeResources, GpuNativeGraphError> {
     let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
     let mut modulus_conversions = BTreeMap::new();
-    for (index, operation) in program.operations.iter().enumerate() {
+    // The indexed matrix tables this program's copies read: a launch prepares the descriptors
+    // of its own tables only, whose candidate views it rebuilds every launch.
+    let mut used_indexed_matrices = BTreeMap::new();
+    let mut pending = program.operations.iter().collect::<Vec<_>>();
+    while let Some(operation) = pending.pop() {
+        if let Some(body) = operation.body.as_ref() {
+            pending.extend(body.iter());
+        }
         let implementation = program
             .implementations
             .resolve(operation.implementation)
             .map_err(|message| invalid(message))?;
+        if implementation.primitive == GpuNativePrimitive::MatrixIndexedCopy {
+            let Some(KernelArg::U32(resource_id)) = operation.arguments.first() else {
+                return Err(invalid("compiled indexed matrix copy has wrong arguments"));
+            };
+            let table = indexed_matrices
+                .get(resource_id)
+                .ok_or_else(|| invalid("indexed matrix descriptor table is missing"))?;
+            used_indexed_matrices.insert(*resource_id, Arc::clone(table));
+        }
         if !matches!(
             implementation.primitive,
             GpuNativePrimitive::ModulusSwitch |
@@ -891,6 +1044,7 @@ pub(crate) fn prepare_compiled_gpu_program(
                 KernelArg::U32(round_scale),
                 KernelArg::U32(source_binding),
                 KernelArg::U32(destination_binding),
+                KernelArg::U64List(_),
             ] = operation.arguments.as_ref()
             else {
                 return Err(invalid("compiled modulus switch has the wrong arguments"));
@@ -975,12 +1129,17 @@ pub(crate) fn prepare_compiled_gpu_program(
             compiled_raw_matrix_part(source, *source_part, PhysicalEncoding::FullCoeff)?;
         let (_, destination_view, destination_bindings) =
             compiled_raw_matrix_part(destination, *destination_part, PhysicalEncoding::FullCoeff)?;
+        let residues = match operation.arguments.last() {
+            Some(KernelArg::U64List(residues)) if round_scale.is_some() => residues.as_ref(),
+            _ => &[],
+        };
         if source_view.physical_device != operation.device ||
             destination_view.physical_device != operation.device ||
             source_view.row_origin != destination_view.row_origin ||
             source_view.column_origin != destination_view.column_origin ||
             source_view.rows != destination_view.rows ||
-            source_view.columns != destination_view.columns ||
+            source_view.columns * (residues.len() / source_view.limbs.len()).max(1) as u64 !=
+                destination_view.columns ||
             source_bindings.len() != source_view.limbs.len() ||
             destination_bindings.len() != destination_view.limbs.len() ||
             source_binding.checked_add(source_view.limbs.len() as u32).is_none() ||
@@ -999,6 +1158,7 @@ pub(crate) fn prepare_compiled_gpu_program(
                 source_ty.ring.crt_moduli(),
                 destination_ty.ring.crt_moduli(),
                 round_scale,
+                residues,
             )?,
             (None, Some(divisor_words)) => {
                 if source_ty.ring != destination_ty.ring {
@@ -1017,12 +1177,10 @@ pub(crate) fn prepare_compiled_gpu_program(
             )?,
             (Some(_), Some(_)) => return Err(invalid("ambiguous CRT conversion plan")),
         };
-        modulus_conversions.insert(
-            u32::try_from(index).map_err(|_| invalid("too many compiled operations"))?,
-            (operation.device, Arc::new(plan)),
-        );
+        modulus_conversions.insert(operation_key(operation), (operation.device, Arc::new(plan)));
     }
     let mut p1 = BTreeMap::new();
+    let mut statistical = BTreeMap::new();
     let mut rns_conversions = BTreeMap::new();
     let mut crt_recompositions = BTreeMap::new();
     let mut compact_packs = BTreeMap::new();
@@ -1030,6 +1188,9 @@ pub(crate) fn prepare_compiled_gpu_program(
     let mut dynamic_round_divides = BTreeMap::new();
     let mut gq = BTreeMap::new();
     let mut cutoff = BTreeMap::new();
+    let mut cutoff_shapes = BTreeMap::new();
+    let mut p1_shapes = BTreeMap::new();
+    let mut gq_shapes = BTreeMap::new();
     let mut resource_ids = BTreeSet::new();
     let mut crt_resource_ids = BTreeSet::new();
     let mut compact_pack_resource_ids = BTreeSet::new();
@@ -1587,8 +1748,8 @@ pub(crate) fn prepare_compiled_gpu_program(
                 else {
                     return Err(invalid("P1 refresh has invalid preparation arguments"));
                 };
-                if !resource_ids.insert(*resource_id) || *tile_columns == 0 {
-                    return Err(invalid("P1 workspace resource ID is duplicated or empty"));
+                if *tile_columns == 0 {
+                    return Err(invalid("P1 workspace is empty"));
                 }
                 let a_owner = owners.get(a_id).ok_or_else(|| invalid("P1 A owner is missing"))?;
                 let b_owner = owners.get(b_id).ok_or_else(|| invalid("P1 B owner is missing"))?;
@@ -1613,6 +1774,19 @@ pub(crate) fn prepare_compiled_gpu_program(
                         "P1 covariance preparation requires packed equal square views",
                     ));
                 }
+                // Reuse only identically shaped resources; lowering orders the
+                // entire previous tile before this covariance refresh.
+                let shape = (operation.device, a_ty.ring.clone(), a.rows, *tile_columns);
+                if let Some(previous) = p1_shapes.get(resource_id) {
+                    if previous != &shape {
+                        return Err(invalid("shared P1 resource has incompatible parameters"));
+                    }
+                    continue;
+                }
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("P1 resource ID is used by another resource kind"));
+                }
+                p1_shapes.insert(*resource_id, shape);
                 let params = backend
                     .parameters_on_physical_device(operation.device, &a_ty)
                     .map_err(|error| invalid(&error))?;
@@ -1625,6 +1799,55 @@ pub(crate) fn prepare_compiled_gpu_program(
                         .map_err(|_| invalid("P1 columns exceed usize"))?,
                 )?;
                 p1.insert(*resource_id, (operation.device, Arc::new(workspace)));
+            }
+            GpuNativePrimitive::StatisticalPerturbation => {
+                let [
+                    KernelArg::U32(resource_id),
+                    KernelArg::Value(output_id),
+                    KernelArg::U32(output_part),
+                    KernelArg::Value(_),
+                    KernelArg::U32(_),
+                    KernelArg::Value(_),
+                    KernelArg::U32(_),
+                    KernelArg::U64(m_bar),
+                    ..,
+                ] = operation.arguments.as_ref()
+                else {
+                    return Err(invalid("statistical perturbation has invalid arguments"));
+                };
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("statistical workspace resource ID is duplicated"));
+                }
+                let output_owner = owners
+                    .get(output_id)
+                    .ok_or_else(|| invalid("statistical perturbation output owner is missing"))?;
+                let (output_ty, output, _) = compiled_raw_matrix_part(
+                    output_owner,
+                    *output_part,
+                    PhysicalEncoding::FullCoeff,
+                )?;
+                let m_bar = usize::try_from(*m_bar)
+                    .map_err(|_| invalid("statistical m_bar exceeds usize"))?;
+                if output.physical_device != operation.device ||
+                    output.row_origin != 0 ||
+                    output.column_origin != 0 ||
+                    output.rows <= m_bar as u64
+                {
+                    return Err(invalid("statistical perturbation output is not a packed tile"));
+                }
+                let params = backend
+                    .parameters_on_physical_device(operation.device, &output_ty)
+                    .map_err(|error| invalid(&error))?;
+                let stream = params.native_launch_stream(operation.device)?;
+                let workspace = GpuRawStatisticalWorkspace::new(
+                    params,
+                    &stream,
+                    m_bar,
+                    output.rows as usize - m_bar,
+                    usize::try_from(output.columns)
+                        .map_err(|_| invalid("statistical columns exceed usize"))?,
+                )?;
+                statistical.insert(*resource_id, (operation.device, Arc::new(workspace)));
             }
             GpuNativePrimitive::GqSample => {
                 let [
@@ -1641,9 +1864,6 @@ pub(crate) fn prepare_compiled_gpu_program(
                 else {
                     return Err(invalid("GQ sample has invalid preparation arguments"));
                 };
-                if !resource_ids.insert(*resource_id) {
-                    return Err(invalid("GQ workspace resource ID is duplicated"));
-                }
                 let source_owner =
                     owners.get(source_id).ok_or_else(|| invalid("GQ source owner is missing"))?;
                 let (source_ty, source, _) = compiled_raw_matrix_part(
@@ -1657,6 +1877,23 @@ pub(crate) fn prepare_compiled_gpu_program(
                 {
                     return Err(invalid("GQ source is not a packed tile on its selected device"));
                 }
+                let shape = (
+                    operation.device,
+                    source_ty.ring.clone(),
+                    source.rows,
+                    source.columns,
+                    *base_bits,
+                );
+                if let Some(previous) = gq_shapes.get(resource_id) {
+                    if previous != &shape {
+                        return Err(invalid("shared GQ resource has incompatible parameters"));
+                    }
+                    continue;
+                }
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("GQ resource ID is used by another resource kind"));
+                }
+                gq_shapes.insert(*resource_id, shape);
                 let params = backend
                     .parameters_on_physical_device(operation.device, &source_ty)
                     .map_err(|error| invalid(&error))?;
@@ -1687,9 +1924,6 @@ pub(crate) fn prepare_compiled_gpu_program(
                 else {
                     return Err(invalid("preimage cutoff has invalid preparation arguments"));
                 };
-                if !resource_ids.insert(*resource_id) {
-                    return Err(invalid("cutoff resource ID is duplicated"));
-                }
                 let candidate_owner = owners
                     .get(candidate_id)
                     .ok_or_else(|| invalid("cutoff candidate owner is missing"))?;
@@ -1704,6 +1938,26 @@ pub(crate) fn prepare_compiled_gpu_program(
                 {
                     return Err(invalid("cutoff candidate is not a packed tile"));
                 }
+                // The lowerer orders tiles that share this staging resource.
+                // Repeated uses must agree on every byte-layout and cutoff parameter.
+                let shape = (
+                    operation.device,
+                    candidate_ty.ring.clone(),
+                    candidate.rows,
+                    candidate.columns,
+                    *magnitude_bytes,
+                    bound_words.clone(),
+                );
+                if let Some(previous) = cutoff_shapes.get(resource_id) {
+                    if previous != &shape {
+                        return Err(invalid("shared cutoff resource has incompatible parameters"));
+                    }
+                    continue;
+                }
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("cutoff resource ID is used by another resource kind"));
+                }
+                cutoff_shapes.insert(*resource_id, shape);
                 let params = backend
                     .parameters_on_physical_device(operation.device, &candidate_ty)
                     .map_err(|error| invalid(&error))?;
@@ -1731,9 +1985,10 @@ pub(crate) fn prepare_compiled_gpu_program(
         hash_samples,
         dynamic_round_divides,
         p1,
+        statistical,
         gq,
         cutoff,
-        indexed_matrices: indexed_matrices.clone(),
+        indexed_matrices: used_indexed_matrices,
     })
 }
 
@@ -1892,17 +2147,35 @@ pub(crate) fn emit_compiled_gpu_op(
                     parts.iter().any(|part| {
                         part.leaf != 0 || part.storage != first.storage || part.device != op.device
                     }) ||
-                    first.view.byte_offset != 0 ||
                     storage.device != op.device ||
-                    storage.bytes != *bytes ||
+                    first
+                        .view
+                        .byte_offset
+                        .checked_add(*bytes)
+                        .is_none_or(|end| end > storage.bytes) ||
                     view.row_origin != 0 ||
                     view.column_origin != 0 ||
                     view.rows != matrix.rows as u64 ||
                     view.columns != matrix.columns as u64
                 {
-                    return Err(invalid("compiled zero requires one complete matrix allocation"));
+                    return Err(invalid("compiled zero requires one complete matrix span"));
                 }
-                storage.address
+                // Body scratch matrices can share an allocation. Zero only this
+                // matrix's span, and ensure every CRT view lies inside that span.
+                for part in parts {
+                    let mut relative_view = part.view.clone();
+                    relative_view.byte_offset = relative_view
+                        .byte_offset
+                        .checked_sub(first.view.byte_offset)
+                        .ok_or_else(|| invalid("compiled zero matrix precedes its span"))?;
+                    relative_view
+                        .validate_in_allocation(*bytes, u64::from(relative_view.element_bytes))
+                        .map_err(invalid)?;
+                }
+                storage
+                    .address
+                    .checked_add(first.view.byte_offset)
+                    .ok_or_else(|| invalid("compiled zero matrix address overflows"))?
             } else {
                 compiled_contiguous_part(destination_owner, *destination_part, *bytes, op.device)?
             };
@@ -1974,69 +2247,6 @@ pub(crate) fn emit_compiled_gpu_op(
             )?;
             builder.retain_owner(Arc::clone(compact_owner));
             builder.retain_owner(Arc::clone(workspace_owner));
-        }
-        GpuNativePrimitive::MatrixMulScalar => {
-            let [
-                KernelArg::Value(matrix_id),
-                KernelArg::U32(matrix_part),
-                KernelArg::Value(scalar_id),
-                KernelArg::U32(scalar_part),
-                KernelArg::Value(destination_id),
-                KernelArg::U32(destination_part),
-                KernelArg::U32(matrix_binding),
-                KernelArg::U32(scalar_binding),
-                KernelArg::U32(destination_binding),
-            ] = op.arguments.as_ref()
-            else {
-                return Err(invalid("compiled scalar product has the wrong arguments"));
-            };
-            if op.outputs.as_ref() != [*destination_id] {
-                return Err(invalid("compiled scalar product output does not match"));
-            }
-            let owner = |id: &PhysicalValueId| {
-                owners.get(id).ok_or_else(|| invalid("compiled scalar product owner is missing"))
-            };
-            let (matrix_owner, scalar_owner) = (owner(matrix_id)?, owner(scalar_id)?);
-            let destination_owner = owner(destination_id)?;
-            let (matrix_ty, matrix, matrix_bindings) =
-                compiled_raw_matrix_part(matrix_owner, *matrix_part, PhysicalEncoding::FullEval)?;
-            let (scalar_ty, scalar, scalar_bindings) =
-                compiled_raw_matrix_part(scalar_owner, *scalar_part, PhysicalEncoding::FullEval)?;
-            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
-                destination_owner,
-                *destination_part,
-                PhysicalEncoding::FullEval,
-            )?;
-            if matrix_ty.ring != scalar_ty.ring ||
-                matrix_ty.ring != destination_ty.ring ||
-                !same_raw_limbs(&matrix, &scalar) ||
-                !same_raw_limbs(&matrix, &destination) ||
-                matrix.physical_device != op.device ||
-                scalar.rows != 1 ||
-                scalar.columns != 1 ||
-                destination.rows != matrix.rows ||
-                destination.columns != matrix.columns
-            {
-                return Err(invalid("compiled scalar product layouts disagree"));
-            }
-            bind_raw_matrix_part(builder, *matrix_binding, &matrix_bindings)?;
-            bind_raw_matrix_part(builder, *scalar_binding, &scalar_bindings)?;
-            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
-            let parameters = backend
-                .parameters_on_physical_device(op.device, &matrix_ty)
-                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
-            parameters.emit_raw_matrix_mul_scalar(
-                builder.launch_stream(),
-                &matrix,
-                &scalar,
-                &destination,
-                *matrix_binding,
-                *scalar_binding,
-                *destination_binding,
-            )?;
-            for retained in [matrix_owner, scalar_owner, destination_owner] {
-                builder.retain_owner(Arc::clone(retained));
-            }
         }
         GpuNativePrimitive::MatrixMulSmallRhs => {
             emit_small_rhs_product(backend, builder, op, None, owners)?;
@@ -2197,6 +2407,128 @@ pub(crate) fn emit_compiled_gpu_op(
             )?;
             builder.retain_owner(Arc::clone(source_owner));
             builder.retain_owner(Arc::clone(destination_owner));
+        }
+        GpuNativePrimitive::MatrixColumnGather => {
+            let [
+                KernelArg::Value(source_id),
+                KernelArg::U32(source_part),
+                KernelArg::Value(destination_id),
+                KernelArg::U32(destination_part),
+                KernelArg::Value(index_id),
+                KernelArg::U32(index_part),
+                KernelArg::U32(source_binding),
+                KernelArg::U32(destination_binding),
+                KernelArg::U32(index_binding),
+                KernelArg::U64(first),
+                KernelArg::U64(stride),
+                KernelArg::U64(count),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("invalid affine column gather arguments"));
+            };
+            if op.outputs.as_ref() != [*destination_id] {
+                return Err(invalid("invalid affine gather output"));
+            }
+            let source_owner =
+                owners.get(source_id).ok_or_else(|| invalid("missing affine source"))?;
+            let destination_owner =
+                owners.get(destination_id).ok_or_else(|| invalid("missing affine destination"))?;
+            let index_owner =
+                owners.get(index_id).ok_or_else(|| invalid("missing affine index"))?;
+            let (source_ty, source, source_bindings) =
+                compiled_raw_matrix_part(source_owner, *source_part, PhysicalEncoding::FullEval)?;
+            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
+                destination_owner,
+                *destination_part,
+                PhysicalEncoding::FullEval,
+            )?;
+            if source_ty.ring != destination_ty.ring {
+                return Err(invalid("affine gather rings disagree"));
+            }
+            let (index, index_bytes) =
+                compiled_raw_integer_part(index_owner, *index_part, *index_binding, op.device)?;
+            bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
+            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            builder.bind_resident_address(index.address, index_bytes, *index_binding)?;
+            backend
+                .parameters_on_physical_device(op.device, &source_ty)
+                .map_err(|e| invalid(&e))?
+                .emit_raw_matrix_column_gather(
+                    builder.launch_stream(),
+                    &source,
+                    &destination,
+                    index,
+                    *first,
+                    *stride,
+                    *count,
+                    [*source_binding, *destination_binding],
+                )?;
+            for owner in [source_owner, destination_owner, index_owner] {
+                builder.retain_owner(Arc::clone(owner));
+            }
+        }
+        GpuNativePrimitive::MatrixColumnBinary => {
+            let [
+                KernelArg::Value(left_id),
+                KernelArg::U32(left_part),
+                KernelArg::Value(right_id),
+                KernelArg::U32(right_part),
+                KernelArg::Value(destination_id),
+                KernelArg::U32(destination_part),
+                KernelArg::U32(left_binding),
+                KernelArg::U32(right_binding),
+                KernelArg::U32(destination_binding),
+                KernelArg::U32(kind),
+                KernelArg::U64(columns_per_job),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("affine column binary has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*destination_id] || *kind > 3 || *columns_per_job == 0 {
+                return Err(invalid("affine column binary has invalid destination or geometry"));
+            }
+            let left_owner =
+                owners.get(left_id).ok_or_else(|| invalid("affine left owner is missing"))?;
+            let right_owner =
+                owners.get(right_id).ok_or_else(|| invalid("affine right owner is missing"))?;
+            let destination_owner = owners
+                .get(destination_id)
+                .ok_or_else(|| invalid("affine destination owner is missing"))?;
+            let (left_ty, left, left_bindings) =
+                compiled_raw_matrix_part(left_owner, *left_part, PhysicalEncoding::FullEval)?;
+            let (right_ty, right, right_bindings) =
+                compiled_raw_matrix_part(right_owner, *right_part, PhysicalEncoding::FullEval)?;
+            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
+                destination_owner,
+                *destination_part,
+                PhysicalEncoding::FullEval,
+            )?;
+            if left_ty.ring != right_ty.ring ||
+                left_ty.ring != destination_ty.ring ||
+                [left.physical_device, right.physical_device, destination.physical_device]
+                    .iter()
+                    .any(|&device| device != op.device)
+            {
+                return Err(invalid("affine column binary rings or devices disagree"));
+            }
+            bind_raw_matrix_part(builder, *left_binding, &left_bindings)?;
+            bind_raw_matrix_part(builder, *right_binding, &right_bindings)?;
+            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, &left_ty)
+                .map_err(GpuNativeGraphError::Native)?;
+            parameters.emit_raw_matrix_column_binary(
+                builder.launch_stream(),
+                &left,
+                &right,
+                &destination,
+                *kind,
+                *columns_per_job,
+                [*left_binding, *right_binding, *destination_binding],
+            )?;
+            for owner in [left_owner, right_owner, destination_owner] {
+                builder.retain_owner(Arc::clone(owner));
+            }
         }
         GpuNativePrimitive::MatrixAdd | GpuNativePrimitive::MatrixSub => {
             let [
@@ -2502,6 +2834,57 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(destination_owner));
             builder.retain_owner(Arc::clone(scalar_owner));
             builder.retain_owner(Arc::clone(status_owner));
+        }
+        GpuNativePrimitive::MatrixColumnAdd => {
+            let [
+                KernelArg::Value(sum_id),
+                KernelArg::U32(sum_part),
+                KernelArg::Value(term_id),
+                KernelArg::U32(term_part),
+                KernelArg::Value(output_id),
+                KernelArg::U32(output_part),
+                KernelArg::Value(index_id),
+                KernelArg::U32(index_part),
+                KernelArg::U32(sum_binding),
+                KernelArg::U32(term_binding),
+                KernelArg::U32(output_binding),
+                KernelArg::U32(index_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled column add has wrong arguments"));
+            };
+            let sum_owner = &owners[sum_id];
+            let term_owner = &owners[term_id];
+            let output_owner = &owners[output_id];
+            let index_owner = &owners[index_id];
+            let (ty, sum, sum_bindings) =
+                compiled_raw_matrix_part(sum_owner, *sum_part, PhysicalEncoding::FullEval)?;
+            let (_, term, term_bindings) =
+                compiled_raw_matrix_part(term_owner, *term_part, PhysicalEncoding::FullEval)?;
+            let (_, output, output_bindings) =
+                compiled_raw_matrix_part(output_owner, *output_part, PhysicalEncoding::FullEval)?;
+            let (index, bytes) =
+                compiled_raw_integer_part(index_owner, *index_part, *index_binding, op.device)?;
+            bind_raw_matrix_part(builder, *sum_binding, &sum_bindings)?;
+            bind_raw_matrix_part(builder, *term_binding, &term_bindings)?;
+            bind_raw_matrix_part(builder, *output_binding, &output_bindings)?;
+            builder.bind_resident_address(index.address, bytes, *index_binding)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, &ty)
+                .map_err(GpuNativeGraphError::Native)?;
+            parameters.emit_raw_matrix_column_add(
+                builder.launch_stream(),
+                &sum,
+                &term,
+                &output,
+                index,
+                *sum_binding,
+                *term_binding,
+                *output_binding,
+            )?;
+            for owner in [sum_owner, term_owner, output_owner, index_owner] {
+                builder.retain_owner(Arc::clone(owner));
+            }
         }
         GpuNativePrimitive::MatrixIndexedCopy => {
             let [
@@ -3362,10 +3745,12 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(value_binding),
                 KernelArg::U32(destination_binding),
                 KernelArg::U32(status_binding),
+                KernelArg::U32(unit),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled integer lift has wrong arguments"));
             };
+            let unit = *unit != 0;
             if op.outputs.as_ref() != [*destination_id] {
                 return Err(invalid("compiled integer lift has wrong output"));
             }
@@ -3386,10 +3771,15 @@ pub(crate) fn emit_compiled_gpu_op(
                 *destination_part,
                 PhysicalEncoding::FullCoeff,
             )?;
-            if (destination_ty.rows, destination_ty.columns) != (1, 1) ||
-                destination.physical_device != op.device
-            {
-                return Err(invalid("integer lift destination must be one polynomial"));
+            let shape_valid = if unit {
+                destination_ty.rows == 1 || destination_ty.columns == 1
+            } else {
+                (destination_ty.rows, destination_ty.columns) == (1, 1)
+            };
+            if !shape_valid || destination.physical_device != op.device {
+                return Err(invalid(
+                    "integer lift destination must be one polynomial or a unit vector",
+                ));
             }
             let status = compiled_raw_control_status(
                 status_owner,
@@ -3409,6 +3799,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 &destination,
                 status,
                 *destination_binding,
+                unit,
             )?;
             for owner in [value_owner, destination_owner, status_owner] {
                 builder.retain_owner(Arc::clone(owner));
@@ -4019,6 +4410,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(round_scale),
                 KernelArg::U32(source_binding),
                 KernelArg::U32(destination_binding),
+                KernelArg::U64List(residues),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled modulus switch has the wrong arguments"));
@@ -4045,7 +4437,8 @@ pub(crate) fn emit_compiled_gpu_op(
                 source.row_origin != destination.row_origin ||
                 source.column_origin != destination.column_origin ||
                 source.rows != destination.rows ||
-                source.columns != destination.columns
+                source.columns * (residues.len() / source.limbs.len()).max(1) as u64 !=
+                    destination.columns
             {
                 return Err(invalid("compiled modulus switch layouts disagree"));
             }
@@ -4071,7 +4464,7 @@ pub(crate) fn emit_compiled_gpu_op(
             bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             let (device, plan) = resources
                 .modulus_conversions
-                .get(&index)
+                .get(&operation_key(op))
                 .ok_or_else(|| invalid("compiled modulus switch has no prepared native plan"))?;
             if *device != op.device {
                 return Err(invalid(
@@ -4177,7 +4570,7 @@ pub(crate) fn emit_compiled_gpu_op(
             bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             let (device, plan) = resources
                 .modulus_conversions
-                .get(&index)
+                .get(&operation_key(op))
                 .ok_or_else(|| invalid("compiled CRT conversion has no prepared native plan"))?;
             if *device != op.device {
                 return Err(invalid("compiled CRT conversion plan belongs to another device"));
@@ -4692,7 +5085,20 @@ pub(crate) fn emit_compiled_gpu_op(
                 .get(derived_id)
                 .ok_or_else(|| invalid("preimage derived seed owner is missing"))?;
             let base_address = compiled_bytes_part(base_owner, *base_part, 32, op.device)?;
-            let attempt_address = compiled_bytes_part(attempt_owner, *attempt_part, 8, op.device)?;
+            let attempt_address = if matches!(attempt_owner.wire_type(), ConcreteWireType::Int) {
+                let (index, _) = compiled_raw_integer_part(
+                    attempt_owner,
+                    *attempt_part,
+                    *attempt_binding,
+                    op.device,
+                )?;
+                if index.count != 1 || index.encoding != GpuSignedValuesEncoding::CanonicalU64 {
+                    return Err(invalid("preimage seed index must be a canonical u64 scalar"));
+                }
+                index.address
+            } else {
+                compiled_bytes_part(attempt_owner, *attempt_part, 8, op.device)?
+            };
             let derived_address = compiled_bytes_part(derived_owner, *derived_part, 32, op.device)?;
             if base_address == derived_address {
                 return Err(invalid("preimage derived seed aliases the base seed"));
@@ -4891,6 +5297,244 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(tp2_owner));
             builder.retain_owner(Arc::clone(output_owner));
             builder.retain_owner(Arc::clone(seed_owner));
+            builder.retain_owner(Arc::clone(workspace));
+        }
+        GpuNativePrimitive::StatisticalSpectra => {
+            let [
+                KernelArg::Value(chunk_id),
+                KernelArg::U32(chunk_part),
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::Value(scratch_id),
+                KernelArg::U32(scratch_part),
+                KernelArg::U64(m_bar),
+                KernelArg::U64(row_offset),
+                KernelArg::U32(chunk_binding),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(scratch_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical spectra has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*precomputation_id] {
+                return Err(invalid(
+                    "compiled statistical spectra output is not its precomputation",
+                ));
+            }
+            let chunk_owner = owners
+                .get(chunk_id)
+                .ok_or_else(|| invalid("statistical spectra chunk owner is missing"))?;
+            let (chunk_ty, chunk, chunk_bindings) =
+                compiled_raw_matrix_part(chunk_owner, *chunk_part, PhysicalEncoding::FullCoeff)?;
+            if chunk.physical_device != op.device {
+                return Err(invalid("statistical spectra physical contract is inconsistent"));
+            }
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let (scratch_owner, scratch) =
+                statistical_bytes_operand(owners, scratch_id, *scratch_part, op.device)?;
+            bind_raw_matrix_part(builder, *chunk_binding, &chunk_bindings)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            builder.bind_resident_address(scratch.0, scratch.1, *scratch_binding)?;
+            let params = backend
+                .parameters_on_physical_device(op.device, &chunk_ty)
+                .map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_spectra(
+                builder.launch_stream(),
+                &chunk,
+                usize::try_from(*m_bar).map_err(|_| invalid("statistical m_bar exceeds usize"))?,
+                usize::try_from(*row_offset)
+                    .map_err(|_| invalid("statistical spectra row exceeds usize"))?,
+                GpuStatisticalTrapGenOperands {
+                    precomputation,
+                    precomputation_binding: *precomputation_binding,
+                    auxiliary: scratch,
+                    auxiliary_binding: *scratch_binding,
+                },
+                *chunk_binding,
+            )?;
+            builder.retain_owner(Arc::clone(chunk_owner));
+            builder.retain_owner(Arc::clone(precomputation_owner));
+            builder.retain_owner(Arc::clone(scratch_owner));
+        }
+        GpuNativePrimitive::StatisticalFactor => {
+            let [
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::Value(attempt_id),
+                KernelArg::U32(attempt_part),
+                KernelArg::Value(status_id),
+                KernelArg::U32(status_part),
+                KernelArg::U64(m_bar),
+                KernelArg::U64(digits),
+                KernelArg::U64(degree),
+                KernelArg::F64(preimage_sigma),
+                KernelArg::F64(variance),
+                KernelArg::F64(alpha),
+                KernelArg::F64(pivot_floor),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(attempt_binding),
+                KernelArg::U32(status_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical factor has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*status_id] ||
+                [preimage_sigma, variance, alpha, pivot_floor]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(invalid("compiled statistical factor output or scalars are invalid"));
+            }
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let attempt_owner = owners
+                .get(attempt_id)
+                .ok_or_else(|| invalid("statistical factor attempt owner is missing"))?;
+            let status_owner = owners
+                .get(status_id)
+                .ok_or_else(|| invalid("statistical factor status owner is missing"))?;
+            let attempt_address = compiled_bytes_part(attempt_owner, *attempt_part, 8, op.device)?;
+            let status_address = compiled_bytes_part(status_owner, *status_part, 16, op.device)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            builder.bind_resident_address(attempt_address, 8, *attempt_binding)?;
+            builder.bind_resident_address(status_address, 16, *status_binding)?;
+            let m_bar =
+                usize::try_from(*m_bar).map_err(|_| invalid("statistical m_bar exceeds usize"))?;
+            let digits =
+                usize::try_from(*digits).map_err(|_| invalid("statistical digits exceed usize"))?;
+            let degree = u32::try_from(*degree)
+                .map_err(|_| invalid("statistical ring dimension exceeds u32"))?;
+            let params =
+                backend.control_parameters_on_device(op.device).map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_factor(
+                builder.launch_stream(),
+                m_bar,
+                digits,
+                GpuStatisticalFactor {
+                    degree,
+                    preimage_sigma: *preimage_sigma,
+                    variance: *variance,
+                    alpha: *alpha,
+                    pivot_floor: *pivot_floor,
+                },
+                GpuStatisticalTrapGenOperands {
+                    precomputation,
+                    precomputation_binding: *precomputation_binding,
+                    auxiliary: (attempt_address, 8),
+                    auxiliary_binding: *attempt_binding,
+                },
+                (status_address, *status_binding),
+            )?;
+            builder.retain_owner(Arc::clone(precomputation_owner));
+            builder.retain_owner(Arc::clone(attempt_owner));
+            builder.retain_owner(Arc::clone(status_owner));
+        }
+        GpuNativePrimitive::StatisticalPerturbation => {
+            let [
+                KernelArg::U32(resource_id),
+                KernelArg::Value(output_id),
+                KernelArg::U32(output_part),
+                KernelArg::Value(seed_id),
+                KernelArg::U32(seed_part),
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::U64(_),
+                KernelArg::F64(p2_sigma),
+                KernelArg::F64(center_scale),
+                KernelArg::F64(rounding),
+                KernelArg::U32(output_binding),
+                KernelArg::U32(seed_binding),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(centers_binding),
+                KernelArg::U32(buffer_binding),
+                KernelArg::U32(p2_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical perturbation has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*output_id] {
+                return Err(invalid("compiled statistical perturbation output is not its tile"));
+            }
+            let output_owner = owners
+                .get(output_id)
+                .ok_or_else(|| invalid("statistical perturbation output owner is missing"))?;
+            let seed_owner = owners
+                .get(seed_id)
+                .ok_or_else(|| invalid("statistical perturbation seed owner is missing"))?;
+            let (output_ty, output, output_bindings) =
+                compiled_raw_matrix_part(output_owner, *output_part, PhysicalEncoding::FullCoeff)?;
+            let seed_address = compiled_bytes_part(seed_owner, *seed_part, 32, op.device)?;
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let (device, workspace) = resources
+                .statistical
+                .get(resource_id)
+                .ok_or_else(|| invalid("statistical perturbation has no prepared workspace"))?;
+            if *device != op.device ||
+                [p2_sigma, center_scale, rounding].iter().any(|value| !value.is_finite())
+            {
+                return Err(invalid("statistical perturbation physical contract is inconsistent"));
+            }
+            bind_raw_matrix_part(builder, *output_binding, &output_bindings)?;
+            builder.bind_resident_address(seed_address, 32, *seed_binding)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            let ranges = workspace.binding_ranges();
+            for ((address, bytes), binding) in
+                ranges.into_iter().zip([centers_binding, buffer_binding, p2_binding])
+            {
+                builder.bind_resident_address(address, bytes, *binding)?;
+            }
+            let params = backend
+                .parameters_on_physical_device(op.device, &output_ty)
+                .map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_perturbation(
+                builder.launch_stream(),
+                &output,
+                seed_address,
+                precomputation,
+                GpuStatisticalPerturbation {
+                    p2_sigma: *p2_sigma,
+                    center_scale: *center_scale,
+                    rounding: *rounding,
+                },
+                workspace,
+                GpuStatisticalBindings {
+                    output_base: *output_binding,
+                    seed: *seed_binding,
+                    precomputation: *precomputation_binding,
+                    centers: *centers_binding,
+                    buffer: *buffer_binding,
+                    p2: *p2_binding,
+                },
+            )?;
+            builder.retain_owner(Arc::clone(output_owner));
+            builder.retain_owner(Arc::clone(seed_owner));
+            builder.retain_owner(Arc::clone(precomputation_owner));
             builder.retain_owner(Arc::clone(workspace));
         }
         GpuNativePrimitive::GqSample => {
@@ -5135,6 +5779,10 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(destination_binding),
                 KernelArg::U32(staging_binding),
                 KernelArg::U32(status_binding),
+                KernelArg::Value(index_id),
+                KernelArg::U32(index_binding),
+                KernelArg::U64(tile_stride),
+                KernelArg::U64(tile_count),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled preimage publication has the wrong arguments"));
@@ -5161,9 +5809,11 @@ pub(crate) fn emit_compiled_gpu_op(
                 .parts
                 .get(*destination_part as usize)
                 .ok_or_else(|| invalid("preimage publication part is absent"))?;
+            // The tile's window starts `origin[1]` columns into its owner.
             let owner_span = destination
                 .rows
                 .checked_mul(destination.storage_columns)
+                .and_then(|count| count.checked_sub(part.view.origin[1]))
                 .and_then(|count| count.checked_mul(u64::from(destination.degree)))
                 .and_then(|count| count.checked_mul(u64::from(destination.magnitude_bytes) + 1))
                 .ok_or_else(|| invalid("preimage publication owner span overflows"))?;
@@ -5173,11 +5823,16 @@ pub(crate) fn emit_compiled_gpu_op(
                 .and_then(|count| count.checked_mul(u64::from(destination.degree)))
                 .and_then(|count| count.checked_mul(u64::from(destination.magnitude_bytes) + 1))
                 .ok_or_else(|| invalid("preimage publication tile length overflows"))?;
-            if *device != op.device ||
+            let last_column = tile_count
+                .checked_sub(1)
+                .and_then(|count| count.checked_mul(*tile_stride))
+                .and_then(|offset| offset.checked_add(part.view.origin[1]))
+                .and_then(|offset| offset.checked_add(destination.columns));
+            if last_column.is_none_or(|end| end > destination.storage_columns) ||
+                *device != op.device ||
                 destination.physical_device != op.device ||
                 destination.bound_domain != 0 ||
                 destination.crt_depth != 1 ||
-                part.view.byte_offset != 0 ||
                 part.view.origin.first() != Some(&0) ||
                 destination
                     .column_offset
@@ -5210,16 +5865,70 @@ pub(crate) fn emit_compiled_gpu_op(
             let params = backend
                 .parameters_on_physical_device(op.device, &destination_ty)
                 .map_err(|error| invalid(&error))?;
+            let index_owner =
+                owners.get(index_id).ok_or_else(|| invalid("preimage tile index is absent"))?;
+            let (tile_index, index_bytes) =
+                compiled_raw_integer_part(index_owner, 0, *index_binding, op.device)?;
+            builder.bind_resident_address(tile_index.address, index_bytes, *index_binding)?;
+            builder.retain_owner(Arc::clone(index_owner));
             params.emit_raw_preimage_publish_accepted(
                 builder.launch_stream(),
                 &destination,
                 plan,
                 status_address,
                 bindings,
+                tile_index,
+                *tile_stride,
+                *tile_count,
             )?;
             builder.retain_owner(Arc::clone(destination_owner));
             builder.retain_owner(Arc::clone(status_owner));
             builder.retain_owner(Arc::clone(plan));
+        }
+        GpuNativePrimitive::PreimageRunFinish => {
+            let [
+                KernelArg::Value(status_id),
+                KernelArg::Value(run_id),
+                KernelArg::U32(status_binding),
+                KernelArg::U32(run_binding),
+                KernelArg::Value(limit_id),
+                KernelArg::U32(limit_binding),
+                KernelArg::U32(maximum),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("invalid preimage run finish arguments"));
+            };
+            if op.outputs.as_ref() != [*run_id] {
+                return Err(invalid("invalid preimage run finish output"));
+            }
+            let status_owner =
+                owners.get(status_id).ok_or_else(|| invalid("missing preimage status"))?;
+            let run_owner =
+                owners.get(run_id).ok_or_else(|| invalid("missing preimage run status"))?;
+            let limit_owner =
+                owners.get(limit_id).ok_or_else(|| invalid("missing preimage retry limit"))?;
+            let limit = compiled_bytes_part(limit_owner, 0, 8, op.device)?;
+            builder.bind_resident_address(limit, 8, *limit_binding)?;
+            builder.retain_owner(Arc::clone(limit_owner));
+            let status = compiled_bytes_part(status_owner, 0, 16, op.device)?;
+            let run = compiled_bytes_part(run_owner, 0, 4, op.device)?;
+            builder.bind_resident_address(status, 16, *status_binding)?;
+            builder.bind_resident_address(run, 4, *run_binding)?;
+            backend
+                .control_parameters_on_device(op.device)
+                .map_err(|e| invalid(&e))?
+                .emit_raw_preimage_run_finish(
+                    builder.launch_stream(),
+                    status,
+                    run,
+                    *status_binding,
+                    *run_binding,
+                    limit,
+                    *maximum,
+                    *limit_binding,
+                )?;
+            builder.retain_owner(Arc::clone(status_owner));
+            builder.retain_owner(Arc::clone(run_owner));
         }
         GpuNativePrimitive::ExportCopy => {
             let [
@@ -5656,7 +6365,8 @@ pub(crate) fn emit_compiled_subgraph_kernel(
                 operands.push(GpuSubgraphOperandView::MatrixFamily {
                     layout,
                     table: table.device_address(),
-                    count: *count as u64,
+                    count: u64::try_from(*count)
+                        .map_err(|_| invalid("subgraph kernel family count exceeds u64"))?,
                 });
             }
             2 | 3 => {
@@ -5779,6 +6489,11 @@ impl RawExportFragment {
     /// Byte offset of `coordinate` within this fragment and the element width
     /// of the view that covers it.
     fn locate(&self, coordinate: &[u64]) -> Result<Option<(u64, u32)>, String> {
+        Ok(self.locate_view(coordinate)?.map(|(offset, view)| (offset, view.element_bytes)))
+    }
+
+    /// Locate the covering view as well as its offset, for bulk reads.
+    fn locate_view(&self, coordinate: &[u64]) -> Result<Option<(u64, &PhysicalView)>, String> {
         'views: for view in &self.views {
             if view.origin.len() != coordinate.len() {
                 continue;
@@ -5800,7 +6515,7 @@ impl RawExportFragment {
             {
                 return Err("raw export element is outside its fragment".into());
             }
-            return Ok(Some((offset, view.element_bytes)));
+            return Ok(Some((offset, view)));
         }
         Ok(None)
     }
@@ -6004,13 +6719,13 @@ pub(crate) fn dense_view(view: &PhysicalView) -> Option<PhysicalView> {
         strides[axis] = stride;
         stride = stride.checked_mul(view.extent[axis])?;
     }
-    Some(PhysicalView {
+    Some(PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
         byte_offset: 0,
         origin: view.origin.clone(),
         extent: view.extent.clone(),
         byte_strides: strides.into_boxed_slice(),
         element_bytes: view.element_bytes,
-    })
+    }))
 }
 
 /// A copy of the elements of a view with `extent` and `strides` into the dense
@@ -6025,13 +6740,13 @@ pub(crate) fn strided_copy(
     if extent.len() > 4 || extent.len() != strides.len() || element_bytes == 0 {
         return Err(invalid("strided copy needs a view of at most four axes"));
     }
-    let view = PhysicalView {
+    let view = PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
         byte_offset: 0,
         origin: vec![0; extent.len()].into_boxed_slice(),
         extent: extent.into(),
         byte_strides: strides.into(),
         element_bytes,
-    };
+    });
     let dense = dense_view(&view).ok_or_else(|| invalid("strided copy size overflows"))?;
     let (source, destination) = match destination_strides {
         None => (strides, dense.byte_strides.as_ref()),
@@ -6148,20 +6863,10 @@ fn raw_matrix_limb<R: Read + Seek + ?Sized>(
     scratch: &mut Vec<u8>,
 ) -> Result<(), String> {
     for fragment in layout.fragments.iter().filter(|fragment| fragment.leaf == leaf) {
-        let Some((offset, width)) = fragment.locate(&[row, column, limb, 0])? else {
+        let Some((offset, view)) = fragment.locate_view(&[row, column, limb, 0])? else {
             continue;
         };
-        let view = fragment
-            .views
-            .iter()
-            .find(|view| {
-                view.origin.len() == 4 &&
-                    (0..3).all(|axis| {
-                        let value = [row, column, limb][axis];
-                        view.origin[axis] <= value && value < view.origin[axis] + view.extent[axis]
-                    })
-            })
-            .ok_or("raw matrix limb has no covering view")?;
+        let width = view.element_bytes;
         let count = residues.len() as u64;
         if !matches!(width, 4 | 8) || view.origin[3] != 0 || view.extent[3] != count {
             return Err("raw matrix limb view does not cover its coefficients".into());
@@ -6376,6 +7081,47 @@ pub(crate) fn zero_artifact_payload(
     }
 }
 
+/// Read a compact coefficient region in canonical axis order with one seek/read
+/// when a single view covers it contiguously. Otherwise leave the byte fallback to the caller.
+fn raw_compact_region<R: Read + Seek + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    coordinate: &[u64],
+    extent: &[u64],
+    output: &mut [u8],
+) -> Result<bool, String> {
+    for fragment in
+        layout.fragments.iter().filter(|fragment| fragment.leaf == RawExportLeaf::Value(0))
+    {
+        let Some((offset, view)) = fragment.locate_view(coordinate)? else {
+            continue;
+        };
+        if view.element_bytes != 1 {
+            continue;
+        }
+        let mut stride = 1;
+        for axis in (0..extent.len()).rev() {
+            if coordinate[axis] + extent[axis] > view.origin[axis] + view.extent[axis] ||
+                (extent[axis] > 1 && view.byte_strides[axis] != stride)
+            {
+                return Ok(false);
+            }
+            stride *= extent[axis];
+        }
+        if offset + output.len() as u64 > fragment.raw_bytes {
+            return Err("raw compact region is outside its fragment".into());
+        }
+        source
+            .seek(SeekFrom::Start(fragment.raw_offset + offset))
+            .map_err(|error| error.to_string())?;
+        source.read_exact(output).map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Stream compact entries with bulk reads of contiguous entries or coefficient
+/// planes, preserving the canonical coefficient/limb/byte order.
 fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
@@ -6399,41 +7145,61 @@ fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         return Err("small matrix raw encoding does not match its bound".into());
     }
     let coefficient_width = magnitude_bytes + 1;
+    let n = matrix.ring.ring_dimension() as usize;
+    let per_limb = bound_domain == mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb;
+    let limbs = if per_limb { matrix.ring.crt_depth() } else { 1 };
+    let mut sink = BufWriter::with_capacity(64 * 1024, sink);
     sink.write_all(&header).map_err(|error| error.to_string())?;
-    let mut output = Vec::with_capacity(64 * 1024);
+    let mut output = vec![0; n * limbs * coefficient_width];
+    let mut plane = Vec::new();
     for row in 0..matrix.rows as u64 {
         for column in 0..matrix.columns as u64 {
-            for coefficient in 0..u64::from(matrix.ring.ring_dimension()) {
-                let limb_count = match bound_domain {
-                    mxx_ir_core::types::CoefficientBoundDomain::Global => 1,
-                    mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb => {
-                        matrix.ring.crt_depth()
+            let mut coordinate = vec![row, column, 0];
+            let mut extent = vec![1, 1, n as u64];
+            if per_limb {
+                coordinate.push(0);
+                extent.push(limbs as u64);
+            }
+            coordinate.push(0);
+            extent.push(coefficient_width as u64);
+            if !raw_compact_region(layout, source, &coordinate, &extent, &mut output)? {
+                plane.resize(n * coefficient_width, 0);
+                if per_limb {
+                    extent[3] = 1;
+                }
+                for limb in 0..limbs {
+                    if per_limb {
+                        coordinate[3] = limb as u64;
                     }
-                };
-                for limb in 0..limb_count as u64 {
-                    for byte in 0..coefficient_width as u64 {
-                        let global = [row, column, coefficient, byte];
-                        let per_limb = [row, column, coefficient, limb, byte];
-                        let coordinate: &[u64] = match bound_domain {
-                            mxx_ir_core::types::CoefficientBoundDomain::Global => &global,
-                            mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb => &per_limb,
-                        };
-                        output.push(raw_export_byte(
-                            layout,
-                            source,
-                            RawExportLeaf::Value(0),
-                            coordinate,
-                        )?);
-                        if output.len() == output.capacity() {
-                            sink.write_all(&output).map_err(|error| error.to_string())?;
-                            output.clear();
+                    coordinate[2] = 0;
+                    *coordinate.last_mut().unwrap() = 0;
+                    if !raw_compact_region(layout, source, &coordinate, &extent, &mut plane)? {
+                        for coefficient in 0..n {
+                            coordinate[2] = coefficient as u64;
+                            for byte in 0..coefficient_width {
+                                *coordinate.last_mut().unwrap() = byte as u64;
+                                plane[coefficient * coefficient_width + byte] = raw_export_byte(
+                                    layout,
+                                    source,
+                                    RawExportLeaf::Value(0),
+                                    &coordinate,
+                                )?;
+                            }
                         }
+                    }
+                    for coefficient in 0..n {
+                        let at = (coefficient * limbs + limb) * coefficient_width;
+                        output[at..at + coefficient_width].copy_from_slice(
+                            &plane[coefficient * coefficient_width..
+                                (coefficient + 1) * coefficient_width],
+                        );
                     }
                 }
             }
+            sink.write_all(&output).map_err(|error| error.to_string())?;
         }
     }
-    sink.write_all(&output).map_err(|error| error.to_string())?;
+    sink.flush().map_err(|error| error.to_string())?;
     u64::try_from(header.len() + payload_len)
         .map_err(|_| "small matrix artifact length overflows u64".into())
 }
@@ -6645,26 +7411,182 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     Ok(written)
 }
 
+/// Stream a compact matrix leaf (per coefficient, a sign byte, 0 for zero, 1 positive, 2
+/// negative, and little-endian magnitude bytes) into the coefficient matrix record that
+/// [`transcode_raw_full_matrix`] writes for the same values, without a CRT reconstruction.
+/// The leaf's entries are decoded once and packed in parallel.
+fn transcode_raw_compact_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    sink: &mut W,
+    matrix: &ConcreteMatrixType,
+    leaf: RawExportLeaf,
+) -> Result<u64, String> {
+    let Some(&PhysicalEncoding::CompactCoeff { magnitude_bytes }) = raw_leaf_encoding(layout, leaf)
+    else {
+        return Err("raw compact matrix export has another encoding".into());
+    };
+    if magnitude_bytes > 8 {
+        return Err("raw compact magnitude exceeds 64 bits".into());
+    }
+    let [fragment] =
+        layout.fragments.iter().filter(|fragment| fragment.leaf == leaf).collect::<Vec<_>>()[..]
+    else {
+        return Err("raw compact matrix export must be one fragment".into());
+    };
+    let mut raw =
+        vec![0u8; usize::try_from(fragment.raw_bytes).map_err(|_| "raw fragment exceeds usize")?];
+    source.seek(SeekFrom::Start(fragment.raw_offset)).map_err(|error| error.to_string())?;
+    source.read_exact(&mut raw).map_err(|error| error.to_string())?;
+    let degree = matrix.ring.ring_dimension() as usize;
+    let width = magnitude_bytes + 1;
+    let modulus =
+        matrix.ring.crt_moduli().iter().fold(BigUint::from(1u8), |value, prime| value * *prime);
+    // The record holds centered coefficients modulo q, `q / 2` positive; a bound beyond 64 bits
+    // admits every magnitude a compact coefficient holds.
+    let half = (&modulus >> 1usize).to_u64();
+    let (rows, columns) = (matrix.rows as u64, matrix.columns as u64);
+    // Every entry's coefficients as a magnitude with the sign in bit 63, and the widest
+    // magnitude's bit count.
+    let entries = (0..rows * columns)
+        .into_par_iter()
+        .map(|index| -> Result<(Vec<u64>, u64), String> {
+            let (row, column) = (index / columns, index % columns);
+            let mut bits = 0u64;
+            let values = (0..degree as u64)
+                .map(|coefficient| {
+                    let (offset, _) = fragment
+                        .locate(&[row, column, coefficient, 0])?
+                        .ok_or("raw compact coefficient lies outside its fragment")?;
+                    let offset = usize::try_from(offset).map_err(|_| "raw offset exceeds usize")?;
+                    let bytes = raw
+                        .get(offset..offset + width)
+                        .ok_or("raw compact coefficient is truncated")?;
+                    let mut word = [0u8; 8];
+                    word[..magnitude_bytes].copy_from_slice(&bytes[1..]);
+                    let magnitude = u64::from_le_bytes(word);
+                    let negative = match (bytes[0], magnitude) {
+                        (0, 0) => false,
+                        (1, m) if m != 0 => false,
+                        (2, m) if m != 0 => true,
+                        _ => return Err("raw compact coefficient is not canonical".into()),
+                    };
+                    if half.is_some_and(|half| magnitude > half || (negative && magnitude == half))
+                    {
+                        return Err("raw compact coefficient exceeds q / 2".into());
+                    }
+                    if magnitude >> 63 != 0 {
+                        return Err("raw compact magnitude exceeds 63 bits".into());
+                    }
+                    bits = bits.max(u64::from(u64::BITS - magnitude.leading_zeros()));
+                    Ok(magnitude | (u64::from(negative) << 63))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((values, bits))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let max_magnitude_bits = entries.iter().map(|(_, bits)| *bits).max().unwrap_or(0);
+    let max_coeff_bits = if max_magnitude_bits == 0 { 0 } else { max_magnitude_bits + 1 };
+    // Each coefficient is shifted into a 64-bit accumulator holding fewer than 8 pending bits.
+    if max_coeff_bits > 56 {
+        return Err("raw compact coefficient width exceeds 56 bits".into());
+    }
+    let max_coeff_bits =
+        u16::try_from(max_coeff_bits).map_err(|_| "coefficient width exceeds u16")?;
+    let bytes_per_coeff = max_coeff_bits.div_ceil(8);
+    let coefficient_count = matrix
+        .rows
+        .checked_mul(matrix.columns)
+        .and_then(|count| count.checked_mul(degree))
+        .ok_or("matrix coefficient count overflows")?;
+    let payload_len = coefficient_count
+        .checked_mul(usize::from(max_coeff_bits))
+        .ok_or("matrix payload bit count overflows")?
+        .div_ceil(8);
+    let level =
+        u32::try_from(matrix.ring.crt_depth() - 1).map_err(|_| "matrix CRT level exceeds u32")?;
+    let header = bincode::encode_to_vec(
+        (1u8, 0u8, level, matrix.rows, matrix.columns, max_coeff_bits, bytes_per_coeff),
+        bincode::config::standard(),
+    )
+    .map_err(|error| error.to_string())?;
+    // The bits of each coefficient, least significant first: the magnitude in
+    // `max_coeff_bits - 1` bits, then the sign. An entry fills whole bytes when its bit count
+    // is a multiple of 8, so the entries pack in parallel; otherwise they pack in order.
+    let bits = u32::from(max_coeff_bits);
+    let pack = |values: &[u64], output: &mut [u8]| {
+        let (mut pending, mut filled, mut position) = (0u64, 0u32, 0usize);
+        for &value in values {
+            let value = (value & !(1 << 63)) | ((value >> 63) << (bits - 1));
+            pending |= value << filled;
+            filled += bits;
+            while filled >= 8 {
+                output[position] = pending as u8;
+                position += 1;
+                pending >>= 8;
+                filled -= 8;
+            }
+        }
+        if filled != 0 {
+            output[position] = pending as u8;
+        }
+    };
+    let mut payload = vec![0u8; payload_len];
+    if bits != 0 {
+        if (degree * bits as usize).is_multiple_of(8) {
+            payload
+                .par_chunks_mut(degree * bits as usize / 8)
+                .zip(entries.par_iter())
+                .for_each(|(output, (values, _))| pack(values, output));
+        } else {
+            let values = entries.into_iter().flat_map(|(values, _)| values).collect::<Vec<_>>();
+            pack(&values, &mut payload);
+        }
+    }
+    let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
+    sink.write_all(&header).map_err(|error| error.to_string())?;
+    let mut written = u64::try_from(header.len()).map_err(|_| "matrix header length overflows")?;
+    written = written
+        .checked_add(write_bincode_length(&mut sink, payload_len)?)
+        .ok_or("matrix artifact length overflows")?;
+    sink.write_all(&payload).map_err(|error| error.to_string())?;
+    written = written
+        .checked_add(u64::try_from(payload_len).map_err(|_| "matrix payload length overflows")?)
+        .ok_or("matrix artifact length overflows")?;
+    sink.flush().map_err(|error| error.to_string())?;
+    Ok(written)
+}
+
+/// Copy `bytes` bytes from `source` to `sink` through one large buffer.
+fn copy_exact<R: Read + ?Sized, W: Write + ?Sized>(
+    source: &mut R,
+    sink: &mut W,
+    mut bytes: u64,
+) -> Result<(), String> {
+    let mut buffer = vec![0u8; (bytes.min(64 << 20)) as usize];
+    while bytes > 0 {
+        let chunk = bytes.min(buffer.len() as u64) as usize;
+        source.read_exact(&mut buffer[..chunk]).map_err(|error| error.to_string())?;
+        sink.write_all(&buffer[..chunk]).map_err(|error| error.to_string())?;
+        bytes -= chunk as u64;
+    }
+    Ok(())
+}
+
+/// Stream a trapdoor into its artifact: the public matrix and the tagged secret encoding of
+/// `DCRTTrapdoor::to_compact_bytes`, one component (a leaf) at a time.
 fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
     sink: &mut W,
     public_matrix: &ConcreteMatrixType,
     digit_count: usize,
+    instantiation: mxx_ir_core::types::TrapdoorInstantiation,
 ) -> Result<u64, String> {
     let public = layout.public.as_ref().ok_or("trapdoor export has no public value")?;
     if public.ty != ConcreteWireType::Matrix(public_matrix.clone()) {
         return Err("trapdoor public value has the wrong matrix type".into());
     }
-    let secret_columns = public_matrix
-        .rows
-        .checked_mul(digit_count)
-        .ok_or("trapdoor secret column count overflows")?;
-    let secret_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows,
-        columns: secret_columns,
-    };
     let mut public_file = tempfile::tempfile().map_err(|error| error.to_string())?;
     let public_len = transcode_raw_eval_matrix(
         layout,
@@ -6673,49 +7595,91 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         public_matrix,
         RawExportLeaf::TrapdoorPublic,
     )?;
-    let square_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows,
-        columns: public_matrix.rows,
-    };
-    let stacked_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows.checked_mul(2).ok_or("trapdoor stacked row count overflows")?,
-        columns: secret_columns,
-    };
-    let secret_shapes = [
-        &secret_matrix,
-        &secret_matrix,
-        &square_matrix,
-        &square_matrix,
-        &square_matrix,
-        &stacked_matrix,
-    ];
-    let mut secret_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-    let mut secret_len = 0u64;
-    for (leaf, shape) in secret_shapes.into_iter().enumerate() {
+    let secret_shapes = crate::sampler::trapdoor::trapdoor_component_shapes(
+        public_matrix.rows,
+        digit_count,
+        instantiation,
+    )
+    .ok_or("trapdoor export has an invalid instantiation")?
+    .into_iter()
+    .map(|(rows, columns)| ConcreteMatrixType { ring: public_matrix.ring.clone(), rows, columns })
+    .collect::<Vec<_>>();
+    // Each component is transcoded into its own file; the precomputation, the bulk of a
+    // statistical trapdoor, is copied straight from the raw file into the sink once every length
+    // before it is known.
+    let mut parts = Vec::with_capacity(secret_shapes.len());
+    for (leaf, shape) in secret_shapes.iter().enumerate() {
         let mut part_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-        let part_len = transcode_raw_full_matrix(
-            layout,
-            source,
-            &mut part_file,
-            shape,
-            RawExportLeaf::Value(leaf as u32),
-        )?;
-        secret_file.write_all(&part_len.to_le_bytes()).map_err(|error| error.to_string())?;
-        part_file.rewind().map_err(|error| error.to_string())?;
-        std::io::copy(&mut part_file, &mut secret_file).map_err(|error| error.to_string())?;
-        secret_len = secret_len
-            .checked_add(8)
-            .and_then(|length| length.checked_add(part_len))
-            .ok_or("trapdoor secret payload length overflows")?;
+        let leaf = RawExportLeaf::Value(leaf as u32);
+        // A statistical trapdoor holds its row chunks of `T` compactly.
+        let part_len = if matches!(
+            raw_leaf_encoding(layout, leaf),
+            Some(PhysicalEncoding::CompactCoeff { .. })
+        ) {
+            transcode_raw_compact_matrix(layout, source, &mut part_file, shape, leaf)?
+        } else {
+            transcode_raw_full_matrix(layout, source, &mut part_file, shape, leaf)?
+        };
+        parts.push((part_file, part_len));
     }
+    // A statistical trapdoor's last leaf is its precomputation, a dense byte range.
+    let precomputation = match instantiation {
+        mxx_ir_core::types::TrapdoorInstantiation::Statistical { m_bar } => {
+            let bytes = crate::sampler::trapdoor::statistical::precomputation_bytes(
+                public_matrix.ring.ring_dimension() as usize,
+                m_bar,
+                digit_count,
+            )
+            .ok_or("trapdoor precomputation length overflows")? as u64;
+            let leaf = RawExportLeaf::Value(secret_shapes.len() as u32);
+            let [fragment] = layout
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.leaf == leaf)
+                .collect::<Vec<_>>()[..]
+            else {
+                return Err("trapdoor precomputation export must be one fragment".into());
+            };
+            if fragment.raw_bytes != bytes {
+                return Err("trapdoor precomputation export has the wrong length".into());
+            }
+            Some((fragment.raw_offset, bytes))
+        }
+        _ => None,
+    };
+    let secret_len = parts
+        .iter()
+        .try_fold(crate::sampler::trapdoor::TAGGED_MAGIC.len() as u64 + 1, |length, (_, part)| {
+            length.checked_add(8)?.checked_add(*part)
+        })
+        .and_then(|length| match precomputation {
+            Some((_, bytes)) => length.checked_add(8)?.checked_add(bytes),
+            None => Some(length),
+        })
+        .ok_or("trapdoor secret payload length overflows")?;
     sink.write_all(&public_len.to_le_bytes()).map_err(|error| error.to_string())?;
     public_file.rewind().map_err(|error| error.to_string())?;
-    std::io::copy(&mut public_file, sink).map_err(|error| error.to_string())?;
+    copy_exact(&mut public_file, sink, public_len)?;
     sink.write_all(&secret_len.to_le_bytes()).map_err(|error| error.to_string())?;
-    secret_file.rewind().map_err(|error| error.to_string())?;
-    std::io::copy(&mut secret_file, sink).map_err(|error| error.to_string())?;
+    sink.write_all(&crate::sampler::trapdoor::TAGGED_MAGIC).map_err(|error| error.to_string())?;
+    sink.write_all(&[if instantiation.is_computational() {
+        crate::sampler::trapdoor::TAG_COMPUTATIONAL
+    } else {
+        crate::sampler::trapdoor::TAG_STATISTICAL
+    }])
+    .map_err(|error| error.to_string())?;
+    for (mut part_file, part_len) in parts {
+        sink.write_all(&part_len.to_le_bytes()).map_err(|error| error.to_string())?;
+        part_file.rewind().map_err(|error| error.to_string())?;
+        copy_exact(&mut part_file, sink, part_len)?;
+    }
+    if let Some((offset, bytes)) = precomputation {
+        source.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+        sink.write_all(&bytes.to_le_bytes()).map_err(|error| error.to_string())?;
+        copy_exact(source, sink, bytes).map_err(|error| {
+            format!("trapdoor precomputation export is truncated or unwritable: {error}")
+        })?;
+    }
     16u64
         .checked_add(public_len)
         .and_then(|n| n.checked_add(secret_len))
@@ -6763,8 +7727,8 @@ pub(crate) fn transcode_raw_artifact<R: Read + Seek + ?Sized, W: Write + ?Sized>
             transcode_raw_bytes(layout, source, sink, *length as u64)
         }
         ConcreteWireType::TypedBlob { .. } => transcode_raw_typed_blob(layout, source, sink),
-        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
-            transcode_raw_trapdoor(layout, source, sink, matrix, *digit_count)
+        ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
+            transcode_raw_trapdoor(layout, source, sink, matrix, *digit_count, *instantiation)
         }
         _ => Err("raw artifact transcode does not support this wire type yet".into()),
     }
@@ -6905,7 +7869,7 @@ impl GpuDcrtBackend {
                 leaf: 0,
                 storage: slot,
                 device,
-                view: PhysicalView {
+                view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: limb.byte_offset as u64,
                     origin: Box::new([0, 0, index as u64, 0]),
                     extent: Box::new([
@@ -6921,15 +7885,15 @@ impl GpuDcrtBackend {
                         limb.coefficient_bytes as u64,
                     ]),
                     element_bytes: limb.coefficient_bytes as u32,
-                },
+                }),
             });
         }
-        let physical = Arc::new(PhysicalValue {
+        let physical = Arc::new(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty: ConcreteWireType::Matrix(matrix.clone()),
             encodings: Box::new([encoding]),
             parts: parts.into_boxed_slice(),
             integer_ranges: BTreeMap::new(),
-        });
+        }));
         let resident = Arc::new(
             GpuResidentValue::new(physical, storage, Box::new([])).map_err(str::to_owned)?,
         );
@@ -7154,6 +8118,199 @@ mod tests {
     use super::*;
     use mxx_ir_core::ParamEnv;
 
+    fn compact_export_fixture(
+        per_limb: bool,
+        layout_kind: usize,
+        n: u32,
+        rows: usize,
+    ) -> (PhysicalExport, ConcreteMatrixType, Vec<u8>) {
+        use mxx_ir_core::types::CoefficientBoundDomain;
+        let ring = mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
+            crt_moduli: vec![
+                mxx_ir_core::IntExpr::constant(65537),
+                mxx_ir_core::IntExpr::constant(786433),
+            ],
+            ring_dimension: n,
+        })
+        .resolve(&ParamEnv::default())
+        .unwrap();
+        let matrix = ConcreteMatrixType { ring, rows, columns: 2 };
+        let limbs = if per_limb { 2 } else { 1 };
+        let width = 3;
+        let step = if layout_kind == 2 { 2 } else { 1 };
+        let entry = n as u64 * limbs * width * step;
+        let mut fragments = Vec::new();
+        // Separate row fragments, nonzero file and view offsets, and two views per fragment.
+        for row in 0..rows as u64 {
+            let mut views = Vec::new();
+            for column in 0..2 {
+                let mut origin = vec![row, column, 0];
+                let mut extent = vec![1, 1, n as u64];
+                let mut strides = vec![
+                    2 * entry,
+                    entry,
+                    if per_limb && layout_kind != 1 { limbs * width * step } else { width * step },
+                ];
+                if per_limb {
+                    origin.push(0);
+                    extent.push(limbs);
+                    strides.push(if layout_kind == 1 { n as u64 * width } else { width * step });
+                }
+                origin.push(0);
+                extent.push(width);
+                strides.push(step);
+                views.push(PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
+                    byte_offset: 7 + column * entry,
+                    origin: origin.into(),
+                    extent: extent.into(),
+                    byte_strides: strides.into(),
+                    element_bytes: 1,
+                }));
+            }
+            if layout_kind == 3 {
+                views = views
+                    .into_iter()
+                    .flat_map(|mut first| {
+                        first.extent[2] = u64::from(n) / 2;
+                        let mut second = first.clone();
+                        second.origin[2] = first.extent[2];
+                        second.byte_offset += first.extent[2] * first.byte_strides[2];
+                        [first, second]
+                    })
+                    .collect();
+            }
+            fragments.push(RawExportFragment {
+                leaf: RawExportLeaf::Value(0),
+                part: row as u32,
+                raw_offset: row * (7 + 2 * entry),
+                raw_bytes: 7 + 2 * entry,
+                views: views.into(),
+            });
+        }
+        let total = rows as u64 * (7 + 2 * entry);
+        let mut raw = vec![0; total as usize];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut raw);
+        let domain = if per_limb {
+            CoefficientBoundDomain::PerCrtLimb
+        } else {
+            CoefficientBoundDomain::Global
+        };
+        let layout = PhysicalExport {
+            physical: Arc::new(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
+                ty: ConcreteWireType::SmallMatrix {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: BigInt::from(65535),
+                    bound_domain: domain,
+                },
+                encodings: vec![if per_limb {
+                    PhysicalEncoding::CompactCoeffPerCrtLimb { magnitude_bytes: 2 }
+                } else {
+                    PhysicalEncoding::CompactCoeff { magnitude_bytes: 2 }
+                }]
+                .into(),
+                parts: Box::new([]),
+                integer_ranges: BTreeMap::new(),
+            })),
+            public: None,
+            fragments: fragments.into(),
+            raw_total_bytes: total,
+        };
+        (layout, matrix, raw)
+    }
+
+    #[test]
+    fn raw_small_matrix_bulk_matches_byte_reads() {
+        use mxx_ir_core::types::CoefficientBoundDomain;
+        struct CountReads {
+            source: std::io::Cursor<Vec<u8>>,
+            reads: usize,
+            seeks: usize,
+        }
+        impl Read for CountReads {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.source.read(bytes)
+            }
+        }
+        impl Seek for CountReads {
+            fn seek(&mut self, at: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.source.seek(at)
+            }
+        }
+        for per_limb in [false, true] {
+            for kind in 0..4 {
+                let (mut layout, matrix, raw) = compact_export_fixture(per_limb, kind, 8, 2);
+                let domain = if per_limb {
+                    CoefficientBoundDomain::PerCrtLimb
+                } else {
+                    CoefficientBoundDomain::Global
+                };
+                let limbs = if per_limb { 2 } else { 1 };
+                for tag in [0, 1] {
+                    let (mut expected, _, _) =
+                        small_matrix_header(&matrix, &BigInt::from(65535), domain, tag).unwrap();
+                    let mut source = std::io::Cursor::new(raw.clone());
+                    for row in 0..2 {
+                        for column in 0..2 {
+                            for coefficient in 0..8 {
+                                for limb in 0..limbs {
+                                    for byte in 0..3 {
+                                        let mut coordinate = vec![row, column, coefficient];
+                                        if per_limb {
+                                            coordinate.push(limb);
+                                        }
+                                        coordinate.push(byte);
+                                        expected.push(
+                                            raw_export_byte(
+                                                &layout,
+                                                &mut source,
+                                                RawExportLeaf::Value(0),
+                                                &coordinate,
+                                            )
+                                            .unwrap(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut source = CountReads {
+                        source: std::io::Cursor::new(raw.clone()),
+                        reads: 0,
+                        seeks: 0,
+                    };
+                    let mut actual = Vec::new();
+                    Arc::make_mut(&mut layout.physical).ty = if tag == 0 {
+                        ConcreteWireType::SmallMatrix {
+                            matrix: matrix.clone(),
+                            max_coefficient_bound: BigInt::from(65535),
+                            bound_domain: domain,
+                        }
+                    } else {
+                        ConcreteWireType::Preimage {
+                            matrix: matrix.clone(),
+                            max_coefficient_bound: BigInt::from(65535),
+                            bound_domain: domain,
+                        }
+                    };
+                    let length = transcode_raw_artifact(&layout, &mut source, &mut actual).unwrap();
+                    assert_eq!(actual, expected);
+                    assert_eq!(length as usize, expected.len());
+                    let calls = if kind >= 2 {
+                        4 * 8 * limbs as usize * 3
+                    } else if kind == 1 {
+                        4 * limbs as usize
+                    } else {
+                        4
+                    };
+                    assert_eq!(source.reads, calls);
+                    assert_eq!(source.seeks, calls);
+                }
+            }
+        }
+    }
+
     #[test]
     fn raw_matrix_view_uses_each_limb_part_layout() {
         let ring = mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
@@ -7182,23 +8339,23 @@ mod tests {
                     leaf: 0,
                     storage: slot,
                     device: 0,
-                    view: PhysicalView {
+                    view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                         byte_offset: 0,
                         origin: Box::new([0, 0, index as u64, 0]),
                         extent: Box::new([1, 1, 1, 8]),
                         byte_strides: Box::new([128, 128, 0, width as u64]),
                         element_bytes: width,
-                    },
+                    }),
                 }
             })
             .collect::<Vec<_>>();
         let resident = GpuResidentValue::new(
-            Arc::new(PhysicalValue {
+            Arc::new(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
                 ty: ConcreteWireType::Matrix(matrix),
                 encodings: Box::new([PhysicalEncoding::FullCoeff]),
                 parts: parts.into_boxed_slice(),
                 integer_ranges: BTreeMap::new(),
-            }),
+            })),
             storage,
             Box::new([]),
         )
@@ -7250,12 +8407,12 @@ mod tests {
         raw_total_bytes: u64,
     ) -> PhysicalExport {
         PhysicalExport {
-            physical: Arc::new(PhysicalValue {
+            physical: Arc::new(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
                 ty: ConcreteWireType::Matrix(ty),
                 encodings: Box::new([PhysicalEncoding::FullEval]),
                 parts: Box::new([]),
                 integer_ranges: BTreeMap::new(),
-            }),
+            })),
             public: None,
             fragments: fragments.into_boxed_slice(),
             raw_total_bytes,
@@ -7273,13 +8430,13 @@ mod tests {
                 part: 0,
                 raw_offset: 0,
                 raw_bytes: 64,
-                views: Box::new([PhysicalView {
+                views: Box::new([PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 0,
                     origin: Box::new([0, 0, 0, 0]),
                     extent: Box::new([1, 1, 1, 8]),
                     byte_strides: Box::new([64, 64, 64, 8]),
                     element_bytes: 8,
-                }]),
+                })]),
             }],
             64,
         );
@@ -7310,13 +8467,13 @@ mod tests {
                 part: limb as u32,
                 raw_offset,
                 raw_bytes: poly_stride + 8 * width,
-                views: Box::new([PhysicalView {
+                views: Box::new([PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 0,
                     origin: Box::new([0, 0, limb as u64, 0]),
                     extent: Box::new([1, 2, 1, 8]),
                     byte_strides: Box::new([2 * poly_stride, poly_stride, 8 * width, width]),
                     element_bytes: width as u32,
-                }]),
+                })]),
             })
             .collect::<Vec<_>>();
         let total = fragments.iter().map(|fragment| fragment.raw_bytes).sum::<u64>() as usize;
@@ -7355,21 +8512,21 @@ mod tests {
                 leaf: 0,
                 storage: StorageRef::Input(0),
                 device: 0,
-                view: PhysicalView {
+                view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 16 + limb * limb_stride,
                     origin: Box::new([0, 0, limb, 0]),
                     extent: Box::new([2, 3, 1, 8]),
                     byte_strides: Box::new([row_stride, poly_stride, 0, 8]),
                     element_bytes: 8,
-                },
+                }),
             })
             .collect::<Vec<_>>();
-        let physical = Arc::new(PhysicalValue {
+        let physical = Arc::new(PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty: ConcreteWireType::Matrix(ty),
             encodings: Box::new([PhysicalEncoding::FullEval]),
             parts: parts.into_boxed_slice(),
             integer_ranges: BTreeMap::new(),
-        });
+        }));
         let dense = PhysicalExport::from_parts(Arc::clone(&physical), &[0, 1, 2]).expect("dense");
         assert_eq!(dense.fragments.len(), 3);
         assert_eq!(dense.raw_total_bytes, 3 * 6 * 8 * 8, "each limb holds only its own residues");

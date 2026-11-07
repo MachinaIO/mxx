@@ -295,6 +295,50 @@ noncomputable def centeredRebaseRuns {q p n rows columns : Nat}
     (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
   1 < p ∧ output = centeredRebase input
 
+/-- Divide centered coefficients by a positive integer, rounding ties toward positive
+infinity as in the native centered-round-divide primitive. The ring and shape are preserved. -/
+noncomputable def centeredRoundDivide {q n rows columns : Nat} (divisor : Int)
+    (input : ExactMatrix q n rows columns) : ExactMatrix q n rows columns :=
+  fun row column ↦ polynomialOfCoefficients fun i ↦
+    let u := ((input row column).coeff i).val
+    let centered := if u ≤ q / 2 then Int.ofNat u else Int.ofNat u - Int.ofNat q
+    (centered + divisor / 2) / divisor
+
+noncomputable def centeredRoundDivideRuns {q n rows columns : Nat} (divisor : Int)
+    (input output : ExactMatrix q n rows columns) : Prop :=
+  1 < q ∧ 0 < divisor ∧ output = centeredRoundDivide divisor input
+
+/-- The exported relation fixes every output coefficient, including negative inputs and ties. -/
+theorem centeredRoundDivideRuns_coeff {q n rows columns : Nat} {divisor : Int}
+    {input output : ExactMatrix q n rows columns} (hn : 0 < n)
+    (runs : centeredRoundDivideRuns divisor input output)
+    (row : Fin rows) (column : Fin columns) (i : Fin n) :
+    (output row column).coeff i =
+      (((if ((input row column).coeff i).val ≤ q / 2
+          then Int.ofNat ((input row column).coeff i).val
+          else Int.ofNat ((input row column).coeff i).val - Int.ofNat q) + divisor / 2) /
+        divisor : Int) := by
+  rcases runs with ⟨hq, _, rfl⟩
+  exact polynomialOfCoefficients_coeff hq hn _ i
+
+/-- Rounding a centered integer incurs at most half a divisor of scaled error. -/
+theorem centeredRoundDivide_scaled_error (value divisor : Int) (hd : 0 < divisor) :
+    -divisor ≤ 2 * (divisor * ((value + divisor / 2) / divisor) - value) ∧
+    2 * (divisor * ((value + divisor / 2) / divisor) - value) ≤ divisor := by
+  have hr0 := Int.emod_nonneg (value + divisor / 2) (ne_of_gt hd)
+  have hrlt := Int.emod_lt_of_pos (value + divisor / 2) hd
+  have hsplit := Int.mul_ediv_add_emod (value + divisor / 2) divisor
+  have hhalf := Int.mul_ediv_add_emod divisor 2
+  have hh0 := Int.emod_nonneg divisor (by decide : (2 : Int) ≠ 0)
+  have hhlt := Int.emod_lt_of_pos divisor (by decide : (0 : Int) < 2)
+  omega
+
+-- Native rounding uses ties toward positive infinity, also for negative coefficients.
+example : ((-3 : Int) + 2 / 2) / 2 = -1 := by norm_num
+example : ((3 : Int) + 2 / 2) / 2 = 2 := by norm_num
+example : ((-5 : Int) + 3 / 2) / 3 = -2 := by norm_num
+example : ((5 : Int) + 3 / 2) / 3 = 2 := by norm_num
+
 /-- Compact rebase preserves the coefficient bound, not a preimage relation
 at the destination modulus. The output is an ordinary bounded matrix. -/
 noncomputable def compactCenteredRebaseRuns {q p n rows columns : Nat}
@@ -427,6 +471,17 @@ noncomputable def rotationPolynomial {q n : Nat} (exponent : Int) : ExactMatrix 
 
 noncomputable def liftInteger {q n : Nat} (value : Int) : ExactMatrix q n 1 1 :=
   fun _ _ ↦ (value : ExactPoly q n)
+
+/-- Repeated diagonal blocks, with zero entries between distinct blocks. -/
+def blockDiagonalRuns {q n rows columns : Nat} (count : Nat)
+    (input : ExactMatrix q n rows columns)
+    (output : ExactMatrix q n (rows * count) (columns * count)) : Prop :=
+  0 < count ∧ ∀ (blockRow blockColumn : Fin count) (row : Fin rows) (column : Fin columns),
+    output ⟨blockRow.val * rows + row.val, by
+      have := blockRow.isLt; have := row.isLt; nlinarith⟩
+      ⟨blockColumn.val * columns + column.val, by
+        have := blockColumn.isLt; have := column.isLt; nlinarith⟩ =
+      if blockRow = blockColumn then input row column else 0
 
 /-- Tensor layout uses left indices as the outer blocks, matching the runtime. -/
 def tensorRuns {q n r₁ r₂ c₁ c₂ : Nat}

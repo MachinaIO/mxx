@@ -68,7 +68,7 @@ impl ParamConstraint {
                 int_contains_loop_index(left) || int_contains_loop_index(right)
             }
             Self::RealPositive { value, .. } | Self::RealNonnegative { value, .. } => {
-                real_contains_loop_index(value)
+                value.contains_loop_index()
             }
         }
     }
@@ -224,6 +224,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RnsModDown { .. } |
                 NodeKind::Transpose |
                 NodeKind::Tensor |
+                NodeKind::BlockDiagonal { .. } |
+                NodeKind::Sha256BitColumns { .. } |
                 NodeKind::UniformResidueSample { .. } |
                 NodeKind::HashSample { .. } |
                 NodeKind::CrtRecompose { .. } |
@@ -360,19 +362,5 @@ fn int_contains_loop_index(value: &IntExpr) -> bool {
             ring.expression().contains_loop_index() || int_contains_loop_index(index)
         }
         IntExpr::Const(_) | IntExpr::Var(_) => false,
-    }
-}
-
-fn real_contains_loop_index(value: &RealExpr) -> bool {
-    match value {
-        RealExpr::FromInt(value) => int_contains_loop_index(value),
-        RealExpr::Add(left, right) |
-        RealExpr::Sub(left, right) |
-        RealExpr::Mul(left, right) |
-        RealExpr::Div(left, right) => {
-            real_contains_loop_index(left) || real_contains_loop_index(right)
-        }
-        RealExpr::Sqrt(value) => real_contains_loop_index(value),
-        RealExpr::Rational(_) | RealExpr::Var(_) => false,
     }
 }

@@ -84,8 +84,10 @@ namespace
         uint8_t *destination, const uint8_t *staging,
         const MxxPreimageStatus *status, size_t byte_count,
         size_t columns, size_t storage_columns, size_t column_offset,
-        size_t degree, size_t cell_width)
+        size_t degree, size_t cell_width, const uint64_t *tile_index,
+        size_t tile_stride)
     {
+        column_offset += static_cast<size_t>(*tile_index) * tile_stride;
         if (status->accepted != 1U ||
             status->error_code != MXX_PREIMAGE_SUCCESS) return;
         const size_t step = static_cast<size_t>(gridDim.x) * blockDim.x;
@@ -121,6 +123,8 @@ struct GpuRawPreimageCutoffPlan
     uint64_t *modulus_words = nullptr;
     uint64_t *half_words = nullptr;
     uint64_t *bound_words = nullptr;
+    // Set when a Graph submission could not be ordered before the frees.
+    bool release_blocked = false;
 };
 
 extern "C" int gpu_raw_preimage_cutoff_metadata_ranges(
@@ -152,6 +156,13 @@ extern "C" int gpu_raw_preimage_cutoff_metadata_ranges(
 extern "C" void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan)
 {
     if (!plan) return;
+    if (plan->release_blocked)
+    {
+        // A Graph may still read the metadata: keep it.
+        if (plan->upload_ready) matrix_report_cleanup_error(gpuEventDestroy(plan->upload_ready));
+        delete plan;
+        return;
+    }
     matrix_report_cleanup_error(mxx_set_device(plan->physical_device));
     if (plan->moduli) matrix_report_cleanup_error(gpuFreeAsync(plan->moduli, plan->stream));
     if (plan->garner_inverses) matrix_report_cleanup_error(gpuFreeAsync(plan->garner_inverses, plan->stream));
@@ -161,6 +172,29 @@ extern "C" void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan)
     if (plan->bound_words) matrix_report_cleanup_error(gpuFreeAsync(plan->bound_words, plan->stream));
     if (plan->upload_ready) matrix_report_cleanup_error(gpuEventDestroy(plan->upload_ready));
     delete plan;
+}
+
+// Order the plan's frees, queued on its stream, after one compiled-Graph
+// submission that reads its metadata.
+extern "C" int gpu_raw_preimage_cutoff_protect_compiled_submission(
+    GpuRawPreimageCutoffPlan *plan, int physical_device, void *completion_event)
+{
+    if (!plan || !completion_event)
+        return set_error("invalid raw preimage cutoff protection arguments");
+    if (physical_device != plan->physical_device)
+    {
+        plan->release_blocked = true;
+        return set_error("raw preimage cutoff protection device mismatch");
+    }
+    gpuError_t error = mxx_set_device(physical_device);
+    if (error == gpuSuccess)
+        error = gpuStreamWaitEvent(plan->stream, reinterpret_cast<gpuEvent_t>(completion_event), 0);
+    if (error != gpuSuccess)
+    {
+        plan->release_blocked = true;
+        return set_error(error);
+    }
+    return 0;
 }
 
 extern "C" int gpu_raw_preimage_cutoff_plan_wait(
@@ -621,9 +655,12 @@ extern "C" int gpu_raw_preimage_publish_accepted(
     const void *staging, size_t staging_bytes,
     const MxxPreimageStatus *status,
     uint32_t destination_binding, uint32_t staging_binding,
-    uint32_t status_binding)
+    uint32_t status_binding, const uint64_t *tile_index,
+    uint64_t tile_stride, uint64_t tile_count, uint32_t index_binding)
 {
-    if (!ctx || !stream_raw || !destination || !plan || plan->ctx != ctx ||
+    if (!tile_index || !tile_count || !tile_stride ||
+        (tile_count - 1) > UINT64_MAX / tile_stride ||
+        !ctx || !stream_raw || !destination || !plan || plan->ctx != ctx ||
         destination->physical_device != plan->physical_device ||
         !destination->payload_address || !destination->rows ||
         !destination->columns || !destination->degree ||
@@ -634,6 +671,9 @@ extern "C" int gpu_raw_preimage_publish_accepted(
         destination->bound_domain != 0 || destination->crt_depth != 1 ||
         !staging || !status)
         return set_error("invalid raw preimage accepted-output view");
+    const uint64_t final_offset = (tile_count - 1) * tile_stride;
+    if (final_offset > destination->storage_columns - destination->columns - destination->column_offset)
+        return set_error("affine preimage publication exceeds its owner");
     size_t count = 0;
     if (!raw_preimage_coefficient_count(
             destination->rows, destination->columns, destination->degree, &count))
@@ -656,6 +696,7 @@ extern "C" int gpu_raw_preimage_publish_accepted(
         raw_preimage_patch(0, 0, destination_binding),
         raw_preimage_patch(1, 0, staging_binding),
         raw_preimage_patch(2, 0, status_binding),
+        raw_preimage_patch(9, 0, index_binding),
     };
     return mxx_gpu_launch_kernel(ctx,
         reinterpret_cast<gpuStream_t>(stream_raw),
@@ -667,5 +708,35 @@ extern "C" int gpu_raw_preimage_publish_accepted(
         static_cast<size_t>(destination->columns),
         static_cast<size_t>(destination->storage_columns),
         static_cast<size_t>(destination->column_offset),
-        static_cast<size_t>(destination->degree), cell_width);
+        static_cast<size_t>(destination->degree), cell_width, tile_index,
+        static_cast<size_t>(tile_stride));
+}
+
+namespace {
+__global__ void raw_preimage_run_finish_kernel(
+    const MxxPreimageStatus *status, uint32_t *run_status, const uint64_t *retry_limit, uint32_t maximum)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        // Planning caps the retry limit to one attempt. Such probes measure the
+        // complete tile template even if that single candidate misses its cutoff.
+        *run_status = *retry_limit < maximum ||
+            (status->accepted == 1U && status->error_code == MXX_PREIMAGE_SUCCESS) ? 0U : 1U;
+}
+}
+
+extern "C" int gpu_raw_preimage_run_finish(GpuContext *ctx, void *stream_raw,
+    const MxxPreimageStatus *status, uint32_t *run_status,
+    uint32_t status_binding, uint32_t run_binding, const uint64_t *retry_limit,
+    uint32_t maximum, uint32_t limit_binding)
+{
+    if (!ctx || !stream_raw || !status || !run_status || !retry_limit || !maximum)
+        return set_error("invalid affine preimage run status");
+    const MxxGraphPatch patches[] = {
+        raw_preimage_patch(0, 0, status_binding),
+        raw_preimage_patch(1, 0, run_binding),
+        raw_preimage_patch(2, 0, limit_binding),
+    };
+    return mxx_gpu_launch_kernel(ctx, reinterpret_cast<gpuStream_t>(stream_raw),
+        raw_preimage_run_finish_kernel, dim3(1), dim3(1), 0,
+        patches, std::size(patches), status, run_status, retry_limit, maximum);
 }

@@ -718,12 +718,13 @@ impl ExecutionResult {
             let count = lease.descriptor.family_count.ok_or_else(|| {
                 ExecutionError::Manifest("staged family lease has no cardinality".to_owned())
             })?;
+            let count = addressable_family_count(count)?;
             for index in 0..count {
                 store
                     .remove_staged(&ArtifactKey {
                         production: lease.production.clone(),
                         name: lease.name.clone(),
-                        index: Some(index),
+                        index: Some((index) as u128),
                     })
                     .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
             }
@@ -735,15 +736,20 @@ impl ExecutionResult {
 
 pub type ExecutionTrace = BTreeMap<WireId, RuntimeValue>;
 
-type TrapdoorParts = (
-    Option<Arc<crate::sampler::trapdoor::DCRTTrapdoor>>,
-    Arc<crate::matrix::dcrt_poly::DCRTPolyMatrix>,
-    ConcreteMatrixType,
-    f64,
-    BigInt,
-    usize,
-    Option<bool>,
-);
+/// A trapdoor operand: its secret (absent for a public gadget trapdoor), public matrix, and the
+/// sampler parameters of its wire type.
+struct TrapdoorParts {
+    secret: Option<Arc<crate::sampler::trapdoor::DCRTTrapdoor>>,
+    public: Arc<crate::matrix::dcrt_poly::DCRTPolyMatrix>,
+    sigma: f64,
+    gadget_base: BigInt,
+    digit_count: usize,
+    instantiation: mxx_ir_core::types::TrapdoorInstantiation,
+    /// The requested preimage width; `None` for the trapdoor's minimum.
+    preimage_sigma: Option<mxx_ir_core::Rational>,
+    /// `Some(small)` for a public gadget trapdoor, whose preimage is a gadget decomposition.
+    gadget_small: Option<bool>,
+}
 
 struct InstanceResult {
     outputs: Vec<RuntimeValue>,
@@ -1225,11 +1231,12 @@ impl<S: SessionStore> Executor<'_, S> {
                         "output {name} staged descriptor does not match validated metadata"
                     )));
                 }
+                let count = addressable_family_count(count)?;
                 for index in 0..count {
                     let staged_key = ArtifactKey {
                         production: staged_production.clone(),
                         name: staged_name.clone(),
-                        index: Some(index),
+                        index: Some((index) as u128),
                     };
                     let payload = self
                         .artifact_store
@@ -1239,7 +1246,7 @@ impl<S: SessionStore> Executor<'_, S> {
                         key: ArtifactKey {
                             production: production.clone(),
                             name: name.clone(),
-                            index: Some(index),
+                            index: Some((index) as u128),
                         },
                         artifact_type: artifact_type.clone(),
                         availability,
@@ -1280,7 +1287,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 continue;
             }
             if let RuntimeValue::IndexedFamily { values: members, .. } = output {
-                if family_count != Some(members.len()) {
+                if family_count != Some(members.len() as u128) {
                     return Err(ExecutionError::Manifest(format!(
                         "output {name} family count does not match validated metadata"
                     )));
@@ -1291,7 +1298,7 @@ impl<S: SessionStore> Executor<'_, S> {
                         key: ArtifactKey {
                             production: production.clone(),
                             name: name.clone(),
-                            index: Some(index),
+                            index: Some((index) as u128),
                         },
                         artifact_type: artifact_type.clone(),
                         availability,
@@ -1388,7 +1395,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     .remove_staged(&ArtifactKey {
                         production: staged_production.clone(),
                         name: staged_name.clone(),
-                        index: Some(index),
+                        index: Some((index) as u128),
                     })
                     .map_err(Self::artifact_error)?;
             }
@@ -1455,7 +1462,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 )));
             }
             let indices: Box<dyn Iterator<Item = Option<usize>>> = match family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+                Some(count) => Box::new((0..addressable_family_count(count)?).map(Some)),
                 None => Box::new(std::iter::once(None)),
             };
             let output_handles = indices
@@ -1463,7 +1470,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     key: ArtifactKey {
                         production: self.production.clone(),
                         name: name.clone(),
-                        index,
+                        index: index.map(|value| value as u128),
                     },
                     artifact_type: descriptor.artifact_type.clone(),
                     availability: descriptor.availability,
@@ -1490,10 +1497,16 @@ impl<S: SessionStore> Executor<'_, S> {
         else {
             return Ok(None);
         };
-        if *validated_count != count {
+        if *validated_count != count as u128 {
             return Err(ExecutionError::MissingMetadata(wire_id));
         }
-        let Some(artifact_type) = ArtifactType::from_wire_type(element) else {
+        // A family of families stays resident: artifacts store matrix-like members only.
+        let Some(artifact_type) = ArtifactType::from_wire_type(element).filter(|artifact_type| {
+            !matches!(
+                artifact_type,
+                ArtifactType::IndexedFamily { .. } | ArtifactType::DependentFamily(_)
+            )
+        }) else {
             return Ok(None);
         };
         let encoded = mxx_ir_core::encoding::canonical_json(&wire_id)
@@ -1502,7 +1515,7 @@ impl<S: SessionStore> Executor<'_, S> {
         let name = format!("runtime-staged-{}", hex_bytes(&digest));
         let descriptor = ManifestArtifact {
             artifact_type,
-            family_count: Some(count),
+            family_count: Some(count as u128),
             // This is a materialized value produced by the active runtime
             // scope.  It has no public deterministic regeneration recipe;
             // staging therefore carries the payload across the scope
@@ -1522,6 +1535,32 @@ impl<S: SessionStore> Executor<'_, S> {
         Ok(Some((name, descriptor)))
     }
 
+    /// Release one private family after its final use, retaining its lease on failure.
+    fn release_staged_family(
+        &mut self,
+        production: &ProductionId,
+        name: &str,
+    ) -> Result<(), ExecutionError> {
+        let identity = (production.clone(), name.to_owned());
+        let Some(descriptor) = self.staged_families.get(&identity) else { return Ok(()) };
+        let count = descriptor.family_count.ok_or_else(|| {
+            self.staged_cleanup_error("staged family descriptor has no cardinality")
+        })?;
+        for index in 0..addressable_family_count(count)? {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: name.to_owned(),
+                index: Some((index) as u128),
+            };
+            self.artifact_store
+                .remove_staged(&key)
+                .map_err(|error| self.staged_cleanup_error(error))?;
+        }
+        self.staged_families.remove(&identity);
+        Ok(())
+    }
+
+    /// Keep leases only for families reachable from returned values.
     fn cleanup_unreturned_staged_families(
         &mut self,
         outputs: &BTreeMap<String, RuntimeValue>,
@@ -1537,40 +1576,17 @@ impl<S: SessionStore> Executor<'_, S> {
                 leases.push(StagedFamilyLease { production, name, descriptor });
                 continue;
             }
-            let Some(count) = descriptor.family_count else {
-                return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
-            };
-            for index in 0..count {
-                let key = ArtifactKey {
-                    production: production.clone(),
-                    name: name.clone(),
-                    index: Some(index),
-                };
-                if let Err(error) = self.artifact_store.remove_staged(&key) {
-                    return Err(self.staged_cleanup_error(error));
-                }
-            }
+            self.release_staged_family(&production, &name)?;
         }
         self.staged_families.clear();
         Ok(leases)
     }
 
+    /// Release all private families, including after a failed execution.
     fn cleanup_all_staged_families(&mut self) -> Result<(), ExecutionError> {
         let staged = self.staged_families.clone();
-        for ((production, name), descriptor) in staged {
-            let Some(count) = descriptor.family_count else {
-                return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
-            };
-            for index in 0..count {
-                let key = ArtifactKey {
-                    production: production.clone(),
-                    name: name.clone(),
-                    index: Some(index),
-                };
-                if let Err(error) = self.artifact_store.remove_staged(&key) {
-                    return Err(self.staged_cleanup_error(error));
-                }
-            }
+        for ((production, name), _) in staged {
+            self.release_staged_family(&production, &name)?;
         }
         self.staged_families.clear();
         Ok(())
@@ -1710,12 +1726,12 @@ impl<S: SessionStore> Executor<'_, S> {
     fn materialize_value(&mut self, value: RuntimeValue) -> Result<RuntimeValue, ExecutionError> {
         match value {
             RuntimeValue::LazyArtifact { production, name, index, descriptor } => {
-                let key = ArtifactKey { production, name, index };
+                let key = ArtifactKey { production, name, index: index.map(|value| value as u128) };
                 let payload = self.load_artifact_payload(&key, &descriptor, false)?;
                 self.decode_artifact(descriptor.artifact_type, payload)
             }
             RuntimeValue::StagedArtifact { production, name, index, descriptor } => {
-                let key = ArtifactKey { production, name, index: Some(index) };
+                let key = ArtifactKey { production, name, index: Some((index) as u128) };
                 let payload = self.load_artifact_payload(&key, &descriptor, true)?;
                 self.decode_artifact(descriptor.artifact_type, payload)
             }
@@ -1849,8 +1865,14 @@ impl<S: SessionStore> Executor<'_, S> {
         let RuntimeValue::Trapdoor(value) = self.materialize(values, wire)? else {
             return Err(ExecutionError::ValueKind(wire));
         };
-        let ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. } =
-            value.wire_type()
+        let ConcreteWireType::Trapdoor {
+            sigma,
+            gadget_base,
+            digit_count,
+            instantiation,
+            preimage_sigma,
+            ..
+        } = value.wire_type()
         else {
             return Err(ExecutionError::ValueKind(wire));
         };
@@ -1858,9 +1880,23 @@ impl<S: SessionStore> Executor<'_, S> {
         let sigma = sigma
             .evaluate_f64(&ParamEnv::default())
             .map_err(|error| self.expression_error(wire.node, error))?;
+        let preimage_sigma = preimage_sigma
+            .as_ref()
+            .map(|width| width.evaluate_rational(&ParamEnv::default()))
+            .transpose()
+            .map_err(|error| self.expression_error(wire.node, error))?;
         let secret = value.cpu_secret_arc();
         let gadget_small = secret.is_none().then_some(false);
-        Ok((secret, public, matrix.clone(), sigma, gadget_base.clone(), *digit_count, gadget_small))
+        Ok(TrapdoorParts {
+            secret,
+            public,
+            sigma,
+            gadget_base: gadget_base.clone(),
+            digit_count: *digit_count,
+            instantiation: *instantiation,
+            preimage_sigma,
+            gadget_small,
+        })
     }
 
     fn put(
@@ -2026,15 +2062,10 @@ impl<S: SessionStore> Executor<'_, S> {
                         let value = self.materialize_value(value)?;
                         self.value_for_placement(value, placement)?
                     }
-                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
-                        let offset = match mode {
-                            LoopInputMode::Zip => 0,
-                            LoopInputMode::ZipOffset { offset } => *offset,
-                            LoopInputMode::Broadcast | LoopInputMode::Gather { .. } => {
-                                unreachable!()
-                            }
-                        };
-                        let index = index.checked_add(offset).ok_or(
+                    LoopInputMode::Zip |
+                    LoopInputMode::ZipOffset { .. } |
+                    LoopInputMode::ZipQuotient { .. } => {
+                        let index = mode.zipped_member(index).ok_or(
                             ExecutionError::SelectIndexOutOfRange {
                                 node: node.id,
                                 index: BigInt::from(index),
@@ -2354,7 +2385,7 @@ pub(crate) fn hash_runtime_value(
                     "indexed input has non-family metadata".into(),
                 ));
             };
-            if values.len() != *count || element_type != element.as_ref() {
+            if values.len() as u128 != *count || element_type != element.as_ref() {
                 return Err(ExecutionError::Manifest(
                     "indexed input does not match validated family metadata".into(),
                 ));
@@ -2363,6 +2394,23 @@ pub(crate) fn hash_runtime_value(
             hasher.update(values.len().to_le_bytes());
             for value in values.iter() {
                 hash_runtime_value(backend, value, element, hasher)?;
+            }
+        }
+        RuntimeValue::DependentFamily { values } => {
+            let ConcreteWireType::DependentFamily { members } = concrete else {
+                return Err(ExecutionError::Manifest(
+                    "dependent family input has non-family metadata".into(),
+                ));
+            };
+            if values.len() != members.len() {
+                return Err(ExecutionError::Manifest(
+                    "dependent family input does not match validated family metadata".into(),
+                ));
+            }
+            hasher.update([12]);
+            hasher.update(values.len().to_le_bytes());
+            for (value, member) in values.iter().zip(members) {
+                hash_runtime_value(backend, value, member, hasher)?;
             }
         }
     }
@@ -2404,7 +2452,7 @@ fn scratch_production_id(
 
 fn collect_staged_families(
     value: &RuntimeValue,
-    families: &mut BTreeMap<(ProductionId, String), usize>,
+    families: &mut BTreeMap<(ProductionId, String), u128>,
 ) {
     match value {
         RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
@@ -2429,13 +2477,19 @@ pub(crate) fn materialize_runtime_value<S: ArtifactStore>(
     match value {
         RuntimeValue::LazyArtifact { production, name, index, descriptor } => {
             let payload = store
-                .load(&ArtifactKey { production, name, index }, &descriptor)
+                .load(
+                    &ArtifactKey { production, name, index: index.map(|value| value as u128) },
+                    &descriptor,
+                )
                 .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
             decode_artifact(backend, descriptor.artifact_type, payload)
         }
         RuntimeValue::StagedArtifact { production, name, index, descriptor } => {
             let payload = store
-                .load_staged(&ArtifactKey { production, name, index: Some(index) }, &descriptor)
+                .load_staged(
+                    &ArtifactKey { production, name, index: Some((index) as u128) },
+                    &descriptor,
+                )
                 .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
             decode_artifact(backend, descriptor.artifact_type, payload)
         }
@@ -2458,6 +2512,13 @@ pub(crate) fn materialize_runtime_value<S: ArtifactStore>(
     }
 }
 
+/// Converts a symbolic family cardinality only at a concrete execution boundary.
+fn addressable_family_count(count: u128) -> Result<usize, ExecutionError> {
+    usize::try_from(count).map_err(|_| {
+        ExecutionError::Manifest(format!("family cardinality {count} exceeds host addressability"))
+    })
+}
+
 fn materialize_artifact_family<S: ArtifactStore>(
     production: ProductionId,
     name: String,
@@ -2469,11 +2530,15 @@ fn materialize_artifact_family<S: ArtifactStore>(
     let count = descriptor
         .family_count
         .ok_or_else(|| ExecutionError::Manifest("artifact family has no cardinality".into()))?;
+    let count = addressable_family_count(count)?;
     let element_type = artifact_wire_type(&descriptor.artifact_type);
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
-        let key =
-            ArtifactKey { production: production.clone(), name: name.clone(), index: Some(index) };
+        let key = ArtifactKey {
+            production: production.clone(),
+            name: name.clone(),
+            index: Some((index) as u128),
+        };
         let payload = if staged {
             store.load_staged(&key, &descriptor)
         } else {
@@ -2511,15 +2576,35 @@ fn artifact_wire_type(artifact: &ArtifactType) -> ConcreteWireType {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
         } => ConcreteWireType::Trapdoor {
             matrix: matrix.clone(),
             sigma: sigma.clone(),
             gadget_base: gadget_base.clone(),
             digit_count: *digit_count,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            instantiation: *instantiation,
+            preimage_sigma: preimage_sigma.clone(),
         },
         ArtifactType::TypedBlob { type_name, schema_hash } => {
             ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
+        }
+        ArtifactType::IndexedFamily { element, count } => ConcreteWireType::IndexedFamily {
+            element: Box::new(artifact_wire_type(element)),
+            count: *count,
+        },
+        ArtifactType::DependentFamily(members) => {
+            let members = members.iter().map(artifact_wire_type).collect::<Vec<_>>();
+            match members.first() {
+                Some(first) if members.iter().all(|member| member == first) => {
+                    ConcreteWireType::IndexedFamily {
+                        element: Box::new(first.clone()),
+                        count: members.len() as u128,
+                    }
+                }
+                _ => ConcreteWireType::DependentFamily { members },
+            }
         }
     }
 }
@@ -2592,6 +2677,8 @@ fn decode_artifact(
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
+                preimage_sigma,
             },
             ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
         ) => {
@@ -2609,6 +2696,8 @@ fn decode_artifact(
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
+                preimage_sigma,
             };
             let value = TrapdoorValue::new(ty, public, Some(Arc::new(secret)))
                 .map_err(|error| ExecutionError::Artifact(error.into()))?;
@@ -2651,6 +2740,12 @@ mod tests {
             rows: 1,
             columns: 1,
         }
+    }
+
+    #[test]
+    fn symbolic_family_execution_rejects_unaddressable_cardinality() {
+        assert_eq!(addressable_family_count(7).unwrap(), 7);
+        assert!(addressable_family_count(usize::MAX as u128 + 1).is_err());
     }
 
     #[test]

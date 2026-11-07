@@ -1,5 +1,48 @@
 //! Environment-variable helpers for native primitives and execution backends.
 
+/// `MXX_TEST_STREAMED_MEMBERS`: family cardinality for streamed-carry unit tests (default: 8).
+#[cfg(test)]
+pub(crate) fn test_streamed_members() -> usize {
+    positive_usize("MXX_TEST_STREAMED_MEMBERS", 8).expect("valid streamed test cardinality")
+}
+
+/// `MXX_TEST_STREAMED_COLUMNS`: target columns in tiled preimage tests (default: 4).
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn test_streamed_columns() -> usize {
+    positive_usize("MXX_TEST_STREAMED_COLUMNS", 4).expect("valid streamed test columns")
+}
+
+/// `MXX_TEST_STREAMED_STEPS`: sequential iterations in carry unit tests (default: 3).
+#[cfg(test)]
+pub(crate) fn test_streamed_steps() -> usize {
+    positive_usize("MXX_TEST_STREAMED_STEPS", 3).expect("valid streamed test iterations")
+}
+
+/// `MXX_TEST_STREAMED_RING_DIMENSION`: power-of-two test ring dimension (default: 8).
+#[cfg(test)]
+pub(crate) fn test_streamed_ring_dimension() -> usize {
+    positive_usize("MXX_TEST_STREAMED_RING_DIMENSION", 8).expect("valid streamed test ring")
+}
+
+/// Parameters of the preimage capacity diagnostic. Defaults are deliberately small;
+/// set `MXX_TEST_CAPACITY_N`, `PRIMES`, `CRT_BITS`, and `BASE_BITS` (all with the
+/// `MXX_TEST_CAPACITY_` prefix) to inspect a different sampler shape.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn test_capacity_parameters() -> (u32, usize, usize, u32) {
+    (
+        positive_usize("MXX_TEST_CAPACITY_N", 8)
+            .expect("capacity ring dimension")
+            .try_into()
+            .expect("capacity dimension fits u32"),
+        positive_usize("MXX_TEST_CAPACITY_PRIMES", 2).expect("capacity CRT depth"),
+        positive_usize("MXX_TEST_CAPACITY_CRT_BITS", 40).expect("capacity CRT bits"),
+        positive_usize("MXX_TEST_CAPACITY_BASE_BITS", 20)
+            .expect("capacity base bits")
+            .try_into()
+            .expect("capacity base bits fit u32"),
+    )
+}
+
 /// `MXX_CUDA_STREAM_POOL_SIZE`: number of reusable compute streams owned by
 /// each GPU context and device. Default: 32.
 pub fn cuda_stream_pool_size() -> usize {
@@ -9,6 +52,24 @@ pub fn cuda_stream_pool_size() -> usize {
         .filter(|n| *n > 0)
         .unwrap_or(32)
 }
+
+/// `MXX_GPU_IMPORT_WINDOW`: the lookahead of windowed lane imports (default 2; 0 disables
+/// windowing). A wave loop of one lane per wave that reads at least
+/// [`IMPORT_WINDOW_MIN_LANES`] artifact members starts each member's import this many first
+/// consumers before its own and frees it after its last use, so members consumed one after
+/// another share device storage instead of all being resident for the whole wave.
+pub fn gpu_import_window() -> usize {
+    std::env::var("MXX_GPU_IMPORT_WINDOW").ok().and_then(|value| value.parse().ok()).unwrap_or(2)
+}
+
+/// `MXX_GPU_BODY_SPILL`: whether a host-driven loop body's top-level family that later loops
+/// of the body read is spilled to private scratch (default 1; 0 keeps it resident).
+pub fn gpu_body_spill() -> bool {
+    std::env::var("MXX_GPU_BODY_SPILL").map_or(true, |value| value.trim() != "0")
+}
+
+/// The fewest artifact member reads of a one-lane wave loop that window their imports.
+pub const IMPORT_WINDOW_MIN_LANES: usize = 4;
 
 /// `MXX_GPU_LOGICAL_DEVICES`: comma-separated physical GPU device ids, one per
 /// logical GPU device. `0,0` exposes two logical devices on physical GPU 0, so
@@ -72,7 +133,9 @@ pub fn gpu_small_rhs_chunk_columns() -> Result<usize, String> {
 
 /// `MXX_GPU_MEMORY_FRACTION`: fraction of each GPU's physical memory one plan's
 /// persistent allocations, its scratch arena and region scratch pool
-/// included, may use. Default: 0.8. Values
+/// included, may use. The same fraction of available host RAM at candidate
+/// allocation time bounds mapped import/export slots, before they are pinned.
+/// Default: 0.95. Values
 /// outside `(0, 1]` are errors.
 pub fn gpu_memory_fraction() -> Result<f64, String> {
     let name = "MXX_GPU_MEMORY_FRACTION";
@@ -83,7 +146,23 @@ pub fn gpu_memory_fraction() -> Result<f64, String> {
             .ok()
             .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
             .ok_or_else(|| format!("{name} must be in (0, 1], got {value:?}")),
-        Err(std::env::VarError::NotPresent) => Ok(0.8),
+        Err(std::env::VarError::NotPresent) => Ok(0.95),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+/// `MXX_GPU_HOST_BACKING`: opt into GPU-addressable host backing for scratch
+/// that exceeds the VRAM budget. Disabled by default; `0` rejects such a
+/// candidate so the planner tries smaller parallelism, `1` enables host backing.
+pub fn gpu_host_backing() -> Result<bool, String> {
+    let name = "MXX_GPU_HOST_BACKING";
+    match std::env::var(name) {
+        Ok(value) => match value.trim() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(format!("{name} must be 0 or 1, got {value:?}")),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(false),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
     }
 }

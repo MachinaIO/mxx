@@ -5,11 +5,10 @@ use crate::{DslContext, Family, GraphValue, IdealSpec, Int, Ring, artifact_bindi
 use mxx_ir_core::{
     artifact::{ArtifactAvailability, ProductionId, SpecHash},
     protocol::{
-        ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointBinding,
-        EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
-        InputContractEntry, InputValueContract, OutputRef, ProtocolDecl, ProtocolInputBinding,
-        ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage,
-        StageId, StageInputName, Workflow,
+        ClosedProtocolBundle, Comparison, EndpointBinding, EndpointSemanticBinding, EndpointSpecId,
+        InputContract, InputContractEntry, InputValueContract, OutputRef, ProtocolDecl,
+        ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
+        ProtocolStage, StageId, StageInputName, Workflow,
     },
 };
 
@@ -101,25 +100,14 @@ pub fn lwe_protocol() -> Result<ProtocolDecl, Box<dyn std::error::Error>> {
             },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "decoded".to_owned(),
-                    ideal_input: "result".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::Exact,
-                    workflow_output: OutputRef { stage: stage_id, output: "decoded".to_owned() },
-                    ideal_output: "result".to_owned(),
-                }],
-            },
+            comparison: Comparison::equality(EndpointBinding {
+                spec: endpoint,
+                semantics: EndpointSemanticBinding::Exact,
+                workflow_output: OutputRef { stage: stage_id, output: "decoded".to_owned() },
+                ideal_output: "result".to_owned(),
+            }),
             operational_decoder_targets: Vec::new(),
-            endpoint_specs: vec![endpoint],
+
             input_contract: InputContract {
                 inputs: inputs
                     .into_iter()
@@ -148,7 +136,7 @@ mod tests {
             .join("../../test_data/lean_ir_fixtures/lwe_protocol");
         // The stage layout is part of the fixture; drop modules of an earlier layout.
         let _ = fs::remove_dir_all(&directory);
-        mxx_ir_core::lean::protocol::export(&lwe_protocol().unwrap(), &directory)
+        mxx_ir_core::lean::protocol::export(&lwe_protocol().unwrap(), &directory, false)
             .expect("generic export accepts the exact endpoint");
         fs::write(directory.join("LweProof.lean"), LWE_PROOF).unwrap();
         fs::write(directory.join("Certificate.lean"), LWE_CERTIFICATE).unwrap();
@@ -168,7 +156,7 @@ mod tests {
     #[test]
     fn exact_endpoint_requires_exact_semantics() {
         let mut bundle = lwe_protocol().unwrap().bundle;
-        bundle.endpoints.entries[0].semantics = EndpointSemanticBinding::ThresholdDecode;
+        bundle.comparison.endpoints.entries[0].semantics = EndpointSemanticBinding::ThresholdDecode;
         assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidEndpointSemantics));
     }
 

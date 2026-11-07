@@ -14,7 +14,7 @@ pub fn export_claim(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut declaration = protocol.protocol().clone();
     declaration.bindings = bindings.clone();
-    mxx_ir_core::lean::protocol::export(&declaration, directory)
+    mxx_ir_core::lean::protocol::export(&declaration, directory, false)
 }
 
 #[cfg(test)]

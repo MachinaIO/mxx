@@ -3,7 +3,9 @@
 //!
 //! The layouts come from the graphs themselves (see [`super::BackendLayout`]), so a protocol's
 //! export needs no runtime parameters. Lean checks every layout obligation: coprime towers whose
-//! product is the modulus, and enough digits to cover each tower.
+//! product is the modulus, and enough digits to cover each tower. The obligations over the tower
+//! list are decided by the kernel (`decide +kernel`), whose GMP arithmetic and absence of an
+//! elaborator recursion limit keep them cheap for long CRT chains.
 
 use super::BackendLayout;
 use std::fmt::Write;
@@ -24,19 +26,19 @@ pub fn render_backend(layouts: &[BackendLayout]) -> String {
 def layout{index} : MxxRuntime.RegularLayout {q} :=
   {{ crtModuli := moduli{index}
     droppedModuli := {dropped}
-    dropped_lt := by decide
-    crtModuli_nonempty := by decide
-    modulus_pos := by decide
-    pairwise_coprime := by unfold Pairwise; decide
-    product_eq := by decide
+    dropped_lt := by decide +kernel
+    crtModuli_nonempty := by decide +kernel
+    modulus_pos := by decide +kernel
+    pairwise_coprime := by unfold Pairwise; decide +kernel
+    product_eq := by decide +kernel
     baseBits := {base_bits}
     base := {base}
     base_eq := by norm_num
     base_gt_one := by norm_num
-    base_even := by decide
+    base_even := by decide +kernel
     digitsPerTower := {digits}
     digits_pos := by norm_num
-    capacity := by decide }}
+    capacity := by decide +kernel }}
 
 "#,
             q = layout.modulus,

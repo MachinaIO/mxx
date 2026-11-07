@@ -91,11 +91,29 @@ pub enum ArtifactType {
         digit_count: usize,
         #[serde(with = "serde_support::bigint")]
         preimage_max_coefficient_bound: BigInt,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::TrapdoorInstantiation::is_computational"
+        )]
+        instantiation: crate::types::TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<crate::expr::RealExpr>,
     },
     TypedBlob {
         type_name: String,
         schema_hash: [u8; 32],
     },
+    /// A family stored as one artifact, of `count` members of type `element`: a family whose
+    /// members are families. Its size does not grow with `count`; symbolic cardinalities
+    /// need not fit a host index, while stores check addressability before materialization.
+    IndexedFamily {
+        element: Box<ArtifactType>,
+        count: u128,
+    },
+    /// A family stored as one artifact, member `k` of type `members[k]`: a family whose member
+    /// types depend on the member index (an output family of a loop over index-dependent rings,
+    /// see [`crate::types::MEMBER_INDEX`]).
+    DependentFamily(Vec<ArtifactType>),
 }
 
 impl ArtifactType {
@@ -124,21 +142,33 @@ impl ArtifactType {
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
+                preimage_sigma,
             } => Some(Self::Trapdoor {
                 matrix: matrix.clone(),
                 sigma: sigma.clone(),
                 gadget_base: gadget_base.clone(),
                 digit_count: *digit_count,
                 preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation: *instantiation,
+                preimage_sigma: preimage_sigma.clone(),
             }),
             ConcreteWireType::TypedBlob { type_name, schema_hash } => {
                 Some(Self::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash })
             }
+            ConcreteWireType::IndexedFamily { element, count } => {
+                let element = Box::new(Self::from_wire_type(element)?);
+                Some(Self::IndexedFamily { element, count: *count })
+            }
+            ConcreteWireType::DependentFamily { members } => members
+                .iter()
+                .map(Self::from_wire_type)
+                .collect::<Option<_>>()
+                .map(Self::DependentFamily),
             ConcreteWireType::ConstantReal |
             ConcreteWireType::ConstantBool |
             ConcreteWireType::Real |
-            ConcreteWireType::Bool |
-            ConcreteWireType::IndexedFamily { .. } => None,
+            ConcreteWireType::Bool => None,
         }
     }
 
@@ -170,7 +200,8 @@ impl ArtifactType {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
-    pub family_count: Option<usize>,
+    /// Symbolic uniform-family cardinality. Concrete stores check addressability separately.
+    pub family_count: Option<u128>,
     pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
@@ -199,7 +230,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationEr
 pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
-    pub family_count: Option<usize>,
+    pub family_count: Option<u128>,
     pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
@@ -286,6 +317,31 @@ pub fn export_validated_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_family_manifest_round_trips_exactly() {
+        let count = (usize::MAX as u128) * 130;
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
+            artifacts: BTreeMap::from([(
+                "wide-family".to_owned(),
+                ManifestArtifact {
+                    artifact_type: ArtifactType::IndexedFamily {
+                        element: Box::new(ArtifactType::Bytes { length: 1 }),
+                        count,
+                    },
+                    family_count: Some(count),
+                    availability: ArtifactAvailability::Transferred,
+                    layout: None,
+                },
+            )]),
+        };
+        validate_manifest(&manifest).unwrap();
+        let encoded = crate::encoding::canonical_json(&manifest).unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains(&count.to_string()));
+        assert_eq!(serde_json::from_slice::<Manifest>(&encoded).unwrap(), manifest);
+    }
 
     #[test]
     fn cached_manifest_artifacts_validate() {

@@ -64,7 +64,7 @@ fn gpu_integer_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> Runt
         )
         .expect("upload signed integer family"),
     );
-    bind_integer_family(owner, values.len())
+    bind_integer_family(owner, values.len() as u128)
 }
 
 /// A resident input binds directly, so replays with values of different sizes
@@ -78,10 +78,10 @@ fn gpu_integer_family_with_words(
         GpuSignedValues::from_bigints_with_words(parameters, 0, values, words)
             .expect("upload signed integer family"),
     );
-    bind_integer_family(owner, values.len())
+    bind_integer_family(owner, values.len() as u128)
 }
 
-fn bind_integer_family(owner: Arc<GpuSignedValues>, count: usize) -> RuntimeValue {
+fn bind_integer_family(owner: Arc<GpuSignedValues>, count: u128) -> RuntimeValue {
     RuntimeValue::gpu_signed_family(
         ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
         owner,
@@ -114,7 +114,7 @@ fn gpu_boolean_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> Runt
     RuntimeValue::gpu_signed_family(
         ConcreteWireType::IndexedFamily {
             element: Box::new(ConcreteWireType::Bool),
-            count: values.len(),
+            count: values.len() as u128,
         },
         owner,
     )
@@ -339,6 +339,7 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
     let sum = coefficient.clone() + Int::constant(BigInt::from(1u64) << 80usize);
     let lifted = sum.clone().lift_to_constant_polynomial(ring.matrix_type((1, 1)));
     let decoded = polynomial.clone().threshold_decode_ints(2, 3);
+    let decoded_family = polynomial.clone().threshold_decode_int_family(2, 8);
     let plaintext_modulus = (BigInt::from(1) << 128usize) + BigInt::from(3);
     let wide_decoded = polynomial.clone().threshold_decode_ints(plaintext_modulus.clone(), 3);
     let wide_bools = polynomial.clone().threshold_decode_bools(plaintext_modulus.clone(), 3);
@@ -365,6 +366,8 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
         .output("lifted", lifted.coefficients())
         .unwrap()
         .output("decoded", Family::<Int>::pack(decoded).unwrap())
+        .unwrap()
+        .output("decoded_family", decoded_family)
         .unwrap()
         .output("wide_decoded", Family::<Int>::pack(wide_decoded).unwrap())
         .unwrap()
@@ -428,6 +431,7 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
         let decoded: Vec<_> =
             canonical.iter().map(|value| ((value * 4 + &modulus) / (&modulus * 2)) % 2).collect();
         assert_eq!(read("decoded"), decoded[..3]);
+        assert_eq!(read("decoded_family"), decoded);
         let wide = mxx_backends::backend::poly::threshold_decode_coefficients(
             canonical.iter().map(|value| value.to_biguint().unwrap()).collect(),
             &modulus,

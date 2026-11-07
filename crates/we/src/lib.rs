@@ -171,7 +171,7 @@ impl WitnessEncryptionProtocolDecl {
         {
             return Err(WitnessEncryptionDeclError::InvalidIdeal);
         }
-        if !matches!(protocol.bundle.comparator, ComparatorSpec::Equality { .. }) {
+        if !matches!(protocol.bundle.comparison.comparator, ComparatorSpec::Equality { .. }) {
             return Err(WitnessEncryptionDeclError::InvalidComparator);
         }
         Ok(Self { protocol, interface })

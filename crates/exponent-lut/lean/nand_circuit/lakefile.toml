@@ -1,0 +1,16 @@
+name = "MxxExponentLutNand"
+version = "0.1.0"
+defaultTargets = ["MxxExponentLutNand"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = ".."
+
+# Lemmas about the NAND programs of `tests/nand_circuit.rs` that hold at every parameter set.
+[[lean_lib]]
+name = "MxxExponentLutNand"
+roots = ["NandProgram"]

@@ -28,7 +28,8 @@
 //! - Freezing rejects cycles, foreign-scope edges, invalid ports, duplicate input names, and two
 //!   different subgraph definitions with the same name ([`FreezeError`]).
 //! - [`FreezeMap::resolve_unique`] maps a construction handle to its frozen wire, rejecting handles
-//!   reachable along more than one structural path.
+//!   reachable along more than one structural path. Producer provenance survives lexical sealing
+//!   when it copies an operation or rematerializes a deterministic hash.
 //!
 //! A `Graph` serializes to JSON with a ring table (`{"ring_table": [...], "graph": ...}`), where
 //! rings are interned and referenced as `{"$ring": i}`. Source locations, construction scopes, and
@@ -83,6 +84,7 @@ impl SourceLocation {
 }
 
 static NEXT_CONSTRUCTION_SCOPE: AtomicU64 = AtomicU64::new(1);
+static NEXT_NODE_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CONSTRUCTION_SCOPES: RefCell<Vec<ConstructionScopeId>> =
@@ -211,6 +213,7 @@ impl NodeHandle {
             construction_scope: scope,
             child,
             benchmark_role: CONSTRUCTION_BENCHMARK_ROLE.with(|current| *current.borrow()),
+            origin: NodeOrigin(NEXT_NODE_ORIGIN.fetch_add(1, Ordering::Relaxed)),
         }))
     }
 
@@ -507,6 +510,53 @@ struct ScopeSealer {
 impl ScopeSealer {
     fn value(&mut self, value: &ValueHandle) -> Result<ValueHandle, FreezeError> {
         if value.construction_scope() != self.scope {
+            // A deterministic public hash needs only its small key/tag inputs in
+            // each body. Carrying the full matrix through a loop keeps
+            // it resident across every nested operation, including large samplers.
+            // Only fixed-shape matrix values qualify: a parameter-sized packed
+            // family must not be resampled in full for each selected member.
+            // Preserve the exact hash metadata and reject non-ancestor values as
+            // usual; fresh samplers must never be rematerialized this way.
+            if matches!(self.policy, CapturePolicy::Lexical { .. }) &&
+                !self.preserved_values.contains(&(value.node.identity(), value.port)) &&
+                value.construction_scope().is_ancestor_of(&self.scope) &&
+                matches!(value.node.kind(), NodeKind::HashSample { .. }) &&
+                matches!(value.wire_type(), WireType::Matrix(matrix)
+                    if matches!(matrix.rows, crate::IntExpr::Const(_)) &&
+                        matches!(matrix.columns, crate::IntExpr::Const(_)))
+            {
+                let identity = value.node.identity();
+                if let Some(node) = self.nodes.get(&identity) {
+                    return node
+                        .output(value.port.0)
+                        .ok_or(FreezeError::InvalidPort { port: value.port.0 });
+                }
+                // Seal the inputs directly. Recursing through a temporary node
+                // would memoize its pointer identity after the temporary dies;
+                // allocator reuse could then conflate distinct hash domains.
+                let arguments = value
+                    .node
+                    .arguments()
+                    .iter()
+                    .map(|argument| self.value(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut local = NodeHandle::new_in_scope(
+                    self.scope.clone(),
+                    value.node.kind().clone(),
+                    arguments,
+                    value.node.output_types().to_vec(),
+                    value.node.source_location().cloned(),
+                    None,
+                );
+                Arc::get_mut(&mut local.0).expect("new node").benchmark_role =
+                    value.node.benchmark_role();
+                Arc::get_mut(&mut local.0).expect("new node").origin = value.node.0.origin;
+                let output = local
+                    .output(value.port.0)
+                    .ok_or(FreezeError::InvalidPort { port: value.port.0 })?;
+                self.nodes.insert(identity, local);
+                return Ok(output);
+            }
             return self.capture(value, LoopInputMode::Broadcast);
         }
         let identity = value.node.identity();
@@ -558,6 +608,32 @@ impl ScopeSealer {
                 }
             }
         }
+        if !self.nodes.contains_key(&identity) &&
+            matches!(value.node.kind(), NodeKind::Input { .. })
+        {
+            // A named graph input declared while a body was being built belongs to the graph,
+            // not to the body: it moves to the enclosing scope (and on to the root as each
+            // enclosing body is sealed) and the body reads it like any outer value. Body
+            // arguments are explicit inputs, which are known nodes already.
+            let parent = self.scope.0.as_ref().map_or(SelfRoot::ID, |scope| scope.parent.clone());
+            let mut hoisted = NodeHandle::new_in_scope(
+                parent,
+                value.node.kind().clone(),
+                Vec::new(),
+                value.node.output_types().to_vec(),
+                value.node.source_location().cloned(),
+                None,
+            );
+            Arc::get_mut(&mut hoisted.0).expect("new node").origin = value.node.0.origin;
+            let input = self.capture(
+                &hoisted
+                    .output(value.port.0)
+                    .ok_or(FreezeError::InvalidPort { port: value.port.0 })?,
+                LoopInputMode::Broadcast,
+            )?;
+            self.nodes.insert(identity, input.node.clone());
+            return Ok(input);
+        }
         let node = if let Some(node) = self.nodes.get(&identity) {
             node.clone()
         } else {
@@ -582,6 +658,7 @@ impl ScopeSealer {
                 );
                 Arc::get_mut(&mut copied.0).expect("new node").benchmark_role =
                     value.node.benchmark_role();
+                Arc::get_mut(&mut copied.0).expect("new node").origin = value.node.0.origin;
                 copied
             };
             self.nodes.insert(identity, node.clone());
@@ -619,7 +696,10 @@ impl ScopeSealer {
         let name = format!("__capture_{}", self.captured.len());
         let ty = match (mode, value.wire_type()) {
             (
-                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } | LoopInputMode::Gather { .. },
+                LoopInputMode::Zip |
+                LoopInputMode::ZipOffset { .. } |
+                LoopInputMode::ZipQuotient { .. } |
+                LoopInputMode::Gather { .. },
                 WireType::IndexedFamily { element, .. },
             ) => *element.clone(),
             _ => value.wire_type().clone(),
@@ -724,6 +804,8 @@ struct GraphNode {
     construction_scope: ConstructionScopeId,
     child: Option<StructuralChild>,
     benchmark_role: Option<BenchmarkRole>,
+    // Construction-only provenance, independent of execution identity and serialization.
+    origin: NodeOrigin,
 }
 
 #[derive(Clone)]
@@ -953,77 +1035,147 @@ impl Graph {
         self.scope(&FrozenGraphScopeId::Root).expect("a frozen graph always has a root")
     }
 
+    /// Reconstructs provenance for producers retained in this graph, including copies made
+    /// during lexical sealing. This lets an observer resolve accounting anchors after the
+    /// construction context has been consumed, without retaining its entire freeze map.
+    ///
+    /// Unlike the map returned directly by [`Graph::freeze`], this does not include eliminated
+    /// aliases of canonical named inputs. Provenance is construction metadata, so deserialization
+    /// cannot recover anchors from a previous construction; persist resolved sites instead.
+    pub fn producer_map(&self) -> FreezeMap {
+        let mut map = FreezeMap::default();
+        for (id, scope) in self.scopes() {
+            for (position, node) in scope.nodes().iter().enumerate() {
+                for port in 0..node.output_types().len() {
+                    map.insert(
+                        &node.output(port as u32).expect("existing port"),
+                        ScopedWireRef {
+                            scope: id.clone(),
+                            wire: WireRef {
+                                node: NodeId(position as u64),
+                                port: Port(port as u32),
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        map
+    }
+
     /// How many times each primitive operation runs when the graph executes
     /// under `env`: a loop body counts once per iteration and a subgraph once
     /// per call, each evaluated in its own environment. A kind whose payload
     /// is a plain operator is keyed with it, as in `MatrixBinary(Multiply)`.
+    ///
+    /// A loop whose body is [`loop_body_is_index_invariant`] is counted once and
+    /// multiplied by its count, so the cost does not grow with the iteration count.
     pub fn operation_counts(
         &self,
         env: &crate::ParamEnv,
     ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        self.weighted_operation_counts(env, None)
+    }
+
+    pub(crate) fn weighted_operation_counts(
+        &self,
+        env: &crate::ParamEnv,
+        weights: Option<&crate::cost::NodeWeights>,
+    ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        let dependencies = self.shape_dependencies();
         let mut memo = BTreeMap::new();
-        self.scope_operation_counts(&FrozenGraphScopeId::Root, env, &mut memo)
+        self.scope_operation_counts(
+            &FrozenGraphScopeId::Root,
+            env,
+            weights,
+            &dependencies,
+            &mut memo,
+        )
     }
 
     fn scope_operation_counts(
         &self,
         scope_id: &FrozenGraphScopeId,
         env: &crate::ParamEnv,
+        weights: Option<&crate::cost::NodeWeights>,
+        dependencies: &BTreeMap<FrozenGraphScopeId, ShapeDependencies>,
         memo: &mut BTreeMap<(FrozenGraphScopeId, crate::ParamEnv), BTreeMap<String, u128>>,
     ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
-        let key = (scope_id.clone(), env.clone());
+        let key = (scope_id.clone(), shape_env(env, &dependencies[scope_id]));
         if let Some(counts) = memo.get(&key) {
             return Ok(counts.clone());
         }
-        let bound = |parent: &crate::ParamEnv, bindings: &[(String, crate::IntExpr)]| {
-            let mut child = parent.clone();
-            for (name, expression) in bindings {
-                child.integers.insert(name.clone(), expression.evaluate(parent)?);
-            }
-            Ok::<_, crate::expr::ExprError>(child)
-        };
         let mut counts = BTreeMap::<String, u128>::new();
-        let add = |counts: &mut BTreeMap<String, u128>, inner: BTreeMap<String, u128>| {
-            for (name, count) in inner {
-                *counts.entry(name).or_insert(0) += count;
-            }
-        };
+        let add =
+            |counts: &mut BTreeMap<String, u128>, inner: BTreeMap<String, u128>, times: u128| {
+                for (name, count) in inner {
+                    let total = counts.entry(name).or_insert(0);
+                    *total = count
+                        .checked_mul(times)
+                        .and_then(|count| total.checked_add(count))
+                        .ok_or(crate::expr::ExprError::CountOverflow)?;
+                }
+                Ok::<_, crate::expr::ExprError>(())
+            };
         let scope = self.scope(scope_id).expect("a child scope id names a frozen scope");
         for (position, node) in scope.nodes.iter().enumerate() {
-            let kind = serde_json::to_value(node.kind()).unwrap_or_default();
-            let tag = kind["tag"].as_str().unwrap_or("Unknown");
-            let name = match kind["value"].as_str() {
-                Some(operator) if operator.starts_with(|c: char| c.is_ascii_uppercase()) => {
-                    format!("{tag}({operator})")
+            if let Some(weights) = weights {
+                if let Some(events) =
+                    weights.get(scope_id).and_then(|nodes| nodes.get(&NodeId(position as u64)))
+                {
+                    add(&mut counts, events.clone(), 1)?;
                 }
-                _ => tag.to_owned(),
-            };
-            *counts.entry(name).or_insert(0) += 1;
+            } else {
+                let kind = serde_json::to_value(node.kind()).unwrap_or_default();
+                let tag = kind["tag"].as_str().unwrap_or("Unknown");
+                let name = match kind["value"].as_str() {
+                    Some(operator) if operator.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                        format!("{tag}({operator})")
+                    }
+                    _ => tag.to_owned(),
+                };
+                *counts.entry(name).or_insert(0) += 1;
+            }
             let child = || {
                 self.child_scope_id(scope_id, NodeId(position as u64))
                     .expect("a structural node has a child scope")
             };
             match node.kind() {
                 NodeKind::SubgraphCall(call) => {
-                    let inner =
-                        self.scope_operation_counts(&child(), &bound(env, &call.bindings)?, memo)?;
-                    add(&mut counts, inner);
+                    let inner = self.scope_operation_counts(
+                        &child(),
+                        &bind_integers(env, &call.bindings)?,
+                        weights,
+                        dependencies,
+                        memo,
+                    )?;
+                    add(&mut counts, inner, 1)?;
                 }
                 NodeKind::ParallelLoop(ParallelLoop { count, index_slot, bindings, .. }) |
                 NodeKind::SequentialLoop(SequentialLoop {
                     count, index_slot, bindings, ..
                 }) => {
                     let (child, iterations) = (child(), count.evaluate(env)?);
+                    let invariant =
+                        loop_body_is_index_invariant(&dependencies[&child], *index_slot, bindings);
                     let mut index = num_bigint::BigInt::from(0u8);
                     while index < iterations {
                         let mut loop_env = env.clone();
                         loop_env.loop_indices.insert(*index_slot, index.clone());
                         let inner = self.scope_operation_counts(
                             &child,
-                            &bound(&loop_env, bindings)?,
+                            &bind_integers(&loop_env, bindings)?,
+                            weights,
+                            dependencies,
                             memo,
                         )?;
-                        add(&mut counts, inner);
+                        if invariant {
+                            let times = u128::try_from(&iterations)
+                                .map_err(|_| crate::expr::ExprError::CountOverflow)?;
+                            add(&mut counts, inner, times)?;
+                            break;
+                        }
+                        add(&mut counts, inner, 1)?;
                         index += 1u8;
                     }
                 }
@@ -1032,6 +1184,71 @@ impl Graph {
         }
         memo.insert(key, counts.clone());
         Ok(counts)
+    }
+
+    /// The loop-index slots and integer parameters each scope's shapes and amount of work can
+    /// read, transitively through its child scopes.
+    ///
+    /// Only the declared output types of the nodes and the loop counts are read: node payloads
+    /// (slice offsets, scalars, family indices) choose data, not shapes or how many operations
+    /// run. A child scope contributes its dependencies minus its own loop slot, with each name
+    /// its call or loop rebinds replaced by the references of that binding.
+    pub fn shape_dependencies(&self) -> BTreeMap<FrozenGraphScopeId, ShapeDependencies> {
+        let mut memo = BTreeMap::new();
+        for scope_id in self.inner.scopes.keys() {
+            self.scope_shape_dependencies(scope_id, &mut memo);
+        }
+        memo
+    }
+
+    fn scope_shape_dependencies(
+        &self,
+        scope_id: &FrozenGraphScopeId,
+        memo: &mut BTreeMap<FrozenGraphScopeId, ShapeDependencies>,
+    ) -> ShapeDependencies {
+        if let Some(dependencies) = memo.get(scope_id) {
+            return dependencies.clone();
+        }
+        let scope = self.scope(scope_id).expect("a child scope id names a frozen scope");
+        let (mut slots, mut names) = (BTreeSet::new(), BTreeSet::new());
+        for (position, node) in scope.nodes.iter().enumerate() {
+            crate::validate::collect_serialized_references(
+                &node.output_types(),
+                &mut names,
+                &mut slots,
+            );
+            let (child_slot, bindings) = match node.kind() {
+                NodeKind::SubgraphCall(call) => (None, &call.bindings),
+                NodeKind::ParallelLoop(ParallelLoop { count, index_slot, bindings, .. }) |
+                NodeKind::SequentialLoop(SequentialLoop {
+                    count, index_slot, bindings, ..
+                }) => {
+                    crate::validate::collect_serialized_references(count, &mut names, &mut slots);
+                    (Some(*index_slot), bindings)
+                }
+                _ => continue,
+            };
+            let child = self
+                .child_scope_id(scope_id, NodeId(position as u64))
+                .expect("a structural node has a child scope");
+            let (mut child_slots, mut child_names) = self.scope_shape_dependencies(&child, memo);
+            for (name, expression) in bindings {
+                if child_names.remove(name) {
+                    crate::validate::collect_serialized_references(
+                        expression,
+                        &mut child_names,
+                        &mut child_slots,
+                    );
+                }
+            }
+            if let Some(slot) = child_slot {
+                child_slots.remove(&slot);
+            }
+            slots.extend(child_slots);
+            names.extend(child_names);
+        }
+        memo.insert(scope_id.clone(), (slots.clone(), names.clone()));
+        (slots, names)
     }
 
     pub fn real_constants(&self) -> &BTreeMap<String, RealExpr> {
@@ -1149,13 +1366,13 @@ impl FrozenCandidates {
 
 #[derive(Clone, Default)]
 pub struct FreezeMap {
-    values: HashMap<(NodeIdentity, Port), FrozenCandidates>,
+    values: HashMap<(NodeOrigin, Port), FrozenCandidates>,
 }
 
 impl FreezeMap {
     fn insert(&mut self, value: &ValueHandle, candidate: ScopedWireRef) {
         self.values
-            .entry((value.node.identity(), value.port))
+            .entry((value.node.0.origin, value.port))
             .and_modify(|candidates| candidates.insert(candidate.clone()))
             .or_insert(FrozenCandidates::Unique(candidate));
     }
@@ -1164,12 +1381,14 @@ impl FreezeMap {
     ///
     /// The same construction handle can be reached from more than one structural
     /// child path. Such a handle is deliberately rejected instead of selecting a
-    /// path based on traversal order.
+    /// path based on traversal order. Copies made while sealing retain their producer's
+    /// provenance, including deterministic hashes rematerialized in a lexical child. Captured
+    /// placeholders are separate inputs and do not inherit the outer producer's provenance.
     pub fn resolve_unique(
         &self,
         value: &ValueHandle,
     ) -> Result<&ScopedWireRef, FreezeResolveError> {
-        match self.values.get(&(value.node.identity(), value.port)) {
+        match self.values.get(&(value.node.0.origin, value.port)) {
             Some(FrozenCandidates::Unique(reference)) => Ok(reference),
             Some(FrozenCandidates::Ambiguous(candidates)) => Err(FreezeResolveError::Ambiguous {
                 candidates: candidates.iter().cloned().collect(),
@@ -1195,6 +1414,9 @@ pub struct ScopedWireRef {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct NodeIdentity(usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct NodeOrigin(u64);
 
 #[derive(Debug, Error)]
 pub enum FreezeError {
@@ -1523,6 +1745,65 @@ struct SerializedNode {
     output_types: Vec<WireType>,
 }
 
+/// The loop-index slots and integer parameters a scope's shapes can read (see
+/// [`Graph::shape_dependencies`]).
+pub type ShapeDependencies = (BTreeSet<u32>, BTreeSet<String>);
+
+/// Whether every iteration of a loop over `index_slot` lowers to the same shapes and work.
+///
+/// `body` is the loop body's [`Graph::shape_dependencies`]. The body is invariant when its shapes
+/// read neither the loop's index directly nor a binding that reads it.
+pub fn loop_body_is_index_invariant(
+    body: &ShapeDependencies,
+    index_slot: u32,
+    bindings: &[(String, crate::IntExpr)],
+) -> bool {
+    let (slots, names) = body;
+    !slots.contains(&index_slot) &&
+        bindings.iter().filter(|(name, _)| names.contains(name)).all(|(_, expression)| {
+            let (mut binding_names, mut binding_slots) = (BTreeSet::new(), BTreeSet::new());
+            crate::validate::collect_serialized_references(
+                expression,
+                &mut binding_names,
+                &mut binding_slots,
+            );
+            !binding_slots.contains(&index_slot)
+        })
+}
+
+/// `env` restricted to the integers and loop indices in `dependencies`: two environments with
+/// the same restriction lower a scope to the same shapes.
+pub fn shape_env(env: &crate::ParamEnv, dependencies: &ShapeDependencies) -> crate::ParamEnv {
+    let (slots, names) = dependencies;
+    crate::ParamEnv {
+        integers: env
+            .integers
+            .iter()
+            .filter(|(name, _)| names.contains(*name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        reals: env.reals.clone(),
+        loop_indices: env
+            .loop_indices
+            .iter()
+            .filter(|(slot, _)| slots.contains(*slot))
+            .map(|(slot, value)| (*slot, value.clone()))
+            .collect(),
+    }
+}
+
+/// `parent` extended with `bindings`, each evaluated in `parent`.
+pub fn bind_integers(
+    parent: &crate::ParamEnv,
+    bindings: &[(String, crate::IntExpr)],
+) -> Result<crate::ParamEnv, crate::expr::ExprError> {
+    let mut child = parent.clone();
+    for (name, expression) in bindings {
+        child.integers.insert(name.clone(), expression.evaluate(parent)?);
+    }
+    Ok(child)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1575,6 +1856,27 @@ mod tests {
         )
         .output(0)
         .unwrap()
+    }
+
+    #[test]
+    fn loop_bodies_are_invariant_unless_their_shapes_read_the_index() {
+        let index = || IntExpr::LoopIndex(3);
+        // b = 1 + i * (2 - i) takes the values 1, 2, 1: equal ends do not imply invariance.
+        let binding = IntExpr::Add(
+            Box::new(IntExpr::constant(1)),
+            Box::new(IntExpr::Mul(
+                Box::new(index()),
+                Box::new(IntExpr::Sub(Box::new(IntExpr::constant(2)), Box::new(index()))),
+            )),
+        );
+        let bindings = vec![("b".to_owned(), binding)];
+        let reads = |slots: &[u32], names: &[&str]| -> ShapeDependencies {
+            (slots.iter().copied().collect(), names.iter().map(|name| (*name).to_owned()).collect())
+        };
+        assert!(!loop_body_is_index_invariant(&reads(&[], &["b"]), 3, &bindings));
+        assert!(loop_body_is_index_invariant(&reads(&[], &["c"]), 3, &bindings));
+        assert!(!loop_body_is_index_invariant(&reads(&[3], &[]), 3, &[]));
+        assert!(loop_body_is_index_invariant(&reads(&[2], &["b"]), 3, &[]));
     }
 
     #[test]
@@ -2131,6 +2433,59 @@ mod tests {
         assert!(graph.real_constants().is_empty());
         assert_eq!(graph.root_scope().nodes().len(), 1);
         assert_eq!(validated.source.root_scope().nodes().len(), 1);
+    }
+
+    #[test]
+    fn freeze_map_preserves_producers_rebuilt_during_lexical_sealing() {
+        let outer = input("outer");
+        let (sealed, original, dead) = with_new_construction_scope(|scope| {
+            let argument = input("argument");
+            let make = || {
+                NodeHandle::new(
+                    NodeKind::MatrixBinary(crate::node::MatrixBinaryOp::Add),
+                    vec![argument.clone(), outer.clone()],
+                    vec![WireType::Matrix(matrix_type())],
+                )
+                .output(0)
+                .unwrap()
+            };
+            let (original, dead) = (make(), make());
+            let sealed = SubgraphHandle::seal(
+                "capturing-body",
+                scope,
+                vec![argument],
+                vec![original.clone()],
+                &[],
+                CapturePolicy::Lexical { parallel_index: None },
+            )
+            .unwrap();
+            assert_ne!(original, sealed.handle.outputs()[0]);
+            (sealed, original, dead)
+        });
+        let rewritten = sealed.handle.outputs()[0].clone();
+        let mut arguments = vec![input("actual")];
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        let output = NodeHandle::subgraph_call(sealed.handle, arguments, Vec::new(), Vec::new())
+            .output(0)
+            .unwrap();
+        let (graph, map) = Graph::freeze(
+            "sealing-provenance",
+            Vec::new(),
+            BTreeMap::from([(
+                "result".to_owned(),
+                GraphOutput { value: output, availability: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(map.resolve_unique(&original).unwrap(), map.resolve_unique(&rewritten).unwrap());
+        assert_eq!(
+            graph.producer_map().resolve_unique(&original).unwrap(),
+            map.resolve_unique(&original).unwrap()
+        );
+        assert_eq!(map.resolve_unique(&dead).unwrap_err(), FreezeResolveError::Missing);
     }
 
     #[test]

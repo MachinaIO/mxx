@@ -101,6 +101,11 @@ namespace gpu_chacha
         out_key[7] = x[15];
     }
 
+    // The stream `(stream0, stream1, stream2, domain_tag)` of `seed`. The block counter is
+    // `state[12]` alone, so a stream of more than one block never runs into another stream: the
+    // stream identifiers fill `state[13..16)` (`stream1` low and `stream0`) and the HChaCha nonce
+    // (`domain_tag`, `stream2`, and `stream1` high, folded into the domain's high word with
+    // `stream2` high, which is zero for every caller).
     __device__ __forceinline__ void rng_init(
         DeviceChaChaRng &rng,
         const GpuRngSeed &seed,
@@ -124,9 +129,9 @@ namespace gpu_chacha
 
         uint32_t hnonce[4] = {
             static_cast<uint32_t>(domain_tag),
-            static_cast<uint32_t>(domain_tag >> 32U),
+            static_cast<uint32_t>(domain_tag >> 32U) ^ static_cast<uint32_t>(stream2 >> 32U),
             static_cast<uint32_t>(stream2),
-            static_cast<uint32_t>(stream2 >> 32U),
+            static_cast<uint32_t>(stream1 >> 32U),
         };
         uint32_t subkey[8];
         hchacha20(base_key, hnonce, subkey);
@@ -135,10 +140,10 @@ namespace gpu_chacha
             rng.state[4 + i] = subkey[i];
         }
 
-        rng.state[12] = static_cast<uint32_t>(stream0);
-        rng.state[13] = static_cast<uint32_t>(stream0 >> 32U);
-        rng.state[14] = static_cast<uint32_t>(stream1);
-        rng.state[15] = static_cast<uint32_t>(stream1 >> 32U);
+        rng.state[12] = 0U;
+        rng.state[13] = static_cast<uint32_t>(stream1);
+        rng.state[14] = static_cast<uint32_t>(stream0);
+        rng.state[15] = static_cast<uint32_t>(stream0 >> 32U);
 
         rng.block_idx = 8U;
     }
@@ -146,11 +151,8 @@ namespace gpu_chacha
     __device__ __forceinline__ void rng_refill(DeviceChaChaRng &rng)
     {
         chacha20_block(rng.state, rng.block);
+        // 2^32 blocks (256 GiB) per stream; no caller draws nearly that many.
         rng.state[12] += 1U;
-        if (rng.state[12] == 0U)
-        {
-            rng.state[13] += 1U;
-        }
         rng.block_idx = 0U;
     }
 

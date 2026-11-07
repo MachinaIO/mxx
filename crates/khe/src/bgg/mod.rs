@@ -9,12 +9,15 @@
 //!   must bind each cached decomposition to the right gate; shapes and bounds alone do not
 //!   establish that binding.
 //! - `boolean`: BGG+ evaluation of dynamic Boolean circuit families.
+//! - `boolean_protocol`: the closed protocol that evaluates such a circuit on BGG+ encodings and
+//!   decrypts its output bit.
 //! - `lwe_lookup`: LWE-based public lookup tables with preprocessing artifacts.
 //! - `naive_vec`, `slot_operation`: per-slot vectors, slot transfer, and rotation.
 //! - `tall_encoding`, `tall_rotation_encoding`: Tall encodings with one row per slot and their
 //!   linear-transform preprocessing.
 
 pub mod boolean;
+pub mod boolean_protocol;
 pub mod circuit;
 pub mod encoding;
 pub mod lwe_lookup;

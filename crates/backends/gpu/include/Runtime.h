@@ -46,14 +46,21 @@ typedef struct GpuIndexedMatrixTable GpuIndexedMatrixTable;
 // primitives.  Keeping it in the private GPU header lets control kernels
 // enqueue work while preserving the owner's producer event without exposing
 // GPU types across the Rust ABI.
+struct GpuExecutionOwner;
 struct MxxGpuDeviceBuffer
 {
     int device = -1;
     gpuStream_t allocation_stream = nullptr;
     uint8_t *address = nullptr;
+    // Optional mapped backing; GPU kernels still use address.
+    void *mapped_host = nullptr;
+    std::shared_ptr<GpuExecutionOwner> execution;
     size_t bytes = 0;
     gpuEvent_t producer = nullptr;
     bool producer_valid = false;
+    // Set when a Graph submission reading the buffer could not be ordered
+    // before its free: the allocation is then kept rather than freed early.
+    bool release_blocked = false;
 };
 #endif
 
@@ -164,9 +171,10 @@ int gpu_device_get_identity(
     int *out_driver_version,
     int *out_runtime_version,
     uint64_t *out_context_generation,
-        char *out_backend, size_t backend_capacity,
-        char *out_architecture, size_t architecture_capacity,
-        int *out_wave_size);
+    size_t *out_resident_threads,
+    char *out_backend, size_t backend_capacity,
+    char *out_architecture, size_t architecture_capacity,
+    int *out_wave_size);
 
 /// Transfers ownership of pinned host pointers to the context-owned
 /// reclaimer. The reclaimer records a completion event on `stream`, waits
@@ -237,6 +245,10 @@ int gpu_device_memory_copy(const MxxGpuDeviceMemory *source, size_t offset,
 int gpu_device_memory_download(
     int physical_device, const void *source, void *destination, size_t bytes,
     const MxxGpuDeviceMemory *owner);
+// Copy between resident device addresses, possibly on different GPUs, and
+// return after the copy completes. The caller keeps both ranges alive.
+int gpu_device_address_copy(
+    int destination_device, void *destination, const void *source, size_t bytes);
 // The elements of a four-dimensional view in two byte-strided layouts.
 struct MxxStridedCopy
 {
@@ -253,13 +265,16 @@ int gpu_export_slot_reset(void *host_header);
 // Stream-ordered device buffer owners used by allocation-free graph bodies.
 // The opaque owner retains the allocation and its producer completion event;
 // callers may create borrowed interior views without duplicating ownership.
-int gpu_device_buffer_alloc(void *stream, size_t bytes, MxxGpuDeviceBuffer **out);
+int gpu_device_buffer_alloc(const GpuContext *ctx, void *stream, size_t bytes,
+    bool host_mapped, MxxGpuDeviceBuffer **out);
 int gpu_device_buffer_address(
     const MxxGpuDeviceBuffer *buffer,
     size_t offset,
     size_t bytes,
     void **out_address);
 int gpu_device_buffer_free(MxxGpuDeviceBuffer *buffer);
+int gpu_device_buffer_protect_compiled_submission(
+    MxxGpuDeviceBuffer *buffer, void *completion_event);
 int gpu_device_buffer_upload(
     MxxGpuDeviceBuffer *buffer,
     size_t offset,
@@ -315,6 +330,16 @@ int gpu_context_ntt_tables(GpuContext *ctx, const MxxRawMatrixView *view,
 int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     int inverse, uint32_t source_binding_base, uint32_t destination_binding_base);
+// One owner interval; repeated column work stays in the device kernel.
+int gpu_raw_matrix_column_gather(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+    const uint64_t *index, uint64_t first_column, uint64_t stride, uint64_t count,
+    uint32_t source_binding, uint32_t destination_binding, uint32_t index_binding);
+int gpu_raw_matrix_column_binary(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *left, const MxxRawMatrixView *right,
+    const MxxRawMatrixView *destination, uint32_t kind, uint64_t columns_per_job,
+    uint32_t left_binding_base, uint32_t right_binding_base,
+    uint32_t destination_binding_base);
 int gpu_raw_matrix_add_sub(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *left, const MxxRawMatrixView *right,
     const MxxRawMatrixView *destination, int subtract,
@@ -363,7 +388,7 @@ int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream,
     const void *value, int value_encoding,
     const MxxRawMatrixView *destination, uint32_t *status,
     uint32_t value_binding, uint32_t destination_binding_base,
-    uint32_t status_binding);
+    uint32_t status_binding, int unit);
 int gpu_indexed_matrix_table_create(GpuContext *ctx, void *stream,
     int32_t physical_device, size_t family_count, size_t limb_count,
     GpuIndexedMatrixTable **out_table);
@@ -371,6 +396,8 @@ int gpu_indexed_matrix_table_upload(GpuIndexedMatrixTable *table, void *stream,
     const MxxRawMatrixLimb *limbs, size_t limb_count);
 uint64_t gpu_indexed_matrix_table_address(const GpuIndexedMatrixTable *table);
 void gpu_indexed_matrix_table_destroy(GpuIndexedMatrixTable *table);
+int gpu_indexed_matrix_table_protect_compiled_submission(
+    GpuIndexedMatrixTable *table, void *completion_event);
 int gpu_raw_matrix_indexed_copy(GpuContext *ctx, void *stream,
     const void *index_address, int index_encoding,
     const GpuIndexedMatrixTable *table, const MxxRawMatrixView *destination,
@@ -439,6 +466,8 @@ int gpu_raw_preimage_cutoff_metadata_ranges(
     const GpuRawPreimageCutoffPlan *plan, uint64_t *addresses,
     size_t *bytes, size_t capacity, size_t *out_count);
 void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan);
+int gpu_raw_preimage_cutoff_protect_compiled_submission(
+    GpuRawPreimageCutoffPlan *plan, int physical_device, void *completion_event);
 int gpu_raw_preimage_add_correction(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *candidate_eval,
     const MxxRawMatrixView *r_eval, const MxxRawMatrixView *e_eval,
@@ -457,7 +486,12 @@ int gpu_raw_preimage_publish_accepted(GpuContext *ctx, void *stream,
     const GpuRawPreimageCutoffPlan *plan, const void *staging,
     size_t staging_bytes, const MxxPreimageStatus *status,
     uint32_t destination_binding, uint32_t staging_binding,
-    uint32_t status_binding);
+    uint32_t status_binding, const uint64_t *tile_index,
+    uint64_t tile_stride, uint64_t tile_count, uint32_t index_binding);
+int gpu_raw_preimage_run_finish(GpuContext *ctx, void *stream,
+    const MxxPreimageStatus *status, uint32_t *run_status,
+    uint32_t status_binding, uint32_t run_binding, const uint64_t *retry_limit,
+    uint32_t maximum, uint32_t limit_binding);
 int gpu_raw_matrix_decompose_coeff(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     uint32_t base_bits, size_t dropped_moduli,
@@ -470,7 +504,8 @@ int gpu_raw_modulus_conversion_prepare(
     GpuContext *ctx, int physical_device, void *stream,
     const uint64_t *source_moduli, size_t source_count,
     const uint64_t *target_moduli, size_t target_count,
-    int round_scale, GpuModulusConversionPlan **out_plan);
+    int round_scale, const uint64_t *gadget_residues, size_t gadget_digits,
+    GpuModulusConversionPlan **out_plan);
 int gpu_raw_centered_rebase_prepare(
     GpuContext *ctx, int physical_device, void *stream,
     const uint64_t *source_moduli, size_t source_count,
@@ -504,6 +539,11 @@ int gpu_raw_compact_pack_emit(
     const MxxRawSmallMatrixView *destination, uint32_t *status,
     uint32_t source_binding_base, uint32_t destination_binding,
     uint32_t status_binding);
+int gpu_raw_matrix_column_add(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *sum, const MxxRawMatrixView *term,
+    const MxxRawMatrixView *output, const void *index, int encoding,
+    uint32_t sum_binding, uint32_t term_binding, uint32_t output_binding,
+    uint32_t index_binding);
 int gpu_raw_matrix_dynamic_slice(
     GpuContext *ctx, void *stream, const MxxRawMatrixView *source,
     const MxxRawMatrixView *destination,

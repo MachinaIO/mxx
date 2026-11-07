@@ -3,6 +3,8 @@
 //! - `poly_circuit`: [`PolyCircuit`], polynomial circuits with gates ([`PolyGate`],
 //!   [`PolyGateKind`]), sub-circuit calls, and serialization.
 //! - `boolean`: Boolean circuit shapes and data with constant, copy, not, and, and xor gates.
+//! - `boolean_lowering`: the lowering of Boolean-idiom polynomial circuits to layered Boolean
+//!   circuits, and its depth without expansion.
 //! - `boolean_dsl`: DSL-level Boolean circuit families and their validity and satisfaction
 //!   predicates.
 //! - `public_lut`: public lookup programs.
@@ -12,6 +14,7 @@
 
 pub mod boolean;
 pub mod boolean_dsl;
+pub mod boolean_lowering;
 pub mod gate;
 pub mod lowering;
 pub mod poly_circuit;
@@ -27,6 +30,9 @@ pub use boolean_dsl::{
     BooleanCircuitFamilyParams, BooleanLayerGate, GateSlot, boolean_circuit_satisfaction_predicate,
     boolean_circuit_validity_predicate, evaluate_boolean_family, evaluate_boolean_matrix_family,
     select_boolean_matrix_output, select_boolean_output,
+};
+pub use boolean_lowering::{
+    BooleanLayering, BooleanLayeringBound, boolean_layering_bound, lower_to_boolean_layers,
 };
 pub use gate::{
     GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec, SubCircuitParamKind,

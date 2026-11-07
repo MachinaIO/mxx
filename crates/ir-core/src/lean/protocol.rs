@@ -31,10 +31,15 @@ pub enum ProtocolExportError {
 /// stage (`Stage_<id>`), per requirement (`Requirement_<i>`), and for the ideal graph (`Ideal`),
 /// the gadget layouts they use (`Backend`), and the linked claim (`Claim`). The claim is stated at
 /// the declaration's parameter bindings and failure probability; a proof package imports `Claim`
-/// and proves `GeneratedClaim.CorrectnessClaim`.
+/// and proves `GeneratedClaim.CorrectnessClaim`. With `facts`, each of these graph modules
+/// `M` also gets `M_Facts` ([`ExportOptions::facts`](crate::lean::ExportOptions::facts)): its
+/// record scopes' wire constants and named facts, for proofs that read atoms by name.
+/// Large graph/facts sources are partitioned at declaration boundaries into parts of at most
+/// three million bytes; the original module name re-exports the same declarations.
 pub fn export(
     protocol: &ProtocolDecl,
     directory: &std::path::Path,
+    facts: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         artifact::export_validated_manifest,
@@ -101,6 +106,7 @@ pub fn export(
                 namespace: name.clone(),
                 module_name: name.clone(),
                 sampling_tape: declaration.failure_probability_log2.is_some(),
+                facts,
                 ..ExportOptions::default()
             },
         )?;
@@ -117,7 +123,20 @@ pub fn export(
             };
             layouts.insert(key, merged);
         }
-        fs::write(directory.join(format!("{name}.lean")), &artifact.source)?;
+        for (module, source) in
+            super::modules::partition(&name, &artifact.source, super::modules::MODULE_BYTES)?
+        {
+            fs::write(directory.join(format!("{module}.lean")), source)?;
+        }
+        if let Some(facts) = &artifact.facts_source {
+            for (module, source) in super::modules::partition(
+                &format!("{name}_Facts"),
+                facts,
+                super::modules::MODULE_BYTES,
+            )? {
+                fs::write(directory.join(format!("{module}.lean")), source)?;
+            }
+        }
         generated.insert(name, artifact);
     }
     let layouts = layouts.into_values().collect::<Vec<_>>();
@@ -315,15 +334,15 @@ pub fn assemble_claim(
             });
         }
     }
-    let ComparatorSpec::Equality { endpoints } = &bundle.comparator else {
+    let ComparatorSpec::Equality { endpoints } = &bundle.comparison.comparator else {
         return Err(ProtocolExportError::Invalid("unsupported comparator".into()));
     };
-    if endpoints.len() != 1 || bundle.endpoints.entries.len() != 1 {
+    if endpoints.len() != 1 || bundle.comparison.endpoints.entries.len() != 1 {
         return Err(ProtocolExportError::Invalid(
             "a claim currently requires exactly one compared endpoint".into(),
         ));
     }
-    let endpoint = &bundle.endpoints.entries[0];
+    let endpoint = &bundle.comparison.endpoints.entries[0];
     let comparison = &endpoints[0];
     if comparison.endpoint != endpoint.spec ||
         comparison.actual_input != endpoint.workflow_output.output ||

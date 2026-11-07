@@ -30,8 +30,8 @@ use crate::{
     },
     ring::{ConcreteRing, RingRef, resolve_ring},
     types::{
-        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port,
-        WireRef, WireType,
+        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, MEMBER_INDEX, MatrixType,
+        NodeId, Port, WireRef, WireType,
     },
 };
 use num_bigint::BigInt;
@@ -200,6 +200,11 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
             let mut variables = BTreeSet::new();
             let mut loop_slots = BTreeSet::new();
             collect_serialized_references(node.kind(), &mut variables, &mut loop_slots);
+            // An input's declared type is its output type, checked below (a family input's
+            // element may depend on the member index).
+            if matches!(node.kind(), NodeKind::Input { .. }) {
+                loop_slots.remove(&MEMBER_INDEX);
+            }
             let declared = &declared_by_scope[scope_id];
             if let Some(name) = variables.iter().find(|name| !declared.contains(*name)) {
                 return Err(ValidationError::UndeclaredCompileVariable(name.clone()));
@@ -253,11 +258,17 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                     "loop-dependent family access must use FamilyGetDynamic",
                 );
             }
+            // Types may depend on an enclosing loop's index (one type per instance) and, inside a
+            // family element, on the member index; the node's own loop index is not in scope for
+            // its outputs.
             for wire_type in node.output_types() {
                 let mut ignored = BTreeSet::new();
                 let mut structural_slots = BTreeSet::new();
                 collect_serialized_references(wire_type, &mut ignored, &mut structural_slots);
-                if let Some(slot) = structural_slots.into_iter().next() {
+                if let Some(slot) = structural_slots
+                    .into_iter()
+                    .find(|slot| *slot != MEMBER_INDEX && !allowed_slots.contains(slot))
+                {
                     return Err(ValidationError::StructuralLoopIndex {
                         scope: scope_id.clone(),
                         slot,
@@ -267,6 +278,82 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
     Ok(())
+}
+
+/// The declared (symbolic) type of `wire` in `scope`.
+fn symbolic_wire_type(scope: &GraphScope, wire: &WireRef) -> WireType {
+    scope.nodes()[wire.node.0 as usize].output_types()[wire.port.0 as usize].clone()
+}
+
+/// The symbolic instance count of a parallel loop, without allocating its members.
+fn parallel_instances(
+    spec: &crate::node::ParallelLoop,
+    env: &ParamEnv,
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+) -> Result<u128, ValidationError> {
+    nonnegative_family_count(spec.count.evaluate(env)?, "parallel count", scope, node)
+}
+
+/// The environment of instance `index` of a parallel loop's body.
+fn instance_env(
+    env: &ParamEnv,
+    spec: &crate::node::ParallelLoop,
+    index: impl Into<BigInt>,
+) -> Result<ParamEnv, ValidationError> {
+    let mut loop_env = env.clone();
+    loop_env.loop_indices.insert(spec.index_slot, index.into());
+    child_bindings(&loop_env, &spec.bindings)
+}
+
+/// Whether a wire type of `scope` or of a scope nested in it names loop index `slot`.
+pub(crate) fn scope_types_reference_slot(
+    graph: &Graph,
+    scope_id: &FrozenGraphScopeId,
+    slot: u32,
+) -> bool {
+    scope_types_reference_slot_cached(graph, scope_id, slot, &mut ScopeTypeSlotMemo::default())
+}
+
+#[derive(Default)]
+struct ScopeTypeSlotMemo {
+    scopes: BTreeMap<(FrozenGraphScopeId, u32), bool>,
+    // Equal wire types recur in many nodes and scopes. Serialize their expressions
+    // once, including all referenced rings, rather than once per node and queried slot.
+    types: BTreeMap<WireType, BTreeSet<u32>>,
+}
+
+/// Cache structural queries only, never executions or parameter instantiations.
+/// Shared named children otherwise cause the same type trees to be serialized along
+/// every path through the scope DAG, including when the answer is negative.
+fn scope_types_reference_slot_cached(
+    graph: &Graph,
+    scope_id: &FrozenGraphScopeId,
+    slot: u32,
+    memo: &mut ScopeTypeSlotMemo,
+) -> bool {
+    let key = (scope_id.clone(), slot);
+    if let Some(result) = memo.scopes.get(&key) {
+        return *result;
+    }
+    let Some(scope) = graph.scope(scope_id) else {
+        return false;
+    };
+    let result = scope.nodes().iter().enumerate().any(|(position, node)| {
+        node.output_types().iter().any(|wire_type| {
+            if !memo.types.contains_key(wire_type) {
+                let mut ignored = BTreeSet::new();
+                let mut slots = BTreeSet::new();
+                collect_serialized_references(wire_type, &mut ignored, &mut slots);
+                memo.types.insert(wire_type.clone(), slots);
+            }
+            memo.types[wire_type].contains(&slot)
+        }) || graph
+            .child_scope_id(scope_id, NodeId(position as u64))
+            .is_some_and(|child| scope_types_reference_slot_cached(graph, &child, slot, memo))
+    });
+    memo.scopes.insert(key, result);
+    result
 }
 
 fn structural_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<u32> {
@@ -488,6 +575,16 @@ pub(crate) fn collect_scope_bindings(
     env: ParamEnv,
     output: &mut BTreeMap<FrozenGraphScopeId, Vec<ParamEnv>>,
 ) -> Result<(), ValidationError> {
+    collect_scope_bindings_cached(graph, scope_id, env, output, &mut ScopeTypeSlotMemo::default())
+}
+
+fn collect_scope_bindings_cached(
+    graph: &Graph,
+    scope_id: &FrozenGraphScopeId,
+    env: ParamEnv,
+    output: &mut BTreeMap<FrozenGraphScopeId, Vec<ParamEnv>>,
+    type_slots: &mut ScopeTypeSlotMemo,
+) -> Result<(), ValidationError> {
     let envs = output.entry(scope_id.clone()).or_default();
     if envs.contains(&env) {
         return Ok(());
@@ -504,9 +601,30 @@ pub(crate) fn collect_scope_bindings(
         let child_env = match node.kind() {
             NodeKind::SubgraphCall(call) => child_bindings(&env, &call.bindings)?,
             NodeKind::ParallelLoop(loop_spec) => {
-                let mut loop_env = env.clone();
-                loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
-                child_bindings(&loop_env, &loop_spec.bindings)?
+                // A body whose types depend on its index is checked for every instance; any other
+                // body is checked at index zero.
+                let instances = if scope_types_reference_slot_cached(
+                    graph,
+                    &child_id,
+                    loop_spec.index_slot,
+                    type_slots,
+                ) {
+                    let count = loop_spec.count.evaluate(&env)?;
+                    count.to_u64().ok_or(ValidationError::Node {
+                        scope: scope_id.clone(),
+                        node: node_id,
+                        message: "parallel count must be a nonnegative integer".to_owned(),
+                    })?
+                } else {
+                    1
+                };
+                for index in 0..instances.max(1) {
+                    let mut loop_env = env.clone();
+                    loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::from(index));
+                    let child_env = child_bindings(&loop_env, &loop_spec.bindings)?;
+                    collect_scope_bindings_cached(graph, &child_id, child_env, output, type_slots)?;
+                }
+                continue;
             }
             NodeKind::SequentialLoop(loop_spec) => {
                 let mut loop_env = env.clone();
@@ -515,7 +633,7 @@ pub(crate) fn collect_scope_bindings(
             }
             _ => continue,
         };
-        collect_scope_bindings(graph, &child_id, child_env, output)?;
+        collect_scope_bindings_cached(graph, &child_id, child_env, output, type_slots)?;
     }
     Ok(())
 }
@@ -670,6 +788,8 @@ fn validate_node(
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation: crate::types::TrapdoorInstantiation::Computational,
+                preimage_sigma: None,
             }]
         }
         NodeKind::TrapdoorPublic => {
@@ -1034,6 +1154,19 @@ fn validate_node(
                 node.id,
             )?)]
         }
+        NodeKind::BlockDiagonal { count } => {
+            require_arity(scope, node, 1)?;
+            if *count == 0 {
+                return node_error(scope, node.id, "block diagonal requires a positive count");
+            }
+            let input = matrix_argument(scope, values, node, 0)?;
+            let (Some(rows), Some(columns)) =
+                (input.rows.checked_mul(*count), input.columns.checked_mul(*count))
+            else {
+                return node_error(scope, node.id, "block diagonal dimensions overflow");
+            };
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { rows, columns, ..input })]
+        }
         NodeKind::Tensor => {
             require_arity(scope, node, 2)?;
             let left = matrix_argument(scope, values, node, 0)?;
@@ -1074,18 +1207,46 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_type)]
         }
-        NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
+        NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound, compact } => {
             require_arity(scope, node, 0)?;
             require_nonnegative_real(sigma.evaluate_f64(env)?, scope, node.id, "Gaussian sigma")?;
             let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
             if max_coefficient_bound.is_negative() {
                 return node_error(scope, node.id, "Gaussian coefficient bound must be nonnegative");
             }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            if *compact {
+                vec![ConcreteWireType::SmallMatrix {
+                    matrix,
+                    max_coefficient_bound,
+                    bound_domain: CoefficientBoundDomain::Global,
+                }]
+            } else {
+                vec![ConcreteWireType::Matrix(matrix)]
+            }
+        }
+        NodeKind::Sha256BitColumns { rows, columns, index_bits, .. } => {
+            require_arity(scope, node, 0)?;
+            if *rows == 0 ||
+                *columns == 0 ||
+                *index_bits == 0 ||
+                *index_bits < (usize::BITS - (rows - 1).leading_zeros()) as usize ||
+                rows.checked_mul(*columns).is_none() ||
+                rows.checked_mul(*index_bits).is_none()
+            {
+                return node_error(scope, node.id, "invalid SHA-256 column geometry or index width");
+            }
+            vec![
+                ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count: *columns as u128,
+                };
+                2
+            ]
         }
         NodeKind::HashIntFamily { count, modulus, tag_components, .. } => {
             validate_hash_key_and_tag(scope, values, node, tag_components, env)?;
-            let count = nonnegative_usize(
+            let count = nonnegative_family_count(
                 count.evaluate(env)?,
                 "hash integer family count",
                 scope,
@@ -1166,6 +1327,8 @@ fn validate_node(
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
         } => {
             require_arity(scope, node, 0)?;
             let sigma = sigma.close(env)?;
@@ -1175,6 +1338,16 @@ fn validate_node(
                 node.id,
                 "trapdoor sigma",
             )?;
+            let preimage_sigma =
+                preimage_sigma.as_ref().map(|width| width.close(env)).transpose()?;
+            if let Some(width) = &preimage_sigma {
+                require_positive_real(
+                    width.evaluate_f64(&ParamEnv::default())?,
+                    scope,
+                    node.id,
+                    "preimage sigma",
+                )?;
+            }
             let gadget_base = gadget_base.evaluate(env)?.abs();
             if gadget_base <= BigInt::one() {
                 return node_error(scope, node.id, "gadget base must be greater than one");
@@ -1186,19 +1359,18 @@ fn validate_node(
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let expected_columns = matrix
-                .rows
-                .checked_mul(digit_count.saturating_add(2))
-                .ok_or_else(|| ValidationError::Node {
-                    scope: scope.clone(),
-                    node: node.id,
-                    message: "trapdoor width overflow".to_owned(),
-                })?;
+            let Some(expected_columns) = instantiation.columns(matrix.rows, digit_count) else {
+                return node_error(
+                    scope,
+                    node.id,
+                    "invalid trapdoor instantiation for the public row count",
+                );
+            };
             if matrix.columns != expected_columns {
                 return node_error(
                     scope,
                     node.id,
-                    "trapdoor columns must equal rows * (digit_count + 2)",
+                    "trapdoor columns must equal the instantiation's trapdoor width",
                 );
             }
             vec![
@@ -1209,6 +1381,8 @@ fn validate_node(
                     gadget_base,
                     digit_count,
                     preimage_max_coefficient_bound,
+                    instantiation: *instantiation,
+                    preimage_sigma,
                 },
             ]
         }
@@ -1290,17 +1464,28 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix)]
         }
-        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, family } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
             let count = positive_usize(length.evaluate(env)?, "decode length", scope, node.id)?;
             if !input.is_scalar() ||
                 count > input.ring.ring_dimension() as usize ||
-                plaintext_modulus.evaluate(env)? <= BigInt::one()
+                plaintext_modulus.evaluate(env)? <= BigInt::one() ||
+                (*family && *output_bool)
             {
                 return node_error(scope, node.id, "invalid threshold decoding parameters");
             }
-            vec![if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int }; count]
+            if *family {
+                vec![ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count: count as u128,
+                }]
+            } else {
+                vec![
+                    if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
+                    count
+                ]
+            }
         }
         NodeKind::CrtRecompose { modulus, plaintext_moduli, reconstruction_coefficients } => {
             if node.args.is_empty() ||
@@ -1378,7 +1563,7 @@ fn validate_node(
             }
             match argument(scope, values, node, 0)? {
                 ConcreteWireType::IndexedFamily { element, count }
-                    if is_integer(element) && *count == ring.ring.ring_dimension() as usize => {}
+                    if is_integer(element) && *count == ring.ring.ring_dimension() as u128 => {}
                 _ => {
                     return node_error(
                         scope,
@@ -1424,7 +1609,7 @@ fn validate_node(
             }
             vec![ConcreteWireType::IndexedFamily {
                 element: Box::new(ConcreteWireType::Int),
-                count: ring.ring.ring_dimension() as usize,
+                count: ring.ring.ring_dimension() as u128,
             }]
         }
         NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
@@ -1455,7 +1640,8 @@ fn validate_node(
                 })?;
             match argument(scope, values, node, 0)? {
                 ConcreteWireType::IndexedFamily { element, count }
-                    if element.as_ref() == &ConcreteWireType::Bool && *count == expected_count => {}
+                    if element.as_ref() == &ConcreteWireType::Bool &&
+                        *count == expected_count as u128 => {}
                 _ => {
                     return node_error(
                         scope,
@@ -1476,32 +1662,37 @@ fn validate_node(
             if node.args.len() != count || count == 0 {
                 return node_error(scope, node.id, "family pack argument count mismatch");
             }
-            let first = argument(scope, values, node, 0)?.clone();
-            if matches!(first, ConcreteWireType::IndexedFamily { .. }) {
-                return node_error(scope, node.id, "family members must have one non-family type");
+            // Members of one type form an indexed family; members of different types (declared by
+            // an element type naming the member index) form a dependent family.
+            let members = (0..count)
+                .map(|index| argument(scope, values, node, index).cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            if members.iter().all(|member| member == &members[0]) {
+                vec![ConcreteWireType::IndexedFamily {
+                    element: Box::new(members[0].clone()),
+                    count: count as u128,
+                }]
+            } else {
+                vec![ConcreteWireType::DependentFamily { members }]
             }
-            for index in 1..count {
-                if argument(scope, values, node, index)? != &first {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "family members must have one non-family type",
-                    );
-                }
-            }
-            vec![ConcreteWireType::IndexedFamily { element: Box::new(first), count }]
         }
         NodeKind::FamilyGetStatic { index } => {
             require_arity(scope, node, 1)?;
-            let ConcreteWireType::IndexedFamily { element, count } =
-                argument(scope, values, node, 0)?.clone()
-            else {
-                return node_error(scope, node.id, "family access requires an indexed family");
-            };
-            if nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)? >= count {
-                return node_error(scope, node.id, "family index is out of range");
+            let index =
+                nonnegative_family_count(index.evaluate(env)?, "family index", scope, node.id)?;
+            match argument(scope, values, node, 0)?.clone() {
+                ConcreteWireType::IndexedFamily { element, count } if index < count => {
+                    vec![*element]
+                }
+                ConcreteWireType::DependentFamily { members } if index < members.len() as u128 => {
+                    vec![members[index as usize].clone()]
+                }
+                ConcreteWireType::IndexedFamily { .. } |
+                ConcreteWireType::DependentFamily { .. } => {
+                    return node_error(scope, node.id, "family index is out of range");
+                }
+                _ => return node_error(scope, node.id, "family access requires an indexed family"),
             }
-            vec![*element]
         }
         NodeKind::FamilyGetDynamic => {
             require_arity(scope, node, 2)?;
@@ -1634,13 +1825,13 @@ fn validate_structural_boundaries(
                     vec![LoopInputMode::Broadcast; args.len()]
                 }
                 NodeKind::ParallelLoop(loop_spec) => {
-                    let count = nonnegative_usize(
+                    let count = nonnegative_family_count(
                         loop_spec.count.evaluate(env)?,
                         "parallel count",
                         scope_id,
                         node_id,
                     )?;
-                    if count < loop_spec.minimum_count {
+                    if count < loop_spec.minimum_count as u128 {
                         return node_error(scope_id, node_id, "parallel count is below its minimum");
                     }
                     if loop_spec.input_modes.len() != args.len() {
@@ -1675,25 +1866,61 @@ fn validate_structural_boundaries(
                         node: input.node,
                         wire: *input,
                     })?;
+                if let (
+                    ConcreteWireType::DependentFamily { members },
+                    LoopInputMode::Zip |
+                    LoopInputMode::ZipOffset { .. } |
+                    LoopInputMode::ZipQuotient { .. },
+                    NodeKind::ParallelLoop(spec),
+                ) = (outer, mode, handle.kind())
+                {
+                    // Instance `k` reads its zipped member (`k + offset`, `floor(k / divisor)`),
+                    // at its own type.
+                    let symbolic = symbolic_wire_type(child_scope, input);
+                    let instances = nonnegative_usize(
+                        spec.count.evaluate(env)?,
+                        "dependent parallel count",
+                        scope_id,
+                        node_id,
+                    )?;
+                    for index in 0..instances {
+                        let member = mode
+                            .zipped_member(index)
+                            .and_then(|member| members.get(member))
+                            .ok_or_else(|| ValidationError::Node {
+                                scope: scope_id.clone(),
+                                node: node_id,
+                                message: "zipped family is too short".to_owned(),
+                            })?;
+                        let instance = instance_env(env, spec, index)?;
+                        if member !=
+                            &concretize_wire_type(&symbolic, &instance, &child_id, input.node)?
+                        {
+                            return node_error(scope_id, node_id, "child input type mismatch");
+                        }
+                    }
+                    continue;
+                }
                 let actual = match mode {
                     LoopInputMode::Broadcast => outer,
-                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
+                    LoopInputMode::Zip |
+                    LoopInputMode::ZipOffset { .. } |
+                    LoopInputMode::ZipQuotient { .. } => {
                         let ConcreteWireType::IndexedFamily { element, count } = outer else {
                             return node_error(scope_id, node_id, "zipped input is not a family");
                         };
                         if let NodeKind::ParallelLoop(spec) = handle.kind() {
-                            let iterations = nonnegative_usize(
+                            let iterations = nonnegative_family_count(
                                 spec.count.evaluate(env)?,
                                 "parallel count",
                                 scope_id,
                                 node_id,
                             )?;
-                            let offset = match mode {
-                                LoopInputMode::Zip => 0,
-                                LoopInputMode::ZipOffset { offset } => offset,
-                                _ => 0,
-                            };
-                            if iterations > 0 && *count < iterations.saturating_add(offset) {
+                            // The last instance reads the largest member.
+                            if iterations > 0 &&
+                                mode.zipped_member(iterations - 1)
+                                    .is_none_or(|last| last >= *count)
+                            {
                                 return node_error(scope_id, node_id, "zipped family is too short");
                             }
                         }
@@ -1734,11 +1961,32 @@ fn validate_structural_boundaries(
                 let child_type = &child.wire_types[output];
                 let call_type =
                     &validated.wire_types[&WireRef { node: node_id, port: Port(port as u32) }];
+                if let (
+                    ConcreteWireType::DependentFamily { members },
+                    NodeKind::ParallelLoop(spec),
+                ) = (call_type, handle.kind())
+                {
+                    // Member `k` is instance `k`'s output, at its own type.
+                    let symbolic = symbolic_wire_type(child_scope, output);
+                    let instances = parallel_instances(spec, env, scope_id, node_id)?;
+                    if members.len() as u128 != instances {
+                        return node_error(scope_id, node_id, "child output type mismatch");
+                    }
+                    for (index, member) in members.iter().enumerate() {
+                        let instance = instance_env(env, spec, index)?;
+                        if member !=
+                            &concretize_wire_type(&symbolic, &instance, &child_id, output.node)?
+                        {
+                            return node_error(scope_id, node_id, "child output type mismatch");
+                        }
+                    }
+                    continue;
+                }
                 let expected = if matches!(handle.kind(), NodeKind::ParallelLoop(_)) {
                     let NodeKind::ParallelLoop(spec) = handle.kind() else { unreachable!() };
                     ConcreteWireType::IndexedFamily {
                         element: Box::new(child_type.clone()),
-                        count: nonnegative_usize(
+                        count: nonnegative_family_count(
                             spec.count.evaluate(env)?,
                             "parallel count",
                             scope_id,
@@ -1920,21 +2168,42 @@ fn concretize_wire_type_inner(
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
         } => ConcreteWireType::Trapdoor {
             matrix: concrete_matrix(matrix, env, scope, node)?,
             sigma: sigma.close(env)?,
             gadget_base: gadget_base.evaluate(env)?,
             digit_count: positive_usize(digit_count.evaluate(env)?, "digit count", scope, node)?,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.evaluate(env)?,
+            instantiation: *instantiation,
+            preimage_sigma: preimage_sigma.as_ref().map(|width| width.close(env)).transpose()?,
         },
         WireType::IndexedFamily { element, count } => {
-            let element = concretize_wire_type(element, env, scope, node)?;
-            if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
-                return node_error(scope, node, "nested indexed families are unsupported");
-            }
-            ConcreteWireType::IndexedFamily {
-                element: Box::new(element),
-                count: nonnegative_usize(count.evaluate(env)?, "family count", scope, node)?,
+            let count =
+                nonnegative_family_count(count.evaluate(env)?, "family count", scope, node)?;
+            // An element type naming the member index resolves member by member.
+            let dependent = WireType::family_member(element, &IntExpr::constant(0)) != **element;
+            if !dependent {
+                // A family member may itself be a family only as a parallel loop's output (a
+                // family pack rejects family members).
+                let element = concretize_wire_type(element, env, scope, node)?;
+                ConcreteWireType::IndexedFamily { element: Box::new(element), count }
+            } else {
+                let addressable_count =
+                    nonnegative_usize(BigInt::from(count), "dependent family count", scope, node)?;
+                let members = (0..addressable_count)
+                    .map(|index| {
+                        let member = WireType::family_member(element, &IntExpr::constant(index));
+                        concretize_wire_type(&member, env, scope, node)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match members.first() {
+                    Some(first) if members.iter().all(|member| member == first) => {
+                        ConcreteWireType::IndexedFamily { element: Box::new(first.clone()), count }
+                    }
+                    _ => ConcreteWireType::DependentFamily { members },
+                }
             }
         }
     })
@@ -2025,6 +2294,10 @@ fn validate_constant(
             }
             Ok(())
         }
+        ConstantMatrix::AllCoefficients { value } => {
+            value.evaluate(env)?;
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -2108,7 +2381,7 @@ fn child_bindings(
     Ok(child)
 }
 
-fn family_element(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<usize>) {
+fn family_element(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<u128>) {
     match ty {
         ConcreteWireType::IndexedFamily { element, count } => (element, Some(*count)),
         scalar => (scalar, None),
@@ -2131,18 +2404,25 @@ fn validate_hash_key_and_tag(
     for index in 1..node.args.len() {
         require_scalar(scope, values, node, index, is_integer, "integer")?;
     }
-    for component in tag_components {
+    for (component_index, component) in tag_components.iter().enumerate() {
         match component {
             HashTagComponent::Bytes(_) => {}
             HashTagComponent::Integer(expression) | HashTagComponent::Decimal(expression) => {
                 expression.evaluate(env)?;
             }
             HashTagComponent::U64Le(expression) => {
-                if expression.evaluate(env)?.to_u64().is_none() {
-                    return node_error(scope, node.id, "little-endian hash tag must fit in u64");
+                let value = expression.evaluate(env)?;
+                if value.to_u64().is_none() {
+                    return node_error(
+                        scope,
+                        node.id,
+                        &format!(
+                            "little-endian hash tag must fit in u64: component {component_index} evaluated to {value}"
+                        ),
+                    );
                 }
             }
-            HashTagComponent::Operand(index) => {
+            HashTagComponent::Operand(index) | HashTagComponent::OperandU64Le(index) => {
                 require_scalar(scope, values, node, *index, is_integer, "integer")?;
             }
         }
@@ -2160,6 +2440,19 @@ fn positive_usize(
         scope: scope.clone(),
         node,
         message: format!("{label} must be a positive usize"),
+    })
+}
+
+fn nonnegative_family_count(
+    value: BigInt,
+    label: &str,
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+) -> Result<u128, ValidationError> {
+    value.to_u128().ok_or_else(|| ValidationError::Node {
+        scope: scope.clone(),
+        node,
+        message: format!("{label} must be a nonnegative 128-bit integer"),
     })
 }
 
@@ -2236,6 +2529,80 @@ mod tests {
         )
         .output(0)
         .expect("matrix input")
+    }
+
+    #[test]
+    fn type_slot_queries_cache_shared_children_without_conflating_slots() {
+        let mut member = matrix_type(17, 1, 1);
+        member.columns = IntExpr::Add(
+            Box::new(IntExpr::LoopIndex(MEMBER_INDEX)),
+            Box::new(IntExpr::constant(1)),
+        );
+        let ty = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(member)),
+            count: IntExpr::constant(2),
+        };
+        let argument = || {
+            value(
+                NodeKind::Input { name: "family".into(), wire_type: ty.clone(), artifact: None },
+                Vec::new(),
+                vec![ty.clone()],
+            )
+        };
+        let mut child = crate::with_new_construction_scope(|scope| {
+            let family = argument();
+            crate::SubgraphHandle::new("leaf", scope, vec![family.clone()], vec![family]).unwrap()
+        });
+        for depth in 0..8 {
+            child = crate::with_new_construction_scope(|scope| {
+                let family = argument();
+                let call = || {
+                    NodeHandle::subgraph_call(
+                        child.clone(),
+                        vec![family.clone()],
+                        Vec::new(),
+                        vec![None],
+                    )
+                    .output(0)
+                    .unwrap()
+                };
+                crate::SubgraphHandle::new(
+                    format!("shared-{depth}"),
+                    scope,
+                    vec![family.clone()],
+                    vec![call(), call()],
+                )
+                .unwrap()
+            });
+        }
+        let output = NodeHandle::subgraph_call(child, vec![argument()], Vec::new(), vec![None])
+            .output(0)
+            .unwrap();
+        let graph = graph("shared-type-query", output);
+        let mut memo = ScopeTypeSlotMemo::default();
+        assert!(!scope_types_reference_slot_cached(
+            &graph,
+            &FrozenGraphScopeId::Root,
+            7,
+            &mut memo,
+        ));
+        assert_eq!(memo.scopes.len(), graph.scopes().len());
+        let unique_types = graph
+            .scopes()
+            .values()
+            .flat_map(|scope| {
+                scope.nodes().iter().flat_map(|node| node.output_types().iter().cloned())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(memo.types.len(), unique_types.len());
+        assert!(scope_types_reference_slot_cached(
+            &graph,
+            &FrozenGraphScopeId::Root,
+            MEMBER_INDEX,
+            &mut memo,
+        ));
+        assert_eq!(memo.scopes.len(), graph.scopes().len() + 1);
+        assert_eq!(memo.types.len(), unique_types.len());
     }
 
     fn bounded_input(
@@ -2428,6 +2795,26 @@ mod tests {
         crate::ring::test_validate(&graph("constant-shape", output), &ParamEnv::default())
             .map(|_| ())
             .map_err(node_message)
+    }
+
+    #[test]
+    fn test_block_diagonal_rejects_zero_count_and_dimension_overflow() {
+        for (count, message) in [
+            (0, "block diagonal requires a positive count"),
+            (usize::MAX, "block diagonal dimensions overflow"),
+        ] {
+            let output = value(
+                NodeKind::BlockDiagonal { count },
+                vec![input("input", matrix_type(17, 2, 3))],
+                vec![WireType::Matrix(matrix_type(17, 1, 1))],
+            );
+            let error = crate::ring::test_validate(
+                &graph("block-diagonal-invalid", output),
+                &ParamEnv::default(),
+            )
+            .unwrap_err();
+            assert_eq!(node_message(error), message);
+        }
     }
 
     #[test]
@@ -2719,6 +3106,80 @@ mod tests {
     }
 
     #[test]
+    fn hash_u64_le_reports_out_of_range_component_value() {
+        let key_type = WireType::Bytes { length: IntExpr::constant(32) };
+        let key = value(
+            NodeKind::Input { name: "key".to_owned(), wire_type: key_type.clone(), artifact: None },
+            Vec::new(),
+            vec![key_type],
+        );
+        let limit = BigInt::from(1u8) << 64usize;
+        for integer in [BigInt::from(-1), &limit - 1, limit.clone()] {
+            let matrix_type = matrix_type(17, 1, 1);
+            let sample = value(
+                NodeKind::HashSample {
+                    matrix_type: matrix_type.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: Vec::new(),
+                    tag_components: vec![crate::node::HashTagComponent::U64Le(IntExpr::Const(
+                        integer.clone(),
+                    ))],
+                    base: None,
+                    digit_count: None,
+                },
+                vec![key.clone()],
+                vec![WireType::Matrix(matrix_type)],
+            );
+            let result =
+                crate::ring::test_validate(&graph("u64-le-boundary", sample), &ParamEnv::default());
+            if integer == &limit - 1 {
+                result.unwrap();
+            } else {
+                assert!(
+                    node_message(result.unwrap_err())
+                        .contains(&format!("component 0 evaluated to {integer}"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_u64_le_operand_must_be_an_integer_scalar() {
+        let key_type = WireType::Bytes { length: IntExpr::constant(32) };
+        let key = value(
+            NodeKind::Input { name: "key".to_owned(), wire_type: key_type.clone(), artifact: None },
+            Vec::new(),
+            vec![key_type],
+        );
+        let row = value(
+            NodeKind::Input { name: "row".to_owned(), wire_type: WireType::Int, artifact: None },
+            Vec::new(),
+            vec![WireType::Int],
+        );
+        let sample = |operand: usize| {
+            let matrix_type = matrix_type(17, 1, 1);
+            value(
+                NodeKind::HashSample {
+                    matrix_type: matrix_type.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: Vec::new(),
+                    tag_components: vec![crate::node::HashTagComponent::OperandU64Le(operand)],
+                    base: None,
+                    digit_count: None,
+                },
+                vec![key.clone(), row.clone()],
+                vec![WireType::Matrix(matrix_type)],
+            )
+        };
+        crate::ring::test_validate(&graph("u64-le-integer", sample(1)), &ParamEnv::default())
+            .unwrap();
+        let error =
+            crate::ring::test_validate(&graph("u64-le-key", sample(0)), &ParamEnv::default())
+                .unwrap_err();
+        assert!(node_message(error).contains("integer"));
+    }
+
+    #[test]
     fn hash_sample_metadata_matches_variant_and_output_schema() {
         let plain_with_base = hash_sample(
             matrix_type(17, 1, 1),
@@ -2995,6 +3456,7 @@ mod tests {
                 matrix_type: gaussian_type.clone(),
                 sigma: crate::RealExpr::from_integer(-1),
                 max_coefficient_bound: IntExpr::constant(0),
+                compact: false,
             },
             Vec::new(),
             vec![WireType::Matrix(gaussian_type)],
@@ -3084,6 +3546,7 @@ mod tests {
                 plaintext_modulus: IntExpr::constant(1),
                 length: IntExpr::constant(9),
                 output_bool: false,
+                family: false,
             },
             vec![level],
             vec![WireType::Int; 9],
@@ -3404,6 +3867,46 @@ mod tests {
     }
 
     #[test]
+    fn oversized_uniform_family_retains_exact_cardinality_and_static_bounds() {
+        let count = (usize::MAX as u128) * 130;
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Int),
+            count: IntExpr::constant(count),
+        };
+        let select = |index| {
+            let family = value(
+                NodeKind::Input {
+                    name: "wide-family".to_owned(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![family_type.clone()],
+            );
+            value(
+                NodeKind::FamilyGetStatic { index: IntExpr::constant(index) },
+                vec![family],
+                vec![WireType::Int],
+            )
+        };
+        let validated = crate::ring::test_validate(
+            &graph("wide-family-valid", select(count - 1)),
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert!(validated.root_scope().wire_types.values().any(|ty| matches!(
+            ty, ConcreteWireType::IndexedFamily { count: found, .. } if *found == count
+        )));
+        assert!(
+            crate::ring::test_validate(
+                &graph("wide-family-invalid", select(count)),
+                &ParamEnv::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn family_validation_rejects_heterogeneous_members_and_warns_for_dynamic_indices() {
         let left = input("left", matrix_type(17, 1, 1));
         let right = input("right", matrix_type(17, 2, 1));
@@ -3415,15 +3918,15 @@ mod tests {
                 count: IntExpr::constant(2),
             }],
         );
-        assert_eq!(
+        assert!(
             node_message(
                 crate::ring::test_validate(
                     &graph("heterogeneous-family", heterogeneous),
                     &ParamEnv::default()
                 )
                 .unwrap_err()
-            ),
-            "family members must have one non-family type"
+            )
+            .starts_with("declared output types")
         );
 
         let first = input("first", matrix_type(17, 1, 1));

@@ -52,12 +52,8 @@ pub struct InputColumnRange {
 }
 #[cfg(feature = "gpu")]
 use mxx_ir_core::types::ConcreteWireType;
-#[cfg(feature = "gpu")]
-use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "gpu")]
-use std::ops::RangeInclusive;
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
 
@@ -84,9 +80,14 @@ pub(crate) enum StorageRef {
     Input(u32),
     Output(u32),
     Scratch(u32),
+    /// A new allocation made by replicating a value, distinct from its source slots.
+    Replica {
+        value: PhysicalValueId,
+        allocation: u32,
+    },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg(feature = "gpu")]
 pub(crate) enum PhysicalEncoding {
     FullCoeff,
@@ -108,17 +109,13 @@ pub(crate) enum PhysicalEncoding {
     TypedBlobLengthPrefixed,
 }
 
-/// Coordinates name logical elements. For a coordinate j, the corresponding
-/// address is `base + byte_offset + sum((j[a] - origin[a]) * byte_strides[a])`.
-#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(feature = "gpu")]
-pub(crate) struct PhysicalView {
-    pub byte_offset: u64,
-    pub origin: Box<[u64]>,
-    pub extent: Box<[u64]>,
-    pub byte_strides: Box<[u64]>,
-    pub element_bytes: u32,
-}
+#[path = "gpu_execution_plan/gpu_metadata.rs"]
+mod gpu_metadata;
+#[cfg(feature = "gpu")]
+pub(crate) use gpu_metadata::{
+    PhysicalMetadataPool, PhysicalValue, PhysicalValueData, PhysicalView, PhysicalViewData,
+};
 
 #[cfg(feature = "gpu")]
 impl PhysicalView {
@@ -170,15 +167,6 @@ pub(crate) struct PhysicalPart {
     pub view: PhysicalView,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(feature = "gpu")]
-pub(crate) struct PhysicalValue {
-    pub ty: ConcreteWireType,
-    pub encodings: Box<[PhysicalEncoding]>,
-    pub parts: Box<[PhysicalPart]>,
-    pub integer_ranges: BTreeMap<u32, RangeInclusive<BigInt>>,
-}
-
 #[cfg(feature = "gpu")]
 impl PhysicalValue {
     /// Validate the compact template shape without expanding a family by its
@@ -197,11 +185,27 @@ impl PhysicalValue {
                 ConcreteWireType::IndexedFamily { element, .. } => {
                     collect_leaves(element, family_axes + 1, public_gadget, out)
                 }
-                ConcreteWireType::Trapdoor { .. } => {
+                // GPU plans reject member-dependent families before allocation.
+                ConcreteWireType::DependentFamily { members } => {
+                    if let Some(member) = members.first() {
+                        collect_leaves(member, family_axes + 1, public_gadget, out)
+                    }
+                }
+                ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
                     if public_gadget {
                         out.push((family_axes + 4, 5));
                     } else {
-                        out.extend(std::iter::repeat_n((family_axes + 4, 0), 6));
+                        let leaves = crate::sampler::trapdoor::trapdoor_component_shapes(
+                            matrix.rows,
+                            *digit_count,
+                            *instantiation,
+                        )
+                        .map_or(0, |shapes| shapes.len());
+                        out.extend(std::iter::repeat_n((family_axes + 4, 0), leaves));
+                        // A statistical trapdoor ends with its precomputation bytes.
+                        if !instantiation.is_computational() {
+                            out.push((family_axes + 1, 4));
+                        }
                     }
                 }
                 ConcreteWireType::Matrix(_) |
@@ -303,7 +307,8 @@ impl PhysicalValue {
             let mut family_bounds = Vec::new();
             let mut leaf_ty = &self.ty;
             while let ConcreteWireType::IndexedFamily { element, count } = leaf_ty {
-                family_bounds.push(*count as u64);
+                family_bounds
+                    .push(u64::try_from(*count).map_err(|_| "physical family count exceeds u64")?);
                 leaf_ty = element;
             }
             if matches!(encoding, PhysicalEncoding::CompactCoeff { .. }) &&
@@ -448,10 +453,13 @@ pub(crate) enum GpuNativePrimitive {
     GadgetDecomposeCoeff,
     GadgetDecomposeCompact,
     MatrixAdd,
+    MatrixColumnAdd,
     MatrixSub,
     MatrixMul,
     MatrixMulAccumulate,
-    MatrixMulScalar,
+    /// A whole owner interval with device-side affine column iteration.
+    MatrixColumnBinary,
+    MatrixColumnGather,
     ExpandCompact,
     MatrixMulSmallRhs,
     MatrixCopyView,
@@ -492,10 +500,14 @@ pub(crate) enum GpuNativePrimitive {
     ThresholdDecode,
     P1CovarianceRefresh,
     P1Sample,
+    StatisticalSpectra,
+    StatisticalFactor,
+    StatisticalPerturbation,
     GqSample,
     PreimageCorrection,
     PreimageCutoff,
     PreimagePublish,
+    PreimageRunFinish,
     PreimageDeriveAttemptSeed,
     ExportCopy,
     ExportPublish,
@@ -557,6 +569,17 @@ impl GpuImplementation {
         }
     }
 
+    pub(crate) fn matrix_column_add() -> Self {
+        use GpuArgumentKind::{U32, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixColumnAdd,
+            argument_kinds: Box::new([
+                Value, U32, Value, U32, Value, U32, Value, U32, U32, U32, U32, U32,
+            ]),
+            output_count: 1,
+        }
+    }
+
     pub(crate) fn matrix_add_sub(subtract: bool) -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
@@ -565,17 +588,6 @@ impl GpuImplementation {
             } else {
                 GpuNativePrimitive::MatrixAdd
             },
-            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32]),
-            output_count: 1,
-        }
-    }
-
-    /// Every polynomial of a matrix times one 1x1 scalar matrix; arguments are
-    /// (matrix, part, scalar, part, destination, part, bindings...).
-    pub(crate) fn matrix_mul_scalar() -> Self {
-        use GpuArgumentKind::{U32, Value};
-        Self {
-            primitive: GpuNativePrimitive::MatrixMulScalar,
             argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32]),
             output_count: 1,
         }
@@ -614,10 +626,10 @@ impl GpuImplementation {
     }
 
     pub(crate) fn modulus_switch() -> Self {
-        use GpuArgumentKind::{U32, Value};
+        use GpuArgumentKind::{U32, U64List, Value};
         Self {
             primitive: GpuNativePrimitive::ModulusSwitch,
-            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32, U32]),
+            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32, U32, U64List]),
             output_count: 1,
         }
     }
@@ -765,6 +777,28 @@ impl GpuImplementation {
         }
     }
 
+    /// Keep one descriptor per owner interval rather than one per C-column job.
+    pub(crate) fn matrix_column_binary() -> Self {
+        use GpuArgumentKind::{U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixColumnBinary,
+            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32, U32, U64]),
+            output_count: 1,
+        }
+    }
+
+    /// One checked affine source window, selected by a resident loop index.
+    pub(crate) fn matrix_column_gather() -> Self {
+        use GpuArgumentKind::{U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixColumnGather,
+            argument_kinds: Box::new([
+                Value, U32, Value, U32, Value, U32, U32, U32, U32, U64, U64, U64,
+            ]),
+            output_count: 1,
+        }
+    }
+
     pub(crate) fn matrix_slice_dynamic() -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
@@ -814,7 +848,7 @@ impl GpuImplementation {
         use GpuArgumentKind::{U32, Value};
         Self {
             primitive: GpuNativePrimitive::LiftIntegerConstant,
-            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32]),
+            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32, U32]),
             output_count: 1,
         }
     }
@@ -943,6 +977,51 @@ impl GpuImplementation {
         }
     }
 
+    /// Statistical TrapGen: the values at the points `j < n / 2` of one coefficient-domain row
+    /// chunk of `T` into the spectra of the precomputation. The chunk and its part, the
+    /// precomputation and its part, the spectra scratch and its part, `m_bar`, the chunk's
+    /// first row, and the chunk, precomputation, and scratch bindings.
+    pub(crate) fn statistical_spectra() -> Self {
+        use GpuArgumentKind::{U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::StatisticalSpectra,
+            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U64, U64, U32, U32, U32]),
+            output_count: 1,
+        }
+    }
+
+    /// Statistical TrapGen: one attempt's Cholesky factorization of the precomputation, which
+    /// accepts or rejects the attempt in the preimage status record. The precomputation, the
+    /// attempt word, and the status with their parts, `m_bar`, `D`, `n`, the width, `s² - r²`,
+    /// `α`, the pivot floor, and the precomputation, attempt, and status bindings.
+    pub(crate) fn statistical_factor() -> Self {
+        use GpuArgumentKind::{F64, U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::StatisticalFactor,
+            argument_kinds: Box::new([
+                Value, U32, Value, U32, Value, U32, U64, U64, U64, F64, F64, F64, F64, U32, U32,
+                U32,
+            ]),
+            output_count: 1,
+        }
+    }
+
+    /// The statistical perturbation of one tile: resource ID, the coefficient-domain output and
+    /// its part, the seed and its part, the trapdoor's precomputation and its part, `m_bar`, the
+    /// sampler's scalars (`p_2` width, center scale, rounding width), and the output, seed,
+    /// precomputation, and three workspace bindings.
+    pub(crate) fn statistical_perturbation() -> Self {
+        use GpuArgumentKind::{F64, U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::StatisticalPerturbation,
+            argument_kinds: Box::new([
+                U32, Value, U32, Value, U32, Value, U32, U64, F64, F64, F64, U32, U32, U32, U32,
+                U32, U32,
+            ]),
+            output_count: 1,
+        }
+    }
+
     pub(crate) fn gq_sample() -> Self {
         use GpuArgumentKind::{F64, U32, Value};
         Self {
@@ -977,10 +1056,21 @@ impl GpuImplementation {
     }
 
     pub(crate) fn preimage_publish() -> Self {
-        use GpuArgumentKind::{U32, Value};
+        use GpuArgumentKind::{U32, U64, Value};
         Self {
             primitive: GpuNativePrimitive::PreimagePublish,
-            argument_kinds: Box::new([U32, Value, U32, Value, U32, U32, U32, U32]),
+            argument_kinds: Box::new([
+                U32, Value, U32, Value, U32, U32, U32, U32, Value, U32, U64, U64,
+            ]),
+            output_count: 1,
+        }
+    }
+
+    pub(crate) fn preimage_run_finish() -> Self {
+        use GpuArgumentKind::{U32, Value};
+        Self {
+            primitive: GpuNativePrimitive::PreimageRunFinish,
+            argument_kinds: Box::new([Value, Value, U32, U32, Value, U32, U32]),
             output_count: 1,
         }
     }
@@ -1140,12 +1230,15 @@ impl GpuImplementation {
 }
 
 /// A process-local table used by both candidate selection and native lowering.
+/// Cloned regions share immutable entries; registration uses copy-on-write.
 /// Keeping the operation kind with the ID prevents a replay from silently
 /// dispatching an opaque number through a different emitter catalogue.
+/// Region programs share the immutable table. Registering a new implementation
+/// detaches only the writer, preserving implementation IDs in existing programs.
 #[derive(Clone, Debug, Default)]
 #[cfg(feature = "gpu")]
 pub(crate) struct GpuImplementationRegistry {
-    entries: Vec<GpuImplementation>,
+    entries: Arc<Vec<GpuImplementation>>,
 }
 
 #[cfg(feature = "gpu")]
@@ -1162,7 +1255,7 @@ impl GpuImplementationRegistry {
         let id = GpuImplId(
             u32::try_from(self.entries.len()).map_err(|_| "too many GPU native implementations")?,
         );
-        self.entries.push(implementation);
+        Arc::make_mut(&mut self.entries).push(implementation);
         Ok(id)
     }
 
@@ -1200,7 +1293,9 @@ pub(crate) struct CompiledGpuOp {
     /// Direct nodes in one reusable conditional body. CUDA embeds it in a
     /// native conditional node; HIP compiles ordinary regions and selects
     /// them at D2H control boundaries. Dependencies are body-local, recursively.
-    pub body: Option<Box<[CompiledGpuOp]>>,
+    /// Region programs share frozen bodies. Scratch dependency edits use
+    /// copy-on-write before prepared resources retain operation addresses.
+    pub body: Option<Arc<[CompiledGpuOp]>>,
 }
 
 #[cfg(feature = "gpu")]
@@ -1283,7 +1378,7 @@ pub(crate) struct CompiledGpuProgram {
     pub operations: Box<[CompiledGpuOp]>,
     /// Dense, plan-global binding indices used by native patch records.
     pub bindings: Arc<[GpuBindingSource]>,
-    pub export_slots: Box<[GpuExportSlotRange]>,
+    pub export_slots: Arc<[GpuExportSlotRange]>,
     /// The registered kernels `SubgraphKernel` operations name by index.
     pub subgraph_kernels: Box<[crate::gpu_subgraph_kernel::GpuSubgraphKernel]>,
 }
@@ -1316,6 +1411,8 @@ pub(crate) enum GpuPreparedWorkspaceKind {
     P1,
     Gq,
     Cutoff,
+    /// The statistical perturbation workspace: centers, buffer, and `p_2`.
+    Statistical,
 }
 
 #[cfg(feature = "gpu")]
@@ -1403,6 +1500,18 @@ impl CompiledGpuProgram {
         }
         // A later writer may reuse an export source allocation after its
         // device copy has completed. No disk completion edge is required.
+        // The writers of every storage, in operation order, are indexed once.
+        let mut writers_by_storage = BTreeMap::<_, Vec<usize>>::new();
+        for (index, writer) in self.operations.iter().enumerate() {
+            let storages = writer
+                .outputs
+                .iter()
+                .flat_map(|id| self.values[id.0 as usize].parts.iter().map(|part| part.storage))
+                .collect::<BTreeSet<_>>();
+            for storage in storages {
+                writers_by_storage.entry(storage).or_default().push(index);
+            }
+        }
         for (copy_index, copy_op) in self.operations.iter().enumerate() {
             let kind = self.implementations.resolve(copy_op.implementation)?.primitive;
             if kind != GpuNativePrimitive::ExportCopy {
@@ -1420,13 +1529,14 @@ impl CompiledGpuProgram {
                 .get(*part as usize)
                 .ok_or("GPU export source part is out of range")?
                 .storage;
-            for writer in self.operations.iter().skip(copy_index + 1) {
-                let reuses_storage = writer.outputs.iter().any(|id| {
-                    self.values[id.0 as usize].parts.iter().any(|output| output.storage == storage)
-                });
-                if !reuses_storage {
-                    continue;
-                }
+            let later_writers = writers_by_storage
+                .get(&storage)
+                .map(|writers| {
+                    let first = writers.partition_point(|index| *index <= copy_index);
+                    &writers[first..]
+                })
+                .unwrap_or_default();
+            for writer in later_writers.iter().map(|index| &self.operations[*index]) {
                 let mut pending = writer.predecessors.to_vec();
                 let mut visited = BTreeSet::new();
                 let mut ordered = false;
@@ -1466,6 +1576,7 @@ impl CompiledGpuProgram {
             } else if let GpuBindingSource::PreparedWorkspace { kind, component, .. } = *source {
                 let valid = match kind {
                     GpuPreparedWorkspaceKind::P1 => component < 5,
+                    GpuPreparedWorkspaceKind::Statistical => component < 3,
                     GpuPreparedWorkspaceKind::Gq | GpuPreparedWorkspaceKind::Cutoff => {
                         component == 0
                     }
@@ -1477,7 +1588,7 @@ impl CompiledGpuProgram {
         }
         let mut next = 0usize;
         let mut sites = BTreeSet::new();
-        for range in &self.export_slots {
+        for range in self.export_slots.iter() {
             if !sites.insert(range.site) ||
                 range.start != next ||
                 range.occurrence_count == 0 ||
@@ -1507,9 +1618,9 @@ impl CompiledGpuProgram {
     }
 }
 
-/// A fixed range of mapped write slots for one export site. Each occurrence
-/// and physical fragment has its own slot, so a producer never waits for disk
-/// completion or reuses a slot within an execute call.
+/// A fixed range of logical write slots for one export site. Physical mapped
+/// storage may be shared only across publications with proven device and host
+/// consumption joins; asynchronous observer slots retain private storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(feature = "gpu")]
 pub(crate) struct GpuExportSlotRange {
@@ -1552,24 +1663,65 @@ pub(crate) fn reserve_gpu_export_slots(
 mod gpu_export_slot_tests {
     use super::*;
 
+    #[test]
+    fn test_region_registry_preserves_ids_when_a_clone_registers() {
+        let mut original = GpuImplementationRegistry::default();
+        let zero = original.register(GpuImplementation::zero()).unwrap();
+        let mut region = original.clone();
+        assert!(Arc::ptr_eq(&original.entries, &region.entries));
+        assert_eq!(region.register(GpuImplementation::zero()).unwrap(), zero);
+        assert!(Arc::ptr_eq(&original.entries, &region.entries));
+        let copy = region.register(GpuImplementation::copy()).unwrap();
+        assert_eq!(original.resolve(zero).unwrap(), region.resolve(zero).unwrap());
+        assert!(original.resolve(copy).is_err());
+        assert_eq!(region.resolve(copy).unwrap(), &GpuImplementation::copy());
+        let publish = original.register(GpuImplementation::export_publish()).unwrap();
+        assert_eq!(original.resolve(publish).unwrap(), &GpuImplementation::export_publish());
+        assert_eq!(region.resolve(copy).unwrap(), &GpuImplementation::copy());
+    }
+
     fn byte_value() -> PhysicalValue {
-        PhysicalValue {
+        PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty: ConcreteWireType::Bytes { length: 8 },
             encodings: Box::new([PhysicalEncoding::Bytes]),
             parts: Box::new([PhysicalPart {
                 leaf: 0,
                 storage: StorageRef::Input(0),
                 device: 0,
-                view: PhysicalView {
+                view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 0,
                     origin: Box::new([0]),
                     extent: Box::new([8]),
                     byte_strides: Box::new([1]),
                     element_bytes: 1,
-                },
+                }),
             }]),
             integer_ranges: BTreeMap::new(),
-        }
+        })
+    }
+
+    #[test]
+    fn test_region_body_dependency_edit_preserves_other_programs() {
+        let mut implementations = GpuImplementationRegistry::default();
+        let implementation = implementations.register(GpuImplementation::zero()).unwrap();
+        let leaf = CompiledGpuOp {
+            implementation,
+            arguments: Box::new([]),
+            outputs: Box::new([]),
+            device: 0,
+            grid: [0; 3],
+            block: [0; 3],
+            shared_bytes: 0,
+            predecessors: Box::new([]),
+            body: None,
+        };
+        let original =
+            CompiledGpuOp { body: Some(Arc::from([leaf.clone(), leaf.clone()])), ..leaf };
+        let mut region = original.clone();
+        assert!(Arc::ptr_eq(original.body.as_ref().unwrap(), region.body.as_ref().unwrap()));
+        Arc::make_mut(region.body.as_mut().unwrap())[1].predecessors = Box::new([0]);
+        assert!(original.body.as_ref().unwrap()[1].predecessors.is_empty());
+        assert_eq!(&*region.body.as_ref().unwrap()[1].predecessors, &[0]);
     }
 
     #[test]
@@ -1650,7 +1802,7 @@ mod gpu_export_slot_tests {
                 GpuBindingSource::ExportSlotPayload { slot: 0 },
                 GpuBindingSource::ExportSlotHeader { slot: 0 },
             ]),
-            export_slots: reserve_gpu_export_slots([(7, 1, 1)]).unwrap(),
+            export_slots: reserve_gpu_export_slots([(7, 1, 1)]).unwrap().into(),
             subgraph_kernels: Box::new([]),
         };
         assert!(program.validate().is_ok());
@@ -1815,7 +1967,8 @@ pub struct GpuLoopSiteKey {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GpuLoopChoice {
     pub key: GpuLoopSiteKey,
-    pub loop_count: usize,
+    /// Logical cardinality, independent of the bounded physical wave width.
+    pub loop_count: u128,
     pub wave_instances: usize,
     pub tail_instances: usize,
 }
@@ -2233,10 +2386,10 @@ mod tests {
     fn large_loops_use_compact_plans() {
         let key = GpuLoopSiteKey { site: 5, shape_class: 2, instance_class: 0 };
         let choice =
-            GpuLoopChoice { key, loop_count: usize::MAX, wave_instances: 4, tail_instances: 3 };
+            GpuLoopChoice { key, loop_count: u128::MAX, wave_instances: 4, tail_instances: 3 };
         let plan = FrozenGpuPlan::new(contract(2), vec![layout()], vec![choice], vec![]).unwrap();
         assert_eq!(plan.loops.len(), 1);
-        assert_eq!(plan.loops[0].loop_count, usize::MAX);
+        assert_eq!(plan.loops[0].loop_count, u128::MAX);
     }
 
     #[test]

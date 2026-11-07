@@ -44,7 +44,11 @@ impl GpuDeviceReal {
         physical_device: i32,
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
-        let buffer = GpuDeviceBuffer::allocate(&stream, 8)?;
+        let buffer = GpuDeviceBuffer::allocate(
+            &stream,
+            8,
+            crate::poly::dcrt::gpu::GpuBufferBacking::Device,
+        )?;
         buffer.upload_initial(0, &0f64.to_le_bytes())?;
         Ok(Self { buffer, _params: params.clone(), physical_device })
     }

@@ -31,8 +31,8 @@ abbrev QL : Nat := 324518553605595287786984016396289
 /-- The slot permutations, as the packed tables the generated stages embed: encoding reads logical
 slot `encodeTable[j]` into native evaluation `j`, and decoding reads native evaluation
 `decodeTable[i]` into logical slot `i`. -/
-abbrev encodeTable : Nat := Stage_encrypt_x.generatedRoot.table_14
-abbrev decodeTable : Nat := Stage_decrypt.generatedRoot.table_12
+abbrev encodeTable : Nat := Stage_encrypt_x.generatedRoot.table_13
+abbrev decodeTable : Nat := Stage_decrypt.generatedRoot.table_11
 
 /-- The hybrid key-switching gadget `P * Q / q_j` of each digit. -/
 def gadget : Fin 3 → Int :=
@@ -64,17 +64,17 @@ theorem keygen_spec {outputs}
     have := (coeff_natAbs_le_polyNorm (Smat 0 0) i).trans (hSbound 0 0)
     unfold q1
     omega
-  have hs1 : witness.w_9_0 0 0 = reducePoly q1 n (Smat 0 0) := by
+  have hs1 : witness.w_8_0 0 0 = reducePoly q1 n (Smat 0 0) := by
     obtain ⟨_, _, h9⟩ := hred1
     rw [h9]
     simp only [modulusReduce, hs]
     exact modulusReduce_reducePoly (by decide) (by decide) (by decide) hn _
-  have hsP : witness.w_10_0 0 0 = reducePoly QP n (Smat 0 0) := by
+  have hsP : witness.w_9_0 0 0 = reducePoly QP n (Smat 0 0) := by
     obtain ⟨_, h10⟩ := hreb
     rw [h10]
     simp only [centeredRebase, hs1]
     exact centeredRebase_reducePoly (by decide) hn _ hsmall
-  have hsQ : witness.w_16_0 0 0 = reducePoly Q n (Smat 0 0) := by
+  have hsQ : witness.w_14_0 0 0 = reducePoly Q n (Smat 0 0) := by
     obtain ⟨_, _, h16⟩ := hred2
     rw [h16]
     simp only [modulusReduce, hs]
@@ -82,10 +82,10 @@ theorem keygen_spec {outputs}
   -- The CRT lift of `s^2` that every relinearization-key target scales.
   obtain ⟨_, _, _, _, _, _, _, _, hT⟩ := hup
   let v : Fin n → Int := fun i ↦
-    Int.ofNat ((matrixMulScalarLeft witness.w_16_0 witness.w_16_0 0 0).coeff i).val
+    Int.ofNat ((matrixMulScalarLeft witness.w_14_0 witness.w_14_0 0 0).coeff i).val
   let D : ErrorPoly n := intPoly fun i ↦
     rnsDigit [18014398507892737, 18014398508138497, 18014398508400641] 3 0 false (v i)
-  have hT0 : witness.w_18_0 0 0 = reducePoly QP n D := by
+  have hT0 : witness.w_16_0 0 0 = reducePoly QP n D := by
     rw [hT ⟨0, by decide⟩ 0 0 0 rfl, polynomialOfCoefficients_eq_reduce]
   have hD (i : Fin n) : D.coeff i ≡ (Smat 0 0 * Smat 0 0).coeff i [ZMOD Q] := by
     rw [intPoly_coeff hn, rnsDigit_three_whole (by decide) (by decide) (by decide)]
@@ -99,7 +99,7 @@ theorem keygen_spec {outputs}
   · obtain ⟨h0, h1⟩ := concatRows_one_one hpk 0
     simp only
     rw [h0, h1]
-    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixPolynomial_single, hEmat,
+    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixScale, hEmat,
       reduceMatrix_apply, hs]
     push_cast
     ring
@@ -109,16 +109,16 @@ theorem keygen_spec {outputs}
     obtain ⟨r0, r1⟩ := concatRows_one_one hrk j
     simp only
     rw [r0, r1]
-    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixPolynomial_single, hErmat,
+    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixScale, hErmat,
       reduceMatrix_apply, hsP]
-    have hgadget : witness.w_25_0 0 j = witness.w_18_0 0 0 * ((gadget j : Int) : ExactPoly QP n) := by
+    have hgadget : witness.w_20_0 0 j = witness.w_16_0 0 0 * ((gadget j : Int) : ExactPoly QP n) := by
       fin_cases j
-      · change witness.w_25_0 0 0 = witness.w_18_0 0 0 * ((gadget 0 : Int) : ExactPoly QP n)
-        rw [g0', g0]; simp [matrixMulScalarLeft, matrixPolynomial_single, gadget]
-      · change witness.w_25_0 0 1 = witness.w_18_0 0 0 * ((gadget 1 : Int) : ExactPoly QP n)
-        rw [g1', g1]; simp [matrixMulScalarLeft, matrixPolynomial_single, gadget]
-      · change witness.w_25_0 0 2 = witness.w_18_0 0 0 * ((gadget 2 : Int) : ExactPoly QP n)
-        rw [g2]; simp [matrixMulScalarLeft, matrixPolynomial_single, gadget]
+      · change witness.w_20_0 0 0 = witness.w_16_0 0 0 * ((gadget 0 : Int) : ExactPoly QP n)
+        rw [g0', g0]; simp [matrixScale, gadget, mul_comm]
+      · change witness.w_20_0 0 1 = witness.w_16_0 0 0 * ((gadget 1 : Int) : ExactPoly QP n)
+        rw [g1', g1]; simp [matrixScale, gadget, mul_comm]
+      · change witness.w_20_0 0 2 = witness.w_16_0 0 0 * ((gadget 2 : Int) : ExactPoly QP n)
+        rw [g2]; simp [matrixScale, gadget, mul_comm]
     rw [hgadget, hT0]
     push_cast
     ring
@@ -144,29 +144,29 @@ theorem encrypt_x_spec {pk : ExactMatrix Q n 2 1} {x : Fin n → Int} {ct : Exac
   obtain ⟨E1mat, hE1mat, hE1b⟩ := gaussianSample_bounded hE1
   obtain ⟨E2mat, hE2mat, hE2b⟩ := gaussianSample_bounded hE2
   have ha : witness.w_1_0 0 0 = pk 0 0 := sliceMatrix_entry hs0 (by decide) (by decide)
-  have hb : witness.w_8_0 0 0 = pk 1 0 := sliceMatrix_entry hs1 (by decide) (by decide)
+  have hb : witness.w_7_0 0 0 = pk 1 0 := sliceMatrix_entry hs1 (by decide) (by decide)
   have htable : polynomialValues false
-      (packedPolynomial (q := t) (n := n) 13 n encodeTable) witness.w_15_0 := hvals
-  have hentry (i : Fin n) : witness.w_15_0 i = packedEntry 13 encodeTable i.val :=
+      (packedPolynomial (q := t) (n := n) 13 n encodeTable) witness.w_14_0 := hvals
+  have hentry (i : Fin n) : witness.w_14_0 i = packedEntry 13 encodeTable i.val :=
     polynomialValues_packed (by decide) hn htable
       (fun j ↦ (Nat.mod_lt _ (by decide)).trans_le (by decide)) i
-  have hrebase : witness.w_18_0 0 0 = reducePoly Q n (centeredIntLift (witness.w_17_0 0 0)) := by
+  have hrebase : witness.w_17_0 0 0 = reducePoly Q n (centeredIntLift (witness.w_16_0 0 0)) := by
     rw [hreb.2]
     exact centeredRebase_eq _ 0 0
   obtain ⟨c0, c1⟩ := concatRows_one_one hcat 0
-  refine ⟨Umat 0 0, E1mat 0 0, E2mat 0 0, witness.w_17_0, witness.w_16_0, hUb 0 0,
+  refine ⟨Umat 0 0, E1mat 0 0, E2mat 0 0, witness.w_16_0, witness.w_15_0, hUb 0 0,
     by simpa using hE1b 0 0, by simpa using hE2b 0 0, hfrom, fun j ↦ ?_, ?_, ?_⟩
   · obtain ⟨value, _, _, ⟨position, hposition, hvalue⟩, hnative⟩ := hpar j
     refine ⟨position, ?_, hnative.trans hvalue⟩
     have := hposition.trans (hentry j)
     exact_mod_cast this
   · rw [c0]
-    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixPolynomial_single, ha,
+    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixScale, ha,
       hUmat, hE1mat, reduceMatrix_apply]
     push_cast
     ring
   · rw [c1]
-    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixPolynomial_single, hb,
+    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixScale, hb,
       hUmat, hE2mat, reduceMatrix_apply, hrebase]
     push_cast
     ring
@@ -180,29 +180,29 @@ theorem encrypt_y_spec {pk : ExactMatrix Q n 2 1} {x : Fin n → Int} {ct : Exac
   obtain ⟨E1mat, hE1mat, hE1b⟩ := gaussianSample_bounded hE1
   obtain ⟨E2mat, hE2mat, hE2b⟩ := gaussianSample_bounded hE2
   have ha : witness.w_1_0 0 0 = pk 0 0 := sliceMatrix_entry hs0 (by decide) (by decide)
-  have hb : witness.w_8_0 0 0 = pk 1 0 := sliceMatrix_entry hs1 (by decide) (by decide)
+  have hb : witness.w_7_0 0 0 = pk 1 0 := sliceMatrix_entry hs1 (by decide) (by decide)
   have htable : polynomialValues false
-      (packedPolynomial (q := t) (n := n) 13 n encodeTable) witness.w_15_0 := hvals
-  have hentry (i : Fin n) : witness.w_15_0 i = packedEntry 13 encodeTable i.val :=
+      (packedPolynomial (q := t) (n := n) 13 n encodeTable) witness.w_14_0 := hvals
+  have hentry (i : Fin n) : witness.w_14_0 i = packedEntry 13 encodeTable i.val :=
     polynomialValues_packed (by decide) hn htable
       (fun j ↦ (Nat.mod_lt _ (by decide)).trans_le (by decide)) i
-  have hrebase : witness.w_18_0 0 0 = reducePoly Q n (centeredIntLift (witness.w_17_0 0 0)) := by
+  have hrebase : witness.w_17_0 0 0 = reducePoly Q n (centeredIntLift (witness.w_16_0 0 0)) := by
     rw [hreb.2]
     exact centeredRebase_eq _ 0 0
   obtain ⟨c0, c1⟩ := concatRows_one_one hcat 0
-  refine ⟨Umat 0 0, E1mat 0 0, E2mat 0 0, witness.w_17_0, witness.w_16_0, hUb 0 0,
+  refine ⟨Umat 0 0, E1mat 0 0, E2mat 0 0, witness.w_16_0, witness.w_15_0, hUb 0 0,
     by simpa using hE1b 0 0, by simpa using hE2b 0 0, hfrom, fun j ↦ ?_, ?_, ?_⟩
   · obtain ⟨value, _, _, ⟨position, hposition, hvalue⟩, hnative⟩ := hpar j
     refine ⟨position, ?_, hnative.trans hvalue⟩
     have := hposition.trans (hentry j)
     exact_mod_cast this
   · rw [c0]
-    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixPolynomial_single, ha,
+    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixScale, ha,
       hUmat, hE1mat, reduceMatrix_apply]
     push_cast
     ring
   · rw [c1]
-    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixPolynomial_single, hb,
+    simp only [matrixAdd, matrixMulScalarLeft, Matrix.add_apply, matrixScale, hb,
       hUmat, hE2mat, reduceMatrix_apply, hrebase]
     push_cast
     ring
@@ -331,18 +331,18 @@ theorem decrypt_spec {ct : ExactMatrix QL n 2 1} {sk : ExactMatrix Q n 1 1} {S :
     simp only [modulusReduce, hsk]
     exact modulusReduce_reducePoly (by decide) (by decide) (by decide) hn _
   have hdecode : polynomialValues false
-      (packedPolynomial (q := t) (n := n) 13 n decodeTable) witness.w_13_0 := htable
-  have hentry (i : Fin n) : witness.w_13_0 i = packedEntry 13 decodeTable i.val :=
+      (packedPolynomial (q := t) (n := n) 13 n decodeTable) witness.w_12_0 := htable
+  have hentry (i : Fin n) : witness.w_12_0 i = packedEntry 13 decodeTable i.val :=
     polynomialValues_packed (by decide) hn hdecode
       (fun j ↦ (Nat.mod_lt _ (by decide)).trans_le (by decide)) i
   refine ⟨matrixAdd (matrixMulScalarLeft witness.w_1_0 (matrixNeg witness.w_3_0)) witness.w_6_0,
-    ?_, matrixMulScalarLeft witness.w_8_0 (matrixPolynomial [998911]), witness.w_11_0, ?_,
+    ?_, matrixScale 998911 witness.w_8_0, witness.w_10_0, ?_,
     hvals, fun i ↦ ?_⟩
   · simp only [matrixAdd, matrixMulScalarLeft, matrixNeg, Matrix.add_apply, Matrix.neg_apply,
       e0, e1, hs]
     ring
-  · simp only [matrixMulScalarLeft, matrixPolynomial_single, hreb.2]
-    rw [centeredRebase_eq]
+  · simp only [matrixScale, hreb.2]
+    rw [centeredRebase_eq, mul_comm]
   · obtain ⟨value, _, _, ⟨position, hposition, hvalue⟩, hnative⟩ := hpar i
     refine ⟨position, ?_, hnative.trans hvalue⟩
     have := hposition.trans (hentry i)

@@ -14,8 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let directory = std::path::PathBuf::from(directory);
     let tfhe = tfhe_round_trip(&utils::tfhe_params());
-    mxx_ir_core::lean::protocol::export(&tfhe.protocol, &directory.join("tfhe"))?;
+    mxx_ir_core::lean::protocol::export(&tfhe.protocol, &directory.join("tfhe"), false)?;
     let bgv = bgv_round_trip(&utils::bgv_params(), utils::modswitch_steps());
-    mxx_ir_core::lean::protocol::export(&bgv.protocol, &directory.join("bgv"))?;
+    mxx_ir_core::lean::protocol::export(&bgv.protocol, &directory.join("bgv"), false)?;
     Ok(())
 }

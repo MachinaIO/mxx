@@ -19,11 +19,11 @@ use mxx_ir_core::generate_crt_basis;
 use mxx_ir_core::{
     IntExpr, ParamEnv, Rational, RealExpr,
     protocol::{
-        ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointBinding,
-        EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
-        InputContractEntry, InputValueContract, OutputRef, ParameterDecl, ParameterKind,
-        ProtocolDecl, ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId,
-        ProtocolPreconditionSpec, ProtocolStage, StageId, StageInputName, Workflow,
+        ClosedProtocolBundle, Comparison, EndpointBinding, EndpointSemanticBinding, EndpointSpecId,
+        InputContract, InputContractEntry, InputValueContract, OutputRef, ParameterDecl,
+        ParameterKind, ProtocolDecl, ProtocolInputBinding, ProtocolInputDestination,
+        ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId, StageInputName,
+        Workflow,
     },
 };
 use num_bigint::BigInt;
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lean = export_directory.clone().unwrap_or_else(|| {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated")
     });
-    mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean)?;
+    mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean, false)?;
 
     if export_directory.is_some() {
         return Ok(());
@@ -205,25 +205,14 @@ fn correctness_protocol(
             },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "decrypted".to_owned(),
-                    ideal_input: "decrypted".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::Exact,
-                    workflow_output: OutputRef { stage, output: "decrypted".to_owned() },
-                    ideal_output: "decrypted".to_owned(),
-                }],
-            },
+            comparison: Comparison::equality(EndpointBinding {
+                spec: endpoint,
+                semantics: EndpointSemanticBinding::Exact,
+                workflow_output: OutputRef { stage, output: "decrypted".to_owned() },
+                ideal_output: "decrypted".to_owned(),
+            }),
             operational_decoder_targets: Vec::new(),
-            endpoint_specs: vec![endpoint],
+
             input_contract: InputContract { inputs: contracts },
             input_bindings,
             precondition_spec: ProtocolPreconditionSpec::default(),

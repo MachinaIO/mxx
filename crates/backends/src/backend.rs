@@ -33,10 +33,11 @@ use crate::{
     transcript::DrawSite,
 };
 use mxx_ir_core::{
-    ParamEnv,
+    ParamEnv, Rational,
     artifact::{ArtifactType, SmallMatrixSemanticKind},
     types::{
-        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, InstantiationFrame, WireRef,
+        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, InstantiationFrame,
+        TrapdoorInstantiation, WireRef,
     },
 };
 use num_bigint::BigInt;
@@ -573,27 +574,6 @@ impl GpuResidentValue {
             .map_err(str::to_owned)
     }
 
-    /// Allocate new device storage with the same physical descriptor without
-    /// copying: a template whose storage is rebound before every use needs
-    /// only a distinct allocation, and its source may not be allocated yet.
-    pub(crate) fn private_placeholder(
-        &self,
-        backend: &crate::backend::poly_gpu::GpuDcrtBackend,
-    ) -> Result<Self, String> {
-        let mut storage = BTreeMap::new();
-        for (&slot, bound) in &self.storage {
-            let parameters = backend.control_parameters_on_device(bound.device)?;
-            let bytes = usize::try_from(bound.bytes)
-                .map_err(|_| "GPU resident placeholder exceeds host address space".to_owned())?;
-            let allocation = Arc::new(
-                crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, bound.device, bytes)
-                    .map_err(|error| error.to_string())?,
-            );
-            storage.insert(slot, BoundStorage::from_device_bytes(allocation)?);
-        }
-        Self::new(Arc::clone(&self.physical), storage, Box::new([])).map_err(str::to_owned)
-    }
-
     pub(crate) fn new(
         physical: Arc<crate::gpu_execution_plan::PhysicalValue>,
         storage: BTreeMap<crate::gpu_execution_plan::StorageRef, BoundStorage>,
@@ -639,6 +619,10 @@ pub enum RuntimeValue {
     Resident(Arc<GpuResidentValue>),
     IndexedFamily {
         element_type: ConcreteWireType,
+        values: Arc<[RuntimeValue]>,
+    },
+    /// A family whose members have different types (`ConcreteWireType::DependentFamily`).
+    DependentFamily {
         values: Arc<[RuntimeValue]>,
     },
     LazyArtifact {
@@ -752,7 +736,7 @@ impl RuntimeValue {
         let ConcreteWireType::IndexedFamily { element, count } = &ty else {
             return Err("GPU signed family requires an indexed-family wire type".into());
         };
-        if *count == 0 || *count != owner.count() {
+        if *count == 0 || *count != owner.count() as u128 {
             return Err("GPU signed family count differs from its owner".into());
         }
         let encoding = match (element.as_ref(), owner.encoding()) {
@@ -785,23 +769,23 @@ impl RuntimeValue {
                 )
             };
         let slot = StorageRef::Input(0);
-        let physical = PhysicalValue {
+        let physical = PhysicalValue::new(crate::gpu_execution_plan::PhysicalValueData {
             ty,
             encodings: Box::new([encoding]),
             parts: Box::new([PhysicalPart {
                 leaf: 0,
                 storage: slot,
                 device: owner.physical_device(),
-                view: PhysicalView {
+                view: PhysicalView::new(crate::gpu_execution_plan::PhysicalViewData {
                     byte_offset: 0,
                     origin,
                     extent,
                     byte_strides,
                     element_bytes: 8,
-                },
+                }),
             }]),
             integer_ranges: BTreeMap::new(),
-        };
+        });
         let resident = GpuResidentValue::new(
             Arc::new(physical),
             BTreeMap::from([(slot, BoundStorage::from_signed_values(owner)?)]),
@@ -834,6 +818,7 @@ impl RuntimeValue {
             PhysicalEncoding::FullEval,
             StorageRef::Input(0),
             owner,
+            None,
         )?;
         Ok(Self::Matrix(PolyMatrix::gpu(ty, resident).map_err(str::to_owned)?))
     }
@@ -888,9 +873,16 @@ impl RuntimeValue {
                 Self::IndexedFamily { element_type, values },
                 ConcreteWireType::IndexedFamily { element, count },
             ) => {
-                values.len() == *count &&
+                values.len() as u128 == *count &&
                     element_type == element.as_ref() &&
                     values.iter().all(|value| value.matches_wire_type(element))
+            }
+            (Self::DependentFamily { values }, ConcreteWireType::DependentFamily { members }) => {
+                values.len() == members.len() &&
+                    values
+                        .iter()
+                        .zip(members)
+                        .all(|(value, member)| value.matches_wire_type(member))
             }
             (
                 Self::LazyArtifactFamily { descriptor, .. } |
@@ -938,9 +930,13 @@ pub struct PreimageRequest<M, T> {
     /// callers leave this absent; fixed executor paths always populate it.
     pub fixed_metadata: Option<PlannedNodeBatchRequest>,
     pub matrix_type: ConcreteMatrixType,
+    /// TrapGen width of the trapdoor.
     pub sigma: f64,
     pub gadget_base: BigInt,
     pub digit_count: usize,
+    pub instantiation: TrapdoorInstantiation,
+    /// Requested preimage width (a standard deviation); `None` for the trapdoor's minimum.
+    pub preimage_sigma: Option<Rational>,
     pub max_coefficient_bound: BigInt,
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,

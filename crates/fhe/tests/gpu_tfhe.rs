@@ -177,7 +177,7 @@ fn test_gpu_tfhe_round_trip() {
     // The executed graphs, linked as one gate, form the closed protocol of the claim. Each stage
     // input fed by an earlier stage's output is linked to it, as the test passes it above.
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lean/tfhe/generated");
-    mxx_ir_core::lean::protocol::export(&protocol, &directory).unwrap();
+    mxx_ir_core::lean::protocol::export(&protocol, &directory, false).unwrap();
 
     let gates = timings.iter().filter(|(stage, _)| stage == "nand").collect::<Vec<_>>();
     let mean_ms =

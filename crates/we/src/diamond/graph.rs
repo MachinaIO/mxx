@@ -21,8 +21,7 @@ use mxx_ir_core::{
     artifact::{ArtifactAvailability, ProductionId, SpecHash},
     node::{ConcatAxis, IndexRange},
     protocol::{
-        ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
-        ComparatorSpec, EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId,
+        ArtifactBinding, ArtifactName, ClosedProtocolBundle, Comparison, ComparatorSpec, EndpointBinding, EndpointSemanticBinding, EndpointSpecId,
         InputContract, InputContractEntry, InputValueContract, OperationalDecoderKind,
         OperationalDecoderTarget, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
         ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
@@ -873,17 +872,7 @@ impl DiamondWeProtocolFamily {
                 },
                 ideal,
                 requirements: vec![valid_parameters, valid, satisfied],
-                comparator: ComparatorSpec::Equality {
-                    endpoints: vec![ComparatorEndpointBinding {
-                        endpoint,
-                        actual_input: DECODED_OUTPUT.to_owned(),
-                        ideal_input: IDEAL_MESSAGE_OUTPUT.to_owned(),
-                        result_output: "failure".to_owned(),
-                        failure_value: true,
-                    }],
-                },
-                endpoints: EndpointBindings {
-                    entries: vec![EndpointBinding {
+                comparison: Comparison::equality(EndpointBinding {
                         spec: endpoint,
                         semantics: EndpointSemanticBinding::DiamondBoolean {
                             message: ProtocolInputId::from(MESSAGE_INPUT),
@@ -893,8 +882,7 @@ impl DiamondWeProtocolFamily {
                             output: DECODED_OUTPUT.to_owned(),
                         },
                         ideal_output: IDEAL_MESSAGE_OUTPUT.to_owned(),
-                    }],
-                },
+                    }),
                 operational_decoder_targets: vec![OperationalDecoderTarget {
                     target_id: "diamond-boolean-interval".to_owned(),
                     residual: OutputRef {
@@ -904,7 +892,7 @@ impl DiamondWeProtocolFamily {
                     endpoint,
                     kind: OperationalDecoderKind::BooleanInterval,
                 }],
-                endpoint_specs: vec![endpoint],
+
                 input_contract: InputContract { inputs: input_contracts },
                 input_bindings,
                 precondition_spec: ProtocolPreconditionSpec {
@@ -1274,13 +1262,13 @@ mod tests {
             ["valid-parameters", "valid", "satisfied"]
         );
         assert_eq!(
-            declaration.protocol().bundle.endpoints.entries[0].workflow_output.output,
+            declaration.protocol().bundle.comparison.endpoints.entries[0].workflow_output.output,
             DECODED_OUTPUT
         );
         assert!(matches!(
-            &declaration.protocol().bundle.comparator,
+            &declaration.protocol().bundle.comparison.comparator,
             ComparatorSpec::Equality { endpoints }
-                if endpoints.len() == 1 && endpoints[0].failure_value
+                if endpoints.len() == 1
         ));
     }
 }

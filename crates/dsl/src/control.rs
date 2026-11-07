@@ -23,7 +23,16 @@ pub fn parallel<T: GraphValue>(
     });
     let (scope, output) = result?;
     let schema = output.schema();
-    let family_schema = FamilyType { element: schema, count: count.clone() };
+    // The element schema depends on the member index only if a body type names the loop index.
+    let depends = schema
+        .wire_types()
+        .iter()
+        .any(|ty| ty.substitute_loop_index(index_slot, &IntExpr::constant(0)) != *ty);
+    let family_schema = FamilyType {
+        element: schema,
+        count: count.clone(),
+        member_slot: depends.then_some(index_slot),
+    };
     if family_schema.wire_types().is_empty() {
         return Err(DslError::Schema);
     }
@@ -38,6 +47,7 @@ pub fn parallel<T: GraphValue>(
 
     let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
     let modes = sealed.captures.iter().map(|capture| capture.mode.clone()).collect();
+    // Outside the body, a type depending on the loop index depends on the member index.
     let types = family_schema.wire_types();
     let node = NodeHandle::parallel_loop(
         sealed.handle,
@@ -54,6 +64,14 @@ pub fn parallel<T: GraphValue>(
 /// Repeatedly computes a new state, returning only the final state.
 ///
 /// The state keeps one schema across iterations, and a zero count returns the initial state.
+///
+/// On the GPU, matrix and small-matrix family carries are streamed through private artifact
+/// storage with two alternating generations. Read them only member-wise (parallel Zip/Gather
+/// lanes or static/dynamic family selection), and return each family from a top-level parallel
+/// loop in the body or unchanged. Such a carry cannot be a root graph output or be consumed as
+/// a whole family; unsupported uses are GPU planning errors. Integer families stay resident.
+/// The CPU releases obsolete staged generations after every iteration, except when another
+/// live value, an invariant, or trace capture still references them.
 pub fn iterate<S: GraphValue>(
     count: impl Into<IntExpr>,
     initial: S,
@@ -159,6 +177,188 @@ pub(super) fn normalize<T: GraphValue>(value: T) -> Result<T, DslError> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn parallel_hash_captures_keep_tags_but_not_resident_matrices() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let sample = ring.hash_matrix(key.clone(), b"public-key".as_slice(), (1, 4));
+        let other = ring.hash_matrix(key, b"another-key".as_slice(), (1, 4));
+        let fresh = ring.uniform_residue((1, 4));
+        let outputs =
+            parallel(3, |_| Ok((sample.clone(), sample.clone(), fresh.clone(), other.clone())))
+                .unwrap();
+        let built =
+            DslContext::new("hash-captures").output("result", outputs).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let root = built.graph.root_scope();
+        assert!(!root.nodes().iter().any(|n| matches!(n.kind(), NodeKind::HashSample { .. })));
+        assert_eq!(
+            root.nodes()
+                .iter()
+                .filter(|n| matches!(n.kind(), NodeKind::UniformResidueSample { .. }))
+                .count(),
+            1
+        );
+        let body = built
+            .graph
+            .scopes()
+            .values()
+            .find(|scope| {
+                matches!(scope.id(), mxx_ir_core::graph::FrozenGraphScopeId::ParallelBody { .. })
+            })
+            .unwrap();
+        let hashes = body
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind(), NodeKind::HashSample { .. }))
+            .collect::<Vec<_>>();
+        let tags = hashes
+            .iter()
+            .map(|hash| {
+                let NodeKind::HashSample { tag_prefix, .. } = hash.kind() else { unreachable!() };
+                tag_prefix.as_slice()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hashes.len(), 2, "distinct hashes remain distinct; repeated reads share one");
+        assert_eq!(
+            tags,
+            [b"public-key".as_slice(), b"another-key".as_slice()].into_iter().collect()
+        );
+        assert_eq!(body.outputs()[0], body.outputs()[1]);
+    }
+
+    /// Initial state stays outside the loop; immutable hash captures are generated
+    /// inside it, while fresh samples retain their single outer sampling site.
+    #[test]
+    fn sequential_hash_captures_preserve_initial_state_and_fresh_sampling() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let sample = ring.hash_matrix(key.clone(), b"public-key".as_slice(), (1, 4));
+        let other = ring.hash_matrix(key, b"another-key".as_slice(), (1, 4));
+        let fresh = ring.uniform_residue((1, 4));
+        let initial = (sample.clone(), sample.clone(), fresh.clone(), other.clone());
+        let outputs = iterate(2, initial, |_, _| {
+            Ok((sample.clone(), sample.clone(), fresh.clone(), other.clone()))
+        })
+        .unwrap();
+        let built = DslContext::new("sequential-hash-captures")
+            .output("result", outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let root = built.graph.root_scope();
+        assert_eq!(
+            root.nodes().iter().filter(|n| matches!(n.kind(), NodeKind::HashSample { .. })).count(),
+            2
+        );
+        assert_eq!(
+            root.nodes()
+                .iter()
+                .filter(|n| matches!(n.kind(), NodeKind::UniformResidueSample { .. }))
+                .count(),
+            1
+        );
+        let body = built
+            .graph
+            .scopes()
+            .values()
+            .find(|scope| {
+                matches!(scope.id(), mxx_ir_core::graph::FrozenGraphScopeId::SequentialBody { .. })
+            })
+            .unwrap();
+        let tags = body
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::HashSample { tag_prefix, .. } => Some(tag_prefix.as_slice()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            tags,
+            [b"public-key".as_slice(), b"another-key".as_slice()].into_iter().collect()
+        );
+        assert!(
+            !body.nodes().iter().any(|n| matches!(n.kind(), NodeKind::UniformResidueSample { .. }))
+        );
+        assert_eq!(body.outputs()[0], body.outputs()[1]);
+        let loop_node =
+            root.nodes().iter().find(|n| matches!(n.kind(), NodeKind::SequentialLoop(_))).unwrap();
+        assert_eq!(
+            root.arguments(loop_node).unwrap().len(),
+            6,
+            "four initial carries, one hash key and one fresh matrix capture"
+        );
+    }
+
+    #[test]
+    fn parallel_distinct_hash_captures_preserve_every_domain() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let samples = (0u64..32)
+            .map(|tag| ring.hash_matrix(key.clone(), tag.to_le_bytes().to_vec(), (1, 4)))
+            .collect::<Vec<_>>();
+        let outputs = parallel(3, |_| Family::pack(samples.clone())).unwrap();
+        let built = DslContext::new("distinct-hash-domains")
+            .output("result", outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let tags = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter_map(|node| match node.kind() {
+                NodeKind::HashSample { tag_prefix, .. } => Some(tag_prefix.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tags, (0u64..32).map(|tag| tag.to_le_bytes().to_vec()).collect());
+    }
+
+    #[test]
+    fn parallel_hash_capture_does_not_resample_a_parameter_sized_packed_matrix() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let sample = ring.hash_matrix(
+            ring.bytes_input("key", 32),
+            b"packed".as_slice(),
+            (IntExpr::constant(1), IntExpr::Var("width".to_owned())),
+        );
+        let outputs = parallel(3, |_| Ok(sample.clone())).unwrap();
+        let built = DslContext::new("packed-hash-capture")
+            .int_parameter("width")
+            .output("result", outputs)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+                .count(),
+            1
+        );
+        for scope in built
+            .graph
+            .scopes()
+            .values()
+            .filter(|scope| !matches!(scope.id(), mxx_ir_core::graph::FrozenGraphScopeId::Root))
+        {
+            assert!(
+                !scope
+                    .nodes()
+                    .iter()
+                    .any(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            );
+        }
+    }
 
     #[test]
     fn escaped_binder_cannot_be_rebound_through_bit_or_hash_metadata() {
@@ -362,5 +562,70 @@ mod tests {
         built.validate(&ParamEnv::default()).unwrap();
         assert!((Int::constant(7) / -3).expression().is_err());
         assert!((Int::constant(7) % -3).expression().is_err());
+    }
+
+    fn multiplications(built: &crate::BuiltGraph) -> u128 {
+        built.operation_counts().unwrap().get("MatrixBinary(Multiply)").copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn index_invariant_loops_are_counted_without_enumeration() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let (a, b) = (ring.input("a", (1, 1)), ring.input("b", (1, 1)));
+        let output = iterate(1_000_000_000_000u64, a.clone(), |_, state| {
+            Ok(parallel(1_000_000_000_000u64, |_| Ok(&state * &b))?.at(0))
+        })
+        .unwrap();
+        let built = DslContext::new("invariant").output("result", output).unwrap().build().unwrap();
+        assert_eq!(multiplications(&built), 1_000_000_000_000u128 * 1_000_000_000_000);
+    }
+
+    #[test]
+    fn empty_loops_count_nothing() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let (a, b) = (ring.input("a", (1, 1)), ring.input("b", (1, 1)));
+        let output = iterate(0, a, |_, state| Ok(&state * &b)).unwrap();
+        let built = DslContext::new("empty").output("result", output).unwrap().build().unwrap();
+        assert_eq!(multiplications(&built), 0);
+    }
+
+    /// A named input declared inside nested loop bodies is a root input of the graph, read by
+    /// the bodies like any outer value.
+    #[test]
+    fn inputs_declared_in_bodies_are_graph_inputs() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let family = parallel(3, |i| {
+            iterate(2, ring.zero((1, 1)), |_, sum| {
+                Ok(sum + ring.input("declared-in-body", (1, 1)).multiply_monomial(i.clone()))
+            })
+        })
+        .unwrap();
+        let built = DslContext::new("body-inputs").output("out", family).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let root_inputs = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::Input { name, .. } if name == "declared-in-body"))
+            .count();
+        assert_eq!(root_inputs, 1);
+    }
+
+    /// Leaves move the outputs of a context through a loop and back into a graph.
+    #[test]
+    fn context_outputs_move_as_leaves() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let family = parallel(2, |i| {
+            let outputs = DslContext::new("inner")
+                .output("value", ring.identity(1).multiply_monomial(i))?
+                .into_outputs();
+            Ok(outputs.into_iter().map(|(_, leaf, _)| leaf).collect::<Vec<_>>())
+        })
+        .unwrap();
+        let leaf = Leaf::of(family.field(|leaves| leaves[0].clone()).unwrap()).unwrap();
+        assert!(matches!(leaf.wire_type(), WireType::IndexedFamily { .. }));
+        assert!(leaf.at(Int::constant(1)).is_some());
+        DslContext::new("leaves").output("out", leaf).unwrap().build().unwrap();
     }
 }

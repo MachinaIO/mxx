@@ -23,9 +23,10 @@ use crate::{
         dcrt::gpu::{GpuDeviceMemory, GpuDeviceMemorySource, GpuSignedValuesEncoding},
     },
 };
-use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
+use mxx_ir_core::artifact::ArtifactType;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
 use std::{error::Error, sync::Arc};
 
 /// Copy an artifact held in GPU memory into `destination` when both describe
@@ -119,51 +120,6 @@ fn copy_device_artifact(
     }))
 }
 
-fn trapdoor_secret_parts(bytes: &[u8]) -> Result<[&[u8]; 6], String> {
-    let mut parts = [&[][..]; 6];
-    let mut offset = 0usize;
-    for part in &mut parts {
-        let header_end =
-            offset.checked_add(8).ok_or("trapdoor secret length overflows host address space")?;
-        let length_bytes: [u8; 8] = bytes
-            .get(offset..header_end)
-            .ok_or("trapdoor secret has a truncated length")?
-            .try_into()
-            .map_err(|_| "trapdoor secret length is malformed")?;
-        let length = usize::try_from(u64::from_le_bytes(length_bytes))
-            .map_err(|_| "trapdoor secret component length overflows host address space")?;
-        offset = header_end;
-        let payload_end = offset
-            .checked_add(length)
-            .ok_or("trapdoor secret component length overflows host address space")?;
-        *part =
-            bytes.get(offset..payload_end).ok_or("trapdoor secret has a truncated component")?;
-        offset = payload_end;
-    }
-    if offset != bytes.len() {
-        return Err("trapdoor secret has trailing bytes".into());
-    }
-    Ok(parts)
-}
-
-fn trapdoor_leaf_types(
-    matrix: &ConcreteMatrixType,
-    digits: usize,
-) -> Result<[ConcreteMatrixType; 6], String> {
-    let rows = matrix.rows;
-    let width = rows.checked_mul(digits).ok_or("trapdoor gadget width overflows")?;
-    let doubled_rows = rows.checked_mul(2).ok_or("trapdoor row count overflows")?;
-    let shape = |rows, columns| ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns };
-    Ok([
-        shape(rows, width),
-        shape(rows, width),
-        shape(rows, rows),
-        shape(rows, rows),
-        shape(rows, rows),
-        shape(doubled_rows, width),
-    ])
-}
-
 /// Fill the preallocated owner selected by one validated artifact descriptor.
 ///
 /// # Safety
@@ -254,6 +210,32 @@ unsafe fn upload_selected_payload(
         }
         (
             expected @ (ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. }),
+            ImportDestination::PlacedBounded { ty },
+            ArtifactPayload::SmallMatrix(bytes),
+        ) => {
+            if ArtifactType::from_wire_type(ty).as_ref() != Some(expected) {
+                return Err("placed bounded import differs from its artifact schema".into());
+            }
+            let (schema, semantic) =
+                expected.bounded_matrix_schema().ok_or("bounded import has no schema")?;
+            let (_, coefficients) = decode_small_matrix_artifact(&schema, &bytes, semantic)
+                .map_err(|error| error.to_string())?;
+            let destination = destination.ok_or("placed bounded import has no bound storage")?;
+            let (_, bound) =
+                destination.storages().next().ok_or("placed bounded import has no storage")?;
+            let buffer = bound
+                .owner
+                .downcast_ref::<crate::poly::dcrt::gpu::GpuDeviceBuffer>()
+                .ok_or("placed bounded import is not in plan scratch")?;
+            if coefficients.len() as u64 != bound.bytes {
+                return Err("placed bounded import size differs from its allocation".into());
+            }
+            let offset = usize::try_from(bound.address - buffer.as_ptr() as u64)
+                .map_err(|_| "placed bounded offset exceeds usize")?;
+            buffer.upload_initial(offset, coefficients).map_err(|error| error.to_string())
+        }
+        (
+            expected @ (ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. }),
             ImportDestination::Bounded { owner, ty },
             ArtifactPayload::SmallMatrix(bytes),
         ) => {
@@ -284,7 +266,7 @@ unsafe fn upload_selected_payload(
         }
         (
             ArtifactType::Int,
-            ImportDestination::Signed { owner, ty },
+            ImportDestination::Signed { owner, ty, payload_capacity },
             ArtifactPayload::Bytes(bytes),
         ) if matches!(
             ty,
@@ -294,6 +276,9 @@ unsafe fn upload_selected_payload(
         {
             if owner.count() != 1 {
                 return Err("integer import destination is not one scalar".into());
+            }
+            if bytes.len() > *payload_capacity {
+                return Err("integer import exceeds its planned payload capacity".into());
             }
             let value = BigInt::from_signed_bytes_le(&bytes);
             if value.to_signed_bytes_le() != bytes {
@@ -344,16 +329,46 @@ unsafe fn upload_selected_payload(
             Ok(())
         }
         (
-            ArtifactType::Trapdoor { matrix, digit_count, .. },
-            ImportDestination::Trapdoor { public, secret },
+            ArtifactType::Trapdoor { matrix, digit_count, instantiation, .. },
+            ImportDestination::Trapdoor { public, secret, precomputation },
             ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
         ) => {
             if &public.1 != matrix {
                 return Err("trapdoor public import has the wrong matrix type".into());
             }
-            let expected_leaves = trapdoor_leaf_types(matrix, *digit_count)?;
-            let secret_parts = trapdoor_secret_parts(&secret_bytes)?;
-            if secret.iter().zip(&expected_leaves).any(|((_, ty), expected)| ty != expected) {
+            let expected_leaves = crate::sampler::trapdoor::trapdoor_component_shapes(
+                matrix.rows,
+                *digit_count,
+                *instantiation,
+            )
+            .ok_or("trapdoor import has an invalid instantiation")?;
+            let (tag, mut secret_parts) =
+                crate::sampler::trapdoor::trapdoor_encoding_parts(&secret_bytes)
+                    .map_err(|error| error.to_string())?;
+            // A statistical encoding ends with the precomputation, which stays on the device.
+            let precomputation_bytes = match precomputation {
+                Some(owner) => Some((owner, secret_parts.pop().ok_or("trapdoor import is empty")?)),
+                None => None,
+            };
+            let expected_tag = if instantiation.is_computational() {
+                crate::sampler::trapdoor::TAG_COMPUTATIONAL
+            } else {
+                crate::sampler::trapdoor::TAG_STATISTICAL
+            };
+            let leaf_shape = |destination: &ImportDestination| match destination {
+                ImportDestination::Matrix { ty, .. } => Some(ty.clone()),
+                ImportDestination::Bounded { ty, .. } => ty.matrix_type().cloned(),
+                _ => None,
+            };
+            if tag != expected_tag ||
+                secret.len() != expected_leaves.len() ||
+                secret_parts.len() != expected_leaves.len() ||
+                secret.iter().zip(&expected_leaves).any(|(destination, (rows, columns))| {
+                    leaf_shape(destination).is_none_or(|ty| {
+                        ty.ring != matrix.ring || (ty.rows, ty.columns) != (*rows, *columns)
+                    })
+                })
+            {
                 return Err("trapdoor secret import has the wrong leaf layout".into());
             }
             // SAFETY: all seven matrices are plan-owned and prior uses have joined.
@@ -364,20 +379,105 @@ unsafe fn upload_selected_payload(
                     &public_bytes,
                 )
             }?;
-            for ((owner, ty), bytes) in secret.iter().zip(secret_parts) {
-                // SAFETY: the same exclusive-plan completion gate protects each leaf.
-                unsafe {
-                    backend.upload_physical_matrix_import_after_completion(owner, ty, bytes)
-                }?;
+            for (destination, bytes) in secret.iter().zip(secret_parts) {
+                match destination {
+                    ImportDestination::Matrix { owner, ty } => {
+                        // SAFETY: the same exclusive-plan completion gate protects each leaf.
+                        unsafe {
+                            backend.upload_physical_matrix_import_after_completion(owner, ty, bytes)
+                        }?;
+                    }
+                    // A compact row chunk of a statistical `T`: the coefficient matrix record
+                    // becomes the owner's sign and magnitude bytes without a CRT reconstruction.
+                    ImportDestination::Bounded { owner, ty } => {
+                        let payload = compact_coefficients_from_matrix_record(
+                            bytes,
+                            ty.matrix_type().ok_or("trapdoor chunk has no matrix type")?,
+                            owner.max_coefficient_bound(),
+                        )?;
+                        owner
+                            .upload_canonical_coefficients_in_place(owner.bound_domain(), &payload)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    _ => return Err("trapdoor secret import has an unknown leaf owner".into()),
+                }
+            }
+            if let Some((owner, bytes)) = precomputation_bytes {
+                owner.upload(bytes).map_err(|error| error.to_string())?;
+                owner.wait_until_ready().map_err(|error| error.to_string())?;
             }
             public.0.wait_until_ready();
-            for (owner, _) in secret {
-                owner.wait_until_ready();
+            for destination in secret {
+                match destination {
+                    ImportDestination::Matrix { owner, .. } => owner.wait_until_ready(),
+                    ImportDestination::Bounded { owner, .. } => owner.wait_until_ready(),
+                    _ => {}
+                }
             }
             Ok(())
         }
         _ => Err("artifact payload kind or typed import owner differs from its descriptor".into()),
     }
+}
+
+/// The compact coefficients (per coefficient a sign byte, 0 for zero, 1 positive, 2 negative, then
+/// the little-endian magnitude in the bytes `bound` needs) of the coefficient matrix record
+/// `record` of the matrix type `matrix`, in row, column, and coefficient order: the payload a
+/// global-bound [`crate::matrix::gpu_dcrt_poly::GpuSmallMatrix`] uploads. Every magnitude must be
+/// at most `bound`.
+fn compact_coefficients_from_matrix_record(
+    record: &[u8],
+    matrix: &mxx_ir_core::types::ConcreteMatrixType,
+    bound: &num_bigint::BigUint,
+) -> Result<Vec<u8>, String> {
+    let ring_dimension = matrix.ring.ring_dimension() as usize;
+    let decoded = crate::matrix::dcrt_poly::decode_compact_dcrt_matrix_bytes(
+        record,
+        ring_dimension,
+        matrix.ring.crt_depth(),
+    )
+    .map_err(|error| error.to_string())?;
+    if decoded.format != 0 ||
+        decoded.level + 1 != matrix.ring.crt_depth() ||
+        (decoded.rows, decoded.columns) != (matrix.rows, matrix.columns)
+    {
+        return Err("trapdoor chunk record differs from its matrix type".into());
+    }
+    let bound = bound.to_u64().ok_or("compact trapdoor chunk bound exceeds 64 bits")?;
+    let magnitude_bytes = (u64::BITS - bound.leading_zeros()).div_ceil(8).max(1) as usize;
+    let width = usize::from(decoded.max_coeff_bits);
+    if width > 64 {
+        return Err("trapdoor chunk coefficient exceeds its compact bound".into());
+    }
+    let count = matrix.rows * matrix.columns * ring_dimension;
+    let mut payload = vec![0u8; count * (magnitude_bytes + 1)];
+    payload.par_chunks_mut(magnitude_bytes + 1).enumerate().try_for_each(
+        |(index, coefficient)| {
+            let base = index * width;
+            let mut value = 0u64;
+            for bit in 0..width {
+                let position = base + bit;
+                if decoded.payload[position / 8] & (1 << (position % 8)) != 0 {
+                    value |= 1 << bit;
+                }
+            }
+            let (magnitude, negative) = match width {
+                0 => (0, false),
+                _ => (value & ((1u64 << (width - 1)) - 1), (value >> (width - 1)) & 1 == 1),
+            };
+            if magnitude > bound || (negative && magnitude == 0) {
+                return Err("trapdoor chunk coefficient exceeds its compact bound".to_owned());
+            }
+            coefficient[0] = match (magnitude, negative) {
+                (0, _) => 0,
+                (_, false) => 1,
+                (_, true) => 2,
+            };
+            coefficient[1..].copy_from_slice(&magnitude.to_le_bytes()[..magnitude_bytes]);
+            Ok(())
+        },
+    )?;
+    Ok(payload)
 }
 
 /// Start reading the artifact `key` into `template`'s planned owner. The

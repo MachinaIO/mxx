@@ -9,16 +9,18 @@ namespace Stage_encrypt_right
 structure Params where
   unit : Unit
 
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Witness where
   w_1_0 : Fin 630 → Int
   w_4_0 : Int
-  w_13_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
+  w_13_0 : mxxMat0
   w_14_0 : Int
   w_22_0 : Int
 
-abbrev generatedRoot.constraints_0 (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (w_0_0 : ByteArray) (w_1_0 : Fin 630 → Int) (w_3_0 : Fin 1 → Int) (w_4_0 : Int) (w_13_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_14_0 : Int) (w_19_0 : Int) (w_21_0 : Int) (w_22_0 : Int) (w_24_0 : Int) (w_25_0 : Int) (outputs : (Fin 630 → Int) × Int × Unit) : Prop :=
+abbrev generatedRoot.constraints_0 (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (w_0_0 : ByteArray) (w_1_0 : Fin 630 → Int) (w_3_0 : Fin 1 → Int) (w_4_0 : Int) (w_13_0 : mxxMat0) (w_14_0 : Int) (w_19_0 : Int) (w_21_0 : Int) (w_22_0 : Int) (w_24_0 : Int) (w_25_0 : Int) (outputs : (Fin 630 → Int) × Int × Unit) : Prop :=
   MxxRuntime.hashIntFamily (hashModel) (4294967296) ([109, 120, 120, 47, 104, 97, 115, 104, 45, 105, 110, 116, 45, 102, 97, 109, 105, 108, 121, 47, 118, 49, 0, 116, 102, 104, 101, 47, 108, 119, 101, 45, 101, 110, 99, 114, 121, 112, 116, 47, 97, 47, 118, 49]) ([]) (w_0_0) w_1_0 ∧
   MxxRuntime.familyGetStatic w_3_0 (0) w_4_0 ∧
   MxxRuntime.gaussianSampleAt tape (path ++ [13]) ((131072/1)) (2097152) w_13_0 ∧

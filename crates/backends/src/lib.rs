@@ -11,6 +11,7 @@
 
 pub mod element;
 pub mod env;
+pub mod lattice_estimator;
 pub mod matrix;
 pub mod modulus;
 pub mod openfhe_guard;
@@ -26,6 +27,7 @@ pub mod backend;
 #[path = "gpu_device_artifact.rs"]
 pub mod device_artifact;
 pub mod executor;
+pub mod gpu_cost_model;
 pub mod gpu_execution_plan;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_graph_memory;
@@ -45,6 +47,8 @@ pub(crate) mod gpu_runtime_import;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_runtime_io;
 pub mod gpu_schedule;
+#[cfg(feature = "gpu")]
+mod gpu_streamed_carry;
 pub mod gpu_subgraph_kernel;
 #[path = "gpu_runtime_metrics.rs"]
 pub mod gpu_warmup;

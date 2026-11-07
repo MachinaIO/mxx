@@ -5,6 +5,8 @@ members = [
     "crates/dsl",
     "crates/backends",
     "crates/khe",
+    "crates/exponent-lut",
+    "crates/pe",
     "crates/func-enc",
     "crates/io",
     "crates/fhe",
@@ -22,6 +24,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 mxx-backends = { path = "crates/backends" }
 mxx-khe = { path = "crates/khe" }
+mxx-exponent-lut = { path = "crates/exponent-lut" }
 mxx-func-enc = { path = "crates/func-enc" }
 mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }
@@ -43,9 +46,10 @@ num-traits = "0.2.19"
 openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
 rand = { version = "0.9.0", features = ["std_rng"] }
 rayon = "1.5"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
+sha3 = "0.10"
 smallvec = "1.15"
 serial_test = { version = "3.5.0", default-features = false }
 tempfile = "3.19.1"

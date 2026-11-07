@@ -37,7 +37,7 @@ use mxx_ir_core::{
         ArtifactInput, ConstantMatrix, HashTagComponent, HashVariant, IndexRange, MatrixBinaryOp,
         NodeKind, ParallelLoop, SampleRange, SequentialLoop,
     },
-    types::{MatrixType, WireType},
+    types::{MEMBER_INDEX, MatrixType, WireType},
 };
 mod control;
 mod family;
@@ -50,7 +50,7 @@ pub use control::{iterate, parallel, select};
 pub use family::Family;
 pub use subgraph::Subgraph;
 use value::argument_name;
-pub use value::{GraphValue, GraphValueSchema};
+pub use value::{GraphValue, GraphValueSchema, Leaf, LeafType};
 
 use num_bigint::BigUint;
 use std::{
@@ -64,7 +64,7 @@ pub use mxx_ir_core::{
     Rational,
     artifact::ArtifactAvailability,
     protocol::{IdealSpec, PurePredicateSpec},
-    types::CoefficientBoundDomain,
+    types::{CoefficientBoundDomain, TrapdoorInstantiation},
 };
 #[cfg(test)]
 mod bundle_tests;
@@ -217,12 +217,17 @@ pub struct TrapdoorType {
     pub gadget_base: IntExpr,
     pub digit_count: IntExpr,
     pub preimage_max_coefficient_bound: IntExpr,
+    pub instantiation: TrapdoorInstantiation,
+    pub preimage_sigma: Option<RealExpr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FamilyType<S> {
     pub element: S,
     pub count: IntExpr,
+    /// The loop slot that stands for the member index in `element` (a `parallel` body's index),
+    /// if the element schema depends on it; its wire types name the member index instead.
+    pub member_slot: Option<u32>,
 }
 
 /// A ring `Z_Q[X]/(X^N + 1)` given by an ordered CRT basis.
@@ -486,17 +491,48 @@ impl Ring {
         )
     }
 
+    /// Imports a sampled trapdoor artifact. Its payload carries the public
+    /// matrix, so the public matrix is the trapdoor's own projection and can
+    /// never disagree with the secret.
     #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub fn trapdoor_artifact_input(
         &self,
         production_id: ProductionId,
-        public_artifact_name: impl Into<String>,
         trapdoor_artifact_name: impl Into<String>,
         rows: impl Into<IntExpr>,
         sigma: impl Into<RealExpr>,
         gadget_base: impl Into<IntExpr>,
         digit_count: impl Into<IntExpr>,
+        preimage_max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Trapdoor {
+        self.trapdoor_artifact_input_with_width(
+            production_id,
+            trapdoor_artifact_name,
+            rows,
+            TrapdoorInstantiation::Computational,
+            sigma,
+            gadget_base,
+            digit_count,
+            None,
+            preimage_max_coefficient_bound,
+        )
+    }
+
+    /// [`Self::trapdoor_artifact_input`] of a trapdoor in the given instantiation whose preimages
+    /// are sampled with width `preimage_sigma` (`None`: the smallest width the sampler accepts).
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    pub fn trapdoor_artifact_input_with_width(
+        &self,
+        production_id: ProductionId,
+        trapdoor_artifact_name: impl Into<String>,
+        rows: impl Into<IntExpr>,
+        instantiation: TrapdoorInstantiation,
+        sigma: impl Into<RealExpr>,
+        gadget_base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+        preimage_sigma: Option<RealExpr>,
         preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Trapdoor {
         let rows = rows.into();
@@ -506,18 +542,8 @@ impl Ring {
         let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
-            columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
+            columns: instantiation.columns_expr(rows, digit_count.clone()),
         });
-        let public_artifact_name = public_artifact_name.into();
-        let public = Mat::source_input(
-            public_artifact_name.clone(),
-            matrix_type.clone(),
-            Some(ArtifactInput {
-                production_id: production_id.clone(),
-                artifact_name: public_artifact_name,
-                availability: ArtifactAvailability::Transferred,
-            }),
-        );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
         let wire_type = WireType::Trapdoor {
             matrix: matrix_type.clone(),
@@ -525,6 +551,8 @@ impl Ring {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            instantiation,
+            preimage_sigma,
         };
         let node = NodeHandle::new(
             NodeKind::Input {
@@ -539,8 +567,16 @@ impl Ring {
             Vec::new(),
             vec![wire_type],
         );
+        let public_node = NodeHandle::new(
+            NodeKind::TrapdoorPublic,
+            vec![node.output(0).expect("trapdoor artifact input")],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
         Trapdoor {
-            public,
+            public: Mat {
+                value: public_node.output(0).expect("trapdoor artifact public output"),
+                matrix_type: matrix_type.clone(),
+            },
             value: node.output(0).expect("trapdoor artifact input"),
             matrix_type,
             preimage_max_coefficient_bound,
@@ -561,6 +597,7 @@ impl Ring {
         digit_count: impl Into<IntExpr>,
         preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Family<Trapdoor> {
+        let instantiation = TrapdoorInstantiation::Computational;
         let count = count.into();
         let rows = rows.into();
         let sigma = sigma.into();
@@ -569,7 +606,7 @@ impl Ring {
         let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
-            columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
+            columns: instantiation.columns_expr(rows, digit_count.clone()),
         });
         let public_artifact_name = public_artifact_name.into();
         let public = Family::<Mat>::source_input(
@@ -593,6 +630,8 @@ impl Ring {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma: None,
         };
         Family::<Trapdoor>::trapdoor_input(
             format!("artifact:{trapdoor_artifact_name}"),
@@ -860,6 +899,14 @@ impl Ring {
         )
     }
 
+    /// A `shape` matrix whose entries are all the polynomial with every
+    /// coefficient equal to `value`; its size does not grow with the ring
+    /// dimension, unlike [`Self::polynomial`] with repeated coefficients.
+    #[track_caller]
+    pub fn all_coefficients(&self, shape: impl IntoShape, value: impl Into<IntExpr>) -> Mat {
+        self.constant(shape, ConstantMatrix::AllCoefficients { value: value.into() })
+    }
+
     /// Reconstructs one polynomial from canonical coefficient bits.
     ///
     /// Bits are coefficient-major and little-endian within each coefficient.
@@ -941,10 +988,44 @@ impl Ring {
                 matrix_type: ty.clone(),
                 sigma: sigma.into(),
                 max_coefficient_bound: max_coefficient_bound.into(),
+                compact: false,
             },
             Vec::new(),
             ty,
         )
+    }
+
+    /// A Gaussian sample as a globally bounded [`SmallMatrix`] whose bound is the cutoff
+    /// `max_coefficient_bound`, so a transferred output stores compact signed coefficients
+    /// instead of residues; multiply it with [`Mat::mul_small_rhs`].
+    pub fn small_gaussian(
+        &self,
+        shape: impl IntoShape,
+        sigma: impl Into<RealExpr>,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> SmallMatrix {
+        let matrix_type = self.matrix_type(shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
+        let node = NodeHandle::new(
+            NodeKind::GaussianSample {
+                matrix_type: matrix_type.clone(),
+                sigma: sigma.into(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+                compact: true,
+            },
+            Vec::new(),
+            vec![WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+                bound_domain: CoefficientBoundDomain::Global,
+            }],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("small Gaussian sample"),
+            matrix_type,
+            max_coefficient_bound,
+            bound_domain: CoefficientBoundDomain::Global,
+        }
     }
 
     #[track_caller]
@@ -1081,6 +1162,34 @@ impl Ring {
         digit_count: impl Into<IntExpr>,
         preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Trapdoor {
+        self.sample_trapdoor_with_width(
+            rows,
+            TrapdoorInstantiation::Computational,
+            sigma,
+            gadget_base,
+            digit_count,
+            None,
+            preimage_max_coefficient_bound,
+        )
+    }
+
+    /// Samples a trapdoor in the given instantiation.
+    ///
+    /// `sigma` is the TrapGen width; every preimage under the trapdoor is sampled with width
+    /// `preimage_sigma` (`None`: the smallest width the sampler accepts) and rejected above
+    /// `preimage_max_coefficient_bound`.
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_trapdoor_with_width(
+        &self,
+        rows: impl Into<IntExpr>,
+        instantiation: TrapdoorInstantiation,
+        sigma: impl Into<RealExpr>,
+        gadget_base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+        preimage_sigma: Option<RealExpr>,
+        preimage_max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Trapdoor {
         let rows = rows.into();
         let sigma = sigma.into();
         let gadget_base = gadget_base.into();
@@ -1088,7 +1197,7 @@ impl Ring {
         let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
-            columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
+            columns: instantiation.columns_expr(rows, digit_count.clone()),
         });
         let node = NodeHandle::new(
             NodeKind::TrapdoorSample {
@@ -1097,6 +1206,8 @@ impl Ring {
                 gadget_base: gadget_base.clone(),
                 digit_count: digit_count.clone(),
                 preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation,
+                preimage_sigma: preimage_sigma.clone(),
             },
             Vec::new(),
             vec![
@@ -1107,6 +1218,8 @@ impl Ring {
                     gadget_base,
                     digit_count,
                     preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                    instantiation,
+                    preimage_sigma,
                 },
             ],
         );
@@ -1151,6 +1264,8 @@ impl Ring {
                 gadget_base: base,
                 digit_count,
                 preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation: TrapdoorInstantiation::Computational,
+                preimage_sigma: None,
             }],
         );
         let public_node = NodeHandle::new(
@@ -1230,6 +1345,35 @@ impl HashTag {
         ));
 
         Ok(())
+    }
+
+    /// Append a signed, length-prefixed integer component. Compile-time and runtime
+    /// values use identical bytes, including indices wider than 64 bits. This is
+    /// the existing Integer/Operand encoding, distinct from `push_u64_le`.
+    pub fn push_integer(&mut self, index: Int) {
+        match index.compile_expression() {
+            Some(expression) => self.components.push(HashTagComponent::Integer(expression)),
+            None => {
+                self.components.push(HashTagComponent::Operand(self.dynamic.len() + 1));
+                self.dynamic.push(index.value);
+            }
+        }
+    }
+
+    /// Append `index` as a `u64` little-endian component (`[3]` and eight bytes).
+    ///
+    /// An index known when the graph is built (a constant, parameter, or loop-index expression)
+    /// becomes a static [`HashTagComponent::U64Le`]; any other runtime integer becomes a hash
+    /// sampler argument read through [`HashTagComponent::OperandU64Le`]. Both forms hash the same
+    /// bytes for the same value, and the value must lie in `[0, 2^64)`.
+    pub fn push_u64_le(&mut self, index: Int) {
+        match index.compile_expression() {
+            Some(expression) => self.components.push(HashTagComponent::U64Le(expression)),
+            None => {
+                self.components.push(HashTagComponent::OperandU64Le(self.dynamic.len() + 1));
+                self.dynamic.push(index.value);
+            }
+        }
     }
 }
 
@@ -1502,17 +1646,18 @@ impl Mat {
         self.transpose()
     }
 
+    /// A sub-matrix. A range's extent is its constant width when its bounds
+    /// cancel to one, so a window at a loop-dependent offset, such as
+    /// `h..h+1` for a remainder `h` of the loop index, keeps a loop-free type.
     #[track_caller]
     pub fn slice(self, rows: Option<IndexRange>, columns: Option<IndexRange>) -> Self {
+        let extent = |range: &IndexRange| {
+            let width = range.end.clone() - range.start.clone();
+            width.cancelled_constant().map_or_else(|| width.canonicalize(), IntExpr::Const)
+        };
         let ty = MatrixType {
-            rows: rows.as_ref().map_or_else(
-                || self.matrix_type.rows.clone(),
-                |range| (range.end.clone() - range.start.clone()).canonicalize(),
-            ),
-            columns: columns.as_ref().map_or_else(
-                || self.matrix_type.columns.clone(),
-                |range| (range.end.clone() - range.start.clone()).canonicalize(),
-            ),
+            rows: rows.as_ref().map_or_else(|| self.matrix_type.rows.clone(), extent),
+            columns: columns.as_ref().map_or_else(|| self.matrix_type.columns.clone(), extent),
             ..self.matrix_type.clone()
         };
         Self::from_node(NodeKind::Slice { rows, columns }, vec![self], ty)
@@ -1526,6 +1671,19 @@ impl Mat {
             ..self.matrix_type.clone()
         };
         Self::from_node(NodeKind::Tensor, vec![self, rhs], ty)
+    }
+
+    /// Repeats this matrix on the diagonal: `I_count ⊗ self`.
+    /// Records one operation regardless of the positive number of blocks.
+    #[track_caller]
+    pub fn block_diagonal(self, count: usize) -> Self {
+        assert!(count > 0, "block diagonal requires at least one block");
+        let ty = MatrixType {
+            rows: self.matrix_type.rows.clone() * IntExpr::constant(count),
+            columns: self.matrix_type.columns.clone() * IntExpr::constant(count),
+            ..self.matrix_type.clone()
+        };
+        Self::from_node(NodeKind::BlockDiagonal { count }, vec![self], ty)
     }
 
     #[track_caller]
@@ -1593,6 +1751,7 @@ impl Mat {
             values: vec![node.output(0).expect("coefficient family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -1612,6 +1771,7 @@ impl Mat {
             values: vec![node.output(0).expect("evaluation family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -1673,6 +1833,7 @@ impl Mat {
                 plaintext_modulus: plaintext_modulus.into(),
                 length: IntExpr::constant(length),
                 output_bool: false,
+                family: false,
             },
             vec![self.value],
             vec![WireType::Int; length],
@@ -1680,6 +1841,36 @@ impl Mat {
         (0..length)
             .map(|port| Int { value: node.output(port as u32).expect("decoded integer") })
             .collect()
+    }
+
+    /// [`Self::threshold_decode_ints`] as one integer family of `length`
+    /// members.
+    #[track_caller]
+    pub fn threshold_decode_int_family(
+        self,
+        plaintext_modulus: impl Into<IntExpr>,
+        length: usize,
+    ) -> Family<Int> {
+        let count = IntExpr::constant(length);
+        let node = NodeHandle::new(
+            NodeKind::ThresholdDecode {
+                plaintext_modulus: plaintext_modulus.into(),
+                length: count.clone(),
+                output_bool: false,
+                family: true,
+            },
+            vec![self.value],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("decoded family")],
+            element_schema: IntType,
+            count,
+            member_slot: None,
+        }
     }
 
     #[track_caller]
@@ -1693,6 +1884,7 @@ impl Mat {
                 plaintext_modulus: plaintext_modulus.into(),
                 length: IntExpr::constant(length),
                 output_bool: true,
+                family: false,
             },
             vec![self.value],
             vec![WireType::Bool; length],
@@ -1764,10 +1956,43 @@ impl Sub for Mat {
 
 impl Mul for Mat {
     type Output = Mat;
+    /// A product with a constant scalar polynomial `c` is the scale of the other operand by `c`
+    /// (the identity by `1`): no ring-sized constant is materialized for it.
     #[track_caller]
     fn mul(self, rhs: Self) -> Self::Output {
         let ty = product_type(&self.matrix_type, &rhs.matrix_type);
+        let scaled = match (constant_scalar(&self), constant_scalar(&rhs)) {
+            (Some(scalar), None) => Some((scalar, rhs.clone())),
+            (None, Some(scalar)) => Some((scalar, self.clone())),
+            _ => None,
+        };
+        if let Some((scalar, other)) = scaled &&
+            other.matrix_type == ty
+        {
+            if scalar == IntExpr::constant(1) {
+                return other;
+            }
+            return Mat::from_node(NodeKind::MatrixScale { scalar }, vec![other], ty);
+        }
         Mat::from_node(NodeKind::MatrixBinary(MatrixBinaryOp::Multiply), vec![self, rhs], ty)
+    }
+}
+
+/// The integer `c` when `matrix` is the constant `1 x 1` polynomial `c` (the identity is `1`).
+fn constant_scalar(matrix: &Mat) -> Option<IntExpr> {
+    if !is_scalar_type(&matrix.matrix_type) {
+        return None;
+    }
+    match matrix.value.node().kind() {
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Polynomial { coefficients }, .. }
+            if coefficients.len() == 1 =>
+        {
+            Some(coefficients[0].clone())
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. } => {
+            Some(IntExpr::constant(1))
+        }
+        _ => None,
     }
 }
 
@@ -2036,6 +2261,32 @@ impl DslContext {
         Int { value: expression }.add(Int::constant(0))
     }
 
+    /// The packed ascending row indices and counts of a deterministic SHA-256 bit matrix.
+    /// Bit `r * columns + c` uses `SHA256(seed || (bit / 256).to_le_bytes())`, with
+    /// little-endian bits within each byte. The graph stores only the seed and dimensions.
+    pub fn sha256_bit_columns(
+        &self,
+        seed: [u8; 32],
+        rows: usize,
+        columns: usize,
+        index_bits: usize,
+    ) -> (Family<Int>, Family<Int>) {
+        let count = IntExpr::constant(columns);
+        let ty = WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
+        let node = NodeHandle::new(
+            NodeKind::Sha256BitColumns { seed, rows, columns, index_bits },
+            Vec::new(),
+            vec![ty; 2],
+        );
+        let family = |port| Family {
+            values: vec![node.output(port).expect("SHA-256 column family")],
+            element_schema: IntType,
+            count: count.clone(),
+            member_slot: None,
+        };
+        (family(0), family(1))
+    }
+
     /// `count` integers uniform on `[0, modulus)` for a power-of-two `modulus`,
     /// derived from the 32-byte key, the tag, and each element's index. The
     /// tag is prefixed with a fixed integer-family domain, so the stream never
@@ -2071,6 +2322,7 @@ impl DslContext {
             values: vec![node.output(0).expect("hash integer family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -2080,19 +2332,7 @@ impl DslContext {
         name: impl Into<String>,
         fixed_count: impl Into<IntExpr>,
     ) -> Family<Int> {
-        let count = fixed_count.into();
-        let wire_type =
-            WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
-        let node = NodeHandle::new(
-            NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
-            Vec::new(),
-            vec![wire_type],
-        );
-        Family {
-            values: vec![node.output(0).expect("integer family input")],
-            element_schema: IntType,
-            count,
-        }
+        int_family_input(name, fixed_count)
     }
 
     pub fn output<V: GraphValue>(
@@ -2151,6 +2391,16 @@ impl DslContext {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
+    }
+
+    /// The named outputs of this context, by leaf name, with their artifact availability
+    /// (`None` for a plain output), without freezing: a caller moves another builder's
+    /// published values into its own graph, for example out of a loop body.
+    pub fn into_outputs(self) -> Vec<(String, Leaf, Option<ArtifactAvailability>)> {
+        self.outputs
+            .into_iter()
+            .map(|(name, output)| (name, Leaf::new(output.value), output.availability))
+            .collect()
     }
 
     pub fn build(self) -> Result<BuiltGraph, DslError> {
@@ -2338,6 +2588,26 @@ macro_rules! tag {
 }
 
 pub use mxx_ir_core::node::ConcatAxis;
+
+/// A runtime integer family input of `fixed_count` members named `name`, declared where it is
+/// first used: a graph built from values that read it declares the input.
+#[track_caller]
+pub fn int_family_input(name: impl Into<String>, fixed_count: impl Into<IntExpr>) -> Family<Int> {
+    let count = fixed_count.into();
+    let wire_type =
+        WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
+    let node = NodeHandle::new(
+        NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
+        Vec::new(),
+        vec![wire_type],
+    );
+    Family {
+        values: vec![node.output(0).expect("integer family input")],
+        element_schema: IntType,
+        count,
+        member_slot: None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2755,6 +3025,34 @@ mod tests {
     }
 
     #[test]
+    fn push_u64_le_is_static_for_compile_time_indices_and_an_operand_otherwise() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let runtime = ring.input("row", (1, 1)).extract_coefficient(0);
+        let mut tag = HashTag::from(b"u64-le-tag:".as_slice());
+        tag.push_u64_le(Int::constant(5).add(Int::constant(2)));
+        tag.push_u64_le(runtime);
+        let sample = ring.hash_matrix(key, tag, (1, 1));
+        let built =
+            DslContext::new("u64-le-tags").output("sample", sample).unwrap().build().unwrap();
+        let hash = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            .unwrap();
+        let NodeKind::HashSample { tag_components, .. } = hash.kind() else { unreachable!() };
+        assert_eq!(
+            tag_components,
+            &vec![HashTagComponent::U64Le(IntExpr::constant(7)), HashTagComponent::OperandU64Le(1),]
+        );
+        assert_eq!(hash.arguments().len(), 2);
+        assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
+        built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
     fn dynamic_integer_hash_tag_is_an_explicit_argument() {
         let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let row = Int::constant(7).add(Int::constant(0));
@@ -2954,6 +3252,42 @@ mod tests {
             .unwrap();
         built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(built.graph.outputs().len(), 9);
+    }
+
+    #[test]
+    fn test_block_diagonal_graph_and_lean_size_are_bounded() {
+        for count in [1, 270, 30_000] {
+            let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+            let graph = DslContext::new("block-diagonal")
+                .output("out", ring.input("input", (2, 3)).block_diagonal(count))
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(graph.graph.root_scope().nodes().len(), 2);
+            let validated = graph.validate(&ParamEnv::default()).unwrap();
+            let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
+            assert_eq!(lean.source.matches("MxxRuntime.blockDiagonalRuns").count(), 1);
+            assert!(!lean.source.contains("MxxRuntime.concatDiagonal"));
+            assert!(lean.source.len() < 30_000);
+        }
+    }
+
+    #[test]
+    fn test_sha256_columns_graph_and_lean_size_are_bounded() {
+        let mut sizes = Vec::new();
+        for rows in [8usize, 64, 8192] {
+            let context = DslContext::new("sha256-columns");
+            let bits = (usize::BITS - (rows - 1).leading_zeros()) as usize;
+            let columns = context.sha256_bit_columns([3; 32], rows, rows + 1, bits);
+            let graph = context.output("out", columns).unwrap().build().unwrap();
+            assert_eq!(graph.graph.root_scope().nodes().len(), 1);
+            let validated = graph.validate(&ParamEnv::default()).unwrap();
+            let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
+            assert_eq!(lean.source.matches("MxxRuntime.sha256BitColumns").count(), 1);
+            assert!(!lean.source.contains("selectInt"));
+            sizes.push(lean.source.len());
+        }
+        assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() < 100);
     }
 
     #[test]
@@ -3295,8 +3629,11 @@ mod tests {
     fn define_accepts_a_formal_nonartifact_family() {
         let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
-        let family_type =
-            FamilyType { element: MatType(ring.matrix_type((1, 1))), count: 2.into() };
+        let family_type = FamilyType {
+            element: MatType(ring.matrix_type((1, 1))),
+            count: 2.into(),
+            member_slot: None,
+        };
         let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::define(
             "formal-matrix-family",
             (matrix_type.clone(), family_type.clone()),

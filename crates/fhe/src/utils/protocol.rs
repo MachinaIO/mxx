@@ -10,11 +10,11 @@ use mxx_dsl::{
 use mxx_ir_core::{
     Graph,
     protocol::{
-        ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
-        ComparatorSpec, EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId,
-        InputContract, InputContractEntry, InputValueContract, OutputRef, ProtocolDecl,
-        ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
-        ProtocolStage, StageId, StageInputName, Workflow,
+        ArtifactBinding, ArtifactName, ClosedProtocolBundle, Comparison, EndpointBinding,
+        EndpointSemanticBinding, EndpointSpecId, InputContract, InputContractEntry,
+        InputValueContract, OutputRef, ProtocolDecl, ProtocolInputBinding,
+        ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage,
+        StageId, StageInputName, Workflow,
     },
 };
 
@@ -178,25 +178,13 @@ fn gate_protocol(stages: Vec<ProtocolStage>) -> ProtocolDecl {
             workflow: Workflow { stages, entrypoint: decrypt.clone() },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "bit".to_owned(),
-                    ideal_input: "bit".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::Exact,
-                    workflow_output: OutputRef { stage: decrypt, output: "bit".to_owned() },
-                    ideal_output: "bit".to_owned(),
-                }],
-            },
+            comparison: Comparison::equality(EndpointBinding {
+                spec: endpoint,
+                semantics: EndpointSemanticBinding::Exact,
+                workflow_output: OutputRef { stage: decrypt, output: "bit".to_owned() },
+                ideal_output: "bit".to_owned(),
+            }),
             operational_decoder_targets: Vec::new(),
-            endpoint_specs: vec![endpoint],
             input_contract: InputContract { inputs: contracts },
             input_bindings: bindings,
             precondition_spec: ProtocolPreconditionSpec::default(),
@@ -441,25 +429,13 @@ fn round_trip_protocol(bgv: &BgvParams, stages: Vec<ProtocolStage>) -> ProtocolD
             workflow: Workflow { stages, entrypoint: decrypt.clone() },
             ideal,
             requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality {
-                endpoints: vec![ComparatorEndpointBinding {
-                    endpoint,
-                    actual_input: "slots".to_owned(),
-                    ideal_input: "slots".to_owned(),
-                    result_output: "failure".to_owned(),
-                    failure_value: true,
-                }],
-            },
-            endpoints: EndpointBindings {
-                entries: vec![EndpointBinding {
-                    spec: endpoint,
-                    semantics: EndpointSemanticBinding::Exact,
-                    workflow_output: OutputRef { stage: decrypt, output: "slots".to_owned() },
-                    ideal_output: "slots".to_owned(),
-                }],
-            },
+            comparison: Comparison::equality(EndpointBinding {
+                spec: endpoint,
+                semantics: EndpointSemanticBinding::Exact,
+                workflow_output: OutputRef { stage: decrypt, output: "slots".to_owned() },
+                ideal_output: "slots".to_owned(),
+            }),
             operational_decoder_targets: Vec::new(),
-            endpoint_specs: vec![endpoint],
             input_contract: InputContract { inputs: contracts },
             input_bindings: bindings,
             precondition_spec: ProtocolPreconditionSpec::default(),

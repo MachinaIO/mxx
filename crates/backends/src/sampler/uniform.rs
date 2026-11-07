@@ -30,10 +30,44 @@ fn rejection_resample_coefficients<T>(
         .collect()
 }
 
+/// Widths above this are sampled by convolution ([`wide_gaussian_split`]); the base samplers
+/// draw at most this width, whose samples a binary64 represents with ample fractional precision.
+/// The GPU sampler (`MatrixSampling.cu`) uses the same constants.
+pub const WIDE_GAUSSIAN_THRESHOLD: f64 = (1u64 << 40) as f64;
+/// The convolution base `B = 2^32` of [`wide_gaussian_split`].
+pub const WIDE_GAUSSIAN_BASE_BITS: u32 = 32;
+/// The largest width the convolution supports: every sample within 13 widths stays below `2^63`.
+pub const WIDE_GAUSSIAN_MAX: f64 = (1u64 << 58) as f64;
+
+/// The split `σ = √(σ_0² + B² σ_1²)` of a wide width `σ`: a Gaussian sample is `y_0 + B y_1` for
+/// `y_0` of width `σ_0 = 4 B` and `y_1` of width `σ_1` (recursively split while above
+/// [`WIDE_GAUSSIAN_THRESHOLD`]). By the convolution theorem (Micciancio–Walter, CRYPTO 2017;
+/// Peikert, CRYPTO 2010), `y_0 + B y_1` is statistically close to the discrete Gaussian of width
+/// `σ` because `σ_0 = 4 B` exceeds the smoothing parameter of `B Z` many times over (its
+/// statistical distance is far below `2^-100`); the floating-point error of the base samplers is
+/// heuristic, as for every sampler. Returns `None` at or below the threshold.
+pub fn wide_gaussian_split(sigma: f64) -> Option<(f64, f64)> {
+    if sigma <= WIDE_GAUSSIAN_THRESHOLD {
+        return None;
+    }
+    assert!(sigma <= WIDE_GAUSSIAN_MAX, "Gaussian width {sigma} exceeds the wide sampler");
+    let base = (1u64 << WIDE_GAUSSIAN_BASE_BITS) as f64;
+    let low = 4.0 * base;
+    Some((low, (sigma * sigma - low * low).sqrt() / base))
+}
+
 pub struct DCRTPolyUniformSampler {}
 
 impl DCRTPolyUniformSampler {
     fn sample_gaussian_unchecked(&self, params: &DCRTPolyParams, sigma: f64) -> DCRTPoly {
+        if let Some((low, high)) = wide_gaussian_split(sigma) {
+            let base = DCRTPoly::from_biguint_to_constant(
+                params,
+                BigUint::from(1u64 << WIDE_GAUSSIAN_BASE_BITS),
+            );
+            return self.sample_gaussian_unchecked(params, low) +
+                self.sample_gaussian_unchecked(params, high) * base;
+        }
         let sampled_poly = crate::poly::dcrt::native::ffi::exact_basis_sample(
             params.ring_dimension(),
             &params.to_crt().0,
@@ -137,6 +171,7 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
 #[cfg(test)]
 mod tests {
     use num_bigint::BigUint;
+    use num_traits::ToPrimitive;
 
     use crate::poly::dcrt::params::DCRTPolyParams;
 
@@ -162,6 +197,42 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn wide_gaussians_keep_their_width_and_cutoff() {
+        let params = DCRTPolyParams::new(256, 2, 50, 25, None, None);
+        let sampler = DCRTPolyUniformSampler::new();
+        let modulus = params.modulus();
+        let sigma = (1u64 << 45) as f64;
+        let cutoff = BigUint::from((3.0 * sigma) as u64);
+        let matrix = sampler.sample_uniform(
+            &params,
+            1,
+            40,
+            DistType::GaussDist { sigma, max_coefficient_bound: Some(cutoff.clone()) },
+        );
+        let mut second_moment = 0.0;
+        let mut count = 0usize;
+        for column in 0..40 {
+            for coefficient in matrix.entry(0, column).coeffs() {
+                let value = coefficient.value().clone();
+                let negative = modulus.as_ref() - &value;
+                let (magnitude, sign) =
+                    if value < negative { (value, 1.0) } else { (negative, -1.0) };
+                assert!(magnitude <= cutoff);
+                let x = sign * magnitude.to_f64().unwrap() / sigma;
+                second_moment += x * x;
+                count += 1;
+            }
+        }
+        // The variance of a Gaussian truncated at 3σ is 0.9733 σ².
+        let variance = second_moment / count as f64;
+        assert!((variance - 0.9733).abs() < 0.06, "variance {variance}");
+        assert_eq!(wide_gaussian_split(WIDE_GAUSSIAN_THRESHOLD), None);
+        let (low, high) = wide_gaussian_split(sigma).unwrap();
+        let base = (1u64 << WIDE_GAUSSIAN_BASE_BITS) as f64;
+        assert!(((low * low + base * base * high * high).sqrt() - sigma).abs() < 1e-6 * sigma);
     }
 
     #[test]

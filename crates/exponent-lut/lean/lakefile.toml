@@ -1,0 +1,20 @@
+name = "MxxExponentLut"
+version = "0.1.0"
+defaultTargets = ["MxxExponentLut"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../ir-core/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../ir-core/lean"
+
+# Lemmas that hold for every exponent-LUT program and parameter set.
+[[lean_lib]]
+name = "MxxExponentLut"
+roots = ["ExponentAutomorphism", "ExponentScale", "ExponentEncoding", "ExponentGadget", "ExponentStacking", "ExponentWalsh", "ExponentLut", "ExponentDecode", "ExponentSampling", "ExponentPublic", "ExponentRuntime", "ExponentIterate", "ExponentDynamic", "ExponentErrorForm", "ExponentMaskForm", "ExponentFunctional"]

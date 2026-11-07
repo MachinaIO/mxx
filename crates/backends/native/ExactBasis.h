@@ -17,6 +17,7 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_block_mod_switch(
 std::unique_ptr<openfhe::DCRTPoly> exact_basis_centered_round_divide(
     const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> divisor_words);
 rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input);
+rust::Vec<int64_t> exact_basis_small_coefficients(const openfhe::DCRTPoly &input);
 void exact_basis_matrix_coefficients(openfhe::Matrix &matrix);
 void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli);
 std::unique_ptr<openfhe::Matrix> exact_basis_p1(

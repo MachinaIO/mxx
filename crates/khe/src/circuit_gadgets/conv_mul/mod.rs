@@ -14,7 +14,7 @@
 //! We build that signed diagonal as `a_d - 2 * wrap_prefix(a_d)` so the construction only uses
 //! small slot-transfer scalars instead of large `q_i - 1` residues.
 
-mod montgomery;
+pub(crate) mod montgomery;
 mod nested_rns;
 
 use crate::{

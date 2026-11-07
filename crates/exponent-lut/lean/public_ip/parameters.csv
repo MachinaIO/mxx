@@ -1,0 +1,2 @@
+parameter_id,noise_model,failure_exponent,ring_dimension,crt_bits,base_bits,crt_depth,primes_per_drop,operations_per_drop,error_sigma,security_bits,input_modulus,dimension,seed
+average-n32-crt2x40,average,100,32,40,20,2,1,1,4,11,32,4,8

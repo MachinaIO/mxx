@@ -49,6 +49,86 @@ impl GraphValueSchema for MatType {
     }
 }
 
+/// One wire of any type, for code that moves the leaves of values it does not interpret (for
+/// example the published outputs of a context, see [`crate::DslContext::into_outputs`]) through
+/// loops and families.
+#[derive(Clone)]
+pub struct Leaf {
+    value: ValueHandle,
+}
+
+/// The wire type of a [`Leaf`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeafType(pub WireType);
+
+impl Leaf {
+    pub(super) fn new(value: ValueHandle) -> Self {
+        Self { value }
+    }
+
+    /// The leaf of a value of one wire, `None` for a composite value.
+    pub fn of(value: impl GraphValue) -> Option<Self> {
+        match value.flatten().as_slice() {
+            [value] => Some(Self { value: value.clone() }),
+            _ => None,
+        }
+    }
+
+    /// The type of the wire.
+    pub fn wire_type(&self) -> &WireType {
+        self.value.wire_type()
+    }
+
+    /// Member `index` of a family leaf, `None` for any other wire.
+    pub fn at(&self, index: impl Into<Int>) -> Option<Leaf> {
+        let WireType::IndexedFamily { element, count } = self.wire_type() else { return None };
+        let family = Family::<Leaf> {
+            values: vec![self.value.clone()],
+            element_schema: LeafType(*element.clone()),
+            count: count.clone(),
+            member_slot: None,
+        };
+        Some(family.at(index))
+    }
+}
+
+impl GraphValue for Leaf {
+    type Schema = LeafType;
+    fn flatten(&self) -> Vec<ValueHandle> {
+        vec![self.value.clone()]
+    }
+
+    fn schema(&self) -> Self::Schema {
+        LeafType(self.value.wire_type().clone())
+    }
+
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
+        match values {
+            [value] if value.wire_type() == &schema.0 => Ok(Self { value: value.clone() }),
+            _ => Err(DslError::Schema),
+        }
+    }
+}
+
+impl GraphValueSchema for LeafType {
+    type Value = Leaf;
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        let node = NodeHandle::new(
+            NodeKind::Input {
+                name: argument_name(next, "leaf"),
+                wire_type: self.0.clone(),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![self.0.clone()],
+        );
+        Leaf { value: node.output(0).expect("leaf argument") }
+    }
+    fn wire_types(&self) -> Vec<WireType> {
+        vec![self.0.clone()]
+    }
+}
+
 impl GraphValue for Bytes {
     type Schema = BytesType;
 
@@ -289,6 +369,8 @@ impl GraphValue for Trapdoor {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
             ..
         } = self.value.wire_type()
         else {
@@ -300,6 +382,8 @@ impl GraphValue for Trapdoor {
             gadget_base: gadget_base.clone(),
             digit_count: digit_count.clone(),
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            instantiation: *instantiation,
+            preimage_sigma: preimage_sigma.clone(),
         }
     }
 
@@ -326,6 +410,8 @@ impl GraphValueSchema for TrapdoorType {
             gadget_base: self.gadget_base.clone(),
             digit_count: self.digit_count.clone(),
             preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            instantiation: self.instantiation,
+            preimage_sigma: self.preimage_sigma.clone(),
         };
         let node = NodeHandle::new(
             NodeKind::Input {
@@ -353,6 +439,8 @@ impl GraphValueSchema for TrapdoorType {
                 gadget_base: self.gadget_base.clone(),
                 digit_count: self.digit_count.clone(),
                 preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+                instantiation: self.instantiation,
+                preimage_sigma: self.preimage_sigma.clone(),
             },
         ]
     }

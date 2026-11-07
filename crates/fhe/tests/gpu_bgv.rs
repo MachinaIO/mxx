@@ -7,7 +7,7 @@
 //! slotwise product modulo `t`. `lake build` in `crates/fhe/lean/bgv` checks the handwritten proof
 //! of that claim.
 
-use mxx_backends::{GpuRuntime, backend::poly_gpu::gpu_backend};
+use mxx_backends::{GpuRuntime, backend::poly_gpu::gpu_backend, poly::PolyParams};
 use mxx_fhe::utils::{
     self,
     gpu::{self, input},
@@ -134,7 +134,7 @@ fn test_gpu_bgv_round_trip() {
     // The executed graphs, linked as one round trip, form the closed protocol of the claim. Each
     // stage input fed by an earlier stage's output is linked to it, as the test passes it above.
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lean/bgv/generated");
-    mxx_ir_core::lean::protocol::export(&protocol, &directory).unwrap();
+    mxx_ir_core::lean::protocol::export(&protocol, &directory, false).unwrap();
 
     let total_ms = timings.iter().map(|(_, milliseconds)| milliseconds).sum::<f64>();
     println!("BGV_TIMING_SUMMARY total_execute_ms={total_ms:.3} stages={}", timings.len());

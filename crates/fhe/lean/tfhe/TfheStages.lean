@@ -252,7 +252,7 @@ theorem keygen_spec {hashModel : HashModel} {tape : SampleTape} {key : ByteArray
     obtain ⟨_, hj⟩ := hsecret j
     obtain ⟨hv, hb⟩ := bit_values hS0 hS0v ⟨j.val, by have := j.isLt; simp only [lweN, N] at *; omega⟩
     rw [hj]
-    show witness.w_1_0 _ % 2 = _
+    show witness.w_1_0 ⟨j.val, _⟩ % 2 = _
     rw [hv]
     rcases hb with h0 | h1
     · rw [h0]; exact h0.symm

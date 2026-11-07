@@ -349,12 +349,13 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph, int scope_device,
     error = gpuGraphGetEdges(graph, from.data(), to.data(), &edge_count);
     if (error != gpuSuccess) return set_error(error);
     std::map<gpuGraphNode_t, size_t> remaining;
-    std::map<gpuGraphNode_t, std::vector<gpuGraphNode_t>> followers;
+    std::map<gpuGraphNode_t, std::vector<gpuGraphNode_t>> followers, parents;
     for (auto node : all) remaining[node] = 0;
     for (size_t edge = 0; edge < edge_count; ++edge)
     {
         ++remaining[to[edge]];
         followers[from[edge]].push_back(to[edge]);
+        parents[to[edge]].push_back(from[edge]);
     }
     auto &scope = scopes[graph];
     scope.device = scope_device;
@@ -365,50 +366,97 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph, int scope_device,
     // Consume every ready ordinary node before a control boundary. Independent
     // work keeps graph parallelism within each region. Removed cross-region
     // dependencies are supplied by the launch stream's submission order.
+    // Track the ready frontier instead of rescanning all remaining nodes after
+    // each dependency layer. Reverse-address chains otherwise take quadratic
+    // host work even though their graph has only a linear number of edges.
+    std::set<gpuGraphNode_t> ready_nodes, ready_controls;
+    const auto enqueue = [&](gpuGraphNode_t node) {
+        (controls.count(node) ? ready_controls : ready_nodes).insert(node);
+    };
+    for (const auto &entry : remaining)
+        if (entry.second == 0) enqueue(entry.first);
     const auto consume = [&](gpuGraphNode_t node) {
+        ready_nodes.erase(node);
+        ready_controls.erase(node);
         remaining.erase(node);
-        for (auto next : followers[node]) --remaining.at(next);
+        for (auto next : followers[node])
+            if (--remaining.at(next) == 0) enqueue(next);
     };
     while (!remaining.empty())
     {
         error = mxx_set_device(scope_device);
         if (error != gpuSuccess) return set_error(error);
-        std::set<gpuGraphNode_t> segment;
-        bool progress = true;
-        while (progress)
+        std::vector<gpuGraphNode_t> segment;
+        while (!ready_nodes.empty())
         {
-            progress = false;
-            for (auto it = remaining.begin(); it != remaining.end();)
-            {
-                auto node = it->first;
-                if (it->second == 0 && controls.count(node) == 0)
-                {
-                    segment.insert(node);
-                    ++it;
-                    consume(node);
-                    progress = true;
-                }
-                else ++it;
-            }
+            auto node = *ready_nodes.begin();
+            segment.push_back(node);
+            consume(node);
         }
         if (!segment.empty())
         {
             regions.emplace_back();
             auto &region = regions.back();
-            error = gpuGraphClone(&region.graph, graph);
+            // Build only this region, in topological order. Cloning the entire
+            // scope and pruning it once per control boundary duplicates host
+            // work and temporary graph metadata by the number of regions.
+            // Cross-region edges are supplied by ordered region submission;
+            // every edge within the region is copied without reduction here.
+            error = gpuGraphCreate(&region.graph, 0);
             if (error != gpuSuccess) return set_error(error);
             std::map<gpuGraphNode_t, gpuGraphNode_t> clones;
-            for (auto original : all)
+            for (auto original : segment)
             {
-                gpuGraphNode_t clone = nullptr;
-                error = gpuGraphNodeFindInClone(&clone, original, region.graph);
-                if (error != gpuSuccess) return set_error(error);
-                if (segment.count(original)) clones.emplace(original, clone);
-                else
+                std::vector<gpuGraphNode_t> dependencies;
+                for (auto parent : parents[original])
                 {
-                    error = gpuGraphDestroyNode(clone);
-                    if (error != gpuSuccess) return set_error(error);
+                    auto found = clones.find(parent);
+                    if (found != clones.end()) dependencies.push_back(found->second);
                 }
+                gpuGraphNode_t clone = nullptr;
+                hipGraphNodeType type;
+                error = hipGraphNodeGetType(original, &type);
+                if (error != gpuSuccess) return set_error(error);
+                switch (type)
+                {
+                    case hipGraphNodeTypeKernel:
+                    {
+                        hipKernelNodeParams parameters{};
+                        error = hipGraphKernelNodeGetParams(original, &parameters);
+                        if (error == gpuSuccess)
+                            error = hipGraphAddKernelNode(&clone, region.graph,
+                                dependencies.data(), dependencies.size(), &parameters);
+                        if (error == gpuSuccess)
+                            error = hipGraphKernelNodeCopyAttributes(original, clone);
+                        break;
+                    }
+                    case hipGraphNodeTypeMemcpy:
+                    {
+                        hipMemcpy3DParms parameters{};
+                        error = hipGraphMemcpyNodeGetParams(original, &parameters);
+                        if (error == gpuSuccess)
+                            error = hipGraphAddMemcpyNode(&clone, region.graph,
+                                dependencies.data(), dependencies.size(), &parameters);
+                        break;
+                    }
+                    case hipGraphNodeTypeMemset:
+                    {
+                        hipMemsetParams parameters{};
+                        error = hipGraphMemsetNodeGetParams(original, &parameters);
+                        if (error == gpuSuccess)
+                            error = hipGraphAddMemsetNode(&clone, region.graph,
+                                dependencies.data(), dependencies.size(), &parameters);
+                        break;
+                    }
+                    case hipGraphNodeTypeEmpty:
+                        error = gpuGraphAddEmptyNode(&clone, region.graph,
+                            dependencies.data(), dependencies.size());
+                        break;
+                    default:
+                        return set_error("unsupported HIP node type in executable region");
+                }
+                if (error != gpuSuccess) return set_error(error);
+                clones.emplace(original, clone);
             }
             if (hip_graph_prepare_executable(region.graph) != 0) return 1;
             error = gpuGraphInstantiateWithFlags(&region.exec, region.graph, 0);
@@ -422,9 +470,7 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph, int scope_device,
                     nodes.emplace(entry.first, std::make_pair(region.exec, entry.second));
             }
         }
-        auto selected = std::find_if(remaining.begin(), remaining.end(),
-            [&](const auto &entry) { return entry.second == 0 && controls.count(entry.first); });
-        if (selected == remaining.end())
+        if (ready_controls.empty())
         {
             if (!remaining.empty()) return set_error("cyclic HIP region graph");
             break;
@@ -433,13 +479,11 @@ int HipGraphSchedule::compile_scope(gpuGraph_t graph, int scope_device,
         // Batch independent lanes on their owning device. A boundary's batches
         // are submitted together, preserving independence across physical GPUs.
         std::map<int, std::vector<gpuGraphNode_t>> groups;
-        std::vector<gpuGraphNode_t> ready;
-        for (const auto &entry : remaining)
-            if (entry.second == 0 && controls.count(entry.first))
-            {
-                ready.push_back(entry.first);
-                groups[controls.at(entry.first).device].push_back(entry.first);
-            }
+        // Snapshot this frontier: consuming a boundary may make another
+        // control ready, which belongs after the next ordinary region.
+        std::vector<gpuGraphNode_t> ready(ready_controls.begin(), ready_controls.end());
+        for (auto node : ready)
+            groups[controls.at(node).device].push_back(node);
         for (auto &group : groups)
         {
             HipControlBatch batch;

@@ -10,6 +10,12 @@ most `intBound`), one real, or one sampler draw. Evaluation checks every value a
 its node declares (`Value.conforms`), so the types the cost reads are the sizes evaluation
 handles.
 
+Every node evaluation and every loop iteration costs at least one unit. The expressions embedded in
+a node, in its parameters and types, are part of the program's text: evaluation reads each of them
+once per evaluation of the node, with every intermediate within `intBound`, so the work of a
+program is at most its cost times its size. A statement bounds the cost of a fixed program, whose
+size is a constant.
+
 The table is part of the trusted statement: a statement that bounds the cost of a program is only
 as meaningful as the table. Every entry is an upper bound for a straightforward implementation
 over the operation's arguments and outputs, generous where an implementation may do more work
@@ -168,7 +174,9 @@ def Op.cost (env : LoopEnv) (op : Op) (args outputs : List Ty) : Option Nat := d
 def loopCost (body : LoopEnv → Option Nat) (env : LoopEnv) (slot : Nat) : Nat → Nat → Option Nat
   | _, 0 => some 0
   | start, count + 1 => do
-      pure ((← body (Function.update env slot start)) + (← loopCost body env slot (start + 1) count))
+      -- Every iteration costs at least one unit, even with an empty body.
+      pure ((← body (Function.update env slot start)) + 1 +
+        (← loopCost body env slot (start + 1) count))
 
 /-- The cost of `scope` of `program`, with `fuel` bounding the nesting of loops and calls. -/
 def scopeCost (program : Program) : Nat → Nat → LoopEnv → Option Nat
@@ -177,7 +185,8 @@ def scopeCost (program : Program) : Nat → Nat → LoopEnv → Option Nat
       let scope ← program.scopes[index]?
       let costs ← scope.nodes.mapM fun node ↦ do
         let args ← node.args.mapM fun ref ↦ do (← scope.nodes[ref.node]?).outputs[ref.port]?
-        let own ← Op.cost env node.op args node.outputs
+        -- Every node evaluation costs at least one unit, for its embedded expressions.
+        let own := (← Op.cost env node.op args node.outputs) + 1
         match node.op with
         | .call body => pure (own + (← scopeCost program fuel body env))
         | .parallelLoop body count slot _ | .sequentialLoop body count slot _ => do

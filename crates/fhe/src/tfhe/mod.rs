@@ -508,15 +508,17 @@ pub struct TfheParams {
     key_switch_base_bits: usize,
     key_switch_digits: usize,
     /// The ring whose uniform residues, reduced modulo `q`, are the LWE masks of the key-switch
-    /// key: its modulus is far above `q`, so the reduction is uniform up to a negligible distance.
+    /// key: its modulus is at least `2^127 q`, so the reduction is within `2^-127` of uniform.
     pub mask_ring: DCRTPolyParams,
     blind_rotation: Arc<BlindRotationCache>,
 }
 
-/// The CRT limbs and limb bits of the ring that samples key-switch masks: about 2^162, so a
-/// residue reduced modulo a 32-bit `q` is within 2^-130 of uniform.
-const MASK_LIMBS: usize = 3;
+/// The limb bits of the ring that samples key-switch masks, and the statistical distance `2^-k`
+/// from uniform of its residues reduced modulo `q`. Its limbs are primes of at least `2^53`, and a
+/// uniform residue modulo `Q` reduced modulo `q` is within `q / Q` of uniform, so the ring has
+/// `ceil((log2 q + k) / 53)` limbs: three, about `2^162`, for a 32-bit `q`.
 const MASK_LIMB_BITS: usize = 54;
+const MASK_DISTANCE_BITS: usize = 127;
 
 /// The name of the blind rotation subgraph, under which a GPU runtime may
 /// register a native kernel for it (see `TfheParams::gpu_blind_rotation_kernel`).
@@ -602,9 +604,10 @@ impl TfheParams {
                 "TFHE key switching needs a positive base and digit count within log2 q bits",
             ));
         }
+        let mask_limbs = (modulus_bits + MASK_DISTANCE_BITS).div_ceil(MASK_LIMB_BITS - 1);
         let mask_ring = DCRTPolyParams::try_new(
             ring_dimension as u32,
-            MASK_LIMBS,
+            mask_limbs,
             MASK_LIMB_BITS,
             common.ring.base_bits(),
             None,
@@ -1315,6 +1318,16 @@ mod tests {
             let bits = (&lwe_modulus - BigUint::one()).bits() as usize;
             TfheParams::new(common, 2, lwe_modulus, 1.0, BigUint::from(16u8), 1, bits).unwrap()
         }
+    }
+
+    #[test]
+    fn mask_ring_is_far_above_the_lwe_modulus() {
+        for parameters in [test_params(), crate::utils::tfhe_params()] {
+            let mask_modulus = parameters.mask_ring.modulus();
+            assert!(*mask_modulus >= &parameters.lwe_modulus << MASK_DISTANCE_BITS);
+        }
+        // The default 32-bit modulus keeps the three limbs of the proven parameters.
+        assert_eq!(crate::utils::tfhe_params().mask_ring.crt_depth(), 3);
     }
 
     fn exact_key_switch_key(

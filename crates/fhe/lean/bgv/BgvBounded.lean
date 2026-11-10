@@ -8,9 +8,9 @@ set_option maxRecDepth 200000
 namespace BgvBounded
 open GeneratedSimulators
 
-theorem simulator_0_cost : simulator_0.cost = some 605757440 := by decide +kernel
-theorem simulator_1_cost : simulator_1.cost = some 605659136 := by decide +kernel
-theorem simulator_2_cost : simulator_2.cost = some 202760192 := by decide +kernel
+theorem simulator_0_cost : simulator_0.cost = some 605790234 := by decide +kernel
+theorem simulator_1_cost : simulator_1.cost = some 605691930 := by decide +kernel
+theorem simulator_2_cost : simulator_2.cost = some 202792981 := by decide +kernel
 
 theorem simulators_within (i : Fin 3) :
     ∃ cost, ([simulator_0, simulator_1, simulator_2].get ⟨i, by simp⟩).cost = some cost ∧

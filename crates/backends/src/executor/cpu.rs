@@ -2009,6 +2009,12 @@ impl<S: SessionStore> Executor<'_, S> {
                         name.clone()
                     })
                     .collect::<Vec<_>>();
+                // Families this scope received as inputs belong to an enclosing scope, which (like
+                // sibling instances) may still read them; the loop never reclaims them.
+                let mut borrowed = BTreeMap::new();
+                for value in inputs.values() {
+                    collect_staged_families(value, &mut borrowed);
+                }
                 for index in 0..count {
                     self.set_placement(parent_placement)?;
                     let child_env = crate::host_control::bind_host_control_environment(
@@ -2040,7 +2046,7 @@ impl<S: SessionStore> Executor<'_, S> {
                         )?
                         .outputs;
                     if self.trace.is_none() {
-                        let mut retained = BTreeMap::new();
+                        let mut retained = borrowed.clone();
                         for value in carried.iter().chain(&invariants) {
                             collect_staged_families(value, &mut retained);
                         }
@@ -2140,7 +2146,8 @@ impl<S: SessionStore> Executor<'_, S> {
                 usize::try_from(descriptor.family_count.ok_or(ExecutionError::ValueKind(wire))?)
                     .map_err(|_| ExecutionError::ValueKind(wire))
             }
-            RuntimeValue::IndexedFamily { values, .. } => Ok(values.len()),
+            RuntimeValue::IndexedFamily { values, .. } |
+            RuntimeValue::DependentFamily { values } => Ok(values.len()),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -2191,7 +2198,8 @@ impl<S: SessionStore> Executor<'_, S> {
                     descriptor: descriptor.clone(),
                 })
             }
-            RuntimeValue::IndexedFamily { values, .. } => {
+            RuntimeValue::IndexedFamily { values, .. } |
+            RuntimeValue::DependentFamily { values } => {
                 values.get(index).cloned().ok_or(ExecutionError::ValueKind(wire))
             }
             _ => Err(ExecutionError::ValueKind(wire)),
@@ -2734,6 +2742,56 @@ mod tests {
             store.test_peak_entries <= 12,
             "only the shared initial and two live generations may remain"
         );
+    }
+
+    /// Parallel instances whose loops start from one outer family each read it intact: the
+    /// first instance's loop does not reclaim the family the others still borrow, also when
+    /// it reaches the loop through a zero-iteration alias.
+    #[test]
+    fn sequential_streamed_family_keeps_initial_borrowed_by_siblings() {
+        for alias in [false, true] {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let ring = ring(&parameters);
+            let initial =
+                parallel(4, |member| Ok(ring.polynomial([member.expression()? + 1]))).unwrap();
+            let lanes = parallel(2, |_| {
+                let start = if alias {
+                    mxx_dsl::iterate(0, initial.clone(), |_, state| Ok(state))?
+                } else {
+                    initial.clone()
+                };
+                let carried = mxx_dsl::iterate(1, start, |_, state| {
+                    parallel(4, |member| Ok(state.at(&member) + ring.polynomial([1.into()])))
+                })?;
+                Ok(carried.at(3))
+            })
+            .unwrap();
+            let graph = DslContext::new("sibling-borrowed-family")
+                .output("first", lanes.at(0))
+                .unwrap()
+                .output("second", lanes.at(1))
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let result = execute(
+                &graph,
+                &mut cpu_backend([parameters.clone()]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            for name in ["first", "second"] {
+                assert_eq!(
+                    matrix_output(&result, name).entry(0, 0).to_bytes(),
+                    DCRTPoly::from_usize_to_constant(&parameters, 5).to_bytes(),
+                    "alias: {alias}"
+                );
+            }
+        }
     }
 
     /// A record of an integer family and an integer crosses stages as per-leaf artifacts.

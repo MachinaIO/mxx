@@ -90,3 +90,19 @@ impl Fhe for TfheScheme<'_> {
         self.params.decrypt(secret_key, ciphertext).unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TfheScheme;
+    use crate::{spec, utils};
+
+    #[test]
+    fn circuit_with_unread_input_exports() {
+        let tfhe = utils::tfhe_params();
+        let scheme = TfheScheme { params: &tfhe };
+        // The output is input 0; no gate reads input 1, so neither graph reads it.
+        let circuit = spec::Circuit::new(2, vec![], 0).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        spec::lean::export(&scheme, &circuit, &scheme.statement(), &[], directory.path()).unwrap();
+    }
+}

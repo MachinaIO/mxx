@@ -79,7 +79,7 @@ theorem conforms_matrix (env : LoopEnv) (type : MatrixTy) {q n r c : Nat}
     (a : ExactMatrix q n r c) :
     Value.conforms env (.matrix type) (.matrix q n r c a) =
       match type.eval env with
-      | some (m, n', r', c') => decide (m.prod = q ∧ n' = n ∧ r' = r ∧ c' = c)
+      | some (m, n', r', c') => decide (m.all (2 ≤ ·) ∧ m.prod = q ∧ n' = n ∧ r' = r ∧ c' = c)
       | none => false := rfl
 
 /-- A family of `k` integers has type `family int count` when `count` is `k`; the family stays

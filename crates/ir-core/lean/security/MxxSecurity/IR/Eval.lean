@@ -16,8 +16,10 @@ Three rules keep the cost of `MxxSecurity.IR.Cost` sound for the work evaluation
 
 * every output of a node must have the type the node declares (`Value.conforms`), so the sizes
   the cost reads from types are the sizes of the values;
-* integer arithmetic fails beyond `intBound`, so a unit-cost integer operation cannot build
-  integers of exponential length;
+* integer constants and the results of integer arithmetic fail beyond `intBound`, so a unit-cost
+  integer operation cannot build integers of exponential length. An integer read from an input
+  is not bounded: work on it is proportional to the input, which the caller supplies;
+* every matrix modulus is at least 2, so a residue is never an unbounded integer;
 * a trapdoor value keeps the secret its generation sampled, and only `gadgetTrapdoor` and
   `trapdoorSample` create one, so a program holds a trapdoor only for a matrix it generated.
 
@@ -50,15 +52,24 @@ structure Context where
 /-- The values of the loop indices in scope, by slot. -/
 abbrev LoopEnv := Nat → Int
 
+/-- The bound on the integers integer arithmetic returns. An integer operation costs one unit,
+which is sound only for integers of bounded size: repeated squaring would otherwise reach
+integers of exponential length at linear cost. -/
+def intBound : Nat := 2 ^ 256
+
+/-- `z`, if it is within `intBound`. -/
+def bounded (z : Int) : Option Int := if z.natAbs < intBound then some z else none
+
 mutual
 /-- The value of an integer expression; structural, so that a cost or a value reduces by
-computation. -/
+computation. Sums and products are bounded like integer arithmetic, so an expression cannot build
+integers of exponential length either. -/
 def IExpr.eval (env : LoopEnv) : IExpr → Option Int
   | .const value => some value
   | .loopIndex slot => some (env slot)
-  | .add left right => do pure ((← left.eval env) + (← right.eval env))
-  | .sub left right => do pure ((← left.eval env) - (← right.eval env))
-  | .mul left right => do pure ((← left.eval env) * (← right.eval env))
+  | .add left right => do bounded ((← left.eval env) + (← right.eval env))
+  | .sub left right => do bounded ((← left.eval env) - (← right.eval env))
+  | .mul left right => do bounded ((← left.eval env) * (← right.eval env))
   | .div left right => do
       let x ← left.eval env
       let y ← right.eval env
@@ -80,12 +91,14 @@ def IExpr.eval (env : LoopEnv) : IExpr → Option Int
       if x < 1 then none else pure (Nat.clog 2 x.toNat)
   | .select selector branches => do
       let index ← selector.eval env
-      let values ← IExpr.evalList env branches
-      if index < 0 then none else values[index.toNat]?
+      if index < 0 then none else IExpr.evalAt env branches index.toNat
 
-def IExpr.evalList (env : LoopEnv) : List IExpr → Option (List Int)
-  | [] => some []
-  | e :: es => do pure ((← e.eval env) :: (← IExpr.evalList env es))
+/-- The value of the expression at `index` of `branches`; the others are not evaluated, as the
+runtime evaluates only the selected branch. -/
+def IExpr.evalAt (env : LoopEnv) : List IExpr → Nat → Option Int
+  | [], _ => none
+  | e :: _, 0 => e.eval env
+  | _ :: es, index + 1 => IExpr.evalAt env es index
 end
 
 /-- A natural number: a nonnegative integer expression. -/
@@ -369,11 +382,6 @@ def intValues? (n : Nat) (members : List Value) : Option (Fin n → Int) := do
   let values ← members.mapM Value.toInt?
   if h : values.length = n then some fun i ↦ values[i.val]'(h ▸ i.isLt) else none
 
-/-- The bound on the integers integer arithmetic returns. An integer operation costs one unit,
-which is sound only for integers of bounded size: repeated squaring would otherwise reach
-integers of exponential length at linear cost. -/
-def intBound : Nat := 2 ^ 256
-
 /-- The Kronecker product, left indices outer, as the runtime lays it out. -/
 noncomputable def tensorMatrix {q n r₁ c₁ r₂ c₂ : Nat} (a : ExactMatrix q n r₁ c₁)
     (b : ExactMatrix q n r₂ c₂) : ExactMatrix q n (r₁ * r₂) (c₁ * c₂) :=
@@ -443,8 +451,13 @@ def tagComponents (env : LoopEnv) (args : List Value) :
   | part :: rest => do
       let component ← match part with
         | .bytes value => some (.bytes value)
-        | .integer value => do pure (.integer (← value.eval env))
-        | .decimal value => do pure (.decimal (← value.eval env))
+        -- Bounded like integer constants, so a component costs one unit.
+        | .integer value => do
+            let v ← value.eval env
+            if v.natAbs < intBound then pure (.integer v) else none
+        | .decimal value => do
+            let v ← value.eval env
+            if v.natAbs < intBound then pure (.decimal v) else none
         | .u64le value => do
             let v ← value.eval env
             if 0 ≤ v ∧ v < 2 ^ 64 then pure (.u64Le v) else none
@@ -502,8 +515,10 @@ noncomputable def decomposeValue (ctx : Context) (base digits : Int) (small : Bo
 noncomputable def applyPure (ctx : Context) (env : LoopEnv) (op : Op) (args : List Value) :
     Option (List Value) :=
   match op, args with
-  | .constInt value, [] => some [.int value]
-  | .evaluateInt value, [] => do pure [.int (← value.eval env)]
+  | .constInt value, [] => if value.natAbs < intBound then some [.int value] else none
+  | .evaluateInt value, [] => do
+      let x ← value.eval env
+      if x.natAbs < intBound then pure [.int x] else none
   | .constReal value, [] => do pure [.real (← value.eval env)]
   | .constBool value, [] => some [.bool value]
   | .constMatrix type value, [] => do pure [← constMatrixValue ctx env type value]
@@ -512,8 +527,9 @@ noncomputable def applyPure (ctx : Context) (env : LoopEnv) (op : Op) (args : Li
         | .add => some (x + y)
         | .sub => some (x - y)
         | .mul => some (x * y)
-        | .div => if y = 0 then none else some (Int.fdiv x y)
-        | .rem => if y = 0 then none else some (Int.fmod x y)
+        -- The runtime divides by `|y|`, rounding down.
+        | .div => if y = 0 then none else some (Int.fdiv x y.natAbs)
+        | .rem => if y = 0 then none else some (Int.fmod x y.natAbs)
       if z.natAbs < intBound then some [.int z] else none
   | .intCompare op, [.int x, .int y] =>
       match op with
@@ -646,7 +662,8 @@ noncomputable def applyPure (ctx : Context) (env : LoopEnv) (op : Op) (args : Li
   | .thresholdDecode plaintext length outputBool family, [.matrix q n 1 1 a] => do
       let t ← plaintext.eval env
       let count ← length.evalNat env
-      if h : 0 < q ∧ 0 < t ∧ count ≤ n then
+      -- The values lie in `[0, t)`, so `t` is bounded like the results of integer arithmetic.
+      if h : 0 < q ∧ 0 < t ∧ t < intBound ∧ count ≤ n then
         let values := List.ofFn fun k : Fin count ↦ thresholdValue t a ⟨k.val, by omega⟩
         if family then pure [.family (values.map .int)]
         else if outputBool then pure (values.map fun v ↦ .bool (decide (v ≠ 0)))
@@ -683,13 +700,19 @@ noncomputable def applyPure (ctx : Context) (env : LoopEnv) (op : Op) (args : Li
       if 0 < inner ∧ entries.length = outer * inner then
         let product := MxxRuntime.intMatrixVectorProduct (outer := outer) transpose
           (fun i : Fin entries.length ↦ entries[i]) (fun j : Fin inner ↦ values[j])
-        pure [.family (List.ofFn fun i ↦ .int (product i))]
+        -- Like `intBinary`, bounded so that repeated products cannot grow integers at unit cost.
+        if ∀ i, (product i).natAbs < intBound then
+          pure [.family (List.ofFn fun i ↦ .int (product i))]
+        else none
       else none
   | .sha256BitColumns seed rows columns indexBits, [] =>
       if seed.length = 32 ∧ 0 < rows ∧ 0 < columns ∧ 0 < indexBits ∧ rows ≤ 2 ^ indexBits then
         let result (i : Fin columns) := Sha256Columns.column seed rows columns indexBits i.val
-        some [.family (List.ofFn fun i ↦ .int (result i).1),
-          .family (List.ofFn fun i ↦ .int (result i).2)]
+        -- The packed indices grow with `indexBits`, so they are bounded like integer arithmetic.
+        if ∀ i, (result i).1 < intBound then
+          some [.family (List.ofFn fun i ↦ .int (result i).1),
+            .family (List.ofFn fun i ↦ .int (result i).2)]
+        else none
       else none
   | .hashSample type variant tagPrefix tag base digitCount, key :: _ => do
       let (m, n, r, c) ← type.eval env
@@ -711,7 +734,9 @@ noncomputable def applyPure (ctx : Context) (env : LoopEnv) (op : Op) (args : Li
       let modulusValue ← modulus.eval env
       let key ← hashKey? key
       let tagBytes := completeHashTag tagPrefix (← tagComponents env args tag)
-      if 1 < modulusValue ∧ modulusValue = 2 ^ Nat.log2 modulusValue.toNat then
+      -- Bounded like integer arithmetic: the digest width grows with the modulus.
+      if 1 < modulusValue ∧ modulusValue ≤ intBound ∧
+          modulusValue = 2 ^ Nat.log2 modulusValue.toNat then
         pure [.family (List.ofFn fun i : Fin k ↦ .int
           ((ctx.hash.integers k modulusValue.toNat key tagBytes i % modulusValue.toNat : Nat) :
             Int))]
@@ -753,7 +778,8 @@ def iterationArgs (modes : List LoopMode) (args : List Value) (i : Nat) : Option
     | .zip => do (← arg.toFamily?)[i]?
     | .zipOffset offset => do (← arg.toFamily?)[i + offset]?
     | .zipQuotient divisor => if divisor = 0 then none else do (← arg.toFamily?)[i / divisor]?
-    | .gather _ => none
+    -- Resolved below, once its index argument is read.
+    | .gather _ => some arg
   let direct ← (List.zipWith read modes args).mapM id
   -- A gathered argument reads the member its index argument names for this iteration.
   (List.zipWith (fun mode pair ↦
@@ -822,7 +848,8 @@ attribute [irreducible] parallelIterations sequentialIterations
 `trapGenPublic`, or `[ā | G - ā t]` of `statTrapGenPublic` with `statisticalRows` columns of
 `ā`, for the backend layout of the ring, with `r`, `e`, `t` Gaussian of width `sigma` cut at
 `trapGenCutoff` and `ā` uniform. It returns the public matrix and the trapdoor that keeps the
-short matrices and the width of its preimages: `preimageSigma`, or the backend's smallest. -/
+short matrices and the width of its preimages: `preimageSigma`, which may not be below the
+backend's smallest, or that smallest width. -/
 noncomputable def trapdoorDraw (ctx : Context) (env : LoopEnv) (type : MatrixTy) (sigma : RExpr)
     (base digits : IExpr) (statisticalRows : Option Nat) (preimageSigma : Option RExpr) :
     Option (Comp (List Value)) := do
@@ -831,9 +858,13 @@ noncomputable def trapdoorDraw (ctx : Context) (env : LoopEnv) (type : MatrixTy)
   let layout ← ctx.backend.layouts.regularLayout q n
   let s ← sigma.evalRat env
   if (← base.eval env) ≠ layout.base ∨ (← digits.eval env) ≠ layout.digitCount then none
+  -- The runtime rejects a width below the backend's smallest.
+  let minimum := ctx.backend.preimageWidth q n r layout.base s statisticalRows
   let preimageWidth ← match preimageSigma with
-    | some value => value.evalRat env
-    | none => some (ctx.backend.preimageWidth q n r layout.base s statisticalRows)
+    | some value => do
+        let w ← value.evalRat env
+        if w < minimum then none else pure w
+    | none => some minimum
   let width := r * layout.digitCount
   match statisticalRows with
   | none => some do
@@ -873,6 +904,9 @@ noncomputable def preimageDraw (env : LoopEnv) (bound : IExpr) :
               else OptionT.fail
           | .sampled _ _ _ width | .statistical _ _ _ width => do
               let b ← OptionT.mk (pure (bound.evalNat env))
+              -- The runtime samples only with a cutoff of at least `floor(6.5 width)`, where
+              -- rejection succeeds with constant probability.
+              if (b : Int) < ⌊13 * width / 2⌋ then OptionT.fail
               let request : PreimageRequest := ⟨q, n, r, c, columns, publicMatrix, target, width, b⟩
               let x ← (liftM (OracleSpec.query (spec := samplerSpec) (.preimage request)) :
                 OptionT Comp request.Coefficients)
@@ -913,8 +947,10 @@ noncomputable def nodeResult (ctx : Context) (scopeEval : Nat → LoopEnv → Li
     | some draw => do pure [← (draw : OptionT Comp Value)]
     | none => OptionT.mk (pure (applyPure ctx env op args))
 
-/-- Whether `value` has type `ty`: the same kind, a matrix of the ring and shape the type names,
-a byte string of its length, a family of its count whose members have its element type. The
+/-- Whether `value` has type `ty`: the same kind, a matrix of the ring and shape the type names
+with every modulus at least 2,
+a byte string of its length, a family of its count whose members have its element type. An
+element type does not depend on the member's index: the exporter rejects such a type. The
 cost of a program is computed from the types its nodes declare, so evaluation checks every
 output against them. -/
 def Value.conforms (env : LoopEnv) : Ty → Value → Bool
@@ -926,7 +962,7 @@ def Value.conforms (env : LoopEnv) : Ty → Value → Bool
   | .matrix type, .matrix q n r c _ | .small type _ _, .matrix q n r c _
   | .preimage type _ _, .matrix q n r c _ | .trapdoor type _ _ _ _ _ _, .trapdoor q n r c _ _ =>
       match type.eval env with
-      | some (m, n', r', c') => decide (m.prod = q ∧ n' = n ∧ r' = r ∧ c' = c)
+      | some (m, n', r', c') => decide (m.all (2 ≤ ·) ∧ m.prod = q ∧ n' = n ∧ r' = r ∧ c' = c)
       | none => false
   | .family element count, .family members =>
       count.evalNat env == some members.length && members.all (Value.conforms env element)

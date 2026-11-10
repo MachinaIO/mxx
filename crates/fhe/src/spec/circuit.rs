@@ -30,13 +30,14 @@ impl Circuit {
         self.input_count
     }
 
-    /// The number of gates on the longest path to the output.
+    /// The number of gates on the longest path through the circuit. [`Self::run`] applies every
+    /// gate, including one the output does not read, so the depth counts every gate.
     pub fn depth(&self) -> usize {
         let mut depths = vec![0; self.input_count];
         for [x, y] in &self.gates {
             depths.push(depths[*x].max(depths[*y]) + 1);
         }
-        depths[self.output]
+        depths.into_iter().max().unwrap_or(0)
     }
 
     /// The output wire's value on `inputs`, with `gate` for each gate.
@@ -78,8 +79,10 @@ mod tests {
     fn depth_is_the_longest_gate_path() {
         // x₀ · (x₁ · x₂) has depth 2; an input as the output has depth 0.
         assert_eq!(Circuit::new(3, vec![[1, 2], [0, 3]], 4).unwrap().depth(), 2);
-        assert_eq!(Circuit::new(3, vec![[1, 2], [0, 3]], 3).unwrap().depth(), 1);
-        assert_eq!(Circuit::new(2, vec![[0, 1]], 0).unwrap().depth(), 0);
+        // A gate the output does not read still runs, so it counts.
+        assert_eq!(Circuit::new(3, vec![[1, 2], [0, 3]], 3).unwrap().depth(), 2);
+        assert_eq!(Circuit::new(1, vec![[0, 0], [1, 1]], 0).unwrap().depth(), 2);
+        assert_eq!(Circuit::new(2, vec![], 0).unwrap().depth(), 0);
         assert!(Circuit::new(2, vec![[0, 2]], 2).is_none());
         assert!(Circuit::new(2, vec![[0, 1]], 3).is_none());
     }

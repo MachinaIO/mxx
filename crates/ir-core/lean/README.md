@@ -163,8 +163,8 @@ cargo run --locked -p mxx-fhe --example export_claims -- "$output"
 cargo run --locked -p mxx-dsl --example rlwe_encrypt -- --export-lean crates/dsl/examples/rlwe/generated
 ```
 
-The FHE exporters and GPU tests use `mxx_fhe::utils::protocol` for the same graph templates,
-metadata and linked declarations. RLWE's export-only mode uses the same program and declaration
+The FHE exporter and GPU tests build the same graphs, those of `mxx_fhe::spec::graphs` for the
+fixtures in `crates/fhe/src/bgv/fixtures.rs` and `mxx_fhe::utils::tfhe_params`. RLWE's export-only mode uses the same program and declaration
 as its GPU mode. Exporting constructs graphs and validates declarations; it executes no
 cryptographic computation and needs neither CUDA nor a GPU.
 

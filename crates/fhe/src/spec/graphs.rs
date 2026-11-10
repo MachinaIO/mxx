@@ -10,7 +10,7 @@ pub enum BindingError {
     NoInputs,
     #[error("the circuit has depth {circuit}, beyond the scheme's {scheme:?}")]
     Depth { circuit: usize, scheme: Depth },
-    #[error("{graph} must read exactly {expected:?}, but reads {found:?}")]
+    #[error("{graph} must read {expected:?}, but reads {found:?}")]
     Inputs { graph: String, expected: Vec<String>, found: Vec<String> },
     #[error("{graph} must write exactly {expected:?}, but writes {found:?}")]
     Outputs { graph: String, expected: Vec<String>, found: Vec<String> },

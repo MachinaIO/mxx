@@ -19,18 +19,26 @@ use crate::{
         LoopInputMode, MatrixBinaryOp, NodeKind, RealBinaryOp,
     },
     ring::{RingExpr, RingRef},
-    types::{CoefficientBoundDomain, MatrixType, NodeId, TrapdoorInstantiation, WireRef, WireType},
+    types::{
+        CoefficientBoundDomain, MEMBER_INDEX, MatrixType, NodeId, TrapdoorInstantiation, WireRef,
+        WireType,
+    },
     validate::ValidatedGraph,
 };
 use num_bigint::BigUint;
 use std::collections::BTreeMap;
 
-/// The Lean terms of the variables in scope: compile parameters bound by a loop or a call.
-type Vars = BTreeMap<String, String>;
+/// The compile parameters in scope: the Lean term of each one a loop or a call binds, and the
+/// values known in this scope. A binding shadows the parameter of the same name in outer scopes,
+/// and has no value when it depends on a loop index.
+#[derive(Clone, Default, PartialEq)]
+struct Vars {
+    terms: BTreeMap<String, String>,
+    env: ParamEnv,
+}
 
 struct Writer<'a> {
     graph: &'a Graph,
-    bindings: &'a ParamEnv,
     /// Scope instances in order of creation, by scope and the bindings of its variables.
     instances: Vec<(FrozenGraphScopeId, Vars)>,
     scopes: Vec<Option<String>>,
@@ -54,7 +62,7 @@ fn bytes(values: &[u8]) -> String {
 
 impl Writer<'_> {
     fn int(&self, expr: &IntExpr, vars: &Vars) -> Result<String, ExportError> {
-        if let Ok(value) = expr.evaluate(self.bindings) {
+        if let Ok(value) = expr.evaluate(&vars.env) {
             return Ok(format!("(.const ({value}))"));
         }
         let pair = |tag: &str, l: &IntExpr, r: &IntExpr| -> Result<String, ExportError> {
@@ -63,9 +71,14 @@ impl Writer<'_> {
         match expr {
             IntExpr::Const(value) => Ok(format!("(.const ({value}))")),
             IntExpr::Var(name) => vars
+                .terms
                 .get(name)
                 .cloned()
                 .ok_or_else(|| encoding(format!("unbound integer parameter {name}"))),
+            // `MxxSecurity.IR` gives every member of a family the element type of member 0.
+            IntExpr::LoopIndex(MEMBER_INDEX) => {
+                Err(encoding("a family element type depends on the member index"))
+            }
             IntExpr::LoopIndex(slot) => Ok(format!("(.loopIndex {slot})")),
             IntExpr::Add(l, r) => pair("add", l, r),
             IntExpr::Sub(l, r) => pair("sub", l, r),
@@ -87,15 +100,20 @@ impl Writer<'_> {
     }
 
     fn real(&self, expr: &RealExpr, vars: &Vars) -> Result<String, ExportError> {
+        let rational = |value: &crate::Rational| {
+            format!("(.rational (({} : Rat) / {}))", value.numerator(), value.denominator())
+        };
         let pair = |tag: &str, l: &RealExpr, r: &RealExpr| -> Result<String, ExportError> {
             Ok(format!("(.{tag} {} {})", self.real(l, vars)?, self.real(r, vars)?))
         };
         match expr {
-            RealExpr::Rational(value) => {
-                let (numerator, denominator) = (value.numerator(), value.denominator());
-                Ok(format!("(.rational (({numerator} : Rat) / {denominator}))"))
-            }
-            RealExpr::Var(name) => Err(encoding(format!("unbound real parameter {name}"))),
+            RealExpr::Rational(value) => Ok(rational(value)),
+            RealExpr::Var(name) => vars
+                .env
+                .reals
+                .get(name)
+                .map(rational)
+                .ok_or_else(|| encoding(format!("unbound real parameter {name}"))),
             RealExpr::FromInt(value) => Ok(format!("(.ofInt {})", self.int(value, vars)?)),
             RealExpr::Add(l, r) => pair("add", l, r),
             RealExpr::Sub(l, r) => pair("sub", l, r),
@@ -106,7 +124,7 @@ impl Writer<'_> {
     }
 
     fn ring(&self, ring: &RingRef, vars: &Vars) -> Result<String, ExportError> {
-        if let Ok(concrete) = ring.resolve(self.bindings) {
+        if let Ok(concrete) = ring.resolve(&vars.env) {
             return Ok(format!(
                 "(.explicit {} {})",
                 list(concrete.crt_moduli().iter().map(|modulus| format!("(.const {modulus})"))),
@@ -216,7 +234,7 @@ impl Writer<'_> {
             ConstantMatrix::Polynomial { coefficients } => {
                 let values = coefficients
                     .iter()
-                    .map(|c| c.evaluate(self.bindings).ok().and_then(|v| BigUint::try_from(v).ok()))
+                    .map(|c| c.evaluate(&vars.env).ok().and_then(|v| BigUint::try_from(v).ok()))
                     .collect::<Option<Vec<_>>>();
                 match values {
                     Some(values) if values.len() >= PACKED_POLYNOMIAL_MIN => {
@@ -263,13 +281,36 @@ impl Writer<'_> {
         ))
     }
 
-    /// The variables of a child scope: those of the parent and the child's bindings.
+    /// The variables of a child scope: those of the parent and the child's bindings, each
+    /// evaluated in the parent scope.
     fn child_vars(&self, vars: &Vars, bindings: &[(String, IntExpr)]) -> Result<Vars, ExportError> {
         let mut child = vars.clone();
         for (name, value) in bindings {
-            child.insert(name.clone(), self.int(value, vars)?);
+            child.terms.insert(name.clone(), self.int(value, vars)?);
+            match value.evaluate(&vars.env) {
+                Ok(value) => child.env.integers.insert(name.clone(), value),
+                Err(_) => child.env.integers.remove(name),
+            };
         }
         Ok(child)
+    }
+
+    /// The variables of a loop body with index slot `slot`. A variable bound outside the loop
+    /// keeps the value of an enclosing loop's index, which the term `.loopIndex slot` would no
+    /// longer name inside this loop, so such a reuse of the slot is rejected.
+    fn loop_vars(
+        &self,
+        vars: &Vars,
+        slot: u32,
+        bindings: &[(String, IntExpr)],
+    ) -> Result<Vars, ExportError> {
+        let index = format!("(.loopIndex {slot})");
+        if vars.terms.values().any(|term| term.contains(&index)) {
+            return Err(encoding(format!(
+                "loop slot {slot} would capture a binding of an enclosing loop's index"
+            )));
+        }
+        self.child_vars(vars, bindings)
     }
 
     /// The index of the instance of `scope` with `vars`, written on first use.
@@ -573,7 +614,7 @@ impl Writer<'_> {
                         format!("(.zipQuotient {divisor})")
                     }
                 }));
-                let vars = self.child_vars(vars, &spec.bindings)?;
+                let vars = self.loop_vars(vars, spec.index_slot, &spec.bindings)?;
                 format!(
                     ".parallelLoop {} {count} {} {modes}",
                     self.instance(child, vars)?,
@@ -583,7 +624,7 @@ impl Writer<'_> {
             NodeKind::SequentialLoop(spec) => {
                 let child = self.child(scope_id, id)?;
                 let count = int(self, &spec.count)?;
-                let vars = self.child_vars(vars, &spec.bindings)?;
+                let vars = self.loop_vars(vars, spec.index_slot, &spec.bindings)?;
                 format!(
                     ".sequentialLoop {} {count} {} {}",
                     self.instance(child, vars)?,
@@ -703,9 +744,9 @@ fn root_inputs(root: &GraphScope) -> Vec<String> {
 /// The `MxxSecurity.IR.Program` term of `validated`. The root's inputs are in name order.
 pub fn program_term(validated: &ValidatedGraph) -> Result<String, ExportError> {
     let graph = &validated.source;
-    let mut writer =
-        Writer { graph, bindings: &validated.bindings, instances: Vec::new(), scopes: Vec::new() };
-    writer.instance(FrozenGraphScopeId::Root, Vars::new())?;
+    let mut writer = Writer { graph, instances: Vec::new(), scopes: Vec::new() };
+    let vars = Vars { terms: BTreeMap::new(), env: validated.bindings.clone() };
+    writer.instance(FrozenGraphScopeId::Root, vars)?;
     let inputs = root_inputs(graph.root_scope()).into_iter().map(|name| format!("{name:?}"));
     let outputs = graph.outputs().keys().map(|name| format!("{name:?}"));
     Ok(format!(
@@ -714,4 +755,73 @@ pub fn program_term(validated: &ValidatedGraph) -> Result<String, ExportError> {
         list(inputs),
         list(outputs)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::program_term;
+    use crate::{
+        Graph, GraphOutput, IntExpr, NodeHandle, ParamEnv, Rational, RealExpr, WireType,
+        graph::{
+            CompileParameter, CompileParameterKind, SubgraphHandle, with_new_construction_scope,
+        },
+        node::NodeKind,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn call_binding_shadows_root_parameter() {
+        let child = with_new_construction_scope(|scope| {
+            let value = NodeHandle::new(
+                NodeKind::EvaluateInt(IntExpr::Var("k".into())),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("child", scope, vec![], vec![value]).unwrap()
+        });
+        let value = NodeHandle::subgraph_call(child, vec![], vec![("k".into(), 2.into())], vec![])
+            .output(0)
+            .unwrap();
+        let graph = Graph::freeze(
+            "shadow",
+            vec![],
+            BTreeMap::from([("value".into(), GraphOutput { value, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let mut root = ParamEnv::default();
+        root.integers.insert("k".into(), 10.into());
+        let term = program_term(&crate::ring::test_validate(&graph, &root).unwrap()).unwrap();
+        assert!(term.contains("(.const (2))") && !term.contains("(10)"), "{term}");
+    }
+
+    #[test]
+    fn real_parameter_is_exported_as_its_value() {
+        let value = NodeHandle::new(
+            NodeKind::ConstantReal(RealExpr::Var("sigma".into())),
+            vec![],
+            vec![WireType::ConstantReal],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "real",
+            vec![CompileParameter { name: "sigma".into(), kind: CompileParameterKind::Real }],
+            BTreeMap::from([("value".into(), GraphOutput { value, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let mut root = ParamEnv::default();
+        root.reals.insert("sigma".into(), Rational::from_integer(3.into()));
+        let term = program_term(&crate::ring::test_validate(&graph, &root).unwrap()).unwrap();
+        assert!(term.contains("(.rational ((3 : Rat) / 1))"), "{term}");
+    }
 }

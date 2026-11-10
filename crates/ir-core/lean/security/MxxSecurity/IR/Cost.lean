@@ -40,9 +40,10 @@ def wordCount : Nat → Nat → Nat
   | fuel + 1, m => if m < 2 ^ 64 then 1 else 1 + wordCount fuel (m / 2 ^ 64)
 
 /-- The words of a residue in a CRT basis: the words of its limbs, at least one. A residue is
-charged by its words, so a large modulus does not make arithmetic on long integers cheap. -/
+charged by its words, so a large modulus does not make arithmetic on long integers cheap. A limb
+`m` has fewer than `m` words, so `m` is enough fuel. -/
 def limbWords (moduli : List Nat) : Nat :=
-  max 1 (moduli.map (wordCount 64)).sum
+  max 1 (moduli.map fun m ↦ wordCount m m).sum
 
 /-- The number of coefficient residues, integers, reals, or bytes of a value of type `ty`. -/
 def Ty.size (env : LoopEnv) : Ty → Option Nat
@@ -72,11 +73,43 @@ def sumSizes (env : LoopEnv) (types : List Ty) : Option Nat := do
   let sizes ← types.mapM (·.size env)
   pure sizes.sum
 
+/-- The cost of hashing one tag component: its bytes, or one unit for a bounded integer. -/
+def TagPart.cost : TagPart → Nat
+  | .bytes value => value.length
+  | _ => 1
+
+/-- The size of what an operation draws or builds as its own parameters and the types of its
+arguments determine, before evaluation checks its outputs against their declared types: the
+draws of a sampler or a trapdoor generation, the outputs of a hash, a constant, or a preimage. -/
+def Op.intrinsic (env : LoopEnv) (op : Op) (args : List Ty) : Option Nat :=
+  match op with
+  | .uniformResidueSample type | .uniformIntervalSample type .. | .gaussianSample type ..
+  | .hashSample type .. | .constMatrix type _ | .liftIntegerToConstantPolynomial type
+  | .packPolynomialCoefficients type _ | .polynomialFromValues type _ => (Ty.matrix type).size env
+  | .hashIntFamily count .. => count.evalNat env
+  | .trapdoorSample type _ _ digitCount _ statisticalRows _ => do
+      let (moduli, n, r, _) ← type.eval env
+      let width := r * (← digitCount.evalNat env)
+      -- `r`, `e`, and `ā` of `trapGenPublic`, or `t` and `ā` of `statTrapGenPublic`.
+      let draws := match statisticalRows with
+        | none => 2 * r * width + r * r
+        | some rows => rows * width + r * rows
+      pure (draws * n * limbWords moduli)
+  | .preimageSample .. =>
+      match args with
+      | [publicMatrix, _, target] => do
+          let (_, inner) ← publicMatrix.shape env
+          let (_, columns) ← target.shape env
+          let (n, limbs) ← publicMatrix.ringSize env
+          pure (inner * columns * n * limbs)
+      | _ => none
+  | _ => some 0
+
 /-- The cost of one node that is not a loop or a call, from the types of its arguments and
-outputs. -/
+outputs and what it draws or builds by its own parameters (`Op.intrinsic`). -/
 def Op.cost (env : LoopEnv) (op : Op) (args outputs : List Ty) : Option Nat := do
-  let moved := (← sumSizes env args) + (← sumSizes env outputs)
-  let out ← sumSizes env outputs
+  let out := max (← sumSizes env outputs) (← op.intrinsic env args)
+  let moved := (← sumSizes env args) + out
   let (n, limbs) ← match outputs.head? with
     | some ty => ty.ringSize env
     | none => some (1, 1)
@@ -110,14 +143,25 @@ def Op.cost (env : LoopEnv) (op : Op) (args outputs : List Ty) : Option Nat := d
       -- One compression per 256 selector bits, charged per bit.
       pure (moved + rows * columns)
   | .ringAutomorphism _ | .multiplyMonomial => pure (moved + out * n)
-  | .polynomialFromValues _ true | .polynomialValues true => pure (moved + n * n * limbs)
+  | .polynomialFromValues _ true => pure (moved + n * n * limbs)
+  | .polynomialValues true => do
+      -- The output is a family of integers, so the ring is the argument's.
+      let (n, limbs) ← match args.head? with
+        | some ty => ty.ringSize env
+        | none => some (1, 1)
+      pure (moved + n * n * limbs)
   | .rnsModUp .. | .rnsModDown .. | .modulusSwitch _ | .blockModSwitch .. | .crtRecompose .. => do
       let (_, sourceLimbs) ← match args.head? with
         | some ty => ty.ringSize env
         | none => some (1, 1)
       pure (moved + (← sumSizes env args) * (sourceLimbs + limbs + 1))
-  | .gadgetDecompose .. | .hashSample .. | .hashIntFamily .. | .trapdoorSample .. |
-    .preimageSample .. | .gadgetTrapdoor .. => pure (moved + out * out)
+  | .hashSample _ _ tagPrefix tag .. | .hashIntFamily _ _ tagPrefix tag =>
+      -- The runtime hashes the key and every tag byte.
+      pure (moved + out * out + tagPrefix.length + (tag.map TagPart.cost).sum)
+  | .gadgetDecompose .. | .trapdoorSample .. | .preimageSample .. | .gadgetTrapdoor .. =>
+      pure (moved + out * out)
+  | .uniformResidueSample .. | .uniformIntervalSample .. | .gaussianSample .. =>
+      pure (moved + out)
   | _ => pure moved
 
 /-- The total cost of the iterations `start, start + 1, ...` of a loop body. -/

@@ -98,12 +98,10 @@ pub(super) fn render(
          instance : DecidableEq scheme.Msg := inferInstanceAs (DecidableEq Msg)\n\n"
     )?;
     let eval = root("Eval")?;
-    let mut expected = (0..inputs).map(roles::ciphertext).collect::<Vec<_>>();
+    let mut allowed = (0..inputs).map(roles::ciphertext).collect::<Vec<_>>();
+    allowed.push(roles::EVALUATION_KEY.to_owned());
+    eval.expect_inputs_within(&allowed)?;
     let keyed = eval.reads(roles::EVALUATION_KEY);
-    if keyed {
-        expected.push(roles::EVALUATION_KEY.to_owned());
-    }
-    eval.expect_inputs(&expected)?;
     eval.expect_outputs(&names(&[roles::CIPHERTEXT]))?;
     let mut supplied =
         (0..inputs).map(|i| (roles::ciphertext(i), format!("c{i}"))).collect::<BTreeMap<_, _>>();
@@ -111,7 +109,7 @@ pub(super) fn render(
         supplied.insert(roles::EVALUATION_KEY.to_owned(), "ek".into());
     }
     let plain = root("Plain")?;
-    plain.expect_inputs(&(0..inputs).map(roles::message).collect::<Vec<_>>())?;
+    plain.expect_inputs_within(&(0..inputs).map(roles::message).collect::<Vec<_>>())?;
     plain.expect_outputs(&names(&[roles::MESSAGE]))?;
     let messages = (0..inputs)
         .map(|i| (roles::message(i), format!("messages ⟨{i}, by decide⟩")))

@@ -231,8 +231,8 @@ are large; it does not remove atoms or reduce the total elaborated proposition.
 | Protocol | Declared in | Statement | Proof |
 | --- | --- | --- | --- |
 | RLWE encryption of one bit | `crates/dsl/examples/rlwe_encrypt.rs` | every execution decrypts its message | `crates/dsl/examples/rlwe` |
-| TFHE NAND gate | `crates/fhe/tests/gpu_tfhe.rs` | the gate fails with probability at most `2^-128` | `crates/fhe/lean/tfhe` |
-| BGV multiply, relinearize, and modulus switch | `crates/fhe/tests/gpu_bgv.rs` | every execution decrypts the slotwise product | `crates/fhe/lean/bgv` |
+| TFHE public-key NAND gate | `crates/fhe/src/tfhe/scheme.rs` (exported by `crates/fhe/examples/export_claims.rs`) | one gate on fresh encryptions fails with probability at most `2^-100` | `crates/fhe/lean/tfhe` |
+| BGV circuit `x₀ · (x₁ · x₂)` | `crates/fhe/src/bgv/scheme.rs` (exported by `crates/fhe/examples/export_claims.rs`) | every execution decrypts the slotwise product; IND-CPA within a cost bound | `crates/fhe/lean/bgv` |
 
 Each declaration uses the graphs it executes, so the statement is about exactly the program that
 runs.

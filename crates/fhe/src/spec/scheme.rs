@@ -9,6 +9,10 @@ use mxx_ir_core::protocol::InputValueContract;
 /// Each algorithm builds its output from DSL values. The type of a ciphertext may depend on the
 /// gates that returned it, such as the level of BGV, and the ciphertext value carries it.
 /// [`Fhe::eval_gate`] is only applied within the scheme's [`Depth`], and may panic beyond it.
+///
+/// An algorithm that reads a key or a ciphertext reads every leaf of it: [`super::lean::export`]
+/// passes a composite value to a graph leaf by leaf, by the leaves the graph reads, so a graph
+/// that reads only some leaves of a composite value exports Lean that does not type-check.
 pub trait Fhe {
     /// A message: the value on a circuit's wire.
     type Message: GraphValue;

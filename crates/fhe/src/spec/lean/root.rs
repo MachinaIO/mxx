@@ -45,6 +45,18 @@ impl Root<'_> {
         Ok(())
     }
 
+    /// Like [`Self::expect_inputs`], but the graph may leave some of `allowed` unread, as a
+    /// circuit's graph does with an input that no gate on the path to its output reads.
+    pub(super) fn expect_inputs_within(&self, allowed: &[String]) -> Result<(), BindingError> {
+        let found = roles_of(&self.root.inputs);
+        if !found.iter().all(|role| allowed.contains(role)) {
+            let mut sorted = allowed.to_vec();
+            sorted.sort();
+            return Err(BindingError::Inputs { graph: self.module.into(), expected: sorted, found });
+        }
+        Ok(())
+    }
+
     pub(super) fn expect_outputs(&self, expected: &[String]) -> Result<(), BindingError> {
         let found = roles_of(&self.root.outputs);
         let mut sorted = expected.to_vec();

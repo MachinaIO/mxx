@@ -213,7 +213,7 @@ The API for running programs on the CPU and GPUs is described in
   kernel for better performance, you write only that kernel. The rest of the protocol stays in the
   DSL, and the automatic tuning of parallelism and memory scheduling still applies around your
   kernel, so you do not reimplement it. TFHE blind rotation uses this option: see
-  [`TfheParams::gpu_blind_rotation_kernel`](crates/fhe/src/tfhe.rs#L1144).
+  [`TfheParams::gpu_blind_rotation_kernel`](crates/fhe/src/tfhe/gpu.rs#L16).
 
 ### Protocols with multiple parties
 

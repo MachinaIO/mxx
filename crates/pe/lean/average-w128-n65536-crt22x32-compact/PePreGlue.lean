@@ -10,6 +10,8 @@ position from its top step and key loop, and the assembly of the per-lane result
 from the member sums).
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

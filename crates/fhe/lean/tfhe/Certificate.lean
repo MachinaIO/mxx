@@ -1,9 +1,13 @@
-import Claim
-import TfheProof
+import TfheCorrectness
 
-/-! Checks that the handwritten proof has exactly the generated statement, and which axioms it
-uses. -/
+/-! The certificate of the generated TFHE scheme: one NAND gate on fresh public-key encryptions
+decrypts correctly except with probability at most `2^-100`. `#print axioms` must list only
+`propext`, `Classical.choice`, and `Quot.sound`. -/
 
-theorem certificate : GeneratedClaim.CorrectnessClaim := MxxFheTfhe.correctness
+namespace TfheCertificate
 
-#print axioms certificate
+theorem correctness : GeneratedScheme.CorrectnessClaim := MxxFheTfhe.correctness
+
+end TfheCertificate
+
+#print axioms TfheCertificate.correctness

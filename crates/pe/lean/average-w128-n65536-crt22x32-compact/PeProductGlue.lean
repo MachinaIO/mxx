@@ -7,6 +7,8 @@ The online column loop and companion loop of a step, the attribute ciphertext of
 reads, the encryption's product companions, and the preprocessed product key give `product_rel`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

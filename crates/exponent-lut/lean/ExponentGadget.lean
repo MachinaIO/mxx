@@ -137,7 +137,6 @@ theorem gadget_action_scaleUp {q p q' m m' : Nat} (hq : q = p * q') (hq' : 1 < q
   have hDq' : D' = reduceMatrix q' n (m + m) m' E := (reduceMatrix_centeredIntLift hq' hn D').symm
   have hrec := gadget_pairMul_decompose hq' hn layout hlayout hexact hg' hD'
     (fun k ↦ reducePoly q' n (x k))
-  simp only at hrec
   rw [← hrec]
   have hleft : (fun k ↦ reducePoly q n (((p : Int) : ErrorPoly n) * x k) • g) =
       fun k ↦ reduceMatrix q n 1 m ((((p : Int) : ErrorPoly n) * x k) • G) := by

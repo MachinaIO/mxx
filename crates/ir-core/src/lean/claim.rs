@@ -98,12 +98,14 @@ fn tuple(values: &[String]) -> String {
     }
 }
 
-fn project(value: &BoundaryValue, binder: &str) -> String {
+/// The projection of a root output from the tuple bound to `binder`.
+pub fn project(value: &BoundaryValue, binder: &str) -> String {
     // Every boundary has already been checked against its graph and tuple layout.
     format!("{binder}{}", &value.projection["outputs".len()..])
 }
 
-fn input_contract_predicate(
+/// The Lean predicate `contract` states of the value `value` of type `ty`.
+pub fn input_contract_predicate(
     contract: &InputContract,
     ty: &ConcreteWireType,
     bindings: &crate::ParamEnv,

@@ -178,7 +178,8 @@ fn stage_module_name(stage: &StageId) -> Result<String, String> {
     Ok(format!("Stage_{}", stage.0))
 }
 
-fn input_contract(value: &InputValueContract) -> Result<InputContract, ProtocolExportError> {
+/// The claim-level contract of an external input contract.
+pub fn input_contract(value: &InputValueContract) -> Result<InputContract, ProtocolExportError> {
     Ok(match value {
         InputValueContract::IntegerRange { lower, upper } => {
             InputContract::IntegerRange { lower: lower.clone(), upper: upper.clone() }

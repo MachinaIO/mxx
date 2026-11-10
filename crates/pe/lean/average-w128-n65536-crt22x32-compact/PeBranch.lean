@@ -8,6 +8,8 @@ whose bottom row comes from the helper of `kInv b` (`switchBot`), the LUT compan
 imported key block `T_b`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

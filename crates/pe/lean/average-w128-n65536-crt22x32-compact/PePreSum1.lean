@@ -9,6 +9,8 @@ product key acted on by the identity coefficient plus the weighted terms of ever
 terms of each lane family are summed by a member-sum loop that starts from members `0` and `1`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof.PreSum1
 
 open Mxx.Primitives MxxRuntime MxxExponentLut PeProof
@@ -35,7 +37,6 @@ theorem coefLoopId {model : HashModel} {tape : SampleTape} {path : List Nat}
       congr 3
       rw [hw6]) h
   obtain ⟨hsum, -⟩ := hacc
-  dsimp only at hsum
   rw [hsum, zero_add, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 128 then
     coefTerm tables 128 1 ⟨i, hi⟩ (by norm_num) else 0)]
   exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]

@@ -375,14 +375,14 @@ theorem crt_three_centered {p1 p2 p3 : Nat} (h1 : 1 < p1) (h2 : 1 < p2) (h3 : 1 
   apply crt_three h12 h13 h23
   · have := (crt_term_modEq h1 (Nat.Coprime.mul_left h12.symm h13.symm) value).add
       ((dvd_modEq_zero (d p1 p3) c2).add (dvd_modEq_zero (d p1 p2) c3))
-    simpa [add_assoc] using this
+    simpa [add_assoc, c1, c2, c3] using this
   · have := (dvd_modEq_zero (d p2 p3) c1).add
       ((crt_term_modEq h2 (Nat.Coprime.mul_left h12 h23.symm) value).add
         (dvd_modEq_zero (d' p1 p2) c3))
-    simpa [add_assoc] using this
+    simpa [add_assoc, c1, c2, c3] using this
   · have := (dvd_modEq_zero (d' p2 p3) c1).add
       ((dvd_modEq_zero (d' p1 p3) c2).add (crt_term_modEq h3 (Nat.Coprime.mul_left h13 h23) value))
-    simpa [add_assoc] using this
+    simpa [add_assoc, c1, c2, c3] using this
 
 theorem rnsInverse_one {m : Nat} (hm : 1 < m) : rnsInverse m 1 = 1 := by
   letI : Fact (1 < m) := ⟨hm⟩
@@ -860,8 +860,13 @@ theorem regularIndexEquiv_symm {q rows : Nat} (layout : RegularLayout q)
 theorem regularColumnIndex_val_of_exact {q rows : Nat} (layout : RegularLayout q)
     (hexact : layout.droppedModuli = 0) (index : Fin (rows * layout.digitCount)) :
     (regularColumnIndex layout index).val = index.val := by
-  simp [regularColumnIndex, RegularLayout.digitCount, RegularLayout.retainedTowers, hexact,
-    finProdFinEquiv, Nat.mod_add_div]
+  have hdigits : layout.digitCount = layout.crtModuli.length * layout.digitsPerTower := by
+    simp [RegularLayout.digitCount, RegularLayout.retainedTowers, hexact]
+  show index.val % layout.digitCount +
+      layout.crtModuli.length * layout.digitsPerTower * (index.val / layout.digitCount) =
+    index.val
+  rw [← hdigits]
+  exact Nat.mod_add_div index.val layout.digitCount
 
 theorem digitCount_of_exact {q : Nat} (layout : RegularLayout q)
     (hexact : layout.droppedModuli = 0) :
@@ -894,7 +899,6 @@ theorem regularGadgetMatrix_two_rows {q n : Nat} (layout : RegularLayout q)
   replace hrow2 := hrow2.trans (congrArg (column.val / ·) hcount.symm)
   replace hlimb2 := hlimb2.trans (congrArg (column.val % ·) hcount.symm)
   replace hlimb1 := hlimb1.trans (congrArg (c'.val % ·) hcount.symm)
-  simp only at hrow2 hlimb2 hlimb1
   unfold regularGadgetMatrix fullGadgetMatrix
   split
   · rename_i heq
@@ -913,6 +917,7 @@ theorem regularGadgetMatrix_two_rows {q n : Nat} (layout : RegularLayout q)
     apply castExactMatrix_zero
     simp only [regularGadgetUnflattened]
     rw [if_neg]
+    · exact rfl
     intro hr
     apply hne
     rw [← hrow2, hr]

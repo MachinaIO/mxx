@@ -165,7 +165,6 @@ theorem stream_sum {α : Type} [AddCommMonoid α] {count : Nat}
       simp only [dif_pos bound]
       exact hstep index current next bound body, trivial⟩) h
   obtain ⟨result, -⟩ := result
-  dsimp only at result
   rw [result]
   congr 1
   rw [← Fin.sum_univ_eq_sum_range (fun index ↦

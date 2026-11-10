@@ -11,6 +11,8 @@ helper blocks `v_(i,k)`, the output block `v_F`, and the compact blocks `v''_i` 
 anchor block of row `i` is a trapdoor preimage `k̃_i` of `σ_i^{-1}(u_i)` for the residual `u_i`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
@@ -174,7 +176,6 @@ theorem slotTarget {model : HashModel} {tape : SampleTape} {path : List Nat}
     (fun k ↦ if hk : k < 37 then helperTerm model key v ⟨i, hi⟩ ⟨k, hk⟩ else 0) (fun _ _ ↦ True) trivial
     (fun k x z hk _ hb ↦ ⟨by simp only [dif_pos hk]; exact helperStep hi hk hb, trivial⟩) hin
   obtain ⟨hsum, -⟩ := hacc
-  dsimp only at hsum
   have e8 : Stage_keygen.parallel_generatedRoot_23.w_8_0 ctx = ∑ k : Fin 37, helperTerm model key v ⟨i, hi⟩ k := by
     rw [hsum]
     show (0 : ExactMatrix Q N 1 1) + _ = _

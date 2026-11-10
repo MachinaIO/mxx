@@ -7,6 +7,8 @@ The keygen outputs in the form of `decrypt_bits`: the anchor preimages with thei
 the extension samples with their bounds.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

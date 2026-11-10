@@ -54,7 +54,7 @@ one from the repository root after building this package:
 
 ```sh
 LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
-  lake +leanprover/lean4:v4.28.0 -d crates/ir-core/lean env lean \
+  lake +leanprover/lean4:v4.35.0 -d crates/ir-core/lean env lean \
   test_data/lean_ir_fixtures/sampler/Generated.lean
 ```
 
@@ -72,7 +72,7 @@ import order, writing each `.olean` into a directory that is also on `LEAN_PATH`
 out=$(mktemp -d)
 for module in Backend Stage_encrypt Stage_decrypt Ideal Claim LweProof Certificate; do
   LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean:$out \
-    lake +leanprover/lean4:v4.28.0 -d crates/ir-core/lean env lean -o "$out/$module.olean" \
+    lake +leanprover/lean4:v4.35.0 -d crates/ir-core/lean env lean -o "$out/$module.olean" \
     "test_data/lean_ir_fixtures/lwe_protocol/$module.lean"
 done
 ```
@@ -136,7 +136,7 @@ linked-claim renderer live in `crates/ir-core/src/lean`.
 
 ## Reproducible proof CI
 
-CI installs Lean `leanprover/lean4:v4.28.0`, fetches mathlib's compiled cache in this package,
+CI installs Lean `leanprover/lean4:v4.35.0`, fetches mathlib's compiled cache in this package,
 and runs `lake build` here, then in `crates/fhe/lean/tfhe`, `crates/fhe/lean/bgv`, and
 `crates/dsl/examples/rlwe`. All four builds are required by the `ci success` job.
 The certificate targets are included in each package's default targets.

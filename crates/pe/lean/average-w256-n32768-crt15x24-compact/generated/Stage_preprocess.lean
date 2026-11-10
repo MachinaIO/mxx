@@ -15451,7 +15451,7 @@ abbrev generatedRoot.OutputType : Type :=
 
 set_option genInjectivity false in
 set_option genSizeOf false in
-structure generatedRoot.Witness where
+structure generatedRoot.Witness.Part0 where
   w_1_0 : Int
   w_4_0 : mxxMat3
   w_5_0 : mxxMat3
@@ -15707,6 +15707,10 @@ structure generatedRoot.Witness where
   w_187_0 : mxxMat3
   w_188_0 : mxxMat3
   w_190_0 : mxxMat3
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness.Part1 where
   w_191_0 : mxxMat3
   w_193_0 : mxxMat3
   w_193_1 : mxxMat3
@@ -15748,6 +15752,10 @@ structure generatedRoot.Witness where
   w_235_1 : mxxMat3
   w_235_2 : mxxMat3
   w_235_3 : mxxMat3
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness extends generatedRoot.Witness.Part0, generatedRoot.Witness.Part1
 
 abbrev generatedRoot.constraints_9 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_17_0 : mxxMat3) (w_20_0 : mxxMat3) (w_23_0 : mxxMat3) (w_26_0 : mxxMat3) (w_30_0 : Fin 15 → mxxMat0) (w_30_1 : Fin 15 → mxxMat0) (w_31_0 : Fin 15 → mxxMat0) (w_31_1 : Fin 15 → mxxMat0) (w_31_2 : Fin 15 → mxxMat0) (w_31_3 : Fin 15 → mxxMat0) (w_31_4 : Fin 15 → mxxMat0) (w_31_5 : Fin 15 → mxxMat0) (w_31_6 : Fin 15 → mxxMat0) (w_31_7 : Fin 15 → mxxMat0) (w_32_0 : Fin 15 → mxxMat0) (w_32_1 : Fin 15 → mxxMat0) (w_32_2 : Fin 15 → mxxMat0) (w_32_3 : Fin 15 → mxxMat0) (w_32_4 : Fin 15 → mxxMat0) (w_32_5 : Fin 15 → mxxMat0) (w_32_6 : Fin 15 → mxxMat0) (w_32_7 : Fin 15 → mxxMat0) (w_33_0 : Fin 15 → mxxMat0) (w_33_1 : Fin 15 → mxxMat0) (w_33_2 : Fin 15 → mxxMat0) (w_33_3 : Fin 15 → mxxMat0) (w_33_4 : Fin 15 → mxxMat0) (w_33_5 : Fin 15 → mxxMat0) (w_33_6 : Fin 15 → mxxMat0) (w_33_7 : Fin 15 → mxxMat0) (w_34_0 : Fin 15 → mxxMat0) (w_34_1 : Fin 15 → mxxMat0) (w_34_2 : Fin 15 → mxxMat0) (w_34_3 : Fin 15 → mxxMat0) (w_34_4 : Fin 15 → mxxMat0) (w_34_5 : Fin 15 → mxxMat0) (w_34_6 : Fin 15 → mxxMat0) (w_34_7 : Fin 15 → mxxMat0) (w_112_0 : mxxMat3) (w_118_0 : mxxMat3) (w_124_0 : mxxMat3) (w_130_0 : mxxMat3) (w_142_0 : mxxMat3) (w_145_0 : mxxMat3) (w_148_0 : mxxMat3) (w_151_0 : mxxMat3) (w_154_0 : Fin 15 → mxxMat0) (w_154_1 : Fin 15 → mxxMat0) (w_155_0 : Fin 15 → mxxMat0) (w_155_1 : Fin 15 → mxxMat0) (w_155_2 : Fin 15 → mxxMat0) (w_155_3 : Fin 15 → mxxMat0) (w_155_4 : Fin 15 → mxxMat0) (w_155_5 : Fin 15 → mxxMat0) (w_155_6 : Fin 15 → mxxMat0) (w_155_7 : Fin 15 → mxxMat0) (w_156_0 : Fin 15 → mxxMat0) (w_156_1 : Fin 15 → mxxMat0) (w_156_2 : Fin 15 → mxxMat0) (w_156_3 : Fin 15 → mxxMat0) (w_156_4 : Fin 15 → mxxMat0) (w_156_5 : Fin 15 → mxxMat0) (w_156_6 : Fin 15 → mxxMat0) (w_156_7 : Fin 15 → mxxMat0) (w_157_0 : Fin 15 → mxxMat0) (w_157_1 : Fin 15 → mxxMat0) (w_157_2 : Fin 15 → mxxMat0) (w_157_3 : Fin 15 → mxxMat0) (w_157_4 : Fin 15 → mxxMat0) (w_157_5 : Fin 15 → mxxMat0) (w_157_6 : Fin 15 → mxxMat0) (w_157_7 : Fin 15 → mxxMat0) (w_157_8 : Fin 15 → mxxMat3) (w_157_9 : Fin 15 → mxxMat3) (w_157_10 : Fin 15 → mxxMat3) (w_157_11 : Fin 15 → mxxMat3) (w_158_0 : Fin 15 → mxxMat0) (w_158_1 : Fin 15 → mxxMat0) (w_158_2 : Fin 15 → mxxMat0) (w_158_3 : Fin 15 → mxxMat0) (w_158_4 : Fin 15 → mxxMat0) (w_158_5 : Fin 15 → mxxMat0) (w_158_6 : Fin 15 → mxxMat0) (w_158_7 : Fin 15 → mxxMat0) (w_158_8 : Fin 15 → mxxMat3) (w_158_9 : Fin 15 → mxxMat3) (w_158_10 : Fin 15 → mxxMat3) (w_158_11 : Fin 15 → mxxMat3) (w_211_0 : mxxMat3) (w_214_0 : mxxMat3) (w_217_0 : mxxMat3) (w_218_0 : mxxMat3) (w_219_0 : mxxMat3) (w_220_0 : mxxMat3) (w_221_0 : mxxMat3) (w_221_1 : mxxMat3) (w_221_2 : mxxMat3) (w_221_3 : mxxMat3) (w_223_0 : mxxMat3) (w_224_0 : mxxMat3) (w_225_0 : mxxMat3) (w_226_0 : mxxMat3) (w_227_0 : mxxMat3) (w_228_0 : mxxMat3) (w_229_0 : mxxMat3) (w_230_0 : mxxMat3) (w_231_0 : mxxMat3) (w_232_0 : mxxMat3) (w_233_0 : mxxMat3) (w_234_0 : mxxMat3) (w_235_0 : mxxMat3) (w_235_1 : mxxMat3) (w_235_2 : mxxMat3) (w_235_3 : mxxMat3) (w_236_0 : mxxMat3) (w_242_0 : mxxMat3) (w_248_0 : mxxMat3) (w_254_0 : mxxMat3) (outputs : (generatedRoot.OutputType)) : Prop :=
   MxxRuntime.familyGetStatic w_157_11 (0) w_218_0 ∧

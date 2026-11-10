@@ -11,7 +11,7 @@ structure Params where
 
 set_option genInjectivity false in
 set_option genSizeOf false in
-structure generatedRoot.Witness where
+structure generatedRoot.Witness.Part0 where
   w_14_0 : Mxx.Primitives.ExactMatrix 1208925815113228574679041 32 1 4
   w_18_0 : Mxx.Primitives.ExactMatrix 1208925815113228574679041 32 1 1
   w_19_0 : Int
@@ -267,6 +267,10 @@ structure generatedRoot.Witness where
   w_266_19 : Int
   w_266_20 : Int
   w_266_21 : Int
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness.Part1 where
   w_266_22 : Int
   w_266_23 : Int
   w_266_24 : Int
@@ -277,6 +281,10 @@ structure generatedRoot.Witness where
   w_266_29 : Int
   w_266_30 : Int
   w_266_31 : Int
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness extends generatedRoot.Witness.Part0, generatedRoot.Witness.Part1
 
 abbrev generatedRoot.constraints_10 (w_265_0 : Mxx.Primitives.ExactMatrix 1208925815113228574679041 32 1 1) (w_266_31 : Int) (w_298_0 : Int) (outputs : Int) : Prop :=
   MxxRuntime.thresholdDecode (2) (32) 31 w_265_0 w_266_31 ∧

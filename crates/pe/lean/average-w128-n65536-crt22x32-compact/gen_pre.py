@@ -740,6 +740,8 @@ def merged_leaf(step):
     outputs = 'outputs0 outputs1 outputs2 outputs3'
     chunks = [f'''{imports}
 
+set_option maxRecDepth 4000000
+
 namespace PeProof.PreLaneM{step}
 
 open Mxx.Primitives MxxRuntime MxxExponentLut PeProof

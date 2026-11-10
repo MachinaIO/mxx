@@ -1,10 +1,7 @@
 //! Shared FHE helpers and coefficient-boundary graphs.
 //! RNS modulus switching must not call the coefficient-boundary helpers.
 
-/// Host-only graph and protocol fixtures shared by GPU tests and Lean export.
-pub mod protocol;
-
-use crate::{BgvHybridParams, BgvParams, FheCommonParams, FheError, TfheParams};
+use crate::{FheCommonParams, FheError, TfheParams};
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 #[cfg(test)]
 use mxx_dsl::{DslError, select};
@@ -111,13 +108,13 @@ pub(crate) fn extract(parameters: &DCRTPolyParams, value: &Mat) -> Result<Family
     Ok(value.coefficients())
 }
 
-fn integer(name: &str, default: usize) -> usize {
+pub(crate) fn integer(name: &str, default: usize) -> usize {
     env::var(name)
         .map(|value| value.parse().unwrap_or_else(|_| panic!("invalid {name}: {value}")))
         .unwrap_or(default)
 }
 
-fn primes(name: &str, defaults: Vec<u64>) -> Vec<u64> {
+pub(crate) fn primes(name: &str, defaults: Vec<u64>) -> Vec<u64> {
     env::var(name)
         .map(|value| {
             value
@@ -128,7 +125,7 @@ fn primes(name: &str, defaults: Vec<u64>) -> Vec<u64> {
         .unwrap_or(defaults)
 }
 
-fn common_params(
+pub(crate) fn common_params(
     n: usize,
     q: Vec<u64>,
     base_bits: usize,
@@ -169,53 +166,18 @@ fn common_params(
     params
 }
 
-pub fn bgv_params() -> BgvParams {
-    let profile = env::var("FHE_TEST_PROFILE").unwrap_or_else(|_| "bgv-54".into());
-    let (q, p, n, t, digit_size, sigma) = match profile.as_str() {
-        "bgv-54" => (
-            vec![18014398507892737, 18014398508138497, 18014398508400641],
-            vec![72057594037616641],
-            8192,
-            1032193,
-            1,
-            "3.2",
-        ),
-        "bgv-36" => (
-            vec![68717740033, 68718346241, 68718428161, 68719230977],
-            vec![137438773249, 137438822401],
-            8192,
-            1032193,
-            2,
-            "3.2",
-        ),
-        _ => panic!("FHE_TEST_PROFILE must be bgv-54 or bgv-36"),
-    };
-    BgvParams::new(
-        common_params(
-            integer("FHE_TEST_RING_DIMENSION", n),
-            primes("FHE_TEST_Q_PRIMES", q),
-            integer("FHE_TEST_BASE_BITS", 8),
-            sigma,
-            false,
-        ),
-        integer("FHE_TEST_PLAINTEXT_MODULUS", t) as u64,
-        Some(BgvHybridParams {
-            digit_size: integer("FHE_TEST_HYBRID_DIGIT_SIZE", digit_size),
-            auxiliary_primes: primes("FHE_TEST_P_PRIMES", p),
-        }),
-    )
-    .expect("valid BGV parameters")
-}
-
-/// The TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (the original TFHE
-/// library set): n = 630, N = 1024, k = 1, LWE noise 2^-15 and ring noise
-/// 2^-25 of their moduli, and a base 2^2, 8-digit key switch of the leading
-/// 16 bits of q = 2^32. The ring torus 2^32 is replaced by the double-CRT
-/// modulus Q = 65537 * 79873 (about 2^32.3) with the same relative noise; its
-/// exact per-limb gadget uses three base 2^6 digits per 17-bit limb in place of
-/// the profile's three approximate base 2^7 torus digits. The generated Lean
-/// claim states that one NAND gate fails with probability at most 2^-128 at
-/// these values. `FHE_TEST_TFHE_*` variables override each value.
+/// TFHE parameters derived from the TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (the original
+/// TFHE library set: n = 630, N = 1024, k = 1, LWE noise 2^-15 and ring noise 2^-25 of their
+/// moduli, and a base 2^2, 8-digit key switch of the leading 16 bits of q = 2^32).
+///
+/// Public-key encryption key-switches every fresh ciphertext, so both NAND inputs carry key
+/// switching noise. To keep a provable `2^-100` failure bound, the LWE noise is lowered to 2^-17
+/// of q (sigma 2^15) and the LWE dimension raised to n = 720. The lattice estimator (binary secret,
+/// q = 2^32, sigma 2^15) puts n = 720 at about 2^95 operations (dual hybrid), above the 2^93 of
+/// the original n = 630, sigma 2^17. The ring torus 2^32 is replaced by the double-CRT modulus
+/// Q = 65537 * 79873 (about 2^32.3) with the same relative noise; its exact per-limb gadget uses
+/// three base 2^6 digits per 17-bit limb in place of the profile's three approximate base 2^7
+/// torus digits. `FHE_TEST_TFHE_*` variables override each value.
 pub fn tfhe_params() -> TfheParams {
     let n = integer("FHE_TEST_TFHE_RING_DIMENSION", 1024);
     let base = integer("FHE_TEST_TFHE_BASE_BITS", 6);
@@ -223,13 +185,13 @@ pub fn tfhe_params() -> TfheParams {
     let ring_sigma = env::var("FHE_TEST_TFHE_RING_SIGMA").unwrap_or_else(|_| "156".into());
     let mut common = common_params(n, q, base, &ring_sigma, true);
     common.error_cutoff = common.error_cutoff.max(ceil_sigma_multiple(&ring_sigma, 16));
-    let lwe_sigma = env::var("FHE_TEST_TFHE_LWE_SIGMA").unwrap_or_else(|_| "131072".into());
+    let lwe_sigma = env::var("FHE_TEST_TFHE_LWE_SIGMA").unwrap_or_else(|_| "32768".into());
     let lwe_error_sigma: f64 = lwe_sigma.parse().expect("finite positive LWE sigma");
     assert!(lwe_error_sigma.is_finite() && lwe_error_sigma > 0.0);
     let lwe_error_cutoff = env::var("FHE_TEST_TFHE_LWE_ERROR_CUTOFF")
         .map(|value| value.parse().expect("integer LWE error cutoff"))
         .unwrap_or_else(|_| ceil_sigma_multiple(&lwe_sigma, 16));
-    let lwe_dimension = integer("FHE_TEST_TFHE_LWE_DIMENSION", 630);
+    let lwe_dimension = integer("FHE_TEST_TFHE_LWE_DIMENSION", 720);
     let lwe_modulus = env::var("FHE_TEST_TFHE_LWE_MODULUS")
         .map(|value| value.parse().expect("power-of-two LWE modulus"))
         .unwrap_or_else(|_| BigUint::one() << 32usize);
@@ -275,12 +237,6 @@ fn ceil_sigma_multiple(sigma: &str, multiple: u64) -> BigUint {
     }
 }
 
-pub fn modswitch_steps() -> usize {
-    let steps = integer("FHE_TEST_MODSWITCH_STEPS", 1);
-    assert!(steps > 0, "the round trip must include modulus switching");
-    steps
-}
-
 /// GPU-only helpers shared by the FHE integration fixtures and GPU unit tests.
 /// Keeping these helpers under the public `utils::gpu` namespace makes the
 /// integration targets use the crate's single implementation without exposing
@@ -288,13 +244,8 @@ pub fn modswitch_steps() -> usize {
 #[cfg(feature = "gpu")]
 pub mod gpu {
     use super::*;
-    use crate::BgvParams;
     use mxx_backends::{GpuRuntime, RuntimeValue, poly::dcrt::gpu::GpuDCRTPolyParams};
     use std::collections::BTreeMap;
-
-    pub fn bgv_gpu_parameters(bgv: &BgvParams) -> Vec<GpuDCRTPolyParams> {
-        related_gpu_parameters(bgv.runtime_parameters().expect("BGV runtime parameters"))
-    }
 
     pub fn tfhe_gpu_parameters(tfhe: &TfheParams) -> Vec<GpuDCRTPolyParams> {
         related_gpu_parameters(tfhe.runtime_parameters())

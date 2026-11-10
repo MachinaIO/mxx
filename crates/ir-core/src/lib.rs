@@ -26,6 +26,7 @@ pub mod node;
 pub mod parallel_reduction;
 pub mod protocol;
 pub mod ring;
+pub mod security;
 mod serde_support;
 pub mod types;
 pub mod validate;

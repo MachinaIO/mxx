@@ -7,6 +7,8 @@ The rows that the online evaluation computes for its branches (`BranchData.row`,
 `Leaf2Data.row`) are the branch rows of `branch1_rel`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

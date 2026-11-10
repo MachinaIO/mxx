@@ -85,7 +85,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     rintro ⟨execution, hruns, hne⟩
     exact hne (correct hruns)
   rw [hempty, MeasureTheory.measure_empty]
-  exact zero_le _
+  exact zero_le
 
 /-- info: 'PublicIpProof.certificate' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in

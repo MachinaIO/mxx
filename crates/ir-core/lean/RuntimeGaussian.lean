@@ -314,7 +314,7 @@ theorem SamplerLaw.lintegral_exp_bit_le (a : ℝ) :
   simp only [SamplerLaw.measure, SamplerLaw.pmf, zero_le_one, dite_true]
   rw [lintegral_countable']
   simp_rw [PMF.toMeasure_apply_singleton _ _ (measurableSet_singleton _),
-    PMF.uniformOfFinset_apply]
+    uniformPMF_apply]
   rw [tsum_eq_sum (s := Finset.Icc 0 1) fun x hx ↦ by rw [if_neg hx, mul_zero]]
   have hIcc : Finset.Icc (0 : ℤ) 1 = {0, 1} := by decide
   simp only [hIcc, Finset.mem_insert, Finset.mem_singleton, zero_ne_one, not_false_eq_true,

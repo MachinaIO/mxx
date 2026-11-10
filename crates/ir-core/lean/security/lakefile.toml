@@ -1,0 +1,24 @@
+name = "mxx-security"
+version = "0.1.0"
+defaultTargets = ["MxxSecurity"]
+
+# Mathlib is shared with `mxx-ir-core` by path, so both resolve to the same v4.35.0 checkout
+# that VCVio also pins.
+[[require]]
+name = "mathlib"
+path = "../.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = ".."
+
+# Pinned explicitly; update only as a deliberate change.
+[[require]]
+name = "VCVio"
+git = "https://github.com/Verified-zkEVM/VCV-io.git"
+rev = "1c7ab7e40e8e7ba9f75c88cd495193b7e6bb4248"
+
+[[lean_lib]]
+name = "MxxSecurity"
+leanOptions = { relaxedAutoImplicit = false }
+roots = ["MxxSecurity"]

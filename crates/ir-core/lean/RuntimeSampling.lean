@@ -43,6 +43,20 @@ structure SampleKey where
 
 abbrev SampleTape := SampleKey → Int
 
+/-- The uniform distribution on a nonempty finite set. Mathlib keeps its uniform laws as
+`Measure.uniformOfFinset`; the sampler laws are built as `PMF`s, so this is the same law in that
+form. -/
+noncomputable def uniformPMF {α : Type} [DecidableEq α] (s : Finset α) (hs : s.Nonempty) : PMF α :=
+  PMF.ofFinset (fun a ↦ if a ∈ s then (s.card : ENNReal)⁻¹ else 0) s
+    (by
+      rw [Finset.sum_congr rfl fun a ha ↦ if_pos ha, Finset.sum_const, nsmul_eq_mul]
+      exact ENNReal.mul_inv_cancel (by simpa using hs.card_pos.ne') (ENNReal.natCast_ne_top _))
+    (fun _ ha ↦ if_neg ha)
+
+theorem uniformPMF_apply {α : Type} [DecidableEq α] (s : Finset α) (hs : s.Nonempty) (a : α) :
+    uniformPMF s hs a = if a ∈ s then (s.card : ENNReal)⁻¹ else 0 :=
+  rfl
+
 /-- The unnormalized truncated Gaussian weight. -/
 noncomputable def gaussianWeight (sigma : Rat) (cutoff : Int) (x : Int) : ENNReal :=
   if |x| ≤ cutoff then ENNReal.ofReal (Real.exp (-((x : ℝ) ^ 2) / (2 * (sigma : ℝ) ^ 2))) else 0
@@ -73,12 +87,12 @@ noncomputable def SamplerLaw.pmf : SamplerLaw → PMF Int
     else PMF.pure 0
   | .interval minimum maximum =>
     if h : minimum ≤ maximum then
-      PMF.uniformOfFinset (Finset.Icc minimum maximum) ⟨minimum, by simp [h]⟩
+      uniformPMF (Finset.Icc minimum maximum) (Finset.nonempty_Icc.mpr h)
     else PMF.pure minimum
   | .residue modulus =>
     if h : 0 < modulus then
-      PMF.uniformOfFinset ((Finset.range modulus).image (fun value : Nat ↦ (value : Int)))
-        ⟨0, by simp [h]⟩
+      uniformPMF ((Finset.range modulus).image (fun value : Nat ↦ (value : Int)))
+        ((Finset.nonempty_range_iff.mpr (Nat.pos_iff_ne_zero.mp h)).image _)
     else PMF.pure 0
 
 noncomputable def SamplerLaw.measure (law : SamplerLaw) : Measure Int := law.pmf.toMeasure
@@ -259,7 +273,7 @@ noncomputable def hashModelOf (values : HashKey → Int) : HashModel where
     values (.sample q n rows columns key blob row.val column.val coefficient.val)
   integers count modulus key blob index := (values (.integers count modulus key blob index.val)).toNat
 
-instance : MeasurableSpace HashModel :=
+noncomputable instance : MeasurableSpace HashModel :=
   MeasurableSpace.map hashModelOf MeasurableSpace.pi
 
 /-- Every hash output independent and uniform (R2). -/
@@ -271,7 +285,8 @@ theorem lintegral_randomOracle_le {f : HashModel → ENNReal} {bound : ENNReal}
     (h : ∀ model, f model ≤ bound) : ∫⁻ model, f model ∂randomOracle ≤ bound := by
   have : IsProbabilityMeasure randomOracle := by
     unfold randomOracle
-    exact Measure.isProbabilityMeasure_map (show Measurable hashModelOf from fun _ hs ↦ hs).aemeasurable
+    exact (Measure.isProbabilityMeasure_map_iff
+      (show Measurable hashModelOf from fun _ hs ↦ hs).aemeasurable).mpr inferInstance
   calc ∫⁻ model, f model ∂randomOracle ≤ ∫⁻ _, bound ∂randomOracle := lintegral_mono h
     _ = bound := by simp
 

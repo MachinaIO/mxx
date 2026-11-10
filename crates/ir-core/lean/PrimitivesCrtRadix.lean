@@ -171,7 +171,7 @@ private theorem balancedResidual_step_bound
       have hprod : (base : Int) * (bound + 1) ≤ base * next :=
         mul_le_mul_of_nonneg_left hlarge (by omega)
       have hprod' : (base : Int) * bound + base ≤ base * next := by
-        convert hprod using 1
+        linarith
       dsimp [next] at hprod'
       omega
     exact_mod_cast hnext_int
@@ -184,7 +184,7 @@ private theorem balancedResidual_step_bound
         mul_le_mul_of_nonneg_left hlarge (by omega)
       have hprod' : base * next ≤ -((base : Int) * bound + base) := by
         have hneg := neg_le_neg hprod
-        convert hneg using 1; ring
+        linarith
       dsimp [next] at hprod'
       omega
     have hnext_int : (next.natAbs : Int) ≤ (bound : Nat) := by
@@ -222,7 +222,7 @@ private theorem balancedResidual_one_zero
       Int.ediv_eq_zero_of_lt_abs (by omega) (by simpa [hbase_abs] using hval_lt)
     have hdigit : balancedDigit base value = value := by
       dsimp [balancedDigit]
-      rw [hmod, hquot, hbase_half]
+      simp only [hmod, hquot, hbase_half]
       by_cases hlt : value < (halfNat : Int)
       · simp [hlt]
       · have heq : value = (halfNat : Int) := by omega
@@ -255,7 +255,7 @@ private theorem balancedResidual_one_zero
       omega
     have hdigit : balancedDigit base value = value := by
       dsimp [balancedDigit]
-      rw [hmod, hquot, hbase_half]
+      simp only [hmod, hquot, hbase_half]
       have hmod_nonneg : 0 ≤ base + value := by omega
       clear hmod hquot hmod_nonneg hbase_abs hneg_bound
       by_cases hzero : value = 0
@@ -422,7 +422,9 @@ theorem crtWeight_intCast_apply (tower other : layout.Tower) (value : Int) :
   rw [crtWeight_apply]
   by_cases h : other = tower
   · subst other
-    simp [crtEquiv]
+    simp only [crtEquiv, if_true, one_mul]
+    exact congrFun (map_intCast (ZMod.prodEquivPi layout.modulus layout.pairwise_coprime) value)
+      tower
   · simp [h, crtEquiv]
 
 theorem crtExpand_eq (values : ∀ tower, ZMod (layout.modulus tower)) :

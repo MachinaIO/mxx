@@ -236,3 +236,37 @@ are large; it does not remove atoms or reduce the total elaborated proposition.
 
 Each declaration uses the graphs it executes, so the statement is about exactly the program that
 runs.
+
+## 7. Probabilistic graphs and allowed assumptions
+
+Security statements need each algorithm as a probabilistic program, not only as a relation.
+With `ExportOptions::sampling_plan`, a root graph's module also defines
+
+```lean
+noncomputable def generatedRoot.comp (params : Params) (inputs) : MxxSecurity.Comp Outputs := do
+  let w₀ ← MxxSecurity.sampleX ...   -- one draw per root sampler, in node order
+  ...
+  pure (MxxSecurity.determined fun outputs ↦
+    ∃ witness, witness.w₀ = w₀ ∧ ... ∧ generatedRoot.body params inputs outputs witness)
+```
+
+`MxxSecurity.Comp` is a VCVio `OracleComp` whose only oracle draws one value of a
+`SamplerLaw`, so its distribution is the product of the runtime's sampler laws. `determined`
+returns the output the relation determines once the draws are fixed; a proof establishes that the
+relation holds for exactly one output. Hash, trapdoor, and preimage samplers, samplers inside
+child scopes, and the sampling tape are rejected, because their laws are not modelled.
+`lean::graph_modules::export_sampled_graphs` writes a set of graphs in this form for a protocol
+crate's own statements, such as `mxx-fhe`'s `spec::lean::export`.
+
+The Lake package `crates/ir-core/lean/security` (library `MxxSecurity`) holds these definitions
+and the only dependency on VCVio, pinned to one commit. `MxxSecurity.Assumptions` formulates the
+allowed hardness assumptions, mirrored in Rust by `security::AssumptionId`:
+
+| `AssumptionId` | Challenge | Real | Random |
+| --- | --- | --- | --- |
+| `DecisionRlwe` | `(a, b)` rows of `samples` ring elements over `Q` | `b = s a + e` | `b` uniform |
+| `RlweKeySwitchCircular` | a public key over `Q` and key rows `(a', b')` over `PQ` | `b'_j = s a'_j + t e'_j + c_j s²` | `b'` uniform |
+
+A statement can only name these identifiers with parameters that `AssumptionParams::validate`
+accepts; it cannot add assumptions. The advantage of an assumption is the distance between the
+distributions of an adversary's output on its real and random challenges.

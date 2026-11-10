@@ -293,7 +293,6 @@ theorem colLoop3 {model : HashModel} {c : ExactMatrix Q4 N 1 16} {top bot : Exac
           subst this
           exact ⟨w7, hrun, x8⟩) h
   obtain ⟨hsum, hQ⟩ := hacc
-  dsimp only at hsum
   refine ⟨?_, hQ jj jj.isLt⟩
   rw [hsum, zero_add]
   rw [sum_unitRow_entry F jj]
@@ -711,7 +710,6 @@ theorem switchLoop3 {model : HashModel} {i0 : Nat} {c : ExactMatrix Q4 N 1 12}
           subst this
           exact ⟨w7, hrun, x8⟩) h
   obtain ⟨hsum, hQ⟩ := hacc
-  dsimp only at hsum
   refine ⟨?_, hQ jj jj.isLt⟩
   rw [hsum, zero_add, sum_unitRow_entry F jj]
   simp [F]

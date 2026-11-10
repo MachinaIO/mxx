@@ -160,7 +160,7 @@ def parallel_generatedRoot_23 (backend : MxxRuntime.BackendContext) (hashModel :
 
 set_option genInjectivity false in
 set_option genSizeOf false in
-structure generatedRoot.Witness where
+structure generatedRoot.Witness.Part0 where
   w_3_0 : mxxMat4
   w_6_0 : mxxMat6
   w_7_0 : mxxMat0
@@ -416,6 +416,10 @@ structure generatedRoot.Witness where
   w_260_0 : mxxMat4
   w_261_0 : mxxMat9
   w_262_0 : mxxMat4
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness.Part1 where
   w_263_0 : mxxMat9
   w_264_0 : mxxMat4
   w_265_0 : mxxMat9
@@ -433,6 +437,10 @@ structure generatedRoot.Witness where
   w_277_0 : mxxMat9
   w_278_0 : mxxMat4
   w_279_0 : mxxMat9
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness extends generatedRoot.Witness.Part0, generatedRoot.Witness.Part1
 
 abbrev generatedRoot.constraints_12 (backend : MxxRuntime.BackendContext) (w_0_0 : MxxRuntime.TrapdoorValue (mxxMat10) Unit) (w_1_0 : mxxMat10) (w_7_0 : mxxMat0) (w_10_0 : Fin 4736 → mxxMat0) (w_21_0 : Fin 128 → mxxMat2) (w_22_0 : Fin 128 → mxxMat4) (w_23_0 : Fin 128 → mxxMat4) (w_25_0 : mxxMat9) (w_27_0 : mxxMat9) (w_29_0 : mxxMat9) (w_31_0 : mxxMat9) (w_33_0 : mxxMat9) (w_35_0 : mxxMat9) (w_37_0 : mxxMat9) (w_39_0 : mxxMat9) (w_41_0 : mxxMat9) (w_43_0 : mxxMat9) (w_45_0 : mxxMat9) (w_47_0 : mxxMat9) (w_49_0 : mxxMat9) (w_51_0 : mxxMat9) (w_53_0 : mxxMat9) (w_55_0 : mxxMat9) (w_57_0 : mxxMat9) (w_59_0 : mxxMat9) (w_61_0 : mxxMat9) (w_63_0 : mxxMat9) (w_65_0 : mxxMat9) (w_67_0 : mxxMat9) (w_69_0 : mxxMat9) (w_71_0 : mxxMat9) (w_73_0 : mxxMat9) (w_75_0 : mxxMat9) (w_77_0 : mxxMat9) (w_79_0 : mxxMat9) (w_81_0 : mxxMat9) (w_83_0 : mxxMat9) (w_85_0 : mxxMat9) (w_87_0 : mxxMat9) (w_89_0 : mxxMat9) (w_91_0 : mxxMat9) (w_93_0 : mxxMat9) (w_95_0 : mxxMat9) (w_97_0 : mxxMat9) (w_99_0 : mxxMat9) (w_101_0 : mxxMat9) (w_103_0 : mxxMat9) (w_105_0 : mxxMat9) (w_107_0 : mxxMat9) (w_109_0 : mxxMat9) (w_111_0 : mxxMat9) (w_113_0 : mxxMat9) (w_115_0 : mxxMat9) (w_117_0 : mxxMat9) (w_119_0 : mxxMat9) (w_121_0 : mxxMat9) (w_123_0 : mxxMat9) (w_125_0 : mxxMat9) (w_127_0 : mxxMat9) (w_129_0 : mxxMat9) (w_131_0 : mxxMat9) (w_133_0 : mxxMat9) (w_135_0 : mxxMat9) (w_137_0 : mxxMat9) (w_139_0 : mxxMat9) (w_141_0 : mxxMat9) (w_143_0 : mxxMat9) (w_145_0 : mxxMat9) (w_147_0 : mxxMat9) (w_149_0 : mxxMat9) (w_151_0 : mxxMat9) (w_153_0 : mxxMat9) (w_155_0 : mxxMat9) (w_157_0 : mxxMat9) (w_159_0 : mxxMat9) (w_161_0 : mxxMat9) (w_163_0 : mxxMat9) (w_165_0 : mxxMat9) (w_167_0 : mxxMat9) (w_169_0 : mxxMat9) (w_171_0 : mxxMat9) (w_173_0 : mxxMat9) (w_175_0 : mxxMat9) (w_177_0 : mxxMat9) (w_179_0 : mxxMat9) (w_181_0 : mxxMat9) (w_183_0 : mxxMat9) (w_185_0 : mxxMat9) (w_187_0 : mxxMat9) (w_189_0 : mxxMat9) (w_191_0 : mxxMat9) (w_193_0 : mxxMat9) (w_195_0 : mxxMat9) (w_197_0 : mxxMat9) (w_199_0 : mxxMat9) (w_201_0 : mxxMat9) (w_203_0 : mxxMat9) (w_205_0 : mxxMat9) (w_207_0 : mxxMat9) (w_209_0 : mxxMat9) (w_211_0 : mxxMat9) (w_213_0 : mxxMat9) (w_215_0 : mxxMat9) (w_217_0 : mxxMat9) (w_219_0 : mxxMat9) (w_221_0 : mxxMat9) (w_223_0 : mxxMat9) (w_225_0 : mxxMat9) (w_227_0 : mxxMat9) (w_229_0 : mxxMat9) (w_231_0 : mxxMat9) (w_233_0 : mxxMat9) (w_235_0 : mxxMat9) (w_237_0 : mxxMat9) (w_239_0 : mxxMat9) (w_241_0 : mxxMat9) (w_243_0 : mxxMat9) (w_245_0 : mxxMat9) (w_247_0 : mxxMat9) (w_249_0 : mxxMat9) (w_251_0 : mxxMat9) (w_253_0 : mxxMat9) (w_255_0 : mxxMat9) (w_257_0 : mxxMat9) (w_259_0 : mxxMat9) (w_261_0 : mxxMat9) (w_263_0 : mxxMat9) (w_264_0 : mxxMat4) (w_265_0 : mxxMat9) (w_266_0 : mxxMat4) (w_267_0 : mxxMat9) (w_268_0 : mxxMat4) (w_269_0 : mxxMat9) (w_270_0 : mxxMat4) (w_271_0 : mxxMat9) (w_272_0 : mxxMat4) (w_273_0 : mxxMat9) (w_274_0 : mxxMat4) (w_275_0 : mxxMat9) (w_276_0 : mxxMat4) (w_277_0 : mxxMat9) (w_278_0 : mxxMat4) (w_279_0 : mxxMat9) (outputs : mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × mxxMat9 × (Fin 128 → mxxMat2) × (Fin 4736 → mxxMat0) × (Fin 128 → mxxMat4) × mxxMat0 × Unit) : Prop :=
   0 ≤ (73534451498) ∧

@@ -18,6 +18,15 @@ SCOPES = {
                    [root + 119 * step for root in [58, 65, 75, 82, 92, 99, 109, 116, 126, 133]]))
     for step in (1,)
 }
+
+def scope_inputs(scope):
+    """The context fields of `scope` that are inputs or constants, which `simpa` must unfold."""
+    facts = (REFERENCE / "generated" / "Stage_online_eval_Facts.lean").read_text()
+    number = scope.rsplit("_", 1)[1]
+    names = re.findall(r"^def (parallel_generatedRoot_" + number + r"\.w_\d+_\d+) [^\n]*\(ctx[^\n]*\n  (?:ctx\.inputs|\(0 :)",
+                       facts, re.M)
+    return ", ".join("Stage_online_eval." + name for name in names)
+
 GROUP_ROOTS = [75, 92, 109, 126]
 OUTER_SCOPES = [39, 46, 46, 46]
 SLOT_SCOPES = [[43, 50, 55, 60]] + [[50, 55, 60, 65] for _ in range(3)]
@@ -508,7 +517,6 @@ theorem sharedLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
         (current, zc0, zc1, Ar slot 0, Ar slot 1, ()) next)
     (fun a current next run ↦ sharedOuter_project (Ar := Ar) (s := current) (t := next)
       (zc0 := zc0) (zc1 := zc1) hm run slot) h
-  dsimp only at projected
   rw [initial] at projected
   apply Matrix.ext
   intro row col
@@ -683,7 +691,7 @@ theorem memberLane {{model : HashModel}} {{tape : SampleTape}} {{path : List Nat
             out += f'  rw [eq{reads[0]}, eq{reads[1]}] at run{slot}\n'
         out += f'''  have slot{slot} := slotFinish{slot} hm ({d}) (s := {initial})
     (t := {output_state(slot_scope)}) companion{slot} {hT}
-    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey] using run{slot})
+    (by simpa only [Leaf2Data.memberBranch, hf0, hf1, hkey, ctx, {scope_inputs(scope)}] using run{slot})
 '''
     out += '  dsimp only at ' + ' '.join(f'slot{start + local}' for local in range(4)) + '\n'
     out += f'  refine ⟨forall4 (pred := fun slot ↦ (leafSlotData first second (chunkSlot {group} slot)).Runs model (15 + member) hb) ' + ' '.join(f'slot{start + local}.1' for local in range(4)) + ', ?_⟩\n'

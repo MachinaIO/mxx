@@ -3,6 +3,9 @@ version = "0.1.0"
 defaultTargets = ["MxxExponentLutPublicIp"]
 
 [leanOptions]
+# Lean 4.35 checks the type of a metavariable assignment at instances transparency, which
+# rejects these proofs' lambdas used as `Matrix` arguments; keep the earlier check.
+backward.isDefEq.respectTransparency.types = false
 relaxedAutoImplicit = false
 pp.unicode.fun = true
 

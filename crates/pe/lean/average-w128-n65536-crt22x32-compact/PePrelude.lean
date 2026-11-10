@@ -12,6 +12,8 @@ Under the secret `s`, the attribute ciphertext of position `i` has the public to
 `c_m = s d₀ + d₁ + e_m + ⌊Q/2⌋ m`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

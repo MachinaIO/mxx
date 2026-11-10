@@ -38,7 +38,7 @@ theorem tapeMeasure_linear_tail {α : Type} [Fintype α] [DecidableEq α] {rows 
       ENNReal.ofReal (2 * Real.exp (-m ^ 2 / (2 * ((sigma : ℝ) ^ 2 * E)))) := by
     intro i
     have h := tail_linear_truncated (μ := fun k : SampleKey ↦ k.law.measure) key hinj hV
-      (fun x a ↦ by dsimp only; rw [hlaw x]; exact SamplerLaw.lintegral_exp_gaussian_le sigma cutoff a)
+      (fun x a ↦ by rw [hlaw x]; exact SamplerLaw.lintegral_exp_gaussian_le sigma cutoff a)
       (c := fun ω ↦ c ω i) T hT (hc i) hE hm
     have hempty : {ω : SampleKey → ℤ | E < ∑ x, c ω i x ^ 2} = ∅ := by
       ext ω

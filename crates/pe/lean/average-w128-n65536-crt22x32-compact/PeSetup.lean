@@ -19,6 +19,8 @@ The digit companions are published compactly over `R_PQ` for the auxiliary modul
 further primes, and the anchor is defined modulo `PQ` (the manuscript's Appendix C).
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

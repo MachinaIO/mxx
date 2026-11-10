@@ -46,7 +46,9 @@ pub mod cost;
 mod facts;
 #[cfg(test)]
 mod fixtures;
+pub mod graph_modules;
 mod modules;
+pub mod program;
 pub mod protocol;
 
 use crate::{
@@ -278,6 +280,12 @@ pub struct ExportOptions {
     /// relations are unchanged); the root boundary types ([`LeanArtifact::root`]) keep the
     /// literals.
     pub facts: bool,
+    /// Also render `generatedRoot.comp`, the root graph as a `MxxSecurity.Comp`: it draws every
+    /// sampler of the root scope from its law, in node order, and returns the outputs that the
+    /// root relation relates to those draws (`MxxSecurity.determined`). The module then imports
+    /// `MxxSecurity.Sampling`. Hash samplers, trapdoor and preimage samplers, samplers in a
+    /// child scope, and the sampling tape are rejected: their laws are not modelled.
+    pub sampling_plan: bool,
 }
 
 impl Default for ExportOptions {
@@ -289,6 +297,7 @@ impl Default for ExportOptions {
             primitives: Default::default(),
             sampling_tape: false,
             facts: false,
+            sampling_plan: false,
         }
     }
 }
@@ -943,6 +952,13 @@ pub fn export(
     validated: &ValidatedGraph,
     options: &ExportOptions,
 ) -> Result<LeanArtifact, ExportError> {
+    if options.sampling_plan && options.sampling_tape {
+        return Err(ExportError::UnsupportedOperation {
+            scope: FrozenGraphScopeId::Root,
+            node: NodeId(0),
+            operation: "a sampling plan draws its samples itself, not from a sampling tape".into(),
+        });
+    }
     let emitter = Emitter::new(validated, options);
     emitter.emit()
 }
@@ -994,6 +1010,8 @@ struct Emitter<'a> {
     current_uses_hash_model: bool,
     current_uses_tape: bool,
     current_witnesses: Vec<(String, String)>,
+    /// The samplers of the current scope in node order: each output and its `Comp` sampler.
+    current_samples: Vec<(String, String)>,
     current_record: bool,
     current_value_expressions: BTreeMap<String, String>,
     scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
@@ -1069,6 +1087,7 @@ impl<'a> Emitter<'a> {
             current_uses_tape: false,
             requires_tape: options.sampling_tape,
             current_witnesses: Vec::new(),
+            current_samples: Vec::new(),
             current_record: false,
             current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
@@ -1140,10 +1159,12 @@ impl<'a> Emitter<'a> {
         // The literals are named from the tables on and the matrix types after them, so the
         // imports keep their offsets.
         self.source = abbreviate_long_literals(&self.source, tables_at, tables_at + tables.len());
+        let imports_end = format!("import MxxIR\nimport {}\n", self.options.runtime_import).len();
         if self.all_coefficients {
-            let imports_end =
-                format!("import MxxIR\nimport {}\n", self.options.runtime_import).len();
             self.source.insert_str(imports_end, "import RuntimeAllCoefficients\n");
+        }
+        if self.options.sampling_plan {
+            self.source.insert_str(imports_end, "import MxxSecurity.Sampling\n");
         }
         self.source.push_str("\nend ");
         self.source.push_str(&self.options.namespace);
@@ -1367,6 +1388,7 @@ impl<'a> Emitter<'a> {
     fn emit_scope(&mut self, scope_id: &FrozenGraphScopeId) -> Result<(), ExportError> {
         self.indent = 1;
         self.current_witnesses.clear();
+        self.current_samples.clear();
         self.current_value_expressions.clear();
         self.current_loops.clear();
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
@@ -1670,15 +1692,7 @@ impl<'a> Emitter<'a> {
         // Large records need projections and recursors, not size or constructor
         // injectivity theorems; generating the latter dominates Lean elaboration.
         let record = if self.current_record {
-            let fields = self
-                .current_witnesses
-                .iter()
-                .map(|(name, ty)| format!("  {name} : {ty}\n"))
-                .collect::<String>();
-            format!(
-                "set_option genInjectivity false in\nset_option genSizeOf false in\nstructure {}.Witness where\n{fields}\n",
-                self.scopes[scope_id]
-            )
+            witness_record(&self.scopes[scope_id], &self.current_witnesses)
         } else {
             String::new()
         };
@@ -1828,6 +1842,34 @@ impl<'a> Emitter<'a> {
             let loop_arguments =
                 loop_names.iter().map(|name| format!("{name} ")).collect::<String>();
             self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
+            if self.options.sampling_plan && matches!(scope_id, FrozenGraphScopeId::Root) {
+                let header = wrapper_header.replacen(
+                    &format!("def {name} "),
+                    &format!("noncomputable def {name}.comp "),
+                    1,
+                );
+                let header = header
+                    .strip_suffix(&format!("(outputs : {output_ty}) : Prop :=\n"))
+                    .expect("root relation header");
+                let mut comp = format!("{header}: MxxSecurity.Comp ({output_ty}) := do\n");
+                let witness_types =
+                    self.current_witnesses.iter().cloned().collect::<BTreeMap<_, _>>();
+                for (sample, sampler) in &self.current_samples {
+                    comp.push_str(&format!(
+                        "  let {sample} : {} ← {sampler}\n",
+                        witness_types[sample]
+                    ));
+                }
+                let pins = self
+                    .current_samples
+                    .iter()
+                    .map(|(sample, _)| format!("witness.{sample} = {sample} ∧ "))
+                    .collect::<String>();
+                comp.push_str(&format!(
+                    "  pure (MxxSecurity.determined fun outputs : {output_ty} ↦\n    ∃ witness : {name}.Witness, {pins}{name}.body {backend}params {input} outputs witness)\n\n"
+                ));
+                self.source.push_str(&comp);
+            }
             if self.options.facts {
                 let scope_facts = facts::render(
                     &scope_facts,
@@ -1963,6 +2005,17 @@ impl<'a> Emitter<'a> {
                 .map(|w| wire_name(*w))
                 .ok_or(ExportError::MissingArguments { scope: scope_id.clone(), node: node_id })
         };
+        if self.options.sampling_plan &&
+            matches!(
+                kind,
+                NodeKind::TrapdoorSample { .. } |
+                    NodeKind::PreimageSample { .. } |
+                    NodeKind::HashSample { .. } |
+                    NodeKind::HashIntFamily { .. }
+            )
+        {
+            return self.unsupported(scope_id, node_id, kind, "a sampling plan has no law for");
+        }
         match kind {
             NodeKind::Input { .. } => {}
             NodeKind::ConstantInt(value) => self.let_output(&output(0), &value.to_string()),
@@ -2358,24 +2411,32 @@ impl<'a> Emitter<'a> {
                     k
                 ));
             }
-            NodeKind::UniformResidueSample { .. } => self.sample_one_at(
-                scope,
-                node_id,
-                existentials,
-                relations,
-                if self.requires_tape {
-                    &self.options.primitives.uniform_residue_sample_at
-                } else {
-                    &self.options.primitives.uniform_residue_sample
-                },
-                &[],
-                true,
-            ),
+            NodeKind::UniformResidueSample { .. } => {
+                self.plan_sample(scope_id, node_id, "MxxSecurity.sampleResidue".into())?;
+                self.sample_one_at(
+                    scope,
+                    node_id,
+                    existentials,
+                    relations,
+                    if self.requires_tape {
+                        &self.options.primitives.uniform_residue_sample_at
+                    } else {
+                        &self.options.primitives.uniform_residue_sample
+                    },
+                    &[],
+                    true,
+                )
+            }
             NodeKind::UniformIntervalSample { range, .. } => {
                 append_expression_guards(&range.minimum, env, relations);
                 append_expression_guards(&range.maximum, env, relations);
                 let lo = env.expr(&range.minimum);
                 let hi = env.expr(&range.maximum);
+                self.plan_sample(
+                    scope_id,
+                    node_id,
+                    format!("MxxSecurity.sampleInterval ({lo}) ({hi})"),
+                )?;
                 self.sample_one_at(
                     scope,
                     node_id,
@@ -2394,6 +2455,11 @@ impl<'a> Emitter<'a> {
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let sigma = env.real_expr(sigma);
                 let bound = env.expr(max_coefficient_bound);
+                self.plan_sample(
+                    scope_id,
+                    node_id,
+                    format!("MxxSecurity.sampleGaussian ({sigma}) ({bound})"),
+                )?;
                 self.sample_one_at(
                     scope,
                     node_id,
@@ -3281,6 +3347,28 @@ impl<'a> Emitter<'a> {
         relations.push(format!("{} ≤ {}", end, extent));
         (start, end)
     }
+    /// Records a sampler of the root scope for `ExportOptions::sampling_plan`.
+    fn plan_sample(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        node: NodeId,
+        sampler: String,
+    ) -> Result<(), ExportError> {
+        if !self.options.sampling_plan {
+            return Ok(());
+        }
+        if !matches!(scope_id, FrozenGraphScopeId::Root) {
+            return Err(ExportError::UnsupportedOperation {
+                scope: scope_id.clone(),
+                node,
+                operation: "a sampling plan draws only root-scope samplers".into(),
+            });
+        }
+        let name = wire_name(WireRef { node, port: crate::types::Port(0) });
+        self.current_samples.push((name, sampler));
+        Ok(())
+    }
+
     fn sample_one(
         &mut self,
         scope: &GraphScope,
@@ -4071,6 +4159,37 @@ pub fn lean_scope_names(graph: &Graph) -> BTreeMap<FrozenGraphScopeId, String> {
         .collect()
 }
 
+/// Fields per witness structure. Lean's code generator rejects a constructor with 256 or more
+/// fields, so a larger witness extends parent structures of at most this many fields each.
+const WITNESS_PART_FIELDS: usize = 255;
+
+/// The witness record of scope `name`. Up to `WITNESS_PART_FIELDS` fields it is one flat
+/// structure; beyond that, `{name}.Witness` extends `{name}.Witness.Part<k>` parents. Projections
+/// such as `witness.w_3_0` and structure-instance notation read the same either way.
+fn witness_record(name: &str, witnesses: &[(String, String)]) -> String {
+    const HEADER: &str = "set_option genInjectivity false in\nset_option genSizeOf false in\n";
+    let fields = |part: &[(String, String)]| {
+        part.iter().map(|(field, ty)| format!("  {field} : {ty}\n")).collect::<String>()
+    };
+    if witnesses.len() <= WITNESS_PART_FIELDS {
+        return format!("{HEADER}structure {name}.Witness where\n{}\n", fields(witnesses));
+    }
+    let parts = witnesses.chunks(WITNESS_PART_FIELDS).collect::<Vec<_>>();
+    let mut record = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        record.push_str(&format!(
+            "{HEADER}structure {name}.Witness.Part{index} where\n{}\n",
+            fields(part)
+        ));
+    }
+    let parents = (0..parts.len())
+        .map(|index| format!("{name}.Witness.Part{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    record.push_str(&format!("{HEADER}structure {name}.Witness extends {parents}\n\n"));
+    record
+}
+
 fn scope_name(id: &FrozenGraphScopeId) -> String {
     match id {
         FrozenGraphScopeId::Root => "generatedRoot".into(),
@@ -4271,6 +4390,30 @@ mod tests {
         );
     }
 
+    /// A witness within Lean's constructor limit stays one flat structure; a larger one extends
+    /// parent structures of at most `WITNESS_PART_FIELDS` fields, in field order.
+    #[test]
+    fn large_witness_records_extend_bounded_parts() {
+        let witnesses = |count: usize| {
+            (0..count).map(|index| (format!("w_{index}_0"), "Nat".to_owned())).collect::<Vec<_>>()
+        };
+        let header = "set_option genInjectivity false in\nset_option genSizeOf false in\n";
+        assert_eq!(
+            witness_record("S", &witnesses(2)),
+            format!("{header}structure S.Witness where\n  w_0_0 : Nat\n  w_1_0 : Nat\n\n")
+        );
+        let flat = witness_record("S", &witnesses(WITNESS_PART_FIELDS));
+        assert!(!flat.contains("extends") && flat.matches("structure").count() == 1);
+        let split = witness_record("S", &witnesses(WITNESS_PART_FIELDS + 2));
+        assert!(split.contains("structure S.Witness.Part0 where\n  w_0_0 : Nat\n"));
+        assert!(
+            split.contains("structure S.Witness.Part1 where\n  w_255_0 : Nat\n  w_256_0 : Nat\n\n")
+        );
+        assert!(split.ends_with(&format!(
+            "{header}structure S.Witness extends S.Witness.Part0, S.Witness.Part1\n\n"
+        )));
+    }
+
     #[test]
     fn ring_property_exports_resolved_crt_value() {
         let ring = crate::ring::test_ring(17 * 97, 8);
@@ -4419,7 +4562,6 @@ mod tests {
         .0;
         let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
-        eprintln!("{}", artifact.source);
         assert!(artifact.source.contains(
             "abbrev sel_0 (i : Int) : Int := MxxIR.selectInt i [1073741441, 1073741329]"
         ));
@@ -4944,6 +5086,58 @@ mod tests {
         assert!(!plain.root.requires_sampling_tape);
         assert!(plain.source.contains("MxxRuntime.gaussianSample ("));
         assert!(!plain.source.contains("SampleTape"));
+    }
+
+    /// The sampling plan draws each root sampler from its law and returns the outputs the root
+    /// relation determines; it refuses the sampling tape.
+    #[test]
+    fn test_export_sampling_plan_draws_root_samplers() {
+        let matrix = MatrixType {
+            ring: crate::ring::test_ring(257, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let sample = |kind| {
+            NodeHandle::new(kind, vec![], vec![WireType::Matrix(matrix.clone())]).output(0).unwrap()
+        };
+        let noise = sample(NodeKind::GaussianSample {
+            matrix_type: matrix.clone(),
+            sigma: crate::expr::RealExpr::from_f64_exact(3.0).unwrap(),
+            max_coefficient_bound: IntExpr::constant(48),
+            compact: false,
+        });
+        let public = sample(NodeKind::UniformResidueSample { matrix_type: matrix.clone() });
+        let sum = NodeHandle::new(
+            NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+            vec![public.clone(), noise],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "sampled",
+            vec![],
+            BTreeMap::from([
+                ("a".into(), GraphOutput { value: public, availability: None }),
+                ("b".into(), GraphOutput { value: sum, availability: None }),
+            ]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let options = ExportOptions { sampling_plan: true, ..Default::default() };
+        let artifact = export(&validated, &options).unwrap();
+        eprintln!("{}", artifact.source);
+        assert!(artifact.source.contains("import MxxSecurity.Sampling\n"));
+        assert!(artifact.source.contains("noncomputable def generatedRoot.comp (params : Params)"));
+        assert!(artifact.source.contains("← MxxSecurity.sampleGaussian ((3/1)) (48)\n"));
+        assert!(artifact.source.contains("← MxxSecurity.sampleResidue\n"));
+        assert!(artifact.source.contains("pure (MxxSecurity.determined fun outputs"));
+        assert!(!export(&validated, &ExportOptions::default()).unwrap().source.contains(".comp"));
+        let taped = ExportOptions { sampling_tape: true, ..options };
+        assert!(export(&validated, &taped).is_err());
     }
 
     #[test]

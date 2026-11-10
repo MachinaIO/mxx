@@ -10,6 +10,8 @@ incoming key `M` (a public top loop and a digit-row loop of companion keys), swi
 the branch key `H_k Dec(T_b)`, and weights the key by the branch coefficient.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof.PreLaneI3
 
 open Mxx.Primitives MxxRuntime MxxExponentLut PeProof

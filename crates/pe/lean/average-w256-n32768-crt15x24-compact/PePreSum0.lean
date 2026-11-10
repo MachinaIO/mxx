@@ -37,7 +37,6 @@ theorem coefLoopId {model : HashModel} {tape : SampleTape} {path : List Nat}
       congr 3
       rw [hw6]) h
   obtain ⟨hsum, -⟩ := hacc
-  dsimp only at hsum
   rw [hsum, zero_add, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 256 then
     coefTerm tables 0 1 ⟨i, hi⟩ (by norm_num) else 0)]
   exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]

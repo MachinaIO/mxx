@@ -10,6 +10,8 @@ table 1: the internal branches as a parallel loop over their lanes, whose weight
 adds, then four leaf groups, each with seven member lanes and four shared-companion slots.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe Stage_online_eval

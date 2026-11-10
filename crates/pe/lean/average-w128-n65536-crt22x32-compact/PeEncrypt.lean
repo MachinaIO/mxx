@@ -10,6 +10,8 @@ of the `37` helper automorphisms, the compact digit companions of the switching 
 the attribute ciphertexts, and the initial state encoding.
 -/
 
+set_option maxRecDepth 200000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
@@ -264,10 +266,8 @@ theorem encrypt_companion {model : HashModel} {tape : SampleTape} {path : List N
     funext r c
     rw [Subsingleton.elim r 0, Subsingleton.elim c 0, matrixMul_eq_mul, e13, e29,
       unitRow_mul_entry _ (by omega), (entryDigit_spec y a).1]
-  have hδ : ∀ k, 2 * ((entryDigit y a).coeff k).natAbs < Q := fun k ↦ by
-    have := (entryDigit_spec y a).2 k
-    have : (32768 : Nat) * 2 < Q := by norm_num
-    omega
+  have hδ : ∀ k, 2 * ((entryDigit y a).coeff k).natAbs < Q := fun k ↦
+    lt_of_le_of_lt (Nat.mul_le_mul_left 2 ((entryDigit_spec y a).2 k)) (by norm_num)
   rw [e30] at h31
   have e31 := rebase_lift hQ hδ h31
   obtain ⟨he35, hb35⟩ := gaussianSampleAt_explicit hN h35
@@ -372,10 +372,8 @@ theorem encrypt_rhsCompanion {model : HashModel} {tape : SampleTape} {path : Lis
     funext r c
     rw [Subsingleton.elim r 0, Subsingleton.elim c 0, matrixMul_eq_mul, e12, e26,
       unitRow_mul_entry _ (by omega), (entryDigit_spec y a).1]
-  have hδ : ∀ k, 2 * ((entryDigit y a).coeff k).natAbs < Q := fun k ↦ by
-    have := (entryDigit_spec y a).2 k
-    have : (32768 : Nat) * 2 < Q := by norm_num
-    omega
+  have hδ : ∀ k, 2 * ((entryDigit y a).coeff k).natAbs < Q := fun k ↦
+    lt_of_le_of_lt (Nat.mul_le_mul_left 2 ((entryDigit_spec y a).2 k)) (by norm_num)
   rw [e27] at h28
   have e28 := rebase_lift hQ hδ h28
   obtain ⟨he32, hb32⟩ := gaussianSampleAt_explicit hN h32

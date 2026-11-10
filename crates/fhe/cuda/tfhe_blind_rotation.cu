@@ -1,7 +1,7 @@
 // The `tfhe.blind_rotation` subgraph kernel: the whole CMUX loop of a TFHE
 // blind rotation in one cooperative launch.
 //
-// Semantics (crates/fhe/src/tfhe.rs `blind_rotation_subgraph`), exact modulo
+// Semantics (crates/fhe/src/tfhe/mod.rs `blind_rotation_subgraph`), exact modulo
 // every CRT limb q_t of the ring:
 //   acc = (initial_a; initial_b), a 2 x 1 evaluation-domain column
 //   for i < n: e_i = ((mask_i * 2N + q / 2) div q) mod 2N

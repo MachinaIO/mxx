@@ -166,7 +166,8 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
   have hw16 : Stage_prelude.generatedRoot.w_16_0 ctx = messageRow model key 1 := hashSample_eq F.c0.h16_0
   have hw22 : Stage_prelude.generatedRoot.w_22_0 ctx = m 0 := by
     obtain ⟨index, _, hvalue⟩ := F.c0.h22_0
-    simpa only [Subsingleton.elim index 0] using hvalue
+    simp only [Subsingleton.elim index 0] at hvalue
+    exact hvalue
   have hw23 : Stage_prelude.generatedRoot.w_23_0 ctx =
       fun _ _ ↦ polynomialOfCoefficients (oneBitCoefficients m) := by
     rw [Stage_prelude.generatedRoot.w_23_0, hw22]

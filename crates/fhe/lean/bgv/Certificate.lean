@@ -1,9 +1,18 @@
-import Claim
-import BgvProof
+import BgvReductions
+import BgvDepth
 
-/-! Checks that the handwritten proof has exactly the generated statement, and which axioms it
-uses. -/
+/-! The certificate of the generated BGV scheme: the correctness of its circuit and its IND-CPA
+statement with reductions whose simulators are IR programs of bounded cost, proven from the
+declared assumptions only. `#print axioms` must list only `propext`,
+`Classical.choice`, and `Quot.sound`. -/
 
-theorem certificate : GeneratedClaim.CorrectnessClaim := MxxFheBgv.correctness
+namespace BgvCertificate
 
-#print axioms certificate
+theorem correctness : GeneratedScheme.CorrectnessClaim := BgvCorrect.correctness
+
+theorem bounded_security : GeneratedScheme.BoundedSecurityClaim := BgvSecurity.bounded_security
+
+end BgvCertificate
+
+#print axioms BgvCertificate.correctness
+#print axioms BgvCertificate.bounded_security

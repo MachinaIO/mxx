@@ -7,6 +7,8 @@ import PeDecode
 `Σ_i σ_i((b - B^(2)) k̃_i)` over the 128 slots, which the generated graph unrolls.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

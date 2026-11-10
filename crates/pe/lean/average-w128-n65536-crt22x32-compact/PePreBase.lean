@@ -9,6 +9,8 @@ The public evaluation of the keys pairs the expanded companion keys with key dig
 public top terms of the digits of public rows.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
@@ -192,7 +194,6 @@ theorem memberAccum {n : Nat} {body : Nat → KeyState → KeyState → Prop}
     (fun i ↦ if hi : i < n then f ⟨i + 2, by omega⟩ r j else 0) (fun _ _ ↦ True) trivial
     (fun i s t hi _ hb ↦ ⟨by simp only [dif_pos hi]; exact hstep i s t hi hb r j, trivial⟩) h
   obtain ⟨hs, -⟩ := hacc
-  dsimp only at hs
   rw [hs, hinit, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < n then f ⟨i + 2, by omega⟩ r j else 0),
     Fin.sum_univ_succ, Fin.sum_univ_succ, add_assoc]
   congr 2

@@ -130,7 +130,8 @@ theorem generated_digit_bound
     (limb : MxxRuntime.RegularLimb concreteLayout)
     (coefficient : Fin ringDimension) :
     (MxxRuntime.regularDigitCoefficient concreteLayout value limb coefficient).natAbs ≤ 16 := by
-  simpa [MxxRuntime.regularDigitCoefficient, base, concreteLayout] using
+  simpa [MxxRuntime.regularDigitCoefficient, Mxx.Primitives.balancedDigitAt, base,
+    concreteLayout] using
     (Mxx.Primitives.balancedDigit_abs_le concreteLayout.base
       concreteLayout.base_gt_one concreteLayout.base_even _)
 
@@ -162,7 +163,8 @@ theorem generated_backend_decomposition
   · norm_num [base, ExampleBackend.layout0]
   · norm_num [regularDigits, ExampleBackend.layout0, ExampleBackend.moduli0,
       MxxRuntime.RegularLayout.digitCount, MxxRuntime.RegularLayout.retainedTowers]
-  · simp [MxxRuntime.castMatrixRows]
+  · simp only [MxxRuntime.castMatrixRows, eq_mp_eq_cast]
+    exact (cast_eq _ _).symm
   · exact MxxRuntime.regularGadgetMatrix_residual_exact _ _
       (by norm_num [q]) (by norm_num [ringDimension]) (by rfl)
 

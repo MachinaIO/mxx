@@ -26,8 +26,10 @@ private theorem root_pow_odd_pow_n {R : Type} [CommRing R] {index : Nat} (hodd :
 private theorem negacyclic_eval_root_pow {R : Type} [CommRing R] {index : Nat} (hodd : Odd index) :
     Polynomial.eval₂ (algebraMap R (Negacyclic n R))
       (AdjoinRoot.root (negacyclicModulus n R) ^ index) (negacyclicModulus n R) = 0 := by
-  simpa [negacyclicModulus, Polynomial.eval₂_add, Polynomial.eval₂_pow] using
-    congrArg (fun x : Negacyclic n R => x + 1) (root_pow_odd_pow_n (n := n) (R := R) hodd)
+  have hmod : negacyclicModulus n R = Polynomial.X ^ n + Polynomial.C 1 := rfl
+  conv_lhs => arg 3; rw [hmod]
+  rw [Polynomial.eval₂_add, Polynomial.eval₂_pow, Polynomial.eval₂_X,
+    Polynomial.eval₂_C, map_one, root_pow_odd_pow_n (n := n) (R := R) hodd, neg_add_cancel]
 
 /-- The substitution `X ↦ X^index` of `R[X]/(X^n + 1)` for an odd index. -/
 noncomputable def substitution {R : Type} [CommRing R] (index : Nat) (hodd : Odd index) :

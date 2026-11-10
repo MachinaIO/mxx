@@ -39143,7 +39143,7 @@ def sequential_generatedRoot_490 (backend : MxxRuntime.BackendContext) (_ : MxxR
 
 set_option genInjectivity false in
 set_option genSizeOf false in
-structure generatedRoot.Witness where
+structure generatedRoot.Witness.Part0 where
   w_10_0 : mxxMat1
   w_12_0 : Fin 4 → mxxMat0
   w_12_1 : Fin 4 → mxxMat0
@@ -39399,6 +39399,10 @@ structure generatedRoot.Witness where
   w_467_0 : mxxMat0
   w_468_0 : mxxMat0
   w_470_0 : mxxMat0
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness.Part1 where
   w_471_0 : mxxMat0
   w_473_0 : mxxMat0
   w_473_1 : mxxMat0
@@ -39410,6 +39414,10 @@ structure generatedRoot.Witness where
   w_488_0 : mxxMat0
   w_490_0 : mxxMat0
   w_490_1 : mxxMat0
+
+set_option genInjectivity false in
+set_option genSizeOf false in
+structure generatedRoot.Witness extends generatedRoot.Witness.Part0, generatedRoot.Witness.Part1
 
 abbrev generatedRoot.constraints_10 (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (w_0_0 : mxxMat0) (w_1_0 : mxxMat0) (w_2_0 : mxxMat0) (w_3_0 : mxxMat0) (w_11_0 : ByteArray) (w_38_0 : Fin 512 → Int) (w_45_0 : Fin 37 → mxxMat0) (w_46_0 : Fin 37 → mxxMat0) (w_50_0 : Fin 85184 → mxxMat6) (w_51_0 : Fin 85184 → mxxMat6) (w_475_0 : Fin 7 → mxxMat1) (w_476_0 : Fin 7 → mxxMat1) (w_477_0 : Fin 7 → mxxMat1) (w_478_0 : Fin 7 → mxxMat1) (w_479_0 : Fin 7 → mxxMat1) (w_480_0 : Fin 7 → mxxMat1) (w_481_0 : Fin 7 → mxxMat1) (w_482_0 : Fin 7 → mxxMat1) (w_415_0 : Fin 15 → mxxMat0) (w_415_1 : Fin 15 → mxxMat0) (w_415_2 : Fin 15 → mxxMat0) (w_415_3 : Fin 15 → mxxMat0) (w_415_4 : Fin 15 → mxxMat0) (w_415_5 : Fin 15 → mxxMat0) (w_466_0 : Fin 7 → mxxMat0) (w_466_1 : Fin 7 → mxxMat0) (w_467_0 : mxxMat0) (w_468_0 : mxxMat0) (w_469_0 : mxxMat0) (w_470_0 : mxxMat0) (w_471_0 : mxxMat0) (w_472_0 : mxxMat0) (w_473_0 : mxxMat0) (w_473_1 : mxxMat0) (w_483_0 : Fin 7 → mxxMat0) (w_483_1 : Fin 7 → mxxMat0) (w_484_0 : mxxMat0) (w_485_0 : mxxMat0) (w_486_0 : mxxMat0) (w_487_0 : mxxMat0) (w_488_0 : mxxMat0) (w_489_0 : mxxMat0) (w_490_0 : mxxMat0) (w_490_1 : mxxMat0) (w_491_0 : mxxMat0) (w_497_0 : mxxMat0) (outputs : mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × mxxMat0 × Unit) : Prop :=
   MxxRuntime.familyGetStatic w_466_0 (0) w_467_0 ∧

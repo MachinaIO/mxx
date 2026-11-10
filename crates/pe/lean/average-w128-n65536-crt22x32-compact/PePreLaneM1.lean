@@ -3,6 +3,8 @@ import PePreLaneM1G1Group
 import PePreLaneM1G2Group
 import PePreLaneM1G3Group
 
+set_option maxRecDepth 4000000
+
 namespace PeProof.PreLaneM1
 
 open Mxx.Primitives MxxRuntime MxxExponentLut PeProof

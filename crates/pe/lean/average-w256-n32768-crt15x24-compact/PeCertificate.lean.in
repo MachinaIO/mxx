@@ -128,7 +128,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     intro exec hr
     exact run_correct hr
   rw [h, MeasureTheory.measure_empty]
-  exact zero_le _
+  exact zero_le
 
 end PeProof
 

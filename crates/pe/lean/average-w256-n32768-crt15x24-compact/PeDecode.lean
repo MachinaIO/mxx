@@ -59,7 +59,6 @@ theorem compactLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
     (fun i ↦ if hi : i < 256 then substituteMatrix (slotAut i) (slotAut_odd ⟨i, hi⟩) x * v ⟨i, hi⟩ else 0)
     (fun _ _ ↦ True) trivial (fun i s t hi _ hb ↦ ⟨by simp only [dif_pos hi]; exact compactStep hi hb, trivial⟩) h
   obtain ⟨hs, -⟩ := hacc
-  dsimp only at hs
   rw [hs, zero_add, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 256 then
     substituteMatrix (slotAut i) (slotAut_odd ⟨i, hi⟩) x * v ⟨i, hi⟩ else 0)]
   exact Finset.sum_congr rfl fun i _ ↦ by simp [i.isLt]

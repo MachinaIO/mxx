@@ -10,6 +10,8 @@ are below `8` and the last table below `2`, and the chain `v_(i+1) = t[128 i + v
 `v_0 = 0` ends at `v_4 = 0`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

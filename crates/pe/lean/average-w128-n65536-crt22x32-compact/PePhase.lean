@@ -10,6 +10,8 @@ substituted, every secret-dependent term of the phase cancels except the small `
 The helper gadget terms cancel by re-indexing the pairs: `σ_i ∘ σ_(kHelp k) = σ_(i + idx k)`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

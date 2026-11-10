@@ -203,7 +203,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     rintro ⟨execution, hruns, hne⟩
     exact hne (run_correct hruns)
   rw [hempty, MeasureTheory.measure_empty]
-  exact zero_le _
+  exact zero_le
 
 /-- info: 'RingGswBggProof.certificate' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in

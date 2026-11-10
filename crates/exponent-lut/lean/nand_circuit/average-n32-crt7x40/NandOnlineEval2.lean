@@ -252,6 +252,8 @@ theorem loop2_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N
       fin_cases k <;> fin_cases j <;> rfl
     · funext j
       fin_cases j <;> rfl
+    · funext j
+      fin_cases j <;> rfl
   · funext k j
     fin_cases k <;> fin_cases j
     exacts [hw82, hw84, hw86, hw88]

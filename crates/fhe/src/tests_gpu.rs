@@ -1,6 +1,6 @@
 //! GPU execution of the production FHE graphs; all artifacts stay in memory.
 use crate::{
-    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme,
+    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams,
     utils::{common, gpu::integers},
 };
 use mxx_backends::{
@@ -56,7 +56,7 @@ fn test_gpu_integer_family_permutation_across_waves() {
 
 fn gpu_parameters(common: &FheCommonParams, bgv: Option<&BgvParams>) -> Vec<GpuDCRTPolyParams> {
     if let Some(bgv) = bgv {
-        return crate::utils::gpu::bgv_gpu_parameters(bgv);
+        return crate::bgv::fixtures::gpu_parameters(bgv);
     }
     let (primes, _, depth) = common.ring.to_crt();
     crate::utils::gpu::related_gpu_parameters(

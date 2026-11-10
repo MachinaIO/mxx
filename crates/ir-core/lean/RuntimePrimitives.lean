@@ -169,8 +169,12 @@ theorem regularUnflattened_reconstruct {q n rows columns : Nat}
   · have h := congrFun (congrFun
       (CrtDecomposition.regularGadgetRow_mul_regularDecompositionColumn
         layout.ordered (target row column) hq hn) ()) ()
-    simpa [Matrix.mul_apply, CrtDecomposition.regularGadgetRow,
-      CrtDecomposition.regularDecompositionColumn] using h
+    erw [Matrix.mul_apply] at h
+    simp only [CrtDecomposition.regularGadgetRow,
+      CrtDecomposition.regularDecompositionColumn] at h
+    simp only [Matrix.mul_apply, CrtDecomposition.regularGadgetRow,
+      CrtDecomposition.regularDecompositionColumn]
+    exact h
   · intro other _ hne
     simp [Ne.symm hne]
   · simp
@@ -235,7 +239,6 @@ theorem fullGadgetMatrix_reconstruct {q n rows columns : Nat}
     fullGadgetMatrix layout * fullDecomposeMatrix layout target = target := by
   classical
   unfold fullGadgetMatrix fullDecomposeMatrix
-  rw [← castExactMatrix_mul]
   let g : ExactMatrix layout.ordered.modulusProduct n rows
       (rows * (layout.crtModuli.length * layout.digitsPerTower)) :=
     fun row column ↦ regularGadgetUnflattened layout row
@@ -247,7 +250,7 @@ theorem fullGadgetMatrix_reconstruct {q n rows columns : Nat}
         ((regularIndexEquiv layout rows).symm row) column
   have hinner : g * d =
       castExactMatrix layout.product_eq target := by
-    rw [← regularUnflattened_reconstruct layout
+    erw [← regularUnflattened_reconstruct layout
       (castExactMatrix layout.product_eq target)
       (by rw [layout.ordered.modulusProduct_eq_q]; exact hq) hn]
     funext row column
@@ -256,7 +259,9 @@ theorem fullGadgetMatrix_reconstruct {q n rows columns : Nat}
       (fun index : Fin rows × RegularLimb layout ↦
         regularGadgetUnflattened (n := n) layout row index *
           regularDigitsUnflattened layout (castExactMatrix layout.product_eq target) index column)
-  rw [hinner, castExactMatrix_cancel]
+  calc castExactMatrix layout.product_eq.symm g * castExactMatrix layout.product_eq.symm d
+      = castExactMatrix layout.product_eq.symm (g * d) := (castExactMatrix_mul _ g d).symm
+    _ = target := by rw [hinner, castExactMatrix_cancel]
 
 /-- The same trailing low-part selection used by the concrete CRT parameters. -/
 def RegularLayout.retainedTowers {q : Nat} (layout : RegularLayout q) : Nat :=
@@ -326,8 +331,13 @@ theorem regularGadgetMatrix_reconstruct {q n rows columns : Nat}
     regularGadgetMatrix layout * regularDecomposeMatrix layout target = target := by
   have hindex (index : Fin (rows * layout.digitCount)) :
       (regularColumnIndex layout index).val = index.val := by
-    simp [regularColumnIndex, RegularLayout.digitCount, RegularLayout.retainedTowers, hexact,
-      finProdFinEquiv, Nat.mod_add_div]
+    have hdigits : layout.digitCount = layout.crtModuli.length * layout.digitsPerTower := by
+      simp [RegularLayout.digitCount, RegularLayout.retainedTowers, hexact]
+    show index.val % layout.digitCount +
+        layout.crtModuli.length * layout.digitsPerTower * (index.val / layout.digitCount) =
+      index.val
+    rw [← hdigits]
+    exact Nat.mod_add_div index.val layout.digitCount
   have hcount : layout.digitCount = layout.crtModuli.length * layout.digitsPerTower := by
     simp [RegularLayout.digitCount, RegularLayout.retainedTowers, hexact]
   have hsum := fullGadgetMatrix_reconstruct layout target hq hn

@@ -24,8 +24,10 @@ theorem root_pow_n :
     (AdjoinRoot.root (negacyclicModulus n R)) ^ n = -1 := by
   have hroot : AdjoinRoot.mk (negacyclicModulus n R) (Polynomial.X ^ n) = -1 := by
     have hzero := (AdjoinRoot.mk_self (f := negacyclicModulus n R))
-    simpa [negacyclicModulus, map_add, AdjoinRoot.mk_X] using congrArg
-      (fun z => z - AdjoinRoot.mk (negacyclicModulus n R) (Polynomial.C 1)) hzero
+    rw [negacyclicModulus, map_add] at hzero
+    rw [negacyclicModulus]
+    rw [show (Polynomial.C (1 : R)) = 1 from map_one _, map_one] at hzero
+    exact eq_neg_of_add_eq_zero_left hzero
   rw [← AdjoinRoot.mk_X, ← (AdjoinRoot.mk (negacyclicModulus n R)).map_pow]
   simpa using hroot
 

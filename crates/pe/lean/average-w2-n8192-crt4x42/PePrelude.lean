@@ -170,7 +170,7 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
   rw [hlower] at hbottom
   refine ⟨hb, ?_, ?_, ?_, ?_, ?_, hb6', hbz, hb16'⟩
   · simp only [matrixAdd, matrixMulScalarLeft_eq, hsecret, hw12, hw14, he16, emAt, hw20,
-      matrixPolynomial_single]
+      matrixPolynomial_single] <;> rfl
   · simp only [Prod.mk.injEq] at vout
     obtain ⟨ho0, -⟩ := vout
     have hw0 := sliceMatrix_window 0 x0 (by simp) (by omega)

@@ -37,7 +37,7 @@ theorem gadgetMatrixRuns_constant {q m : Nat} {backend : BackendContext} {base d
   simp only [regularGadgetUnflattened]
   split
   · exact ⟨_, rfl⟩
-  · exact ⟨0, by simp⟩
+  · exact ⟨0, by simp <;> exact rfl⟩
 
 private theorem coeff_algebraMap {R : Type} [CommRing R] (hn : 0 < n) (x : R) (i : Fin n) :
     (algebraMap R (Negacyclic n R) x).coeff i = if i.val = 0 then x else 0 := by

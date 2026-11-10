@@ -11,6 +11,8 @@ evaluation encodes `0` under the preprocessed output key, and the key of the pre
 phase into `⌊Q/2⌋ m` plus an error below `Q / 4`. The bad set is empty, so its measure is `0`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe
@@ -123,6 +125,6 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     intro exec hr
     exact run_correct hr
   rw [h, MeasureTheory.measure_empty]
-  exact zero_le _
+  exact zero_le
 
 end PeProof

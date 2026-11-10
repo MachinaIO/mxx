@@ -125,6 +125,8 @@ def adapt(text):
     text = text.replace('45 + Int.ofNat', '31 + Int.ofNat')
     text = re.sub(r'(lutInner\d+ \(model := model\) \(tape := tape\) \(path := path\))',
                   r'\1 (params := params)', text)
+    # The reference's own recursion limit is replaced by this row's.
+    text = text.replace('set_option maxRecDepth 4000000\n\n', '', 1)
     text = text.replace('namespace PeProof',
                         'set_option maxRecDepth 200000\n\nnamespace PeProof', 1)
     text = text.replace('⟨512 * i,', '⟨DATEHALFSTRIDE * i,')
@@ -306,6 +308,8 @@ The statistical TrapGen anchor has 265 sampled columns plus the 30 gadget column
 
 def generate_requirement():
     text = (REFERENCE / 'PeRequirement.lean').read_text()
+    # The reference's own recursion limit does not apply to this row.
+    text = text.replace('set_option maxRecDepth 4000000\n\n', '', 1)
     text = text.replace('[9]', '[10]')
     start = text.index('theorem iter_four')
     finish = text.index('theorem and_step', start)

@@ -196,7 +196,6 @@ theorem SubG.fresh {κ : Type} [Fintype κ] [DecidableEq κ] (key : κ → ι)
   rw [mul_comm (ENNReal.ofReal _)]
   refine mul_le_mul_right (ENNReal.ofReal_le_ofReal (Real.exp_le_exp.mpr ?_)) _
   have := mul_le_mul_of_nonneg_left (hL ω) hV
-  simp only
   rw [← Finset.sum_div]
   linarith
 
@@ -292,7 +291,7 @@ theorem SamplerLaw.lintegral_exp_interval_symmetric_le (h : ℕ) (a : ℝ) :
   simp only [SamplerLaw.measure, SamplerLaw.pmf, hle, dite_true]
   rw [lintegral_countable']
   simp_rw [PMF.toMeasure_apply_singleton _ _ (measurableSet_singleton _),
-    PMF.uniformOfFinset_apply]
+    uniformPMF_apply]
   rw [tsum_eq_sum (s := I) fun x hx ↦ by rw [if_neg hx, mul_zero]]
   rw [Finset.sum_congr rfl fun x hx ↦ by rw [if_pos hx], ← Finset.sum_mul]
   -- The real sum of the moments over the symmetric interval.

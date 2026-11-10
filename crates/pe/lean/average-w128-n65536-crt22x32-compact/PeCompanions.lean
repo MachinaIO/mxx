@@ -7,6 +7,8 @@ Each compact companion over `R_{PQ}` expands to an encoding over `R_Q` of its di
 pair against the gadget (`expand_rel`), within `companionBound`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

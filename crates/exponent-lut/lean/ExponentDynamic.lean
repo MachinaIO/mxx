@@ -299,7 +299,7 @@ theorem IterRuns.accumulate_entries {σ : Type} {q W C : Nat} {body : Nat → σ
       funext r v
       rw [Subsingleton.elim r 0, Matrix.add_apply, he v]
       simp only [dif_pos hi]) h
-  rw [hacc.1, Matrix.add_apply, Matrix.sum_apply,
+  erw [hacc.1, Matrix.add_apply, Matrix.sum_apply,
     Finset.sum_range (fun i ↦ (if hi : i < C then (fun _ v ↦ F v ⟨i, hi⟩ : ExactMatrix q n 1 W)
       else 0) 0 w)]
   congr 1

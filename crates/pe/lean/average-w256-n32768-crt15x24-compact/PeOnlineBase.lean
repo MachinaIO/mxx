@@ -94,7 +94,6 @@ theorem colAction {σ : Type} {body : Nat → σ → σ → Prop} {r : Nat} (pro
         simp only [dif_pos hi, Nat.div_one]
         exact h1, trivial⟩) h'
     obtain ⟨hsum, -⟩ := hacc
-    dsimp only at hsum
     rw [hsum, hinit k, zero_add, sum_unitRow_entry F jj]
     simp [F]
   refine ⟨fun k ↦ hrun k, ?_⟩
@@ -316,7 +315,6 @@ theorem coefAccum {body : Nat → ExactMatrix Q N 1 1 → ExactMatrix Q N 1 1 �
       simp only [dif_pos hi]
       exact hstep i s t hi hb, trivial⟩) h
   obtain ⟨hsum, -⟩ := hacc
-  dsimp only at hsum
   rw [hsum, zero_add, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 256 then
     coefTerm tables offset k ⟨i, hi⟩ ho else 0)]
   exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]
@@ -337,7 +335,6 @@ theorem coefAccumC {body : Nat → ExactMatrix Q N 1 1 → ExactMatrix Q N 1 1 �
       simp only [dif_pos hi]
       exact hstep i s t hi hb, trivial⟩) h
   obtain ⟨hsum, -⟩ := hacc
-  dsimp only at hsum
   rw [hsum, zero_add, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 256 then
     coefTermC tables offset k ⟨i, hi⟩ ho else 0)]
   exact Finset.sum_congr rfl fun j _ ↦ by simp [j.isLt]

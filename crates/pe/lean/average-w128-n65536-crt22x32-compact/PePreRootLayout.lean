@@ -9,6 +9,8 @@ contains second-depth leaf `parent + 15 * member`. Thus leaf `l` uses group
 `(1 + l % 15) / 4`, local slot `(1 + l % 15) % 4`, and member `l / 15`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

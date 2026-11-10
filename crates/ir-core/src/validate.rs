@@ -3594,6 +3594,28 @@ mod tests {
     }
 
     #[test]
+    fn test_rns_mod_up_program_term_names_source_basis() {
+        let mut source_type = matrix_type(17 * 97, 2, 3);
+        source_type.ring = RingRef::new(crate::RingExpr::Explicit {
+            crt_moduli: vec![IntExpr::constant(97), IntExpr::constant(17)],
+            ring_dimension: 8,
+        });
+        let result = value(
+            NodeKind::RnsModUp {
+                destination: crate::ring::test_ring(17 * 97 * 113, 8),
+                digit_size: 1,
+                normalize: true,
+            },
+            vec![input("source", source_type)],
+            vec![WireType::Matrix(matrix_type(17 * 97 * 113, 4, 3))],
+        );
+        let validated = crate::ring::test_validate(&graph("mod-up", result), &ParamEnv::default())
+            .expect("valid mod-up");
+        let term = crate::lean::program::program_term(&validated).expect("program term");
+        assert!(term.contains(".rnsModUp (.explicit [(.const 97), (.const 17)] 8) "), "{term}");
+    }
+
+    #[test]
     fn test_rns_mod_down_checks_destination_and_plaintext() {
         for (destination, plaintext, valid) in [
             (17, 2, true),

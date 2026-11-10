@@ -68,11 +68,9 @@ theorem keyInner {model : HashModel} {tape : SampleTape} {path : List Nat}
         (unitRow ((j : Nat) : Int) : ExactMatrix Q N 1 60) 0 w)
       (fun _ _ ↦ True) trivial (fun i s t hi _ hb ↦ ⟨hp i s t hi hb, trivial⟩) h jj
   have h0 := hk (fun s ↦ s.1) 0 (fun i s t hi hb w ↦ by
-    dsimp only
     rw [(keyInner_step (U := fun r ↦ keyDigits A ⟨30 + a, by omega⟩ r) a.isLt hi hb).1]
     rfl)
   have h1 := hk (fun s ↦ s.2.1) 1 (fun i s t hi hb w ↦ by
-    dsimp only
     rw [(keyInner_step (U := fun r ↦ keyDigits A ⟨30 + a, by omega⟩ r) a.isLt hi hb).2]
     rfl)
   fin_cases k
@@ -155,7 +153,6 @@ theorem keyLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
     (fun i ↦ if hi : i < 30 then keyCompanionSum model key 0 A k jj ⟨i, hi⟩ else 0) (fun _ _ ↦ True) trivial
     (fun i s t hi _ hb ↦ ⟨by simp only [dif_pos hi]; exact keyLoop_step hA0 hA1 hi hb k jj, trivial⟩) h
   obtain ⟨hs, -⟩ := hacc
-  dsimp only at hs
   rw [hs, ← Fin.sum_univ_eq_sum_range (fun i ↦ if hi : i < 30 then
     keyCompanionSum model key 0 A k jj ⟨i, hi⟩ else 0)]
   congr 1

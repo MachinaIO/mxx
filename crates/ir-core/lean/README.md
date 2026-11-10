@@ -54,7 +54,7 @@ one from the repository root after building this package:
 
 ```sh
 LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
-  lake +leanprover/lean4:v4.28.0 -d crates/ir-core/lean env lean \
+  lake +leanprover/lean4:v4.35.0 -d crates/ir-core/lean env lean \
   test_data/lean_ir_fixtures/sampler/Generated.lean
 ```
 
@@ -72,7 +72,7 @@ import order, writing each `.olean` into a directory that is also on `LEAN_PATH`
 out=$(mktemp -d)
 for module in Backend Stage_encrypt Stage_decrypt Ideal Claim LweProof Certificate; do
   LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean:$out \
-    lake +leanprover/lean4:v4.28.0 -d crates/ir-core/lean env lean -o "$out/$module.olean" \
+    lake +leanprover/lean4:v4.35.0 -d crates/ir-core/lean env lean -o "$out/$module.olean" \
     "test_data/lean_ir_fixtures/lwe_protocol/$module.lean"
 done
 ```
@@ -136,7 +136,7 @@ linked-claim renderer live in `crates/ir-core/src/lean`.
 
 ## Reproducible proof CI
 
-CI installs Lean `leanprover/lean4:v4.28.0`, fetches mathlib's compiled cache in this package,
+CI installs Lean `leanprover/lean4:v4.35.0`, fetches mathlib's compiled cache in this package,
 and runs `lake build` here, then in `crates/fhe/lean/tfhe`, `crates/fhe/lean/bgv`, and
 `crates/dsl/examples/rlwe`. All four builds are required by the `ci success` job.
 The certificate targets are included in each package's default targets.
@@ -163,8 +163,8 @@ cargo run --locked -p mxx-fhe --example export_claims -- "$output"
 cargo run --locked -p mxx-dsl --example rlwe_encrypt -- --export-lean crates/dsl/examples/rlwe/generated
 ```
 
-The FHE exporters and GPU tests use `mxx_fhe::utils::protocol` for the same graph templates,
-metadata and linked declarations. RLWE's export-only mode uses the same program and declaration
+The FHE exporter and GPU tests build the same graphs, those of `mxx_fhe::spec::graphs` for the
+fixtures in `crates/fhe/src/bgv/fixtures.rs` and `mxx_fhe::utils::tfhe_params`. RLWE's export-only mode uses the same program and declaration
 as its GPU mode. Exporting constructs graphs and validates declarations; it executes no
 cryptographic computation and needs neither CUDA nor a GPU.
 

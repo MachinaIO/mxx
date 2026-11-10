@@ -9,6 +9,8 @@ leaf decompositions, encryption helpers, LUT companions and preprocessed branch 
 `step_correct`. The mathematical interface is independent of the runtime artifact layout.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

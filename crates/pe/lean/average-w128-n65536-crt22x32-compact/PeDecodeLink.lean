@@ -6,6 +6,8 @@ import PeDecryptBits
 `decode_phase` with its inputs identified: the bits are those of the phase of `decrypt_bits`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

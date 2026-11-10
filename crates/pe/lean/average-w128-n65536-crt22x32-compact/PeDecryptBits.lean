@@ -8,6 +8,8 @@ error whose coefficients are bounded; under `4 (31 + decErr + 1) + 4 < Q` every 
 message bit.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
@@ -172,7 +174,8 @@ theorem decrypt_bits {model : HashModel} {key : ByteArray} {sm : ErrorPoly N} (h
     simp only [Finset.sum_const, Finset.card_univ, Fintype.card_fin, smul_eq_mul, decErr]
   intro k
   rw [show (reduceMatrix Q N 1 1 (em + (halfQ : ErrorPoly N) • mM - Err)) 0 0 =
-    reducePoly Q N (em 0 0 + (halfQ : ErrorPoly N) * intPoly m - Err 0 0) from rfl, reducePoly_coeff hQ hN]
+    reducePoly Q N (em 0 0 + (halfQ : ErrorPoly N) * intPoly m - Err 0 0) from by
+      simp only [reduceMatrix, Matrix.sub_apply, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul, mM], reducePoly_coeff hQ hN]
   have hc : (em 0 0 + (halfQ : ErrorPoly N) * intPoly m - Err 0 0).coeff k =
       (em 0 0).coeff k + halfQ * m k - (Err 0 0).coeff k := by
     rw [Negacyclic.coeff_sub, Negacyclic.coeff_add, intCast_eq_algebraMap, Negacyclic.coeff_smul,

@@ -11,6 +11,8 @@ the imported key `T` (`mask_switch`), and applies the public scalar action `V`
 (`Rel.blockAction`).
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

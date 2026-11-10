@@ -1,0 +1,41 @@
+name = "mxx-fhe"
+version = "0.1.0"
+defaultTargets = ["MxxFhe"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../../ir-core/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../../ir-core/lean"
+
+# VCVio and its own requirements are shared with `mxx-security`, which pins them.
+[[require]]
+name = "VCVio"
+path = "../../../ir-core/lean/security/.lake/packages/VCVio"
+
+[[require]]
+name = "PolyFun"
+path = "../../../ir-core/lean/security/.lake/packages/PolyFun"
+
+[[require]]
+name = "QuantumFoundations"
+path = "../../../ir-core/lean/security/.lake/packages/QuantumFoundations"
+
+[[require]]
+name = "cslib"
+path = "../../../ir-core/lean/security/.lake/packages/cslib"
+
+[[require]]
+name = "mxx-security"
+path = "../../../ir-core/lean/security"
+
+# The implementation-agnostic definitions of public-key FHE and their generic lemmas.
+[[lean_lib]]
+name = "MxxFhe"
+roots = ["MxxFhe"]

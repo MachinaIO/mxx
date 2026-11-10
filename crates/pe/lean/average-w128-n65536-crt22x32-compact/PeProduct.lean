@@ -8,6 +8,8 @@ plus the companion row of the bottom digit rows, encodes `μ X^x` under the prod
 `M_{k,j} = Σ_a B_{jj,a,k} Dec(A_{k,44+a}) + A_{k,0} topRows(Dec(R))`.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

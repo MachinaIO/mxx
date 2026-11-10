@@ -50,6 +50,8 @@ The 128 slot preimages, which the generated graph reads in the lexicographic ord
 indices, are reordered by slot.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
@@ -96,7 +98,7 @@ theorem key_sample {{rows : Nat}} {{tape : SampleTape}} {{site : List Nat}} {{x 
     (h : gaussianSampleAt tape site ({{SIGMA}}) 73534451498 x) :
     x = reduceMatrix Q N rows 1 (keySample tape site) ∧ CoeffBound (keySample (rows := rows) tape site) keyCutoff := by
   obtain ⟨hx, hb⟩ := gaussianSampleAt_explicit hN h
-  exact ⟨hx, fun r c k ↦ by have := hb r c k; simpa using this⟩
+  exact ⟨hx, fun r c k ↦ by have := hb r c k; first | simpa using this | exact this⟩
 
 /-- The anchor blocks of slot `i` among the keygen wires. -/
 def anchorW {{model : HashModel}} {{tape : SampleTape}} {{path : List Nat}}
@@ -220,8 +222,12 @@ CASES
 
 end PeProof
 """
-    sigma = re.search(r'local notation "mxxNat1" => (\d+)', (HERE / "generated" / "Stage_keygen.lean").read_text()).group(1)
-    sigma2 = re.search(r'local notation "mxxNat2" => (\d+)', (HERE / "generated" / "Stage_keygen.lean").read_text()).group(1)
+    keygen = (HERE / "generated" / "Stage_keygen.lean").read_text()
+    # The notations of the Gaussian width `sigma = numerator / denominator` the sampler reads.
+    numerator, denominator = re.search(r'gaussianSampleAt tape \(path \+\+ \[0\]\) \(\((mxxNat\d+)/(mxxNat\d+)\)\)',
+                                       keygen).groups()
+    sigma = re.search(rf'local notation "{numerator}" => (\d+)', keygen).group(1)
+    sigma2 = re.search(rf'local notation "{denominator}" => (\d+)', keygen).group(1)
     text = (text.replace("{SIGMA}", f"{sigma} / {sigma2}").replace("CASES", "\n".join(cases))
             .replace("ANCHORW", ", ".join(anchor_w)))
     (HERE / "PeKeygenRoot.lean").write_text(text)

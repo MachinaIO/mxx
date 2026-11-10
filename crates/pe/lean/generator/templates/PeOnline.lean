@@ -62,7 +62,6 @@ theorem colLoopMul {model : HashModel} {tape : SampleTape} {path : List Nat} {c 
           subst this
           exact ⟨w7, hrun, x8⟩) h
   obtain ⟨hsum, hQ⟩ := hacc
-  dsimp only at hsum
   refine ⟨?_, hQ jj jj.isLt⟩
   rw [hsum, zero_add]
   rw [sum_unitRow_entry F jj]
@@ -114,7 +113,6 @@ theorem colLoopHelper {model : HashModel} {tape : SampleTape} {path : List Nat} 
           subst this
           exact ⟨w7, hrun, x8⟩) h
   obtain ⟨hsum, hQ⟩ := hacc
-  dsimp only at hsum
   refine ⟨?_, hQ jj jj.isLt⟩
   rw [hsum, zero_add]
   rw [sum_unitRow_entry F jj]
@@ -166,7 +164,6 @@ theorem colLoopSwitch {model : HashModel} {tape : SampleTape} {path : List Nat} 
           subst this
           exact ⟨w7, hrun, x8⟩) h
   obtain ⟨hsum, hQ⟩ := hacc
-  dsimp only at hsum
   refine ⟨?_, hQ jj jj.isLt⟩
   rw [hsum, zero_add]
   rw [sum_unitRow_entry F jj]
@@ -890,8 +887,11 @@ theorem online_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
   all_goals try rfl
   have hj := hout j
   rw [hE] at hj
+  have hσ : σc = ![substituteMatrix K hK (mulRow 0), substituteMatrix K hK (mulRow 1)] := by
+    funext j
+    fin_cases j <;> rfl
   fin_cases j
-  · simpa [σc, matrixMul] using hj
-  · simpa [σc, matrixMul] using hj
+  · simpa [hσ, matrixMul, hrow, top, bot] using hj
+  · simpa [hσ, matrixMul, hrow, top, bot] using hj
 
 end PeProof

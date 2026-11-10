@@ -13,6 +13,8 @@ The encryption of `X^0`, the four online steps, and the requirement's chain: the
 `0` under the preprocessed output key.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

@@ -121,7 +121,7 @@ theorem preprocess_link {model : HashModel} {tape : SampleTape} {key : ByteArray
     have hpe : (⟨8 * (p / 8 : Nat) + p % 8, by omega⟩ : Fin 16) = p := Fin.ext (by simp; omega)
     simp only [halves, rowWindow, hMM] at hp
     rw [hpe] at hp
-    convert hp using 1
+    convert hp using 1 <;> rfl
   have hV1' := V1c_eq hg hV1
   have hVK' := VKc_eq hg hVK
   have hAF : ∀ k j : Fin 2, outputKey model key

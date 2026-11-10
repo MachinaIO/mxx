@@ -7,6 +7,8 @@ Every branch's encoding is acted on by its public scalar `V_b = Dec(W⁻¹ α_b 
 128 branches of `H` interpolates the table.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut MxxPe

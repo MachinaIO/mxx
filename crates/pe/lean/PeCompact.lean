@@ -250,7 +250,7 @@ theorem gadgetMatrixRuns_const {q m : Nat} {backend : BackendContext} {base digi
     unfold regularGadgetUnflattened
     split
     · exact ⟨_, rfl⟩
-    · exact ⟨0, by simp⟩
+    · exact ⟨0, by simp <;> exact rfl⟩
   choose w hw using fun c : Fin m ↦ hfull 0 (regularColumnIndex layout (Fin.cast hwidth c))
   refine ⟨w, fun c ↦ ?_⟩
   rw [castMatrixColumns_apply]

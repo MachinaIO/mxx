@@ -25,7 +25,7 @@ theorem measurable_of_dependsOn {β : Type} [MeasurableSpace β] {f : (ι → �
     funext ω
     exact hf fun i hi ↦ by simp [extend, Finset.mem_coe.mp hi]
   rw [hfac]
-  exact (measurable_of_countable _).comp (measurable_pi_lambda _ fun i ↦ measurable_pi_apply _)
+  exact (measurable_of_countable _).comp (Measurable.of_eval fun i ↦ measurable_pi_apply _)
 
 theorem dependsOn_update {β : Type} {f : (ι → ℤ) → β} {S : Set ι} (hf : DependsOn f S) {k : ι}
     (hk : k ∉ S) (ω : ι → ℤ) (x : ℤ) : f (update ω k x) = f ω :=
@@ -35,11 +35,12 @@ variable (μ : ι → Measure ℤ) [∀ i, IsProbabilityMeasure (μ i)]
 
 theorem measurable_update_pair (k : ι) :
     Measurable fun p : ℤ × (ι → ℤ) ↦ update p.2 k p.1 := by
-  refine measurable_pi_lambda _ fun i ↦ ?_
+  refine Measurable.of_eval fun i ↦ ?_
   by_cases h : i = k
   · subst h
     simpa using measurable_fst
-  · simpa [update_of_ne h] using (measurable_pi_apply i).comp measurable_snd
+  · simp only [update_of_ne h]
+    exact (measurable_pi_apply i).comp measurable_snd
 
 /-- Resampling one coordinate independently leaves the product measure unchanged. -/
 theorem infinitePi_eq_map_update (k : ι) :

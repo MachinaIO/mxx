@@ -8,6 +8,8 @@ The 128 slot preimages, which the generated graph reads in the lexicographic ord
 indices, are reordered by slot.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
@@ -54,7 +56,7 @@ theorem key_sample {rows : Nat} {tape : SampleTape} {site : List Nat} {x : Exact
     (h : gaussianSampleAt tape site (1131299253824644287551751132617585608914050298945165586182356207494300740924615835754287453274858803 / 100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000) 73534451498 x) :
     x = reduceMatrix Q N rows 1 (keySample tape site) ∧ CoeffBound (keySample (rows := rows) tape site) keyCutoff := by
   obtain ⟨hx, hb⟩ := gaussianSampleAt_explicit hN h
-  exact ⟨hx, fun r c k ↦ by have := hb r c k; simpa using this⟩
+  exact ⟨hx, fun r c k ↦ by have := hb r c k; first | simpa using this | exact this⟩
 
 /-- The anchor blocks of slot `i` among the keygen wires. -/
 def anchorW {model : HashModel} {tape : SampleTape} {path : List Nat}

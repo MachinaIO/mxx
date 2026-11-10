@@ -8,6 +8,8 @@ bottom entries alone (as encryption computes its companions) and, in their top r
 public top row (as preprocessing computes the public top terms).
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

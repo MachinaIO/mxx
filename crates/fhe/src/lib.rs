@@ -3,9 +3,8 @@
 //! Methods construct graphs; key generation, sampling, polynomial arithmetic, and decryption run
 //! when `mxx-backends` executes the validated graph, on the CPU or the GPU. TFHE implements NAND
 //! bootstrapping over integer LWE; BGV is leveled, with SIMD slots, rotations, and hybrid RNS key
-//! switching, and has no bootstrapping. [`FheScheme`] is the shared matrix-plaintext `keygen`,
-//! `encrypt`, `decrypt`, `add`, and `mul` interface, implemented by BGV; TFHE has its own integer
-//! LWE API.
+//! switching, and has no bootstrapping. Both implement the one implementation-agnostic syntax of
+//! public-key homomorphic encryption, [`spec::Fhe`], which binds them to the Lean statements.
 //!
 //! Parameters do not imply a security level, and the test parameters are correctness fixtures.
 //! Ciphertext and key compatibility beyond ring and shape is the caller's responsibility: graph
@@ -28,17 +27,16 @@
 //! carry correction factors or bounds, so carry them alongside the components when connecting
 //! separate protocol stages.
 
-mod bgv;
+pub mod bgv;
 mod params;
+pub mod spec;
 #[cfg(all(test, feature = "gpu"))]
 mod tests_gpu;
-mod tfhe;
-#[cfg(feature = "gpu")]
-mod tfhe_gpu;
+pub mod tfhe;
 pub mod utils;
 
 pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvHybridParams, BgvParams};
-use mxx_dsl::{DslError, GraphValue, Mat};
+use mxx_dsl::DslError;
 pub use params::FheCommonParams;
 pub use tfhe::{
     BootstrappingKey, BootstrappingKeySchema, KeySwitchKey, KeySwitchKeySchema, LweCiphertext,
@@ -67,35 +65,4 @@ pub enum FheError {
     Protocol(#[from] mxx_ir_core::protocol::ProtocolError),
     #[error(transparent)]
     Specification(#[from] mxx_ir_core::protocol::SpecificationError),
-}
-
-/// Shared matrix-plaintext graph operations. TFHE uses its dedicated integer
-/// LWE API; BGV multiplication uses a relinearization key.
-pub trait FheScheme {
-    type Plaintext: GraphValue;
-    type Ciphertext: GraphValue;
-    type MulRhs: GraphValue;
-    type EvaluationKey;
-
-    fn common_params(&self) -> &FheCommonParams;
-    /// Returns `(secret_key, encryption_key)` graph handles.
-    fn keygen(&self) -> Result<(Mat, Mat), FheError>;
-    fn encrypt(&self, key: &Mat, plaintext: &Self::Plaintext)
-    -> Result<Self::Ciphertext, FheError>;
-    fn decrypt(
-        &self,
-        secret: &Mat,
-        ciphertext: &Self::Ciphertext,
-    ) -> Result<Self::Plaintext, FheError>;
-    fn add(
-        &self,
-        lhs: &Self::Ciphertext,
-        rhs: &Self::Ciphertext,
-    ) -> Result<Self::Ciphertext, FheError>;
-    fn mul(
-        &self,
-        lhs: &Self::Ciphertext,
-        rhs: &Self::MulRhs,
-        eval_key: &Self::EvaluationKey,
-    ) -> Result<Self::Ciphertext, FheError>;
 }

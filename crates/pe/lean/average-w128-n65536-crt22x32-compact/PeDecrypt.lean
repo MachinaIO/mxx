@@ -7,6 +7,8 @@ The helper encodings and the output encoding in the form of the phase identity, 
 from its anchor preimage, and the integer phase error with its coefficient bound.
 -/
 
+set_option maxRecDepth 4000000
+
 namespace PeProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut

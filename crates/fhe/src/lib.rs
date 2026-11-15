@@ -36,7 +36,7 @@ pub mod tfhe;
 pub mod utils;
 
 pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvHybridParams, BgvParams};
-use mxx_dsl::DslError;
+use mxx_lattice_dsl::DslError;
 pub use params::FheCommonParams;
 pub use tfhe::{
     BootstrappingKey, BootstrappingKeySchema, KeySwitchKey, KeySwitchKeySchema, LweCiphertext,

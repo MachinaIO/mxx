@@ -1,4 +1,4 @@
-# mxx-dsl API specification
+# mxx-lattice-dsl API specification
 
 This document lists every value type and operation of the DSL, grouped by purpose, with how to
 call each one. It is written for readers who know lattice cryptography but not mxx. Read it top

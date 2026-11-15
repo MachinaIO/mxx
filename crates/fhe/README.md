@@ -3,7 +3,7 @@
 `mxx-fhe` builds fully homomorphic encryption with the mxx DSL: TFHE with NAND bootstrapping over
 integer LWE, and leveled BGV with SIMD slots, rotations, relinearization, and hybrid RNS key
 switching. Its methods build graphs rather than encrypting eagerly, so the same key generation,
-encryption, evaluation, and decryption can run on the CPU or a supported GPU backend. It depends on `mxx-dsl`,
+encryption, evaluation, and decryption can run on the CPU or a supported GPU backend. It depends on `mxx-lattice-dsl`,
 `mxx-ir-core`, and `mxx-backends`.
 
 ## Contents

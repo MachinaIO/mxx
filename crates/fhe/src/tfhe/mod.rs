@@ -7,14 +7,14 @@ use crate::{
     utils::{check_family, check_matrix},
 };
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_dsl::{
-    DslError, Family, FamilyType, GraphValue, GraphValueSchema, Int, IntType, Mat, MatType,
-    Subgraph, iterate, parallel, select,
-};
 use mxx_ir_core::{
     IntExpr, RealExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
     types::WireType,
+};
+use mxx_lattice_dsl::{
+    DslError, Family, FamilyType, GraphValue, GraphValueSchema, Int, IntType, Mat, MatType,
+    Subgraph, iterate, parallel, select,
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
@@ -1299,7 +1299,7 @@ mod tests {
     use super::*;
     use crate::utils::{common, execute_graph, int_input};
     use mxx_backends::RuntimeValue;
-    use mxx_dsl::{BuiltGraph, DslContext, IntType};
+    use mxx_lattice_dsl::{BuiltGraph, DslContext, IntType};
     use std::collections::BTreeMap;
 
     fn test_params() -> TfheParams {

@@ -5,8 +5,8 @@
 use crate::{
     GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
 };
-use mxx_dsl::{DslContext, HashTag, Ring, parallel};
 use mxx_ir_core::{FrozenGraphScopeId, IntExpr, NodeId, ParamEnv, generate_crt_basis};
+use mxx_lattice_dsl::{DslContext, HashTag, Ring, parallel};
 use std::{collections::BTreeMap, sync::Arc};
 
 fn env_usize(name: &str, default: usize) -> usize {

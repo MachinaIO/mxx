@@ -25,8 +25,10 @@ use mxx_backends::{
     },
     transcript::SamplingMode,
 };
-use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select};
 use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
+use mxx_lattice_dsl::{
+    ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select,
+};
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 
@@ -230,7 +232,7 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
             Ok(outputs) => Ok(outputs),
             Err(error) => {
                 body_error = Some(error);
-                Err(mxx_dsl::DslError::Schema)
+                Err(mxx_lattice_dsl::DslError::Schema)
             }
         });
         if let Some(error) = body_error {

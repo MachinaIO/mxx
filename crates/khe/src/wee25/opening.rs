@@ -1,7 +1,6 @@
 //! Standalone WEE25 opening and verification graphs.
 
 use crate::wee25::{Wee25CommitmentCompiler, Wee25CommitmentError};
-use mxx_dsl::{Family, Mat, Preimage};
 #[cfg(test)]
 use mxx_ir_core::types::CoefficientBoundDomain;
 use mxx_ir_core::{
@@ -9,6 +8,7 @@ use mxx_ir_core::{
     artifact::{ArtifactAvailability, ProductionId},
     node::{ConcatAxis, ConstantMatrix, IndexRange},
 };
+use mxx_lattice_dsl::{Family, Mat, Preimage};
 use rayon::prelude::*;
 use std::{collections::BTreeMap, ops::Range};
 
@@ -435,8 +435,8 @@ mod tests {
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
         transcript::SamplingMode,
     };
-    use mxx_dsl::DslContext;
     use mxx_ir_core::{ParamEnv, artifact::SpecHash, node::NodeKind, types::WireType};
+    use mxx_lattice_dsl::DslContext;
     use num_bigint::{BigInt, BigUint};
     use std::collections::{BTreeMap, HashMap};
 
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn imported_top_is_preimage_and_bottom_is_matrix_with_explicit_rhs_node() {
         let compiler = Wee25CommitmentCompiler {
-            ring: mxx_dsl::Ring::from_crt_moduli(vec![17.into()], 8),
+            ring: mxx_lattice_dsl::Ring::from_crt_moduli(vec![17.into()], 8),
             secret_size: 1,
             tree_base: 2,
             digit_count: 2,

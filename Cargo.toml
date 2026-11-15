@@ -1,8 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/core",
     "crates/ir-core",
-    "crates/dsl",
+    "crates/lattice-dsl",
+    "crates/lattice-leaves",
     "crates/backends",
     "crates/khe",
     "crates/exponent-lut",
@@ -27,8 +29,10 @@ mxx-khe = { path = "crates/khe" }
 mxx-exponent-lut = { path = "crates/exponent-lut" }
 mxx-func-enc = { path = "crates/func-enc" }
 mxx-io = { path = "crates/io" }
+mxx-core = { path = "crates/core" }
 mxx-ir-core = { path = "crates/ir-core" }
-mxx-dsl = { path = "crates/dsl" }
+mxx-lattice-dsl = { path = "crates/lattice-dsl" }
+mxx-lattice-leaves = { path = "crates/lattice-leaves" }
 mxx-fhe = { path = "crates/fhe" }
 bigdecimal = "0.4"
 bincode = "2.0.1"

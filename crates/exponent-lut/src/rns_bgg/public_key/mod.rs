@@ -11,11 +11,13 @@ use crate::{
     },
 };
 use mxx_backends::{RuntimeValue, poly::Poly};
-use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     artifact::{ArtifactAvailability, ProductionId},
     types::WireType,
+};
+use mxx_lattice_dsl::{
+    Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat,
 };
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -72,7 +74,7 @@ impl<M: GraphValue> GraphValue for RnsBggPublicKey<M> {
     fn from_values(
         schema: &Self::Schema,
         values: &[ValueHandle],
-    ) -> Result<Self, mxx_dsl::DslError> {
+    ) -> Result<Self, mxx_lattice_dsl::DslError> {
         Ok(Self::new(schema.wire, M::from_values(&schema.matrix, values)?))
     }
 }

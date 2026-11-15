@@ -1,0 +1,13 @@
+name = "MxxCore"
+defaultTargets = ["MxxCore"]
+
+# The machine model, program logic, and their pins come from mathcal-A. This revision is on the
+# branch `claude/lean-project-cli-27d0d8`, which is not on the remote yet: until it is, build with
+# `scripts/check_core_lean.sh`, which reads a local mathcal-A build without writing to it.
+[[require]]
+name = "MathcalA"
+git = "https://github.com/MachinaIO/mathcal-A"
+rev = "382e21f565d5372330df8ce8b6c6bb032e695410"
+
+[[lean_lib]]
+name = "MxxCore"

@@ -6,12 +6,12 @@
 //! small probability over the sampled keys and errors.
 
 use mxx_backends::{GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend};
-use mxx_dsl::BuiltGraph;
 use mxx_fhe::{
     spec::{Circuit, graphs, roles},
     tfhe::scheme::TfheScheme,
     utils::{self, gpu},
 };
+use mxx_lattice_dsl::BuiltGraph;
 use num_bigint::BigInt;
 use rand::Rng;
 use std::{collections::BTreeMap, time::Instant};

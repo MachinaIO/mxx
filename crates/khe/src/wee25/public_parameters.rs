@@ -3,11 +3,11 @@
 use crate::wee25::{
     WEE25_T_BOTTOM, Wee25CommitmentCompiler, Wee25CommitmentError, Wee25PublicParameterWires,
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Trapdoor};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     node::{ConstantMatrix, IndexRange},
 };
+use mxx_lattice_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Trapdoor};
 
 /// The trapdoor of the public matrix `b`. The trapdoor output flattens into `b` itself
 /// ([`WEE25_PUBLIC_B`](crate::wee25::WEE25_PUBLIC_B), `.0`) and this trapdoor (`.1`).
@@ -208,7 +208,7 @@ impl Wee25PublicParameterCompiler {
 mod tests {
     use super::*;
     use crate::bgg::test_utils::{execute_graph, matrix_output};
-    use mxx_dsl::DslContext;
+    use mxx_lattice_dsl::DslContext;
 
     use mxx_backends::{
         ExecutionResult, RuntimeValue,

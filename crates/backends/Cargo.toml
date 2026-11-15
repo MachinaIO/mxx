@@ -36,7 +36,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-mxx-dsl.workspace = true
+mxx-core.workspace = true
+mxx-lattice-dsl.workspace = true
 serial_test.workspace = true
 tracing-subscriber.workspace = true
 

@@ -126,7 +126,7 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         // A member reference names its member by the index expression itself,
         // so a read can tell the loop member it belongs to.
         Ok(RhsRef {
-            id: mxx_dsl::GraphValue::schema(family).element.id,
+            id: mxx_lattice_dsl::GraphValue::schema(family).element.id,
             index: Some(Int::evaluate(index.clone())),
         })
     }
@@ -138,7 +138,7 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         position: &IntExpr,
     ) -> Result<RhsRef<Int>, crate::program::ProgramLowerError<RnsBggError>> {
         Ok(RhsRef {
-            id: mxx_dsl::GraphValue::schema(family).element.id,
+            id: mxx_lattice_dsl::GraphValue::schema(family).element.id,
             index: Some(
                 self.selected_member(data, position)
                     .map_err(crate::program::ProgramLowerError::Backend)?,
@@ -453,8 +453,11 @@ impl<'a> PublicKeyLowering<'a> {
             .map(|member| key_of(Some(IntExpr::constant(member))))
             .collect::<Result<Vec<_>, _>>()?;
         let pick = |part: fn(&RnsBggMatrix) -> &Mat| {
-            mxx_dsl::select(index.clone(), keys.iter().map(|key| part(key).clone()).collect())
-                .map_err(graph)
+            mxx_lattice_dsl::select(
+                index.clone(),
+                keys.iter().map(|key| part(key).clone()).collect(),
+            )
+            .map_err(graph)
         };
         Ok((
             (pick(|key| &key.0.0)?, pick(|key| &key.0.1)?),
@@ -531,7 +534,7 @@ impl<'a> PublicKeyLowering<'a> {
         let width = 2 * columns;
         let split = |row: &Mat| super::split_row(row, columns);
         let schema = |_| DslError::Schema;
-        mxx_dsl::iterate(IntExpr::constant(switched.len()), initial, |index, sum| {
+        mxx_lattice_dsl::iterate(IntExpr::constant(switched.len()), initial, |index, sum| {
             let branch = index.expression()?;
             let k = select(&switched, branch.clone());
             let start = (branch * IntExpr::constant(width)).canonicalize();
@@ -627,7 +630,7 @@ impl<'a> PublicKeyLowering<'a> {
             };
         let input_rows = [&key.0, &key.1].map(super::join_row);
         let mut sum = initial;
-        let mut parents: Option<mxx_dsl::Family<RnsBggMatrix>> = None;
+        let mut parents: Option<mxx_lattice_dsl::Family<RnsBggMatrix>> = None;
         let mut products = [Vec::with_capacity(plan.len()), Vec::with_capacity(plan.len())];
         for depth in plan {
             let switches = &depth.switches;
@@ -667,7 +670,7 @@ impl<'a> PublicKeyLowering<'a> {
             // The switched keys of the next depth's parents, in one parallel loop.
             let keys = (depth.internal > 0)
                 .then(|| {
-                    mxx_dsl::parallel(depth.internal, |position| {
+                    mxx_lattice_dsl::parallel(depth.internal, |position| {
                         let index = position.expression()?;
                         switched_key(
                             select(switches, index.clone()),
@@ -680,24 +683,28 @@ impl<'a> PublicKeyLowering<'a> {
                 .transpose()?;
             let ks = &depth.branches;
             if let Some(keys) = &keys {
-                sum = mxx_dsl::iterate(IntExpr::constant(depth.internal), sum, |index, sum| {
-                    let branch = index.expression()?;
-                    let action = scalar_action(
-                        self.parameters,
-                        level,
-                        coefficient(select(ks, branch)).map_err(schema)?,
-                    )
-                    .map_err(schema)?;
-                    Ok(super::add_public_matrices(
-                        sum,
-                        scalar_action_matrix(keys.at(index), &action),
-                    ))
-                })
+                sum = mxx_lattice_dsl::iterate(
+                    IntExpr::constant(depth.internal),
+                    sum,
+                    |index, sum| {
+                        let branch = index.expression()?;
+                        let action = scalar_action(
+                            self.parameters,
+                            level,
+                            coefficient(select(ks, branch)).map_err(schema)?,
+                        )
+                        .map_err(schema)?;
+                        Ok(super::add_public_matrices(
+                            sum,
+                            scalar_action_matrix(keys.at(index), &action),
+                        ))
+                    },
+                )
                 .map_err(graph)?;
             }
             let leaves = depth.branches.len() - depth.internal;
             if leaves > 0 {
-                sum = mxx_dsl::iterate(IntExpr::constant(leaves), sum, |index, sum| {
+                sum = mxx_lattice_dsl::iterate(IntExpr::constant(leaves), sum, |index, sum| {
                     let branch =
                         (IntExpr::constant(depth.internal) + index.expression()?).canonicalize();
                     let switched = switched_key(
@@ -769,7 +776,7 @@ impl<'a> PublicKeyLowering<'a> {
         let schema = |_| DslError::Schema;
         let public_rows = super::automorphism_public_rows(self.parameters, level)?;
         let input_rows = [&key.0, &key.1].map(super::join_row);
-        let mut parents: Vec<mxx_dsl::Family<RnsBggMatrix>> = Vec::new();
+        let mut parents: Vec<mxx_lattice_dsl::Family<RnsBggMatrix>> = Vec::new();
         let mut published = Vec::new();
         let product = |rows: &[[Mat; 2]], k: IntExpr, inverse: IntExpr| {
             let tag = setup.package_tag(&RnsBggPackage::Automorphism(k.clone()));
@@ -828,7 +835,7 @@ impl<'a> PublicKeyLowering<'a> {
             if depth.internal == 0 {
                 continue;
             }
-            let family = mxx_dsl::parallel(depth.internal, |position| {
+            let family = mxx_lattice_dsl::parallel(depth.internal, |position| {
                 let b = position.expression()?;
                 let rows = if depth_index == 0 {
                     input_rows.clone()
@@ -872,7 +879,7 @@ impl<'a> PublicKeyLowering<'a> {
         for (group_index, group) in
             crate::rns_bgg::dynamic::leaf_members(&plan).into_iter().enumerate()
         {
-            let family = mxx_dsl::parallel(group.switches.len(), |member| {
+            let family = mxx_lattice_dsl::parallel(group.switches.len(), |member| {
                 let member = member.expression()?;
                 let rows = group
                     .depths
@@ -1073,12 +1080,12 @@ impl<'a> PublicKeyLowering<'a> {
         let payload = &self.payload()?.row;
         let columns =
             self.parameters.lut_output_columns(next_level, table.output_representation())?;
-        let switching_ciphertexts = mxx_dsl::parallel(count, |index| {
+        let switching_ciphertexts = mxx_lattice_dsl::parallel(count, |index| {
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            let mut tag = mxx_dsl::HashTag::from(
+            let mut tag = mxx_lattice_dsl::HashTag::from(
                 format!("rns-bgg/lut-b/{:?}/{level}/{next_level}", lut_id).into_bytes(),
             );
             tag.push("sigma");
@@ -1376,8 +1383,10 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         } else {
             None
         };
-        let result =
-            mxx_dsl::iterate(IntExpr::constant(table.input_width()), initial, |index, sum| {
+        let result = mxx_lattice_dsl::iterate(
+            IntExpr::constant(table.input_width()),
+            initial,
+            |index, sum| {
                 let index = selected.clone().map(Int::from).unwrap_or(index);
                 let sigma = IntExpr::Select {
                     selector: Box::new(index.expression()?),
@@ -1413,8 +1422,9 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                 .map_err(|_| DslError::Schema)?;
                 let branch = super::multiply_public_by_columns(data, switched_key_decomposition);
                 Ok(super::add_public_matrices(sum, branch))
-            })
-            .map_err(graph)?;
+            },
+        )
+        .map_err(graph)?;
         self.finish_lut(result)
     }
 }
@@ -1668,7 +1678,7 @@ mod test {
         }
         // Both LUTs read the helpers of level zero; a graph with both
         // outputs declares each helper input once.
-        let mut context = mxx_dsl::DslContext::new("equal-luts-online-eval");
+        let mut context = mxx_lattice_dsl::DslContext::new("equal-luts-online-eval");
         for (index, encoding) in online_eval_outputs.iter().enumerate() {
             context = context.output(format!("row-{index}"), encoding.row.1.clone()).unwrap();
         }
@@ -1714,7 +1724,11 @@ mod test {
         );
     }
 
-    fn input_key_matrix(ring: &mxx_dsl::Ring, prefix: &str, columns: usize) -> RnsBggMatrix {
+    fn input_key_matrix(
+        ring: &mxx_lattice_dsl::Ring,
+        prefix: &str,
+        columns: usize,
+    ) -> RnsBggMatrix {
         let entry = |suffix: &str| ring.input(format!("{prefix}-{suffix}"), (1, columns));
         ((entry("00"), entry("01")), (entry("10"), entry("11")))
     }

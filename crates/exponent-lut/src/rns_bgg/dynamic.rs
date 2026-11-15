@@ -42,7 +42,7 @@
 //! they are read ([`expand_compact_row`]); their keys are the expansions of
 //! `2 x 2` keys over `R_pq` ([`expand_compact_matrix`]).
 use super::*;
-use mxx_dsl::Int;
+use mxx_lattice_dsl::Int;
 
 /// `Select(selector, values)`: the value at position `selector`.
 pub(crate) fn select(values: &[usize], selector: IntExpr) -> IntExpr {
@@ -133,7 +133,7 @@ pub(crate) fn lut_automorphisms(
 pub(crate) fn automorphism_ciphertext(
     parameters: &RnsBggParameters,
     setup: &RnsBggDynamicSetup,
-    hash_key: mxx_dsl::Bytes,
+    hash_key: mxx_lattice_dsl::Bytes,
     k: IntExpr,
     inverse: IntExpr,
     inverse_helper: RnsBggRow,
@@ -151,10 +151,10 @@ pub(crate) fn automorphism_ciphertext(
 pub(crate) fn automorphism_public_top(
     parameters: &RnsBggParameters,
     setup: &RnsBggDynamicSetup,
-    hash_key: mxx_dsl::Bytes,
+    hash_key: mxx_lattice_dsl::Bytes,
     k: IntExpr,
     inverse: IntExpr,
-) -> Result<mxx_dsl::Mat, RnsBggError> {
+) -> Result<mxx_lattice_dsl::Mat, RnsBggError> {
     let routed = map_row(setup.helper_key(parameters, hash_key, inverse)?.0, |entry| {
         entry.ring_automorphism(k.clone())
     });

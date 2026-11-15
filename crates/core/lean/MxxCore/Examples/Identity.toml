@@ -1,0 +1,6 @@
+module = "MxxCore.Examples.Identity"
+impl = "MxxCore.Examples.Identity.Impl"
+algorithms = ["run"]
+params = "MxxCore.Examples.Identity.Params"
+correct = "MxxCore.Examples.Identity.Correct"
+notions = []

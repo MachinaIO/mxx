@@ -21,13 +21,13 @@ use mxx_backends::{
         },
     },
 };
-use mxx_dsl::{Bool, DslContext, Family, Int, Ring, iterate, parallel, select};
 use mxx_ir_core::{
     ParamEnv,
     node::{IntBinaryOp, IntCompareOp, NodeKind},
     ring::{RingExpr, RingRef},
     types::{ConcreteMatrixType, ConcreteWireType},
 };
+use mxx_lattice_dsl::{Bool, DslContext, Family, Int, Ring, iterate, parallel, select};
 use num_bigint::BigInt;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -121,7 +121,7 @@ fn gpu_boolean_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> Runt
     .expect("bind exact boolean family")
 }
 
-fn control_graph(moduli: &[u64], ring_dimension: u32) -> mxx_dsl::BuiltGraph {
+fn control_graph(moduli: &[u64], ring_dimension: u32) -> mxx_lattice_dsl::BuiltGraph {
     control_graph_with_count(moduli, ring_dimension, 4)
 }
 
@@ -139,7 +139,7 @@ fn matrix_partial_slice_concat_replays_with_fresh_owners() {
         |start: usize, end: usize| Some(IndexRange { start: start.into(), end: end.into() });
     let left = input.clone().slice(range(0, 2), range(0, 2));
     let right = input.slice(range(0, 2), range(2, 4));
-    let combined = mxx_dsl::Mat::concat(ConcatAxis::Columns, vec![left, right]);
+    let combined = mxx_lattice_dsl::Mat::concat(ConcatAxis::Columns, vec![left, right]);
     let graph = context
         .output("matrix", combined.clone() + combined)
         .unwrap()
@@ -453,7 +453,7 @@ fn control_graph_with_count(
     moduli: &[u64],
     ring_dimension: u32,
     count: usize,
-) -> mxx_dsl::BuiltGraph {
+) -> mxx_lattice_dsl::BuiltGraph {
     let context = DslContext::new("gpu-resident-control-regression");
     let ring =
         Ring::from_crt_moduli(moduli.iter().copied().map(Into::into).collect(), ring_dimension);
@@ -498,7 +498,7 @@ fn sequential_control_graph(
     moduli: &[u64],
     ring_dimension: u32,
     count: usize,
-) -> mxx_dsl::BuiltGraph {
+) -> mxx_lattice_dsl::BuiltGraph {
     let context = DslContext::new("gpu-resident-sequential-control-regression");
     let ring =
         Ring::from_crt_moduli(moduli.iter().copied().map(Into::into).collect(), ring_dimension);
@@ -514,7 +514,7 @@ fn sequential_control_graph(
         .expect("build sequential resident graph")
 }
 
-fn all_nodes(graph: &mxx_dsl::BuiltGraph) -> Vec<&mxx_ir_core::NodeHandle> {
+fn all_nodes(graph: &mxx_lattice_dsl::BuiltGraph) -> Vec<&mxx_ir_core::NodeHandle> {
     graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect()
 }
 
@@ -890,7 +890,7 @@ fn parallel_loops_inside_sequential_device_loops_run_every_lane() {
         let anchor = test_ring(&parameters).input("anchor", (1, 1));
         let scaled = Family::pack(vec![anchor.clone(), anchor.clone() * 2]).unwrap();
         // Each step maps s to (2s + 1) + (2s + 2) = 4s + 3 through two lanes.
-        let step = |state: mxx_dsl::Mat| {
+        let step = |state: mxx_lattice_dsl::Mat| {
             let lanes = parallel(2, |lane| Ok(state.clone() * 2 + scaled.at(lane)))?;
             Ok(lanes.at(Int::constant(0)) + lanes.at(Int::constant(1)))
         };
@@ -922,7 +922,8 @@ fn sequential_loops_nested_in_device_bodies_restart_every_invocation() {
         let context = DslContext::new("sequential-in-sequential");
         let anchor = test_ring(&parameters).input("anchor", (1, 1));
         // Inner: two doublings. Outer: three times (inner(s) + anchor).
-        let double_twice = |state: mxx_dsl::Mat| iterate(2, state, |_, inner| Ok(inner * 2));
+        let double_twice =
+            |state: mxx_lattice_dsl::Mat| iterate(2, state, |_, inner| Ok(inner * 2));
         let outer =
             iterate(3, anchor.clone(), |_, state| Ok(double_twice(state)? + anchor.clone()))
                 .unwrap();

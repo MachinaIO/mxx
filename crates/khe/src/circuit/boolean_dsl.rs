@@ -2,8 +2,8 @@
 
 use super::{BooleanCircuitData, BooleanCircuitShape, BooleanGateData};
 use mxx_backends::RuntimeValue;
-use mxx_dsl::{Bool, DslContext, DslError, Family, Int, Mat, iterate, parallel, select};
 use mxx_ir_core::IntExpr;
+use mxx_lattice_dsl::{Bool, DslContext, DslError, Family, Int, Mat, iterate, parallel, select};
 use num_bigint::BigInt;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -257,7 +257,7 @@ fn reduce_bool_family(values: Family<Bool>, count: IntExpr) -> Result<Bool, DslE
 /// slots use canonical zero padding.
 pub fn boolean_circuit_validity_predicate(
     context: DslContext,
-) -> Result<mxx_dsl::PurePredicateSpec, DslError> {
+) -> Result<mxx_lattice_dsl::PurePredicateSpec, DslError> {
     let (context, params) = BooleanCircuitFamilyParams::declare(context);
     let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
     let instance_width = context.evaluate_int(params.instance_width.clone());
@@ -307,7 +307,7 @@ pub fn boolean_circuit_validity_predicate(
         Int::constant(1).less_equal(max_width.clone()),
         input_width.less_equal(max_width),
     ]);
-    mxx_dsl::PurePredicateSpec::new(
+    mxx_lattice_dsl::PurePredicateSpec::new(
         context
             .output("valid", bool_all([params_valid, records_valid, output_valid]))?
             .build()?
@@ -325,7 +325,7 @@ pub fn boolean_circuit_validity_predicate(
 /// circuit output is true. Circuit-data validity is checked by the separate validity predicate.
 pub fn boolean_circuit_satisfaction_predicate(
     context: DslContext,
-) -> Result<mxx_dsl::PurePredicateSpec, DslError> {
+) -> Result<mxx_lattice_dsl::PurePredicateSpec, DslError> {
     let (context, params) = BooleanCircuitFamilyParams::declare(context);
     let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
     let instance_width = context.evaluate_int(params.instance_width.clone());
@@ -365,7 +365,7 @@ pub fn boolean_circuit_satisfaction_predicate(
     let final_layer = evaluate_boolean_family(&params, circuit.clone(), inputs)?;
     let output = select_boolean_output(&circuit, &final_layer);
     let inputs_valid = reduce_bool_family(input_validity, params.max_layer_width)?;
-    mxx_dsl::PurePredicateSpec::new(
+    mxx_lattice_dsl::PurePredicateSpec::new(
         context.output("satisfied", inputs_valid & output)?.build()?.graph,
     )
     .map_err(Into::into)
@@ -419,7 +419,7 @@ mod tests {
     }
 
     fn execute_predicate(
-        predicate: &mxx_dsl::PurePredicateSpec,
+        predicate: &mxx_lattice_dsl::PurePredicateSpec,
         bindings: &ParamEnv,
         inputs: BTreeMap<String, RuntimeValue>,
         output: &str,

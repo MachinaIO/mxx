@@ -20,7 +20,6 @@ use crate::{
     branching_program::{ATTRIBUTE_COORDINATE, INITIAL_STATE_COORDINATE},
 };
 use mxx_backends::{SessionStore, poly::PolyParams};
-use mxx_dsl::{Bytes, DslContext, HashTag, Mat, Ring, Trapdoor};
 use mxx_exponent_lut::{
     api::{self, StageExecution, StageGraph},
     program::{AttributeKnowledge, InputBinding, ProgramInputDeclaration},
@@ -30,6 +29,7 @@ use mxx_ir_core::{
     IntExpr, ParamEnv,
     artifact::{ArtifactAvailability, Manifest, ProductionId},
 };
+use mxx_lattice_dsl::{Bytes, DslContext, HashTag, Mat, Ring, Trapdoor};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 

@@ -1,6 +1,6 @@
-# mxx-dsl
+# mxx-lattice-dsl
 
-`mxx-dsl` is the Rust-based DSL for writing lattice protocols. You write a protocol with ring
+`mxx-lattice-dsl` is the Rust-based DSL for writing lattice protocols. You write a protocol with ring
 elements, matrices, samplers, trapdoors, and loops as ordinary Rust values and operators. The
 code records an `mxx-ir-core` graph that a backend in `mxx-backends` can validate and execute.
 The DSL library depends only on `mxx-ir-core`; its examples also use `mxx-backends`.

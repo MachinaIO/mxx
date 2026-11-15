@@ -126,9 +126,9 @@ impl ExpLayout {
 
     pub fn mono(
         &self,
-        ring: &mxx_dsl::Ring,
+        ring: &mxx_lattice_dsl::Ring,
         exponent: &BigInt,
-    ) -> Result<mxx_dsl::Mat, LayoutError> {
+    ) -> Result<mxx_lattice_dsl::Mat, LayoutError> {
         use mxx_ir_core::node::ConstantMatrix;
         let dimension = ring.ring_dimension() as usize;
         self.validate(dimension)?;
@@ -1040,12 +1040,12 @@ impl ProgramData {
 pub(crate) fn data_inputs(
     program: &ExponentLutProgram,
     name: impl Fn(DataId) -> String,
-) -> BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>> {
+) -> BTreeMap<DataId, mxx_lattice_dsl::Family<mxx_lattice_dsl::Int>> {
     program
         .data
         .iter()
         .map(|(family, declaration)| {
-            (*family, mxx_dsl::int_family_input(name(*family), declaration.count))
+            (*family, mxx_lattice_dsl::int_family_input(name(*family), declaration.count))
         })
         .collect()
 }
@@ -1059,12 +1059,15 @@ pub(crate) fn data_inputs(
 #[allow(clippy::type_complexity)]
 pub(crate) fn validate_data_values(
     program: &ExponentLutProgram,
-    values: BTreeMap<DataId, (mxx_dsl::Family<mxx_dsl::Int>, mxx_dsl::Int)>,
+    values: BTreeMap<DataId, (mxx_lattice_dsl::Family<mxx_lattice_dsl::Int>, mxx_lattice_dsl::Int)>,
 ) -> Result<
-    (BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>, BTreeMap<DataId, mxx_dsl::Int>),
+    (
+        BTreeMap<DataId, mxx_lattice_dsl::Family<mxx_lattice_dsl::Int>>,
+        BTreeMap<DataId, mxx_lattice_dsl::Int>,
+    ),
     ProgramValidationError,
 > {
-    let whole = |first: &mxx_dsl::Int| {
+    let whole = |first: &mxx_lattice_dsl::Int| {
         first.expression().is_ok_and(|first| first.canonicalize() == IntExpr::constant(0))
     };
     let matches = values.len() == program.data.len() &&

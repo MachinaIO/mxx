@@ -26,8 +26,8 @@ use mxx_backends::{
         dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
-use mxx_dsl::{DslContext, Family, parallel};
 use mxx_ir_core::{ParamEnv, ValidatedGraph, node::NodeKind};
+use mxx_lattice_dsl::{DslContext, Family, parallel};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;

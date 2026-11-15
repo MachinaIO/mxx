@@ -12,12 +12,12 @@ use crate::bgg::{
     BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
     tall_rotation_encoding::{TallLinearTransformEncodingWires, TallRotationEncodingKey},
 };
-use mxx_dsl::{DslError, Family, Int, Mat, parallel, select};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     node::{ConcatAxis, IndexRange},
     types::MatrixType,
 };
+use mxx_lattice_dsl::{DslError, Family, Int, Mat, parallel, select};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use rayon::prelude::*;
@@ -454,7 +454,7 @@ impl BggTallEncodingCompiler {
         input: &BggTallEncodingWire,
         scalar: &Mat,
         row_factor: Mat,
-        decomposed_row_factor: Option<mxx_dsl::Preimage>,
+        decomposed_row_factor: Option<mxx_lattice_dsl::Preimage>,
         large: bool,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         let rows = match decomposed_row_factor {
@@ -716,7 +716,7 @@ pub(crate) fn anchor_matrix_rows(
     rows: &Family<Mat>,
     num_blocks: usize,
     lane_scalars: &[BigUint],
-    ring: &mxx_dsl::Ring,
+    ring: &mxx_lattice_dsl::Ring,
 ) -> Result<Family<Mat>, TallCompileError> {
     let lanes = lane_scalars.len();
     let slot_count =
@@ -798,8 +798,8 @@ mod tests {
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
         transcript::SamplingMode,
     };
-    use mxx_dsl::{BuiltGraph, DslContext, Ring};
     use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_lattice_dsl::{BuiltGraph, DslContext, Ring};
     use num_bigint::BigInt;
     use std::collections::{BTreeMap, BTreeSet};
 

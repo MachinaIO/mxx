@@ -184,7 +184,7 @@ impl<'a> RnsEncryptBuild<'a> {
                 ),
                 InputBinding::Family(family) => graph.transferred_output(
                     name(RnsBggDynamicSetup::rhs_bottom_role(*coordinate, true)),
-                    mxx_dsl::parallel(family.count().clone(), |member| {
+                    mxx_lattice_dsl::parallel(family.count().clone(), |member| {
                         bottom(Some(member.expression()?), family.member(&ring, member))
                             .map_err(|_| DslError::Schema)
                     })
@@ -345,8 +345,10 @@ impl<'a> RnsEncryptBuild<'a> {
         graph = graph
             .transferred_output(
                 name(AUTOMORPHISM_HELPER_ROLE.to_owned()),
-                mxx_dsl::parallel(setup.helper_automorphisms().len(), |member| Ok(helper(member)))
-                    .map_err(ApiError::scheme)?,
+                mxx_lattice_dsl::parallel(setup.helper_automorphisms().len(), |member| {
+                    Ok(helper(member))
+                })
+                .map_err(ApiError::scheme)?,
             )
             .map_err(ApiError::scheme)?
             .transferred_output(name(AUTOMORPHISM_COMPANION_ROLE.to_owned()), companions)
@@ -384,7 +386,7 @@ impl<'a> RnsEncryptBuild<'a> {
                         self.parameters,
                         hash_key.clone(),
                         *coordinate,
-                        member.map(mxx_dsl::Int::evaluate),
+                        member.map(mxx_lattice_dsl::Int::evaluate),
                     )?,
                 );
                 if public {
@@ -415,7 +417,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     graph.transferred_output(role, encoding.row)
                 }
                 (InputBinding::Family(plaintexts), true) => {
-                    let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                    let stored = mxx_lattice_dsl::parallel(plaintexts.count().clone(), |index| {
                         let plaintext = plaintexts.member(&ring, index.clone());
                         let encoding = encode(Some(index.expression()?), plaintext)
                             .map_err(|_| DslError::Schema)?;
@@ -426,7 +428,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     graph.transferred_output(role, stored)
                 }
                 (InputBinding::Family(plaintexts), false) => {
-                    let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                    let stored = mxx_lattice_dsl::parallel(plaintexts.count().clone(), |index| {
                         let plaintext = plaintexts.member(&ring, index.clone());
                         encode(Some(index.expression()?), plaintext)
                             .map(|encoding| encoding.row)
@@ -459,7 +461,7 @@ impl<'a> RnsEncryptBuild<'a> {
         let columns = self.parameters.component_columns(0)?;
         let gadget = self.parameters.public_gadget(0)?;
         let secret = reduce_secret(self.parameters, payload, 0)?;
-        mxx_dsl::parallel(automorphisms.len(), |member| {
+        mxx_lattice_dsl::parallel(automorphisms.len(), |member| {
             let k = select(automorphisms, member.expression()?);
             let schema = |_| DslError::Schema;
             let public =
@@ -515,7 +517,7 @@ impl<'a> RnsEncryptBuild<'a> {
         let p = crate::rns_bgg::dynamic::compact_modulus(setup);
         // Derive the selected artifact member in the lane. A root index family
         // over all digit companions would retain one index view per occurrence.
-        mxx_dsl::parallel(IntExpr::constant(members * count), |lane| {
+        mxx_lattice_dsl::parallel(IntExpr::constant(members * count), |lane| {
             let schema = |_| DslError::Schema;
             let index = lane.expression()?;
             let member = quotient(&index, count);
@@ -637,7 +639,7 @@ pub(super) fn public_top_ciphertexts(
     let element: RnsBggRow = (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
     let fields = families.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
     let bottoms = family_of_fields(&element, count.clone(), &fields).map_err(graph)?;
-    let tops = mxx_dsl::parallel(count, |member| {
+    let tops = mxx_lattice_dsl::parallel(count, |member| {
         setup
             .rhs_public_top(parameters, hash_key.clone(), coordinate, Some(member.expression()?))
             .map_err(|_| DslError::Schema)
@@ -1080,13 +1082,13 @@ impl EncodingLowering<'_> {
         let count = IntExpr::constant(switched.len());
         match cached {
             Some(key) => {
-                let row = mxx_dsl::iterate(count, initial.0, |index, sum| {
+                let row = mxx_lattice_dsl::iterate(count, initial.0, |index, sum| {
                     Ok(add_encoding_rows(sum, branch_terms(index)?.0))
                 })
                 .map_err(graph)?;
                 Ok((row, key))
             }
-            None => mxx_dsl::iterate(count, initial, |index, (row_sum, key_sum)| {
+            None => mxx_lattice_dsl::iterate(count, initial, |index, (row_sum, key_sum)| {
                 let (row, key) = branch_terms(index)?;
                 let key = key.ok_or(DslError::Schema)?;
                 Ok((add_encoding_rows(row_sum, row), add_public_matrices(key_sum, key)))
@@ -1266,7 +1268,7 @@ impl EncodingLowering<'_> {
             // parallel loop.
             let switched = (depth.internal > 0)
                 .then(|| {
-                    let pairs = mxx_dsl::parallel(depth.internal, |position| {
+                    let pairs = mxx_lattice_dsl::parallel(depth.internal, |position| {
                         let index = position.expression()?;
                         let pre_key = product_key(index.clone()).map_err(schema)?;
                         let (row, key) = self
@@ -1338,7 +1340,7 @@ impl EncodingLowering<'_> {
                     if count == 0 {
                         return Ok(state);
                     }
-                    mxx_dsl::iterate(
+                    mxx_lattice_dsl::iterate(
                         IntExpr::constant(count),
                         state,
                         |index, (row_sum, key_sum)| {
@@ -1482,7 +1484,7 @@ impl EncodingLowering<'_> {
             let inverse_helpers = members(&inverses, &|k| setup.helper_member(k))?;
             let helpers = members(switches, &|k| setup.helper_member(k))?;
             let keys = import(crate::rns_bgg::BranchGroup::Internal { depth: d }, depth.internal);
-            let family = mxx_dsl::parallel(depth.internal, |position| {
+            let family = mxx_lattice_dsl::parallel(depth.internal, |position| {
                 let b = position.expression()?;
                 let (parent, rows) = if d == 0 {
                     (input.row.clone(), input_rows.clone())
@@ -1539,7 +1541,7 @@ impl EncodingLowering<'_> {
             let inverses = members(&group.switches, &|k| setup.automorphism_inverse(k))?;
             let inverse_helpers = members(&inverses, &|k| setup.helper_member(k))?;
             let helpers = members(&group.switches, &|k| setup.helper_member(k))?;
-            let terms = mxx_dsl::parallel(group.switches.len(), |member| {
+            let terms = mxx_lattice_dsl::parallel(group.switches.len(), |member| {
                 let member = member.expression()?;
                 let mut parent_rows = Vec::new();
                 let mut key_rows = Vec::new();
@@ -1571,7 +1573,7 @@ impl EncodingLowering<'_> {
                 for slot in 0..group.depths.len() {
                     // Keep the next import inside the sequential body, so only the current
                     // and read-ahead T rows are live while this slot is switched.
-                    state = mxx_dsl::iterate(1, state, |_, (sum, top, bottom)| {
+                    state = mxx_lattice_dsl::iterate(1, state, |_, (sum, top, bottom)| {
                         let (next_top, next_bottom) = read((slot + 1) % group.depths.len());
                         let (_, _, term) = finish(
                             &parent_rows[slot],
@@ -2527,7 +2529,12 @@ mod test {
         let gadget = parameters.public_gadget(0).unwrap();
         let hash_key = ring.bytes_input("hash-key", 32);
         let hashed = setup
-            .compact_matrix(&parameters, 0, hash_key, mxx_dsl::HashTag::from(b"compact".to_vec()))
+            .compact_matrix(
+                &parameters,
+                0,
+                hash_key,
+                mxx_lattice_dsl::HashTag::from(b"compact".to_vec()),
+            )
             .unwrap();
         let expand = |entry| {
             crate::rns_bgg::dynamic::expand_compact_entry(&parameters, &setup, 0, &gadget, entry)

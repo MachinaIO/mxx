@@ -1939,8 +1939,8 @@ mod tests {
             dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
         },
     };
-    use mxx_dsl::{DslContext, HashTag, Int, IntType, Ring, parallel};
     use mxx_ir_core::ParamEnv;
+    use mxx_lattice_dsl::{DslContext, HashTag, Int, IntType, Ring, parallel};
 
     /// A later wave's family member must survive intervening waves until
     /// its last dynamic read, even though the read uses a pointer table.

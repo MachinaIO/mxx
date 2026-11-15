@@ -19,7 +19,7 @@ default = []
 gpu = ["mxx-backends/gpu"]
 
 [dependencies]
-mxx-dsl.workspace = true
+mxx-lattice-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-backends.workspace = true
 num-bigint.workspace = true
@@ -31,6 +31,7 @@ thiserror.workspace = true
 cc.workspace = true
 
 [dev-dependencies]
+mxx-core.workspace = true
 bigdecimal.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

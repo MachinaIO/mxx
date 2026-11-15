@@ -1,11 +1,11 @@
 //! Encrypts and decrypts one bit with Ring-LWE on the GPU, and exports the Lean statement that
-//! every execution decrypts its message to `crates/dsl/examples/rlwe/generated`, where
+//! every execution decrypts its message to `crates/lattice-dsl/examples/rlwe/generated`, where
 //! `lake build` checks its proof.
 //!
-//! Regenerate without a GPU with `cargo run -p mxx-dsl --example rlwe_encrypt --
+//! Regenerate without a GPU with `cargo run -p mxx-lattice-dsl --example rlwe_encrypt --
 //! --export-lean <directory>`. This mode only constructs and exports the protocol.
 //!
-//! Run with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
+//! Run with `cargo run -r -p mxx-lattice-dsl --example rlwe_encrypt --features gpu`.
 
 use bigdecimal::BigDecimal;
 use mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound;
@@ -13,7 +13,6 @@ use mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound;
 use mxx_backends::{
     GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
 };
-use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, IdealSpec, Int, IntType, Ring};
 #[cfg(feature = "gpu")]
 use mxx_ir_core::generate_crt_basis;
 use mxx_ir_core::{
@@ -26,6 +25,7 @@ use mxx_ir_core::{
         Workflow,
     },
 };
+use mxx_lattice_dsl::{BuiltGraph, DslContext, DslError, HashTag, IdealSpec, Int, IntType, Ring};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
 #[cfg(feature = "gpu")]
@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program = rlwe_program(ring_dimension)?;
 
     // State the program's correctness in Lean: for every seed and message bit, the decrypted bit
-    // is the message. `lake build` in `crates/dsl/examples/rlwe` checks the proof.
+    // is the message. `lake build` in `crates/lattice-dsl/examples/rlwe` checks the proof.
     let lean = export_directory.clone().unwrap_or_else(|| {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated")
     });

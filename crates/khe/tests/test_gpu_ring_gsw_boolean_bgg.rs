@@ -385,7 +385,7 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     assert!(row.security_bits >= security_target, "the row reaches the security target");
     let sigma = BigDecimal::from_str(&row.error_sigma).unwrap();
     let bgg = BooleanBggProtocolParameters {
-        ring: mxx_dsl::Ring::new(row.crt_bits, row.crt_depth, row.ring_dimension),
+        ring: mxx_lattice_dsl::Ring::new(row.crt_bits, row.crt_depth, row.ring_dimension),
         base_bits: row.base_bits,
         digit_count: noise.digit_count,
         error: Some((rational(&sigma), BigUint::from(row.error_cutoff))),

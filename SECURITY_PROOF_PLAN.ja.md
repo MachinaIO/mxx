@@ -61,7 +61,7 @@ BGVのIND-CPA（敵が`pk`と再線形化鍵`rk`を受け取る）には、次�
 
 ## 段階0: ツールチェイン移行とVCVio導入
 
-1. 全Leanパッケージの`lean-toolchain`を`v4.35.0`へ、Mathlibを`v4.35.0`へ上げます。対象は`crates/ir-core/lean`、`crates/dsl/examples/rlwe`、`crates/fhe/lean/{bgv,tfhe}`、`crates/khe/lean/**`、`crates/exponent-lut/lean/**`、`crates/pe/lean/**`、`crates/we/lean`です。
+1. 全Leanパッケージの`lean-toolchain`を`v4.35.0`へ、Mathlibを`v4.35.0`へ上げます。対象は`crates/ir-core/lean`、`crates/lattice-dsl/examples/rlwe`、`crates/fhe/lean/{bgv,tfhe}`、`crates/khe/lean/**`、`crates/exponent-lut/lean/**`、`crates/pe/lean/**`、`crates/we/lean`です。
 2. 新しいLakeパッケージ`crates/ir-core/lean/security`（ライブラリ`MxxSecurity`）を作り、そこでだけVCVioを特定のcommit（`1c7ab7e40e8e7ba9f75c88cd495193b7e6bb4248`）に固定して`require`します。ir-core本体はVCVioに依存しないので、既存のcorrectnessパッケージはVCVioとその推移依存（PolyFun、QuantumFoundationsなど）を取り込みません。VCVioのAPIは頻繁に変わるため、更新は明示的な作業として行います。
 3. 既存certificateをすべて再検査します。Mathlibの補題名の変更などで証明が壊れた箇所を修正します。巨大exportのパッケージ（PE W128など）は時間がかかるので個別に記録します。
 4. CI（`.github/workflows/ci.yml`のLean build jobとclaim freshness check）を新ツールチェインに合わせます。
@@ -101,7 +101,7 @@ BGVのIND-CPA（敵が`pk`と再線形化鍵`rk`を受け取る）には、次�
 
 生成器は`Scheme.lean`に、役割どおりに`comp`を組み立てた`MxxSecurity.PkFhe.Scheme`のインスタンスと、`CorrectnessClaim`と`SecurityClaim`を出力します。
 
-**完了条件:** RLWE例（`crates/dsl/examples/rlwe`）とBGVの全stageで`comp`と健全性補題が生成され、`lake build`に通ること。既存の関係claimとその証明は変更しないこと。
+**完了条件:** RLWE例（`crates/lattice-dsl/examples/rlwe`）とBGVの全stageで`comp`と健全性補題が生成され、`lake build`に通ること。既存の関係claimとその証明は変更しないこと。
 
 ## 段階2（core）: 公開鍵型FHEの定義と仮定の一覧（`MxxSecurity`）
 

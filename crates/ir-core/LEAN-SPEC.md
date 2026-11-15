@@ -1,8 +1,13 @@
 # Lean correctness statements
 
+> **Legacy.** This document specifies correctness claims of protocols whose ideal functionality is
+> written in the DSL (`ProtocolDecl`). New protocols use a protocol specification in their
+> primitive's crate, whose claims are generated from RV64IM proof images
+> (`ARCHITECTURE-SPEC.md`, section 6). This path keeps working for its existing users.
+
 This document explains how to turn a protocol written in the DSL into a Lean theorem, and exactly
 which statement that theorem is. It is written for readers who know lattice cryptography and Lean
-but not mxx. The DSL itself is specified in `crates/dsl/SPEC.md`.
+but not mxx. The DSL itself is specified in `crates/lattice-dsl/SPEC.md`.
 
 ## 1. Overview
 
@@ -38,7 +43,7 @@ A protocol is a `mxx_ir_core::protocol::ProtocolDecl`; `ProtocolDecl::new` check
 Every input of every graph must be fed by exactly one of the following:
 
 - **An earlier stage's output (a link).** Each stage lists links from producer outputs to its
-  inputs, as you pass one execution's output to the next. `mxx_dsl::artifact_bindings` builds
+  inputs, as you pass one execution's output to the next. `mxx_lattice_dsl::artifact_bindings` builds
   them for a composite value from its schema.
 - **An external input.** A value the caller chooses, such as a message or a 32-byte hash key.
   It can feed several inputs, typically a stage input and the ideal input with the same meaning,
@@ -69,7 +74,7 @@ graphs or parameters change; never edit them.
 ## 4. The generated statement
 
 `Claim.lean` builds the statement from four definitions. The RLWE example
-(`crates/dsl/examples/rlwe_encrypt.rs`) declares one stage `rlwe` that encrypts and decrypts a
+(`crates/lattice-dsl/examples/rlwe_encrypt.rs`) declares one stage `rlwe` that encrypts and decrypts a
 bit, external inputs `seed` (32 bytes) and `message` (in `[0, 1]`), and an ideal functionality
 that returns the message; it generates this `Claim.lean` (matrix types and parameter records
 abbreviated):
@@ -230,7 +235,7 @@ are large; it does not remove atoms or reduce the total elaborated proposition.
 
 | Protocol | Declared in | Statement | Proof |
 | --- | --- | --- | --- |
-| RLWE encryption of one bit | `crates/dsl/examples/rlwe_encrypt.rs` | every execution decrypts its message | `crates/dsl/examples/rlwe` |
+| RLWE encryption of one bit | `crates/lattice-dsl/examples/rlwe_encrypt.rs` | every execution decrypts its message | `crates/lattice-dsl/examples/rlwe` |
 | TFHE public-key NAND gate | `crates/fhe/src/tfhe/scheme.rs` (exported by `crates/fhe/examples/export_claims.rs`) | one gate on fresh encryptions fails with probability at most `2^-100` | `crates/fhe/lean/tfhe` |
 | BGV circuit `x₀ · (x₁ · x₂)` | `crates/fhe/src/bgv/scheme.rs` (exported by `crates/fhe/examples/export_claims.rs`) | every execution decrypts the slotwise product; IND-CPA within a cost bound | `crates/fhe/lean/bgv` |
 

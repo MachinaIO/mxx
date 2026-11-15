@@ -16,8 +16,8 @@ use crate::{
     BootstrappingKey, KeySwitchKey, LweCiphertext, TfheParams,
     spec::{Correctness, Depth, Fhe, Statement},
 };
-use mxx_dsl::{Family, Int, IntType, Mat};
 use mxx_ir_core::protocol::InputValueContract;
+use mxx_lattice_dsl::{Family, Int, IntType, Mat};
 
 /// TFHE at `params`.
 pub struct TfheScheme<'a> {

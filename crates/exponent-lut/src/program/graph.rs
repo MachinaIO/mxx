@@ -12,32 +12,32 @@ pub struct RhsRef<I> {
     pub index: Option<I>,
 }
 
-impl<I: mxx_dsl::GraphValue> mxx_dsl::GraphValue for RhsRef<I> {
+impl<I: mxx_lattice_dsl::GraphValue> mxx_lattice_dsl::GraphValue for RhsRef<I> {
     type Schema = RhsRef<I::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
-        self.index.as_ref().map_or_else(Vec::new, mxx_dsl::GraphValue::flatten)
+        self.index.as_ref().map_or_else(Vec::new, mxx_lattice_dsl::GraphValue::flatten)
     }
 
     fn schema(&self) -> Self::Schema {
-        RhsRef { id: self.id, index: self.index.as_ref().map(mxx_dsl::GraphValue::schema) }
+        RhsRef { id: self.id, index: self.index.as_ref().map(mxx_lattice_dsl::GraphValue::schema) }
     }
 
     fn from_values(
         schema: &Self::Schema,
         values: &[ValueHandle],
-    ) -> Result<Self, mxx_dsl::DslError> {
+    ) -> Result<Self, mxx_lattice_dsl::DslError> {
         match &schema.index {
             None if values.is_empty() => Ok(Self { id: schema.id, index: None }),
             Some(index_schema) if values.len() == 1 => {
                 Ok(Self { id: schema.id, index: Some(I::from_values(index_schema, values)?) })
             }
-            _ => Err(mxx_dsl::DslError::Schema),
+            _ => Err(mxx_lattice_dsl::DslError::Schema),
         }
     }
 }
 
-impl<S: mxx_dsl::GraphValueSchema> mxx_dsl::GraphValueSchema for RhsRef<S> {
+impl<S: mxx_lattice_dsl::GraphValueSchema> mxx_lattice_dsl::GraphValueSchema for RhsRef<S> {
     type Value = RhsRef<S::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
@@ -48,13 +48,13 @@ impl<S: mxx_dsl::GraphValueSchema> mxx_dsl::GraphValueSchema for RhsRef<S> {
     }
 
     fn wire_types(&self) -> Vec<WireType> {
-        self.index.as_ref().map_or_else(Vec::new, mxx_dsl::GraphValueSchema::wire_types)
+        self.index.as_ref().map_or_else(Vec::new, mxx_lattice_dsl::GraphValueSchema::wire_types)
     }
 }
 
 /// A family of composite elements assembled directly from the family of
 /// each field. `fields` lists those families' values in the order in which
-/// [`mxx_dsl::GraphValue::flatten`] lists the fields of one element, and
+/// [`mxx_lattice_dsl::GraphValue::flatten`] lists the fields of one element, and
 /// `element` is any element of the family's schema, used only for that
 /// schema (for example one built from each field family's first member).
 ///
@@ -63,31 +63,33 @@ impl<S: mxx_dsl::GraphValueSchema> mxx_dsl::GraphValueSchema for RhsRef<S> {
 /// were made: a stage binds its imported families before lowering, and a
 /// loop body that reads a member then captures the family instead of
 /// importing it.
-pub fn family_of_fields<T: mxx_dsl::GraphValue>(
+pub fn family_of_fields<T: mxx_lattice_dsl::GraphValue>(
     element: &T,
     count: IntExpr,
     fields: &[ValueHandle],
-) -> Result<mxx_dsl::Family<T>, mxx_dsl::DslError> {
-    let schema = mxx_dsl::FamilyType { element: element.schema(), count, member_slot: None };
-    <mxx_dsl::Family<T> as mxx_dsl::GraphValue>::from_values(&schema, fields)
+) -> Result<mxx_lattice_dsl::Family<T>, mxx_lattice_dsl::DslError> {
+    let schema =
+        mxx_lattice_dsl::FamilyType { element: element.schema(), count, member_slot: None };
+    <mxx_lattice_dsl::Family<T> as mxx_lattice_dsl::GraphValue>::from_values(&schema, fields)
 }
 
 /// A family of graph values bound to a Program input: stored members, or members the composing
 /// graph computes where they are read, so that no family of them is a graph value.
 #[derive(Clone)]
-pub enum GraphFamily<T: mxx_dsl::GraphValue> {
-    Values(mxx_dsl::Family<T>),
+pub enum GraphFamily<T: mxx_lattice_dsl::GraphValue> {
+    Values(mxx_lattice_dsl::Family<T>),
     Computed {
         count: IntExpr,
-        member: std::sync::Arc<dyn Fn(mxx_dsl::Int) -> Result<T, mxx_dsl::DslError>>,
+        member:
+            std::sync::Arc<dyn Fn(mxx_lattice_dsl::Int) -> Result<T, mxx_lattice_dsl::DslError>>,
     },
 }
 
-impl<T: mxx_dsl::GraphValue> GraphFamily<T> {
+impl<T: mxx_lattice_dsl::GraphValue> GraphFamily<T> {
     /// The family of `count` members whose member `i` is `member(i)`, computed where it is read.
     pub fn computed(
         count: impl Into<IntExpr>,
-        member: impl Fn(mxx_dsl::Int) -> Result<T, mxx_dsl::DslError> + 'static,
+        member: impl Fn(mxx_lattice_dsl::Int) -> Result<T, mxx_lattice_dsl::DslError> + 'static,
     ) -> Self {
         Self::Computed { count: count.into().canonicalize(), member: std::sync::Arc::new(member) }
     }
@@ -100,7 +102,7 @@ impl<T: mxx_dsl::GraphValue> GraphFamily<T> {
     }
 
     /// Member `index`, read or computed in the current graph scope.
-    pub fn at(&self, index: mxx_dsl::Int) -> Result<T, mxx_dsl::DslError> {
+    pub fn at(&self, index: mxx_lattice_dsl::Int) -> Result<T, mxx_lattice_dsl::DslError> {
         match self {
             Self::Values(values) => Ok(values.at(index)),
             Self::Computed { member, .. } => member(index),
@@ -114,14 +116,14 @@ impl<T: mxx_dsl::GraphValue> GraphFamily<T> {
 /// they are given ([`Self::with_data`]).
 #[derive(Default)]
 pub struct GraphFamilyExecution {
-    data: std::collections::BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>,
+    data: std::collections::BTreeMap<DataId, mxx_lattice_dsl::Family<mxx_lattice_dsl::Int>>,
 }
 
 impl GraphFamilyExecution {
     /// An execution that reads the integer data families `data`, each a
     /// graph input family of its declared count.
     pub fn with_data(
-        data: std::collections::BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>,
+        data: std::collections::BTreeMap<DataId, mxx_lattice_dsl::Family<mxx_lattice_dsl::Int>>,
     ) -> Self {
         Self { data }
     }
@@ -131,9 +133,9 @@ impl GraphFamilyExecution {
         &self,
         data: DataId,
         position: &IntExpr,
-    ) -> Result<mxx_dsl::Int, ProgramLowerError<Error>> {
+    ) -> Result<mxx_lattice_dsl::Int, ProgramLowerError<Error>> {
         let family = self.data.get(&data).ok_or(ProgramValidationError::MissingBinding)?;
-        Ok(family.at(mxx_dsl::Int::evaluate(position.clone())))
+        Ok(family.at(mxx_lattice_dsl::Int::evaluate(position.clone())))
     }
 }
 
@@ -146,25 +148,25 @@ pub(crate) trait GraphParallelLowering:
 {
     /// Graph values one parallel body produces besides its result, returned
     /// by the same loop as a family of their own.
-    type SideOutput: mxx_dsl::GraphValue;
+    type SideOutput: mxx_lattice_dsl::GraphValue;
     /// A body of `count` instances starts; `index` is its member index.
     fn begin_graph_parallel(&mut self, count: &IntExpr, index: &IntExpr);
     fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error>;
     /// The loop was built: `side` holds each instance's side output.
     fn commit_graph_parallel(
         &mut self,
-        side: mxx_dsl::Family<Self::SideOutput>,
+        side: mxx_lattice_dsl::Family<Self::SideOutput>,
     ) -> Result<(), Self::Error>;
 }
 
 impl<E> FamilyExecution<E> for GraphFamilyExecution
 where
     E: GraphParallelLowering,
-    E::Wire: mxx_dsl::GraphValue,
-    E::Rhs: mxx_dsl::GraphValue,
+    E::Wire: mxx_lattice_dsl::GraphValue,
+    E::Rhs: mxx_lattice_dsl::GraphValue,
 {
-    type WireFamily = mxx_dsl::Family<E::Wire>;
-    type RhsFamily = mxx_dsl::Family<E::Rhs>;
+    type WireFamily = mxx_lattice_dsl::Family<E::Wire>;
+    type RhsFamily = mxx_lattice_dsl::Family<E::Rhs>;
 
     fn wire_at(
         &mut self,
@@ -172,7 +174,7 @@ where
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
-        Ok(family.at(mxx_dsl::Int::evaluate(index.clone())))
+        Ok(family.at(mxx_lattice_dsl::Int::evaluate(index.clone())))
     }
 
     /// `family.at(data.at(position))`: a dynamic member read whose index is a
@@ -193,7 +195,7 @@ where
         family: &Self::RhsFamily,
         index: &IntExpr,
     ) -> Result<E::Rhs, ProgramLowerError<E::Error>> {
-        Ok(family.at(mxx_dsl::Int::evaluate(index.clone())))
+        Ok(family.at(mxx_lattice_dsl::Int::evaluate(index.clone())))
     }
 
     fn rhs_selected(
@@ -277,7 +279,7 @@ pub(crate) fn graph_select<W, E>(
     mut candidates: Vec<W>,
 ) -> Result<W, ProgramLowerError<E>>
 where
-    W: mxx_dsl::GraphValue,
+    W: mxx_lattice_dsl::GraphValue,
     E: std::error::Error + Send + Sync + 'static,
 {
     if let IntExpr::Const(index) = selector.canonicalize() {
@@ -288,7 +290,7 @@ where
             ))?;
         return Ok(candidates.swap_remove(index));
     }
-    Ok(mxx_dsl::select(mxx_dsl::Int::evaluate(selector.clone()), candidates)?)
+    Ok(mxx_lattice_dsl::select(mxx_lattice_dsl::Int::evaluate(selector.clone()), candidates)?)
 }
 
 /// Lower `body` once as a graph parallel loop over `range`, for any family
@@ -299,29 +301,30 @@ pub(crate) fn graph_parallel<X, E>(
     evaluator: &mut E,
     range: &FamilyRange,
     body: impl FnOnce(&mut X, &mut E, IntExpr) -> Result<E::Wire, ProgramLowerError<E::Error>>,
-) -> Result<mxx_dsl::Family<E::Wire>, ProgramLowerError<E::Error>>
+) -> Result<mxx_lattice_dsl::Family<E::Wire>, ProgramLowerError<E::Error>>
 where
     E: GraphParallelLowering,
-    E::Wire: mxx_dsl::GraphValue,
+    E::Wire: mxx_lattice_dsl::GraphValue,
 {
     let mut failure = None;
     let start = range.start().clone();
-    let family = mxx_dsl::parallel(range.count().clone(), |local| {
+    let family = mxx_lattice_dsl::parallel(range.count().clone(), |local| {
         if failure.is_some() {
-            return Err(mxx_dsl::DslError::Schema);
+            return Err(mxx_lattice_dsl::DslError::Schema);
         }
-        let index = local.expression().map_err(|_| mxx_dsl::DslError::CompileTimeIndex)?;
+        let index = local.expression().map_err(|_| mxx_lattice_dsl::DslError::CompileTimeIndex)?;
         let index = IntExpr::Add(Box::new(start.clone()), Box::new(index)).canonicalize();
         evaluator.begin_graph_parallel(range.count(), &index);
         match body(execution, evaluator, index) {
             Ok(value) => {
-                let side =
-                    evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?;
+                let side = evaluator
+                    .finish_graph_parallel()
+                    .map_err(|_| mxx_lattice_dsl::DslError::Schema)?;
                 Ok((value, side))
             }
             Err(error) => {
                 failure = Some(error);
-                Err(mxx_dsl::DslError::Schema)
+                Err(mxx_lattice_dsl::DslError::Schema)
             }
         }
     });
@@ -347,14 +350,14 @@ pub(crate) fn graph_sequential_sum<X, E>(
 ) -> Result<E::Wire, ProgramLowerError<E::Error>>
 where
     E: ExponentLUTProgramLowering,
-    E::Wire: mxx_dsl::GraphValue,
+    E::Wire: mxx_lattice_dsl::GraphValue,
 {
     let mut failure = None;
-    let result = mxx_dsl::iterate(count, initial, |index, state| {
+    let result = mxx_lattice_dsl::iterate(count, initial, |index, state| {
         let index = index.expression()?;
         body(execution, evaluator, index, state).map_err(|error| {
             failure = Some(error);
-            mxx_dsl::DslError::Schema
+            mxx_lattice_dsl::DslError::Schema
         })
     });
     if let Some(error) = failure {
@@ -368,11 +371,11 @@ where
 pub(crate) fn graph_sum<E>(
     evaluator: &mut E,
     count: IntExpr,
-    mut member: impl FnMut(mxx_dsl::Int) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+    mut member: impl FnMut(mxx_lattice_dsl::Int) -> Result<E::Wire, ProgramLowerError<E::Error>>,
 ) -> Result<E::Wire, ProgramLowerError<E::Error>>
 where
     E: ExponentLUTProgramLowering,
-    E::Wire: mxx_dsl::GraphValue,
+    E::Wire: mxx_lattice_dsl::GraphValue,
 {
     let count_value = count.evaluate(&mxx_ir_core::ParamEnv::default()).ok();
     if count_value.as_ref().is_some_and(|count| *count <= 0.into()) {
@@ -380,7 +383,7 @@ where
             reason: "cannot reduce an empty family".into(),
         });
     }
-    let first = member(mxx_dsl::Int::constant(0))?;
+    let first = member(mxx_lattice_dsl::Int::constant(0))?;
     if count_value.as_ref().is_some_and(|count| *count == 1.into()) {
         return Ok(first);
     }
@@ -390,22 +393,22 @@ where
         .mul_small_constant(&first, &[1], &IntExpr::constant(0))
         .map_err(ProgramLowerError::Backend)?;
     let mut failure = None;
-    let result = mxx_dsl::iterate(count - 1usize, initial, |index, state| {
+    let result = mxx_lattice_dsl::iterate(count - 1usize, initial, |index, state| {
         if failure.is_some() {
-            return Err(mxx_dsl::DslError::Schema);
+            return Err(mxx_lattice_dsl::DslError::Schema);
         }
         let rhs = match member(index.add(1usize)) {
             Ok(rhs) => rhs,
             Err(error) => {
                 failure = Some(error);
-                return Err(mxx_dsl::DslError::Schema);
+                return Err(mxx_lattice_dsl::DslError::Schema);
             }
         };
         match evaluator.add(&state, &rhs) {
             Ok(value) => Ok(value),
             Err(error) => {
                 failure = Some(ProgramLowerError::Backend(error));
-                Err(mxx_dsl::DslError::Schema)
+                Err(mxx_lattice_dsl::DslError::Schema)
             }
         }
     });
@@ -424,12 +427,12 @@ where
 pub(crate) fn graph_column_sums<E>(
     evaluator: &mut E,
     (columns, per_column): (usize, usize),
-    mut member: impl FnMut(mxx_dsl::Int) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+    mut member: impl FnMut(mxx_lattice_dsl::Int) -> Result<E::Wire, ProgramLowerError<E::Error>>,
     place: impl Fn(E::Wire, &IntExpr) -> E::Wire,
 ) -> Result<E::Wire, ProgramLowerError<E::Error>>
 where
     E: ExponentLUTProgramLowering,
-    E::Wire: mxx_dsl::GraphValue,
+    E::Wire: mxx_lattice_dsl::GraphValue,
 {
     if columns < 2 {
         return Err(ProgramLowerError::UnsupportedStructure {
@@ -439,9 +442,9 @@ where
     let first = graph_sum(evaluator, IntExpr::constant(per_column), |index| member(index))?;
     let initial = place(first, &IntExpr::constant(0));
     let mut failure = None;
-    let result = mxx_dsl::iterate(columns - 1, initial, |column, row| {
+    let result = mxx_lattice_dsl::iterate(columns - 1, initial, |column, row| {
         if failure.is_some() {
-            return Err(mxx_dsl::DslError::Schema);
+            return Err(mxx_lattice_dsl::DslError::Schema);
         }
         let column = column.add(1usize);
         let start = column.clone().mul(per_column);
@@ -455,7 +458,7 @@ where
         });
         sum.map_err(|error| {
             failure = Some(error);
-            mxx_dsl::DslError::Schema
+            mxx_lattice_dsl::DslError::Schema
         })
     });
     if let Some(error) = failure {
@@ -468,7 +471,7 @@ impl GraphFamilyExecution {
     /// Lower a parallel body while retaining graph-valued side outputs.
     ///
     /// A body may return a tuple whose second field is an existing
-    /// tuple/map [`mxx_dsl::GraphValue`] containing per-operation actions.
+    /// tuple/map [`mxx_lattice_dsl::GraphValue`] containing per-operation actions.
     /// Both fields are emitted by the same structural loop, so nested scopes
     /// and repeated inner indices remain qualified by every lexical axis.
     /// The returned side family is intended for publication/import by the
@@ -482,20 +485,24 @@ impl GraphFamilyExecution {
             &mut E,
             IntExpr,
         ) -> Result<(E::Wire, S), ProgramLowerError<E::Error>>,
-    ) -> Result<(mxx_dsl::Family<E::Wire>, mxx_dsl::Family<S>), ProgramLowerError<E::Error>>
+    ) -> Result<
+        (mxx_lattice_dsl::Family<E::Wire>, mxx_lattice_dsl::Family<S>),
+        ProgramLowerError<E::Error>,
+    >
     where
         E: ExponentLUTProgramLowering + ProgramLoweringContext,
-        E::Wire: mxx_dsl::GraphValue,
-        E::Rhs: mxx_dsl::GraphValue,
-        S: mxx_dsl::GraphValue,
+        E::Wire: mxx_lattice_dsl::GraphValue,
+        E::Rhs: mxx_lattice_dsl::GraphValue,
+        S: mxx_lattice_dsl::GraphValue,
     {
         let mut failure = None;
         let start = range.start().clone();
-        let combined = mxx_dsl::parallel(range.count().clone(), |local| {
+        let combined = mxx_lattice_dsl::parallel(range.count().clone(), |local| {
             if failure.is_some() {
-                return Err(mxx_dsl::DslError::Schema);
+                return Err(mxx_lattice_dsl::DslError::Schema);
             }
-            let index = local.expression().map_err(|_| mxx_dsl::DslError::CompileTimeIndex)?;
+            let index =
+                local.expression().map_err(|_| mxx_lattice_dsl::DslError::CompileTimeIndex)?;
             match body(
                 self,
                 evaluator,
@@ -504,7 +511,7 @@ impl GraphFamilyExecution {
                 Ok(value) => Ok(value),
                 Err(error) => {
                     failure = Some(error);
-                    Err(mxx_dsl::DslError::Schema)
+                    Err(mxx_lattice_dsl::DslError::Schema)
                 }
             }
         });
@@ -525,8 +532,8 @@ mod tests {
         ExponentLUTProgramLowering, FamilyExecution, FamilyRange, LoweringSite,
         ProgramLoweringContext,
     };
-    use mxx_dsl::Int;
     use mxx_ir_core::IntExpr;
+    use mxx_lattice_dsl::Int;
     use num_bigint::BigInt;
 
     #[test]
@@ -545,7 +552,7 @@ mod tests {
     #[test]
     fn rhs_reference_keeps_id_in_schema_and_only_indexes_are_ports() {
         use crate::program::RhsId;
-        use mxx_dsl::{GraphValue, GraphValueSchema, Int};
+        use mxx_lattice_dsl::{GraphValue, GraphValueSchema, Int};
 
         let scalar = RhsRef { id: RhsId(7), index: None::<Int> };
         assert!(scalar.flatten().is_empty());
@@ -564,7 +571,7 @@ mod tests {
     #[test]
     fn rhs_reference_rejects_wrong_port_count() {
         use crate::program::RhsId;
-        use mxx_dsl::{GraphValue, Int};
+        use mxx_lattice_dsl::{GraphValue, Int};
 
         let scalar = RhsRef { id: RhsId(1), index: None::<Int> };
         assert!(RhsRef::<Int>::from_values(&scalar.schema(), &scalar.flatten()).is_ok());
@@ -633,14 +640,14 @@ mod tests {
     }
 
     impl super::GraphParallelLowering for GraphEvaluator {
-        type SideOutput = Vec<mxx_dsl::Mat>;
+        type SideOutput = Vec<mxx_lattice_dsl::Mat>;
         fn begin_graph_parallel(&mut self, _: &IntExpr, _: &IntExpr) {}
         fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
             Ok(Vec::new())
         }
         fn commit_graph_parallel(
             &mut self,
-            _: mxx_dsl::Family<Self::SideOutput>,
+            _: mxx_lattice_dsl::Family<Self::SideOutput>,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -648,7 +655,7 @@ mod tests {
 
     #[test]
     fn graph_parallel_lifts_tuple_side_outputs_with_scope() {
-        use mxx_dsl::{DslContext, Int};
+        use mxx_lattice_dsl::{DslContext, Int};
 
         let mut families = GraphFamilyExecution::default();
         let mut evaluator = GraphEvaluator::default();
@@ -683,11 +690,11 @@ mod tests {
         use crate::program::{
             AttributeKnowledge, Environment, ExponentLutProgramBuilder, InputBinding, Operand,
         };
-        use mxx_dsl::{DslContext, Family, FamilyType, IntType};
         use mxx_ir_core::{
             artifact::{ArtifactAvailability, ProductionId, SpecHash},
             node::{LoopInputMode, NodeKind},
         };
+        use mxx_lattice_dsl::{DslContext, Family, FamilyType, IntType};
 
         let mut builder = ExponentLutProgramBuilder::new();
         let input =
@@ -748,8 +755,8 @@ mod tests {
     struct MatEvaluator;
 
     impl ExponentLUTProgramLowering for MatEvaluator {
-        type Wire = mxx_dsl::Mat;
-        type Rhs = mxx_dsl::Mat;
+        type Wire = mxx_lattice_dsl::Mat;
+        type Rhs = mxx_lattice_dsl::Mat;
         type Error = GraphError;
 
         fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
@@ -786,12 +793,12 @@ mod tests {
     /// `[3, 7, 11]`, each sum placed in its column by the unit row tensor.
     #[test]
     fn graph_column_sums_place_each_block_sum_in_its_column() {
-        use mxx_dsl::DslContext;
         use mxx_ir_core::node::ConstantMatrix;
+        use mxx_lattice_dsl::DslContext;
         let parameters =
             mxx_backends::poly::dcrt::params::DCRTPolyParams::new(8, 1, 30, 15, None, None);
         let ring = crate::test_support::ring_of(&parameters);
-        let members = mxx_dsl::parallel(IntExpr::constant(6), |index| {
+        let members = mxx_lattice_dsl::parallel(IntExpr::constant(6), |index| {
             let value = IntExpr::Add(Box::new(index.expression()?), Box::new(IntExpr::constant(1)));
             Ok(ring.polynomial([value.canonicalize()]))
         })
@@ -822,7 +829,7 @@ mod tests {
 
     #[test]
     fn graph_parallel_preserves_nonzero_nested_indices() {
-        use mxx_dsl::DslContext;
+        use mxx_lattice_dsl::DslContext;
         let mut families = GraphFamilyExecution::default();
         let mut evaluator = GraphEvaluator::default();
         let outer =

@@ -54,7 +54,11 @@ pub struct ParameterDecl {
 
 pub type ParamDecls = Vec<ParameterDecl>;
 
-/// The single canonical Rust protocol declaration.
+/// A protocol declaration with an ideal functionality written in the DSL.
+///
+/// **Legacy.** New protocols state correctness and security through a protocol specification in
+/// their primitive's crate, with claims generated from proof images (`ARCHITECTURE-SPEC.md`,
+/// section 6); this declaration stays for its existing users and gains no new ones.
 ///
 /// Rust stores compile parameters, the closed protocol bundle, and the correctness claim to state
 /// about it, and validates their wiring. Correctness proofs belong to the application, not this

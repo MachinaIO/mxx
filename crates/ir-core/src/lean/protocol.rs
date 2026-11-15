@@ -27,7 +27,8 @@ pub enum ProtocolExportError {
     Invalid(String),
 }
 
-/// Writes every Lean module of `protocol`'s correctness claim into `directory`: one module per
+/// **Legacy** (see [`ProtocolDecl`]). Writes every Lean module of
+/// `protocol`'s correctness claim into `directory`: one module per
 /// stage (`Stage_<id>`), per requirement (`Requirement_<i>`), and for the ideal graph (`Ideal`),
 /// the gadget layouts they use (`Backend`), and the linked claim (`Claim`). The claim is stated at
 /// the declaration's parameter bindings and failure probability; a proof package imports `Claim`

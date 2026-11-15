@@ -69,8 +69,8 @@ fn test_gpu_rns_bgg_operations_per_drop_three_at_boundaries() {
 fn test_gpu_rns_bgg_column_decomposition_matches_dense_action() {
     use super::{compact_decompose_columns, multiply_rows_by_columns};
     use mxx_backends::{GpuRuntime, MemoryArtifactStore, RuntimeValue};
-    use mxx_dsl::{DslContext, Mat};
     use mxx_ir_core::{ParamEnv, node::ConcatAxis};
+    use mxx_lattice_dsl::{DslContext, Mat};
     use std::collections::BTreeMap;
     let read = |name, default| std::env::var(name).map_or(default, |v| v.parse().unwrap());
     let pool = DCRTPolyParams::new(read("MXX_COLUMN_ACTION_TEST_N", 16), 2, 17, 4, None, None);

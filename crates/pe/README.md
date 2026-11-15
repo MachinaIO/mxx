@@ -6,7 +6,7 @@ All other plaintext coefficients are zero. `encrypt` accepts a `bool`, and `decr
 program `F` decrypts it exactly when `F(x) = 0`. Encryption needs no predicate, so one ciphertext
 serves keys for every program of the setup's function class. The scheme runs on the Dynamic
 RNS-BGG evaluator of [`mxx-exponent-lut`](../exponent-lut/README.md), and every stage is a graph
-that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `mxx-ir-core`, and
+that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-lattice-dsl`, `mxx-ir-core`, and
 `mxx-backends`.
 
 ## Contents

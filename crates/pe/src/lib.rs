@@ -89,8 +89,8 @@ pub enum PeError {
     Graph(String),
 }
 
-impl From<mxx_dsl::DslError> for PeError {
-    fn from(error: mxx_dsl::DslError) -> Self {
+impl From<mxx_lattice_dsl::DslError> for PeError {
+    fn from(error: mxx_lattice_dsl::DslError) -> Self {
         Self::Graph(error.to_string())
     }
 }

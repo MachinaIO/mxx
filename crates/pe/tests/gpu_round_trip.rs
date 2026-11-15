@@ -86,7 +86,6 @@ use mxx_backends::{
         dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
     },
 };
-use mxx_dsl::{DslContext, IdealSpec, Int};
 use mxx_exponent_lut::{
     api::{ApiError, StageExecution, StageOutputs, StageStorage, StageStore},
     program::ProgramData,
@@ -106,6 +105,7 @@ use mxx_ir_core::{
     },
     types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType},
 };
+use mxx_lattice_dsl::{DslContext, IdealSpec, Int};
 use mxx_pe::{
     BranchingProgram, PeClass, PeNoiseReport, PeParameterRequest, PeParameters, decrypt, encrypt,
     keygen, setup,
@@ -601,8 +601,8 @@ fn pe_protocol(
     let read_family = requirement.int_family_input("reads", steps);
     let table_family = requirement.int_family_input("tables", steps * lookup);
     // Each check is one loop, so the requirement does not grow with the class.
-    let all = |count: usize, check: &dyn Fn(Int) -> mxx_dsl::Bool| {
-        mxx_dsl::iterate(count, mxx_dsl::Bool::constant(true), |index, valid| {
+    let all = |count: usize, check: &dyn Fn(Int) -> mxx_lattice_dsl::Bool| {
+        mxx_lattice_dsl::iterate(count, mxx_lattice_dsl::Bool::constant(true), |index, valid| {
             Ok(valid & check(index))
         })
         .unwrap()
@@ -615,7 +615,7 @@ fn pe_protocol(
     let last = all(lookup, &|entry| {
         table_family.at(Int::constant(((steps - 1) * lookup) as i64) + entry).less(Int::constant(2))
     });
-    let output = mxx_dsl::iterate(steps, Int::constant(0), |step, current| {
+    let output = mxx_lattice_dsl::iterate(steps, Int::constant(0), |step, current| {
         let index = current + family.at(read_family.at(step.clone()));
         Ok(table_family.at(step * Int::constant(lookup as i64) + index))
     })

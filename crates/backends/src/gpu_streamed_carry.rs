@@ -638,8 +638,8 @@ mod tests {
         session::SessionStore,
         transcript::SamplingMode,
     };
-    use mxx_dsl::{DslContext, Family, Int, Mat, Ring, iterate, parallel};
     use mxx_ir_core::artifact::SpecHash;
+    use mxx_lattice_dsl::{DslContext, Family, Int, Mat, Ring, iterate, parallel};
     use std::collections::BTreeSet;
 
     /// Key resolution uses the immutable initial production, then alternating scratch parities.
@@ -701,7 +701,7 @@ mod tests {
             (1, 1),
             ArtifactAvailability::Cached,
         );
-        let base = context.input::<Int>("base", mxx_dsl::IntType).unwrap();
+        let base = context.input::<Int>("base", mxx_lattice_dsl::IntType).unwrap();
         let out =
             parallel(4, |lane| Ok(family.at(base.clone() + Int::evaluate(lane.expression()?))))
                 .unwrap();
@@ -859,7 +859,7 @@ mod tests {
         steps: usize,
         seed: usize,
     ) -> mxx_ir_core::ValidatedGraph {
-        use mxx_dsl::Int;
+        use mxx_lattice_dsl::Int;
         let initial =
             parallel(members, |member| Ok(ring.polynomial([member.expression()? + seed]))).unwrap();
         let carried = iterate(steps, initial, |iteration, state| {
@@ -887,7 +887,7 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_direct_gathered_carry_reads_are_streamed() {
-        use mxx_dsl::Int;
+        use mxx_lattice_dsl::Int;
         let (_, gpu, ring) = parameters();
         let mut runtime =
             GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
@@ -985,7 +985,7 @@ mod tests {
         let (cpu, gpu, ring) = parameters();
         let members = 4usize;
         let context = DslContext::new("nested-selected-carry-imports");
-        let selector: Int = context.input("selector", mxx_dsl::IntType).unwrap();
+        let selector: Int = context.input("selector", mxx_lattice_dsl::IntType).unwrap();
         let seed = usize::from(rand::random::<u16>());
         let initial =
             parallel(members, |member| Ok(ring.polynomial([member.expression()? + seed]))).unwrap();
@@ -1432,7 +1432,8 @@ mod tests {
         let (_, gpu, ring) = parameters();
         let initial = parallel(8, |_| Ok(ring.zero((1, 1)))).unwrap();
         let out = iterate(3, initial, |_, state| {
-            let selected = mxx_dsl::select(Int::constant(0), vec![state.clone(), state]).unwrap();
+            let selected =
+                mxx_lattice_dsl::select(Int::constant(0), vec![state.clone(), state]).unwrap();
             parallel(8, |member| Ok(selected.at(&member)))
         })
         .unwrap();

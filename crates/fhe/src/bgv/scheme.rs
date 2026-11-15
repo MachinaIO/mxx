@@ -31,15 +31,15 @@ use crate::{
     utils,
 };
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_dsl::{
-    BuiltGraph, DslContext, Family, FamilyType, GraphValue, Int, IntType, Mat, Ring, concat_rows,
-    parallel,
-};
 use mxx_ir_core::{
     Graph, ParamEnv, Rational,
     node::IndexRange,
     protocol::InputValueContract,
     security::{AssumptionParams, SamplerLaw},
+};
+use mxx_lattice_dsl::{
+    BuiltGraph, DslContext, Family, FamilyType, GraphValue, Int, IntType, Mat, Ring, concat_rows,
+    parallel,
 };
 use num_bigint::{BigInt, BigUint};
 

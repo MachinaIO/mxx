@@ -4,8 +4,8 @@ use crate::bgg::{
     BggEncodingSampler, BggPublicKeyCompiler, BggPublicKeyWire, BggSampleError, BggSamplerLayout,
     encoding::same_matrix_type,
 };
-use mxx_dsl::{Bytes, DslError, Family, HashTag, Mat};
 use mxx_ir_core::{IntExpr, node::IndexRange};
+use mxx_lattice_dsl::{Bytes, DslError, Family, HashTag, Mat};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -55,7 +55,7 @@ impl NaiveBggVecCompiler {
         }
         let compiler = self.public_key.clone();
         let reveal = input.reveal_plaintext;
-        let matrices = mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+        let matrices = mxx_lattice_dsl::parallel(input.matrices.count().clone(), |index| {
             let matrix = input.matrices.at(&index);
             let scalar = scalars.at(&index);
             Ok(compiler
@@ -78,14 +78,14 @@ impl NaiveBggVecCompiler {
         }
         let vector_compiler = self.public_key.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
+        let vectors = mxx_lattice_dsl::parallel(input.vectors.count().clone(), |index| {
             let key =
                 BggPublicKeyWire { matrix: input.pubkeys.at(&index), reveal_plaintext: reveal };
             let factor = vector_compiler.large_scalar_decomposition(&key, &scalars.at(&index));
             Ok(input.vectors.at(&index).mul_small_rhs(factor))
         })?;
         let key_compiler = self.public_key.clone();
-        let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
+        let pubkeys = mxx_lattice_dsl::parallel(input.pubkeys.count().clone(), |index| {
             let matrix = input.pubkeys.at(&index);
             let scalar = scalars.at(&index);
             Ok(key_compiler
@@ -96,7 +96,7 @@ impl NaiveBggVecCompiler {
             .plaintexts
             .clone()
             .map(|values| {
-                mxx_dsl::parallel(values.count().clone(), |index| {
+                mxx_lattice_dsl::parallel(values.count().clone(), |index| {
                     let value = values.at(&index);
                     let scalar = scalars.at(&index);
                     Ok(value * scalar)
@@ -119,7 +119,7 @@ impl NaiveBggVecCompiler {
         let compiler = self.public_key.clone();
         let target = target.clone();
         let reveal = input.reveal_plaintext;
-        let matrices = mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+        let matrices = mxx_lattice_dsl::parallel(input.matrices.count().clone(), |index| {
             let matrix = input.matrices.at(&index);
             Ok(compiler
                 .matrix_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &target)
@@ -188,7 +188,7 @@ impl NaiveBggVecCompiler {
             lhs.plaintexts.clone().ok_or(NaiveVecCompileError::MissingLeftPlaintext)?;
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let vectors = mxx_dsl::parallel(lhs.vectors.count().clone(), |index| {
+        let vectors = mxx_lattice_dsl::parallel(lhs.vectors.count().clone(), |index| {
             let decomposed = rhs.pubkeys.at(&index).decompose(base.clone(), digits.clone());
             let left = lhs.vectors.at(&index);
             let right = rhs.vectors.at(&index);
@@ -202,7 +202,7 @@ impl NaiveBggVecCompiler {
             .clone()
             .zip(rhs.plaintexts.clone())
             .map(|(left, right)| {
-                mxx_dsl::parallel(left.count().clone(), |index| {
+                mxx_lattice_dsl::parallel(left.count().clone(), |index| {
                     let left = left.at(&index);
                     let right = right.at(&index);
                     Ok(left * right)
@@ -242,13 +242,13 @@ impl NaiveBggVecCompiler {
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
         let decomposed = target.clone().decompose(base, digits);
-        let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
+        let vectors = mxx_lattice_dsl::parallel(input.vectors.count().clone(), |index| {
             let value = input.vectors.at(&index);
             Ok(value.mul_small_rhs(decomposed.clone()))
         })?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
-        let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
+        let pubkeys = mxx_lattice_dsl::parallel(input.pubkeys.count().clone(), |index| {
             let matrix = input.pubkeys.at(&index);
             Ok(key_compiler
                 .matrix_mul(
@@ -285,7 +285,7 @@ impl NaiveBggVecCompiler {
         let reveal = lhs.reveal_plaintext && rhs.reveal_plaintext;
         let left_reveal = lhs.reveal_plaintext;
         let right_reveal = rhs.reveal_plaintext;
-        let matrices = mxx_dsl::parallel(lhs.matrices.count().clone(), |index| {
+        let matrices = mxx_lattice_dsl::parallel(lhs.matrices.count().clone(), |index| {
             let left = lhs.matrices.at(&index);
             let right = rhs.matrices.at(&index);
             Ok(operation(
@@ -307,7 +307,7 @@ impl NaiveBggVecCompiler {
         + 'static,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding_pair(lhs, rhs)?;
-        let vectors = mxx_dsl::parallel(lhs.vectors.count().clone(), |index| {
+        let vectors = mxx_lattice_dsl::parallel(lhs.vectors.count().clone(), |index| {
             let left = lhs.vectors.at(&index);
             let right = rhs.vectors.at(&index);
             Ok(vector_op(left, right))
@@ -318,7 +318,7 @@ impl NaiveBggVecCompiler {
             .clone()
             .zip(rhs.plaintexts.clone())
             .map(|(left, right)| {
-                mxx_dsl::parallel(left.count().clone(), |index| {
+                mxx_lattice_dsl::parallel(left.count().clone(), |index| {
                     let left = left.at(&index);
                     let right = right.at(&index);
                     Ok(vector_op(left, right))
@@ -347,7 +347,7 @@ impl NaiveBggVecCompiler {
         let compiler = self.public_key.clone();
         let left_reveal = lhs.pubkey_reveal_plaintext;
         let right_reveal = rhs.pubkey_reveal_plaintext;
-        mxx_dsl::parallel(lhs.pubkeys.count().clone(), |index| {
+        mxx_lattice_dsl::parallel(lhs.pubkeys.count().clone(), |index| {
             let left = lhs.pubkeys.at(&index);
             let right = rhs.pubkeys.at(&index);
             Ok(operation(
@@ -366,7 +366,7 @@ impl NaiveBggVecCompiler {
         large: bool,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
-        let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
+        let vectors = mxx_lattice_dsl::parallel(input.vectors.count().clone(), |index| {
             let value = input.vectors.at(&index);
             if large {
                 let key = BggPublicKeyWire {
@@ -382,7 +382,7 @@ impl NaiveBggVecCompiler {
         let compiler = self.public_key.clone();
         let scalar_for_keys = scalar.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
+        let pubkeys = mxx_lattice_dsl::parallel(input.pubkeys.count().clone(), |index| {
             let matrix = input.pubkeys.at(&index);
             Ok({
                 let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
@@ -398,7 +398,7 @@ impl NaiveBggVecCompiler {
             .clone()
             .map(|values| {
                 let scalar = scalar.clone();
-                mxx_dsl::parallel(values.count().clone(), |index| {
+                mxx_lattice_dsl::parallel(values.count().clone(), |index| {
                     let value = values.at(&index);
                     Ok(value * scalar.clone())
                 })
@@ -464,7 +464,7 @@ impl NaiveBggPublicKeyVecSampler {
                 let family = {
                     let ring = self.layout.ring();
                     let key = hash_key.clone();
-                    mxx_dsl::parallel(self.slot_count.clone(), |slot| {
+                    mxx_lattice_dsl::parallel(self.slot_count.clone(), |slot| {
                         Ok({
                             let mut tag = HashTag::from(prefix.clone());
                             tag.push(slot);
@@ -535,22 +535,25 @@ impl NaiveBggEncodingVecSampler {
                         let sampler = self.scalar.clone();
                         let secret = secret.clone();
                         let reveal = public_keys[0].reveal_plaintext;
-                        mxx_dsl::parallel(public_keys[0].matrices.count().clone(), |index| {
-                            let one_key = public_keys[0].matrices.at(&index);
-                            Ok(sampler
-                                .sample(
-                                    secret.clone(),
-                                    None,
-                                    &[BggPublicKeyWire {
-                                        matrix: one_key,
-                                        reveal_plaintext: reveal,
-                                    }],
-                                    &[],
-                                )
-                                .expect("validated scalar sampler")
-                                .remove(0)
-                                .vector)
-                        })
+                        mxx_lattice_dsl::parallel(
+                            public_keys[0].matrices.count().clone(),
+                            |index| {
+                                let one_key = public_keys[0].matrices.at(&index);
+                                Ok(sampler
+                                    .sample(
+                                        secret.clone(),
+                                        None,
+                                        &[BggPublicKeyWire {
+                                            matrix: one_key,
+                                            reveal_plaintext: reveal,
+                                        }],
+                                        &[],
+                                    )
+                                    .expect("validated scalar sampler")
+                                    .remove(0)
+                                    .vector)
+                            },
+                        )
                     }?
                 } else {
                     {
@@ -558,29 +561,35 @@ impl NaiveBggEncodingVecSampler {
                         let secret = secret.clone();
                         let one_reveal = public_keys[0].reveal_plaintext;
                         let reveal = public_keys[output].reveal_plaintext;
-                        mxx_dsl::parallel(public_keys[0].matrices.count().clone(), |index| {
-                            let (one_key, key, plaintext) = (
-                                public_keys[0].matrices.at(&index),
-                                public_keys[output].matrices.at(&index),
-                                plaintexts[output - 1].at(&index),
-                            );
-                            Ok(sampler
-                                .sample(
-                                    secret.clone(),
-                                    None,
-                                    &[
-                                        BggPublicKeyWire {
-                                            matrix: one_key,
-                                            reveal_plaintext: one_reveal,
-                                        },
-                                        BggPublicKeyWire { matrix: key, reveal_plaintext: reveal },
-                                    ],
-                                    &[plaintext],
-                                )
-                                .expect("validated scalar sampler")
-                                .remove(1)
-                                .vector)
-                        })
+                        mxx_lattice_dsl::parallel(
+                            public_keys[0].matrices.count().clone(),
+                            |index| {
+                                let (one_key, key, plaintext) = (
+                                    public_keys[0].matrices.at(&index),
+                                    public_keys[output].matrices.at(&index),
+                                    plaintexts[output - 1].at(&index),
+                                );
+                                Ok(sampler
+                                    .sample(
+                                        secret.clone(),
+                                        None,
+                                        &[
+                                            BggPublicKeyWire {
+                                                matrix: one_key,
+                                                reveal_plaintext: one_reveal,
+                                            },
+                                            BggPublicKeyWire {
+                                                matrix: key,
+                                                reveal_plaintext: reveal,
+                                            },
+                                        ],
+                                        &[plaintext],
+                                    )
+                                    .expect("validated scalar sampler")
+                                    .remove(1)
+                                    .vector)
+                            },
+                        )
                     }?
                 };
                 Ok(NaiveBggEncodingVecWire {
@@ -591,9 +600,10 @@ impl NaiveBggEncodingVecSampler {
                         if output == 0 {
                             {
                                 let ring = self.scalar.layout.ring();
-                                mxx_dsl::parallel(public_keys[0].matrices.count().clone(), |_| {
-                                    Ok(ring.identity(1))
-                                })
+                                mxx_lattice_dsl::parallel(
+                                    public_keys[0].matrices.count().clone(),
+                                    |_| Ok(ring.identity(1)),
+                                )
                             }
                             .expect("family")
                         } else {
@@ -620,8 +630,8 @@ mod tests {
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::ParamEnv;
+    use mxx_lattice_dsl::{DslContext, Ring};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 

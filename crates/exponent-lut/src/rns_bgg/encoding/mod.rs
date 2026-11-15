@@ -21,11 +21,13 @@ use mxx_backends::{
     RuntimeValue, SessionStore, backend::poly::threshold_decode_coefficients,
     matrix::dcrt_poly::DCRTPolyMatrix, poly::Poly,
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
 use mxx_ir_core::{
     IntExpr, ParamEnv, ValueHandle,
     artifact::{ArtifactAvailability, Manifest, ProductionId},
     types::WireType,
+};
+use mxx_lattice_dsl::{
+    Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat,
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
@@ -386,7 +388,7 @@ where
 /// Keep only the runtime inputs `graph` declares; a stage binds every secret
 /// it holds, but a graph may not read all of them.
 pub(crate) fn declared_runtime_inputs(
-    graph: &mxx_dsl::BuiltGraph,
+    graph: &mxx_lattice_dsl::BuiltGraph,
     mut runtime: BTreeMap<String, RuntimeValue>,
 ) -> BTreeMap<String, RuntimeValue> {
     runtime.retain(|name, _| super::graph_declares_input(graph, name));
@@ -686,7 +688,8 @@ pub struct RnsOnlineEvalBuild<'a> {
     root_inputs: BTreeMap<WireId, String>,
     /// Outputs a composing caller adds to the stage graph (see `RnsOnlineEvalBuild::add_output`).
     #[allow(clippy::type_complexity)]
-    extra_outputs: Vec<Box<dyn FnOnce(DslContext) -> Result<DslContext, mxx_dsl::DslError>>>,
+    extra_outputs:
+        Vec<Box<dyn FnOnce(DslContext) -> Result<DslContext, mxx_lattice_dsl::DslError>>>,
     /// The resident inputs of the stage, by graph input name: the Program's given data
     /// ([`RnsOnlineEvalBuild::with_data`]) and the inputs a composing caller binds.
     runtime: BTreeMap<String, RuntimeValue>,

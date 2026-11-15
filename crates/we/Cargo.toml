@@ -12,7 +12,7 @@ gpu = ["mxx-backends/gpu", "mxx-khe/gpu"]
 [dependencies]
 mxx-backends = { path = "../backends" }
 mxx-khe = { path = "../khe" }
-mxx-dsl = { path = "../dsl" }
+mxx-lattice-dsl = { path = "../lattice-dsl" }
 mxx-ir-core = { path = "../ir-core" }
 num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
 num-integer = "0.1"

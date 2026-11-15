@@ -463,7 +463,7 @@ pub enum ProgramLowerError<E: Error + Send + Sync + 'static> {
     #[error("program validation failed: {0}")]
     Program(#[from] ProgramValidationError),
     #[error("DSL graph construction failed: {0}")]
-    Dsl(#[from] mxx_dsl::DslError),
+    Dsl(#[from] mxx_lattice_dsl::DslError),
     #[error("program lowering backend failed: {0}")]
     Backend(#[source] E),
     #[error("unsupported program structure: {reason}")]

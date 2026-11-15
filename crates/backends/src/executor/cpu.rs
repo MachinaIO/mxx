@@ -2584,13 +2584,13 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
     };
-    use mxx_dsl::{DslContext, Family, Int, Mat, Ring, parallel};
     use mxx_ir_core::{
         IntExpr,
         artifact::ArtifactAvailability,
         node::{ConcatAxis, IndexRange},
         types::CoefficientBoundDomain,
     };
+    use mxx_lattice_dsl::{DslContext, Family, Int, Mat, Ring, parallel};
     use num_bigint::BigInt;
 
     /// Sequential family updates equal an unrolled graph and retain at most two generations.
@@ -2611,7 +2611,7 @@ mod tests {
         let initial =
             parallel(members, |member| Ok(ring.polynomial([member.expression()? + offset])))
                 .unwrap();
-        let carried = mxx_dsl::iterate(steps, initial.clone(), |iteration, state| {
+        let carried = mxx_lattice_dsl::iterate(steps, initial.clone(), |iteration, state| {
             parallel(members, |member| {
                 Ok(state.at(&member) +
                     ring.polynomial([iteration.expression()? + member.expression()? + 1]))
@@ -2675,7 +2675,7 @@ mod tests {
             let ring = ring(&parameters);
             let initial =
                 parallel(4, |member| Ok(ring.polynomial([member.expression()? + 7]))).unwrap();
-            let carried = mxx_dsl::iterate(steps, initial, |_, state| Ok(state)).unwrap();
+            let carried = mxx_lattice_dsl::iterate(steps, initial, |_, state| Ok(state)).unwrap();
             let graph = DslContext::new("alias-streamed-family")
                 .output("out", carried.at(3))
                 .unwrap()
@@ -2709,7 +2709,7 @@ mod tests {
         let initial =
             parallel(4, |member| Ok(ring.polynomial([member.expression()? + 1]))).unwrap();
         let invariant = initial.clone();
-        let carried = mxx_dsl::iterate(3, initial.clone(), |_, state| {
+        let carried = mxx_lattice_dsl::iterate(3, initial.clone(), |_, state| {
             parallel(4, |member| Ok(state.at(&member) + invariant.at(&member)))
         })
         .unwrap();
@@ -2756,11 +2756,11 @@ mod tests {
                 parallel(4, |member| Ok(ring.polynomial([member.expression()? + 1]))).unwrap();
             let lanes = parallel(2, |_| {
                 let start = if alias {
-                    mxx_dsl::iterate(0, initial.clone(), |_, state| Ok(state))?
+                    mxx_lattice_dsl::iterate(0, initial.clone(), |_, state| Ok(state))?
                 } else {
                     initial.clone()
                 };
-                let carried = mxx_dsl::iterate(1, start, |_, state| {
+                let carried = mxx_lattice_dsl::iterate(1, start, |_, state| {
                     parallel(4, |member| Ok(state.at(&member) + ring.polynomial([1.into()])))
                 })?;
                 Ok(carried.at(3))
@@ -2797,7 +2797,7 @@ mod tests {
     /// A record of an integer family and an integer crosses stages as per-leaf artifacts.
     #[test]
     fn integer_record_artifacts_round_trip_between_stages() {
-        use mxx_dsl::{GraphValue, IntType};
+        use mxx_lattice_dsl::{GraphValue, IntType};
         let producer = DslContext::new("integer-record-producer");
         let record =
             (producer.int_family_input("mask", 3), producer.input::<Int>("body", IntType).unwrap());
@@ -2976,7 +2976,7 @@ mod tests {
     /// a negative operand is rejected.
     #[test]
     fn runtime_u64_le_hash_tag_matches_static_u64_le() {
-        use mxx_dsl::{HashTag, IntType};
+        use mxx_lattice_dsl::{HashTag, IntType};
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = ring(&parameters);
         let value = rand::random::<u64>();
@@ -3020,7 +3020,7 @@ mod tests {
 
     #[test]
     fn runtime_wide_integer_hash_tag_matches_static_integer() {
-        use mxx_dsl::{HashTag, IntType};
+        use mxx_lattice_dsl::{HashTag, IntType};
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = ring(&parameters);
         let value = (BigInt::from(1u8) << 70usize) + BigInt::from(rand::random::<u64>());
@@ -3167,8 +3167,8 @@ mod tests {
     }
     #[test]
     fn root_block_aliases_preserve_multiple_consumers_and_trace_results() {
-        use mxx_dsl::Mat;
         use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        use mxx_lattice_dsl::Mat;
 
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = ring(&parameters);
@@ -3237,8 +3237,8 @@ mod tests {
     #[test]
 
     fn test_block_diagonal_matches_concat_and_identity_tensor() {
-        use mxx_dsl::Mat;
         use mxx_ir_core::node::ConcatAxis;
+        use mxx_lattice_dsl::Mat;
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = ring(&parameters);
         let input = ring.uniform_residue((2, 3));
@@ -3279,8 +3279,8 @@ mod tests {
 
     #[test]
     fn shared_tensor_row_sum_group_executes_tensor_once_and_matches_trace() {
-        use mxx_dsl::Mat;
         use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        use mxx_lattice_dsl::Mat;
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let scalar = |value: u8| {
             DCRTPolyMatrix::from_poly_vec_row(
@@ -3347,8 +3347,8 @@ mod tests {
     #[test]
 
     fn composed_sparse_rows_preserve_outputs_and_observable_parent_boundaries() {
-        use mxx_dsl::Mat;
         use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        use mxx_lattice_dsl::Mat;
         for mode in 0..3 {
             let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
             let ring = ring(&parameters);

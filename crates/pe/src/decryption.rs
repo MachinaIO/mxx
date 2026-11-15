@@ -34,12 +34,12 @@ use crate::{
     keygen::{COMPRESSED_KEY, Group, HELPER_KEY, OUTPUT_KEY, anchor_keys},
 };
 use mxx_backends::{RuntimeValue, SessionStore};
-use mxx_dsl::{DslContext, Int, Mat};
 use mxx_exponent_lut::{
     api::{self, StageExecution, StageGraph, StageOutputs},
     rns_bgg::{RnsBggDynamicSetup, RnsOnlineEvalBuild, RnsOutputUse},
 };
 use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
+use mxx_lattice_dsl::{DslContext, Int, Mat};
 use std::collections::BTreeMap;
 
 pub(crate) const OUTPUT_ROW: &str = "mxx-pe/output-row";
@@ -204,7 +204,7 @@ pub(crate) fn phase_graph(
                 cutoff.clone(),
                 ArtifactAvailability::Transferred,
             );
-            mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+            mxx_lattice_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
                 let i = Group::select(&group.elements, row.expression()?);
                 Ok(sum + masked.clone().ring_automorphism(i).mul_small_rhs(blocks.at(row)))
             })?
@@ -225,7 +225,7 @@ pub(crate) fn phase_graph(
     let setup = public_key.setup();
     let masked = anchor - second;
     let anchor_keys = anchor_keys(&ring, parameters, key);
-    let anchors = mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+    let anchors = mxx_lattice_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
         let i = Group::select(&group.elements, row.expression()?);
         Ok(sum + masked.clone().mul_small_rhs(anchor_keys.at(row)).ring_automorphism(i))
     })?;
@@ -238,15 +238,15 @@ pub(crate) fn phase_graph(
         ArtifactAvailability::Transferred,
     );
     // Read a compact row once and consume its helper columns sequentially.
-    let helpers = mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+    let helpers = mxx_lattice_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
         let own = helper_keys.at(row.clone());
         let i = Group::select(&group.elements, row.expression()?);
-        mxx_dsl::iterate(p, sum, |k_index, sum| {
+        mxx_lattice_dsl::iterate(p, sum, |k_index, sum| {
             let k_expr = k_index.expression()?;
             let k = Group::select(&group.helpers, k_expr.clone());
             let public = setup
                 .helper_key(rns, hash_key.clone(), k)
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                .map_err(|_| mxx_lattice_dsl::DslError::Schema)?;
             let helper = read_helper(&helper_rows, k_index);
             let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
             let value = (helper - public_second_row).ring_automorphism(i.clone()) +
@@ -282,7 +282,7 @@ pub(crate) fn helper_rows(
     public_key: &PePublicKey,
     packages: &mxx_ir_core::artifact::ProductionId,
     p: usize,
-) -> Result<[mxx_dsl::Family<Mat>; 2], PeError> {
+) -> Result<[mxx_lattice_dsl::Family<Mat>; 2], PeError> {
     let ring = public_key.ring()?;
     let columns = public_key.parameters().digits();
     Ok([0, 1].map(|port| {
@@ -297,7 +297,7 @@ pub(crate) fn helper_rows(
 }
 
 /// Helper member `member` as one `1 x m` row over `q`: its two blocks joined.
-pub(crate) fn read_helper(rows: &[mxx_dsl::Family<Mat>; 2], member: Int) -> Mat {
+pub(crate) fn read_helper(rows: &[mxx_lattice_dsl::Family<Mat>; 2], member: Int) -> Mat {
     Mat::concat(ConcatAxis::Columns, vec![rows[0].at(member.clone()), rows[1].at(member)])
 }
 

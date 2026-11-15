@@ -1,0 +1,6 @@
+module = "MxxLatticeLeaves.Examples.AddModSum"
+impl = "MxxLatticeLeaves.Examples.AddModSum.Impl"
+algorithms = ["run"]
+params = "MxxLatticeLeaves.Examples.AddModSum.Params"
+correct = "MxxLatticeLeaves.Examples.AddModSum.Correct"
+notions = []

@@ -1,7 +1,7 @@
 use crate::FheError;
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_dsl::{Mat, Ring};
 use mxx_ir_core::{IntExpr, ParamEnv, node::SampleRange};
+use mxx_lattice_dsl::{Mat, Ring};
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 

@@ -19,8 +19,8 @@ mod workload;
 
 use bigdecimal::BigDecimal;
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_dsl::{Bytes, Family, Mat, Preimage, Ring, SmallMatrix};
 use mxx_ir_core::{IntExpr, ring::ConcreteRing};
+use mxx_lattice_dsl::{Bytes, Family, Mat, Preimage, Ring, SmallMatrix};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -77,7 +77,7 @@ pub(crate) fn hash_key_input_name(namespace: Option<&[u8; 32]>) -> String {
 
 /// Whether `graph` declares a root input named `name`, so a stage binds an
 /// optional runtime input only when its graph consumes it.
-pub(crate) fn graph_declares_input(graph: &mxx_dsl::BuiltGraph, name: &str) -> bool {
+pub(crate) fn graph_declares_input(graph: &mxx_lattice_dsl::BuiltGraph, name: &str) -> bool {
     graph.graph.root_scope().nodes().iter().any(|node| {
         matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { name: input, .. } if input == name)
     })
@@ -176,8 +176,8 @@ pub enum RnsBggError {
     Graph(String),
 }
 
-impl From<mxx_dsl::DslError> for RnsBggError {
-    fn from(error: mxx_dsl::DslError) -> Self {
+impl From<mxx_lattice_dsl::DslError> for RnsBggError {
+    fn from(error: mxx_lattice_dsl::DslError) -> Self {
         Self::Graph(error.to_string())
     }
 }
@@ -298,7 +298,7 @@ pub struct RnsBggParameters {
     /// Components appended to the tag of every public matrix a Program's preprocessing and
     /// evaluation hash on this chain (see [`Self::with_hash_domain`]).
     #[serde(default, with = "empty_graph_domain")]
-    hash_domain: Vec<mxx_dsl::Int>,
+    hash_domain: Vec<mxx_lattice_dsl::Int>,
 }
 
 impl std::fmt::Debug for RnsBggParameters {
@@ -347,7 +347,7 @@ pub struct RnsBggRoot {
     parameters: DCRTPolyParams,
     hash_key: [u8; 32],
     #[serde(default, with = "empty_graph_domain")]
-    domain: Vec<mxx_dsl::Int>,
+    domain: Vec<mxx_lattice_dsl::Int>,
     #[serde(default, with = "empty_derived_roots")]
     derived: BTreeMap<String, DerivedRootKey>,
 }
@@ -355,7 +355,7 @@ pub struct RnsBggRoot {
 /// The root key of a derived root input: a function of this root, the root hash key handle and
 /// the input member.
 pub type DerivedRootKey = std::sync::Arc<
-    dyn Fn(&RnsBggRoot, Bytes, Option<mxx_dsl::Int>) -> Result<RnsBggMatrix, RnsBggError>
+    dyn Fn(&RnsBggRoot, Bytes, Option<mxx_lattice_dsl::Int>) -> Result<RnsBggMatrix, RnsBggError>
         + Send
         + Sync,
 >;
@@ -378,8 +378,8 @@ impl RnsBggRoot {
 
     /// This root with the hash domain `domain`: every root key is hashed under its tag followed
     /// by `domain` (`u64` components, static for loop indices and runtime otherwise, see
-    /// [`mxx_dsl::HashTag::push_u64_le`]), so one root hash key serves several instances.
-    pub fn with_domain(mut self, domain: Vec<mxx_dsl::Int>) -> Self {
+    /// [`mxx_lattice_dsl::HashTag::push_u64_le`]), so one root hash key serves several instances.
+    pub fn with_domain(mut self, domain: Vec<mxx_lattice_dsl::Int>) -> Self {
         self.domain = domain;
         self
     }
@@ -399,7 +399,7 @@ impl RnsBggRoot {
         &self,
         hash_key: Bytes,
         tag: &str,
-        member: Option<mxx_dsl::Int>,
+        member: Option<mxx_lattice_dsl::Int>,
     ) -> Result<RnsBggMatrix, RnsBggError> {
         match self.derived.get(tag) {
             Some(derived) => derived(self, hash_key, member),
@@ -446,13 +446,13 @@ impl RnsBggRoot {
 
     /// The root key of the root object tagged `tag`: four `1 x m_0` blocks hashed at `Q_0` under
     /// the root hash key `hash_key` ([`Self::hash_key_input`]).
-    pub fn key(&self, hash_key: Bytes, tag: impl Into<mxx_dsl::HashTag>) -> RnsBggMatrix {
+    pub fn key(&self, hash_key: Bytes, tag: impl Into<mxx_lattice_dsl::HashTag>) -> RnsBggMatrix {
         public_key::matrix_from_hash(&self.ring(), hash_key, self.domain_tag(tag), self.columns())
     }
 
     /// `tag` followed by this root's hash domain ([`Self::with_domain`]): the tag of any other
     /// public matrix a caller hashes per instance under the root hash key.
-    pub fn domain_tag(&self, tag: impl Into<mxx_dsl::HashTag>) -> mxx_dsl::HashTag {
+    pub fn domain_tag(&self, tag: impl Into<mxx_lattice_dsl::HashTag>) -> mxx_lattice_dsl::HashTag {
         let mut tag = tag.into();
         push_domain(&mut tag, &self.domain);
         tag
@@ -481,8 +481,8 @@ impl RnsBggRoot {
     }
 
     /// The root tag of the LUT helper of automorphism `sigma`.
-    pub fn helper_tag(sigma: mxx_dsl::Int) -> mxx_dsl::HashTag {
-        let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/root-lut-a".to_vec());
+    pub fn helper_tag(sigma: mxx_lattice_dsl::Int) -> mxx_lattice_dsl::HashTag {
+        let mut tag = mxx_lattice_dsl::HashTag::from(b"rns-bgg/root-lut-a".to_vec());
         tag.push(sigma);
         tag
     }
@@ -490,8 +490,9 @@ impl RnsBggRoot {
     /// The root tag of an input's root object `tag`, or of its member `member`.
     /// Member indices use the same length-prefixed integer encoding in static
     /// and runtime tags, including indices wider than 64 bits.
-    pub fn input_tag(tag: &str, member: Option<mxx_dsl::Int>) -> mxx_dsl::HashTag {
-        let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/root-input/{tag}").into_bytes());
+    pub fn input_tag(tag: &str, member: Option<mxx_lattice_dsl::Int>) -> mxx_lattice_dsl::HashTag {
+        let mut tag =
+            mxx_lattice_dsl::HashTag::from(format!("rns-bgg/root-input/{tag}").into_bytes());
         if let Some(member) = member {
             tag.push("member");
             tag.push_integer(member);
@@ -601,17 +602,18 @@ impl RnsBggParameters {
     /// These parameters with the hash domain `domain`: the tag of every public matrix that a
     /// Program's preprocessing and online evaluation sample from their stage hash key (input
     /// keys, LUT keys, RHS and LUT-switching tops) ends with `domain`
-    /// ([`mxx_dsl::HashTag::push_u64_le`] components). One graph that lowers a Program for many
-    /// instances in a loop (one hash key, one Program) passes the instance indices here, so
-    /// every instance samples its own matrices: loop indices hash statically, runtime integers
-    /// as hash arguments of the same bytes. The parameter identity does not depend on it.
-    pub fn with_hash_domain(mut self, domain: Vec<mxx_dsl::Int>) -> Self {
+    /// ([`mxx_lattice_dsl::HashTag::push_u64_le`] components). One graph that lowers a Program for
+    /// many instances in a loop (one hash key, one Program) passes the instance indices here,
+    /// so every instance samples its own matrices: loop indices hash statically, runtime
+    /// integers as hash arguments of the same bytes. The parameter identity does not depend on
+    /// it.
+    pub fn with_hash_domain(mut self, domain: Vec<mxx_lattice_dsl::Int>) -> Self {
         self.hash_domain = domain;
         self
     }
 
     /// Append the hash domain ([`Self::with_hash_domain`]) to `tag`.
-    pub(crate) fn push_hash_domain(&self, tag: &mut mxx_dsl::HashTag) {
+    pub(crate) fn push_hash_domain(&self, tag: &mut mxx_lattice_dsl::HashTag) {
         push_domain(tag, &self.hash_domain);
     }
 
@@ -1028,7 +1030,7 @@ impl RnsBggParameters {
     pub fn root_key(
         &self,
         hash_key: Bytes,
-        tag: impl Into<mxx_dsl::HashTag>,
+        tag: impl Into<mxx_lattice_dsl::HashTag>,
         level: usize,
         form: RnsBggForm,
     ) -> Result<RnsBggMatrix, RnsBggError> {
@@ -1337,7 +1339,7 @@ impl RnsBggParameters {
                     .unwrap_or_else(|| ring.polynomial([IntExpr::constant(1)])))
             })
             .collect::<Result<Vec<_>, RnsBggError>>()?;
-        mxx_dsl::select(mxx_dsl::Int::evaluate(scale.log2.clone()), weights)
+        mxx_lattice_dsl::select(mxx_lattice_dsl::Int::evaluate(scale.log2.clone()), weights)
             .map(Some)
             .map_err(|error| RnsBggError::Graph(error.to_string()))
     }
@@ -1499,9 +1501,9 @@ impl InputKeySource {
     pub fn key(
         &self,
         parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
+        hash_key: mxx_lattice_dsl::Bytes,
         wire: WireId,
-        member: Option<mxx_dsl::Int>,
+        member: Option<mxx_lattice_dsl::Int>,
     ) -> Result<RnsBggPublicKey, RnsBggError> {
         match self {
             Self::Static { level, knowledge, root: Some((tag, root_hash_key)) } => {
@@ -1801,19 +1803,19 @@ pub(crate) fn instance_name(prefix: Option<&str>, role: &str) -> String {
 /// Terms remain symbolic family members; neither count nor column width expands the graph.
 pub fn parallel_component_sum(
     count: usize,
-    term: impl Fn(mxx_dsl::Int) -> Result<Vec<Mat>, RnsBggError>,
+    term: impl Fn(mxx_lattice_dsl::Int) -> Result<Vec<Mat>, RnsBggError>,
 ) -> Result<Vec<Mat>, RnsBggError> {
     if count == 0 {
         return Err(RnsBggError::Binding("a component sum must be nonempty"));
     }
     if count == 1 {
-        return term(mxx_dsl::Int::constant(0));
+        return term(mxx_lattice_dsl::Int::constant(0));
     }
     let mut failure = None;
-    let terms = mxx_dsl::parallel(count, |index| {
+    let terms = mxx_lattice_dsl::parallel(count, |index| {
         term(index).map_err(|error| {
             failure = Some(error);
-            mxx_dsl::DslError::Schema
+            mxx_lattice_dsl::DslError::Schema
         })
     });
     if let Some(error) = failure {
@@ -1824,8 +1826,10 @@ pub fn parallel_component_sum(
         left.into_iter().zip(right).map(|(a, b)| a + b).collect::<Vec<_>>()
     };
     let initial = add(terms.at(0usize), terms.at(1usize));
-    mxx_dsl::iterate(count - 2, initial, |index, total| Ok(add(total, terms.at(index.add(2usize)))))
-        .map_err(|error| RnsBggError::Graph(error.to_string()))
+    mxx_lattice_dsl::iterate(count - 2, initial, |index, total| {
+        Ok(add(total, terms.at(index.add(2usize))))
+    })
+    .map_err(|error| RnsBggError::Graph(error.to_string()))
 }
 
 /// A carrier entry `E` in column `column` of a row of `columns` blocks:
@@ -1893,7 +1897,7 @@ fn mul_small_constant_entry(ring: &Ring, entry: Mat, coefficients: &[i64], shift
         if exponent == IntExpr::constant(0) {
             entry
         } else {
-            entry.multiply_monomial(mxx_dsl::Int::from(exponent))
+            entry.multiply_monomial(mxx_lattice_dsl::Int::from(exponent))
         }
     };
     match terms.as_slice() {
@@ -1996,7 +2000,10 @@ fn plaintext_monomial<P: mxx_backends::poly::Poly>(value: &P) -> Result<(BigInt,
 #[derive(Clone)]
 pub(crate) enum PlaintextFamily {
     /// Compact signed monomials supplied as resident integer inputs.
-    Monomials { coefficients: Family<mxx_dsl::Int>, exponents: Family<mxx_dsl::Int> },
+    Monomials {
+        coefficients: Family<mxx_lattice_dsl::Int>,
+        exponents: Family<mxx_lattice_dsl::Int>,
+    },
     /// Plaintexts supplied by a composing graph ([`RhsPlaintexts`]).
     Graph(RhsPlaintexts),
 }
@@ -2009,7 +2016,7 @@ pub enum RhsPlaintexts {
     Values(Family<Mat>),
     /// The `count` constant polynomials of the integers `integers` from member `first`, each
     /// lifted where it is read, so no family of plaintexts is a graph value.
-    Lifted { integers: Family<mxx_dsl::Int>, first: mxx_dsl::Int, count: IntExpr },
+    Lifted { integers: Family<mxx_lattice_dsl::Int>, first: mxx_lattice_dsl::Int, count: IntExpr },
 }
 
 impl PlaintextFamily {
@@ -2022,7 +2029,7 @@ impl PlaintextFamily {
     }
 
     /// Member `index`, built where it is read in the ring `ring`.
-    pub(crate) fn member(&self, ring: &Ring, index: mxx_dsl::Int) -> Mat {
+    pub(crate) fn member(&self, ring: &Ring, index: mxx_lattice_dsl::Int) -> Mat {
         match self {
             Self::Monomials { coefficients, exponents } => {
                 signed_monomial(ring, coefficients.at(index.clone()), exponents.at(index))
@@ -2037,8 +2044,8 @@ impl PlaintextFamily {
 
 pub(crate) fn signed_monomial(
     ring: &Ring,
-    coefficient: mxx_dsl::Int,
-    exponent: mxx_dsl::Int,
+    coefficient: mxx_lattice_dsl::Int,
+    exponent: mxx_lattice_dsl::Int,
 ) -> Mat {
     coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1))).multiply_monomial(exponent)
 }
@@ -2096,11 +2103,13 @@ pub(crate) fn plaintext_handles(
 ) -> Result<InputBinding<Mat, PlaintextFamily>, String> {
     let (coefficient_name, exponent_name) =
         (format!("{name}.coefficient"), format!("{name}.exponent"));
-    let context = mxx_dsl::DslContext::new("plaintext");
+    let context = mxx_lattice_dsl::DslContext::new("plaintext");
     Ok(match shape {
         InputBinding::Scalar(()) => {
             let input = |name: String| {
-                context.input::<mxx_dsl::Int>(name, mxx_dsl::IntType).map_err(|e| e.to_string())
+                context
+                    .input::<mxx_lattice_dsl::Int>(name, mxx_lattice_dsl::IntType)
+                    .map_err(|e| e.to_string())
             };
             InputBinding::Scalar(signed_monomial(
                 ring,
@@ -2227,7 +2236,7 @@ pub(crate) fn ciphertext_matrix(
 
 /// Append a hash domain to `tag`: the marker `domain` and every component as a `u64`, so tags
 /// of distinct domains differ and an empty domain leaves `tag` unchanged.
-pub(crate) fn push_domain(tag: &mut mxx_dsl::HashTag, domain: &[mxx_dsl::Int]) {
+pub(crate) fn push_domain(tag: &mut mxx_lattice_dsl::HashTag, domain: &[mxx_lattice_dsl::Int]) {
     if domain.is_empty() {
         return;
     }
@@ -2238,9 +2247,9 @@ pub(crate) fn push_domain(tag: &mut mxx_dsl::HashTag, domain: &[mxx_dsl::Int]) {
 }
 
 /// Push a 32-byte digest to `tag` as one decimal integer component.
-pub(crate) fn push_digest(tag: &mut mxx_dsl::HashTag, digest: &[u8]) {
+pub(crate) fn push_digest(tag: &mut mxx_lattice_dsl::HashTag, digest: &[u8]) {
     let value = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, digest);
-    tag.push_decimal(mxx_dsl::Int::evaluate(IntExpr::Const(value)))
+    tag.push_decimal(mxx_lattice_dsl::Int::evaluate(IntExpr::Const(value)))
         .expect("a constant is a compile-time integer");
 }
 
@@ -2265,7 +2274,7 @@ pub(crate) enum BranchGroup {
 #[derive(Clone)]
 pub(crate) struct BranchKeys {
     pub(crate) group: BranchGroup,
-    pub(crate) rows: [mxx_dsl::Family<Mat>; 2],
+    pub(crate) rows: [mxx_lattice_dsl::Family<Mat>; 2],
 }
 
 /// Artifact role of product-key row `port`: `branches.d{depth}.internal.{port}` or
@@ -2281,21 +2290,21 @@ pub(crate) fn branch_keys_role(wire: WireId, group: BranchGroup, port: usize) ->
 /// The sum of the `count` members of `family`, in the shape a GPU plan fuses into its producing
 /// root parallel loop (members 0 and 1 added, then a loop adding member `index + 2`), so that no
 /// member stays resident.
-pub(crate) fn member_sum<T: mxx_dsl::GraphValue + Clone + 'static>(
-    family: &mxx_dsl::Family<T>,
+pub(crate) fn member_sum<T: mxx_lattice_dsl::GraphValue + Clone + 'static>(
+    family: &mxx_lattice_dsl::Family<T>,
     count: usize,
     add: impl Fn(T, T) -> T + Clone + 'static,
 ) -> Result<T, RnsBggError> {
     if count == 0 {
         return Err(RnsBggError::Binding("a member sum needs a member"));
     }
-    let first = family.at(mxx_dsl::Int::constant(0));
+    let first = family.at(mxx_lattice_dsl::Int::constant(0));
     if count == 1 {
         return Ok(first);
     }
-    let first = add(first, family.at(mxx_dsl::Int::constant(1)));
+    let first = add(first, family.at(mxx_lattice_dsl::Int::constant(1)));
     let rest = family.clone();
-    Ok(mxx_dsl::iterate(count - 2, first, move |index, state| {
+    Ok(mxx_lattice_dsl::iterate(count - 2, first, move |index, state| {
         Ok(add(state, rest.at(index.add(2))))
     })?)
 }
@@ -2308,8 +2317,8 @@ pub(crate) fn companion_key(
     parameters: &RnsBggParameters,
     setup: &RnsBggDynamicSetup,
     level: usize,
-    hash_key: mxx_dsl::Bytes,
-    tag: &mxx_dsl::HashTag,
+    hash_key: mxx_lattice_dsl::Bytes,
+    tag: &mxx_lattice_dsl::HashTag,
     a: IntExpr,
     j: IntExpr,
 ) -> Result<RnsBggMatrix, RnsBggError> {
@@ -2333,7 +2342,11 @@ pub(crate) fn companion_key(
 }
 
 /// The hash tag of the companion key `B_{a,j}` of the package tagged `tag`.
-pub(crate) fn companion_tag(tag: &mxx_dsl::HashTag, a: IntExpr, j: IntExpr) -> mxx_dsl::HashTag {
+pub(crate) fn companion_tag(
+    tag: &mxx_lattice_dsl::HashTag,
+    a: IntExpr,
+    j: IntExpr,
+) -> mxx_lattice_dsl::HashTag {
     let mut tag = tag.clone();
     tag.push("column");
     tag.push(j);
@@ -2447,41 +2460,47 @@ pub(crate) fn companion_columns(
     }
     let digit_rows = 2 * parameters.component_columns(level)? - first_row;
     let block = 2 * output_columns;
-    let schema = |_| mxx_dsl::DslError::Schema;
+    let schema = |_| mxx_lattice_dsl::DslError::Schema;
     let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
     let mut rows = vec![ring.zero((1, branches * block)); sums];
     // The public rows' keys `A_{s,:,a} Dec(top_s)_{a,:}`: per branch, the top
     // row is decomposed once and each of its digit rows scales one key entry.
     if let (Some((count, top)), true) = (&public_rows, companion_key.is_some()) {
         let count = *count;
-        let public = mxx_dsl::iterate(branches, rows[..2].to_vec(), |branch, rows: Vec<Mat>| {
-            let branch = branch.expression()?;
-            let decomposition =
-                top(branch.clone()).map_err(schema)?.decompose(base, digits).centered_rebase(&ring);
-            let keys =
-                mxx_dsl::iterate(count, vec![ring.zero((1, block)); 2], |a, keys: Vec<Mat>| {
-                    let a = a.expression()?;
-                    let digit =
-                        unit_row(&ring, digits, a.clone()).mul_small_rhs(decomposition.clone());
-                    keys.into_iter()
-                        .enumerate()
-                        .map(|(r, key)| {
-                            Ok(key +
-                                key_entry(branch.clone(), r, a.clone()).map_err(schema)? *
-                                    digit.clone())
-                        })
-                        .collect()
-                })?;
-            let place = unit_row(&ring, branches, branch);
-            Ok(rows
-                .into_iter()
-                .zip(keys)
-                .map(|(row, key)| row + place.clone().tensor(key))
-                .collect())
-        })?;
+        let public =
+            mxx_lattice_dsl::iterate(branches, rows[..2].to_vec(), |branch, rows: Vec<Mat>| {
+                let branch = branch.expression()?;
+                let decomposition = top(branch.clone())
+                    .map_err(schema)?
+                    .decompose(base, digits)
+                    .centered_rebase(&ring);
+                let keys = mxx_lattice_dsl::iterate(
+                    count,
+                    vec![ring.zero((1, block)); 2],
+                    |a, keys: Vec<Mat>| {
+                        let a = a.expression()?;
+                        let digit =
+                            unit_row(&ring, digits, a.clone()).mul_small_rhs(decomposition.clone());
+                        keys.into_iter()
+                            .enumerate()
+                            .map(|(r, key)| {
+                                Ok(key +
+                                    key_entry(branch.clone(), r, a.clone()).map_err(schema)? *
+                                        digit.clone())
+                            })
+                            .collect()
+                    },
+                )?;
+                let place = unit_row(&ring, branches, branch);
+                Ok(rows
+                    .into_iter()
+                    .zip(keys)
+                    .map(|(row, key)| row + place.clone().tensor(key))
+                    .collect())
+            })?;
         rows.splice(..2, public);
     }
-    Ok(mxx_dsl::iterate(branches * digit_rows, rows, |pair, rows: Vec<Mat>| {
+    Ok(mxx_lattice_dsl::iterate(branches * digit_rows, rows, |pair, rows: Vec<Mat>| {
         let pair = Box::new(pair.expression()?);
         let digit_rows = Box::new(IntExpr::constant(digit_rows));
         let branch = IntExpr::FloorDiv(pair.clone(), digit_rows.clone()).canonicalize();
@@ -2503,7 +2522,7 @@ pub(crate) fn companion_columns(
         if let Some((left, right)) = read(IntExpr::constant(0)).map_err(schema)? {
             initial.extend([left, right]);
         }
-        let blocks = mxx_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
+        let blocks = mxx_lattice_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
             let j = j.expression()?;
             let next = IntExpr::Rem(
                 Box::new(j.clone() + IntExpr::constant(1)),
@@ -2562,14 +2581,14 @@ pub(crate) fn companion_block(
     }
     let digit_rows = 2 * parameters.component_columns(level)? - first_row;
     let block = 2 * output_columns;
-    let schema = |_| mxx_dsl::DslError::Schema;
+    let schema = |_| mxx_lattice_dsl::DslError::Schema;
     let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
     let mut rows = vec![ring.zero((1, block)); sums * branches];
     // The public rows' keys `A_{:,a} Dec(top)_{a,:}`: the top row is decomposed once and each
     // of its digit rows scales one key entry.
     if let (Some((count, top)), true) = (&public_rows, companion_key.is_some()) {
         let decomposition = top()?.decompose(base, digits).centered_rebase(&ring);
-        let keys = mxx_dsl::iterate(
+        let keys = mxx_lattice_dsl::iterate(
             *count,
             vec![ring.zero((1, block)); 2 * branches],
             |a, keys: Vec<Mat>| {
@@ -2588,7 +2607,7 @@ pub(crate) fn companion_block(
             rows[branch * sums..branch * sums + 2].clone_from_slice(key);
         }
     }
-    Ok(mxx_dsl::iterate(digit_rows, rows, |row, rows: Vec<Mat>| {
+    Ok(mxx_lattice_dsl::iterate(digit_rows, rows, |row, rows: Vec<Mat>| {
         let a = (row.expression()? + IntExpr::constant(first_row)).canonicalize();
         let digits = (0..branches)
             .map(|branch| {
@@ -2606,7 +2625,7 @@ pub(crate) fn companion_block(
         if let Some((left, right)) = read(IntExpr::constant(0)).map_err(schema)? {
             initial.extend([left, right]);
         }
-        let mut rows = mxx_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
+        let mut rows = mxx_lattice_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
             let j = j.expression()?;
             let next = IntExpr::Rem(
                 Box::new(j.clone() + IntExpr::constant(1)),
@@ -2665,21 +2684,25 @@ pub(crate) fn column_action(
     let digits = decomposition.modulus_digits();
     let width = 2 * columns;
     let [top, bottom] = [&matrix.0, &matrix.1].map(join_row);
-    Ok(mxx_dsl::iterate(width, vec![ring.zero((1, width)); rows.len()], |j, sums: Vec<Mat>| {
-        let j = j.expression()?;
-        let column = Mat::concat(
-            mxx_ir_core::node::ConcatAxis::Rows,
-            vec![row_entry(&top, j.clone()), row_entry(&bottom, j.clone())],
-        )
-        .decompose(base, digits)
-        .centered_rebase(&ring);
-        let unit = unit_row(&ring, width, j);
-        Ok(sums
-            .into_iter()
-            .zip(&rows)
-            .map(|(sum, row)| sum + row.clone().mul_small_rhs(column.clone()) * unit.clone())
-            .collect())
-    })?)
+    Ok(mxx_lattice_dsl::iterate(
+        width,
+        vec![ring.zero((1, width)); rows.len()],
+        |j, sums: Vec<Mat>| {
+            let j = j.expression()?;
+            let column = Mat::concat(
+                mxx_ir_core::node::ConcatAxis::Rows,
+                vec![row_entry(&top, j.clone()), row_entry(&bottom, j.clone())],
+            )
+            .decompose(base, digits)
+            .centered_rebase(&ring);
+            let unit = unit_row(&ring, width, j);
+            Ok(sums
+                .into_iter()
+                .zip(&rows)
+                .map(|(sum, row)| sum + row.clone().mul_small_rhs(column.clone()) * unit.clone())
+                .collect())
+        },
+    )?)
 }
 
 /// A lazy column action: decompose only the selected source column inside
@@ -2766,18 +2789,19 @@ impl RightAction for ColumnDecomposition {
         let sums = parallel_component_sum(2 * columns, |index| {
             let index =
                 index.expression().map_err(|error| RnsBggError::Graph(error.to_string()))?;
-            let block = mxx_dsl::Int::evaluate(
+            let block = mxx_lattice_dsl::Int::evaluate(
                 IntExpr::FloorDiv(Box::new(index.clone()), Box::new(columns.into())).canonicalize(),
             );
             let column = (index.clone() % columns).canonicalize();
-            let digits = |left: &Mat, right: &Mat| -> Result<mxx_dsl::SmallMatrix, RnsBggError> {
-                let entry = mxx_dsl::select(
-                    block.clone(),
-                    vec![row_entry(left, column.clone()), row_entry(right, column.clone())],
-                )
-                .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-                Ok(entry.decompose(first.base, first.digits).centered_rebase(&first.ring))
-            };
+            let digits =
+                |left: &Mat, right: &Mat| -> Result<mxx_lattice_dsl::SmallMatrix, RnsBggError> {
+                    let entry = mxx_lattice_dsl::select(
+                        block.clone(),
+                        vec![row_entry(left, column.clone()), row_entry(right, column.clone())],
+                    )
+                    .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+                    Ok(entry.decompose(first.base, first.digits).centered_rebase(&first.ring))
+                };
             let top = digits(&first.entries.0, &second.entries.0)?;
             let bottom = digits(&first.entries.1, &second.entries.1)?;
             let mut place = column_placement(2 * columns, &index);
@@ -3133,8 +3157,8 @@ pub(crate) fn mod_down_encoding(value: RnsBggRow, destination: &Ring) -> RnsBggR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::GraphValue;
     use mxx_ir_core::IntExpr;
+    use mxx_lattice_dsl::GraphValue;
     use num_traits::One;
 
     /// A scaled public product divides its LHS payload by `2^k` inside the decomposition: the
@@ -3289,7 +3313,7 @@ mod tests {
             let action = parameters.output_action(0, &k).unwrap();
             let digits = action.clone().right_multiply(ring.identity(columns));
             let reconstruction = action.right_multiply(parameters.public_gadget(0).unwrap());
-            let graph = mxx_dsl::DslContext::new("gadget-inverse-norms")
+            let graph = mxx_lattice_dsl::DslContext::new("gadget-inverse-norms")
                 .output("digits", digits)
                 .unwrap()
                 .output("reconstruction", reconstruction)
@@ -3523,7 +3547,7 @@ mod tests {
             ("positive", monomial.clone()),
             ("general", monomial.clone() + DCRTPoly::const_rotate_poly(&level, 2)),
         ];
-        let mut context = mxx_dsl::DslContext::new("plaintext-constants");
+        let mut context = mxx_lattice_dsl::DslContext::new("plaintext-constants");
         for (name, value) in &cases {
             context = context.output(*name, plaintext_constant(&ring, value)).unwrap();
         }
@@ -3565,7 +3589,7 @@ mod tests {
             BigInt::from(primes[0]) * primes[1] * primes[2]
         );
 
-        let graph = mxx_dsl::DslContext::new("checked-modulus-conversion")
+        let graph = mxx_lattice_dsl::DslContext::new("checked-modulus-conversion")
             .transferred_output("reduced", reduced)
             .unwrap()
             .transferred_output("equal", equal)
@@ -3589,7 +3613,7 @@ mod tests {
         let snapshot = serde_json::to_value(&parameters).unwrap();
         let restored: RnsBggParameters = serde_json::from_value(snapshot.clone()).unwrap();
         assert_eq!(serde_json::to_value(restored).unwrap(), snapshot);
-        let bound = parameters.with_hash_domain(vec![mxx_dsl::Int::constant(1)]);
+        let bound = parameters.with_hash_domain(vec![mxx_lattice_dsl::Int::constant(1)]);
         assert!(serde_json::to_value(bound).unwrap_err().to_string().contains("bound graph"));
         let mut unbound = snapshot.clone();
         unbound.as_object_mut().unwrap().remove("hash_domain");
@@ -3602,7 +3626,7 @@ mod tests {
         let restored: RnsBggRoot = serde_json::from_value(snapshot.clone()).unwrap();
         assert_eq!(serde_json::to_value(restored).unwrap(), snapshot);
         assert!(
-            serde_json::to_value(root.clone().with_domain(vec![mxx_dsl::Int::constant(1)]))
+            serde_json::to_value(root.clone().with_domain(vec![mxx_lattice_dsl::Int::constant(1)]))
                 .is_err()
         );
         let derived =
@@ -3701,7 +3725,7 @@ mod tests {
 // snapshots may contain only unbound domains; reject instead of silently discarding them.
 mod empty_graph_domain {
     pub fn serialize<S: serde::Serializer>(
-        value: &[mxx_dsl::Int],
+        value: &[mxx_lattice_dsl::Int],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         if !value.is_empty() {
@@ -3711,7 +3735,7 @@ mod empty_graph_domain {
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Vec<mxx_dsl::Int>, D::Error> {
+    ) -> Result<Vec<mxx_lattice_dsl::Int>, D::Error> {
         let values = <Vec<serde::de::IgnoredAny> as serde::Deserialize>::deserialize(deserializer)?;
         if !values.is_empty() {
             return Err(serde::de::Error::custom("cannot deserialize a bound graph hash domain"));

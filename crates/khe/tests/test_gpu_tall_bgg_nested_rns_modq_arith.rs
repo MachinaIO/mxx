@@ -20,7 +20,7 @@ use mxx_backends::{
     sampler::bounds::{compute_preimage_sigma, hard_cutoff_from_sigma_bound},
     utils::{gen_biguint_for_modulus, mod_inverse},
 };
-use mxx_dsl::{BuiltGraph, DslContext, Int, Ring, parallel};
+use mxx_lattice_dsl::{BuiltGraph, DslContext, Int, Ring, parallel};
 use mxx_ir_core::{
     IntExpr, ParamEnv, RealExpr, ValidatedGraph,
     artifact::{

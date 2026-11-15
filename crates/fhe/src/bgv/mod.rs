@@ -10,13 +10,13 @@ use mxx_backends::{
     },
     utils::mod_inverse,
 };
-use mxx_dsl::{
-    DslError, Family, GraphValue, GraphValueSchema, Int, Mat, MatType, concat_rows, parallel,
-};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
     types::WireType,
+};
+use mxx_lattice_dsl::{
+    DslError, Family, GraphValue, GraphValueSchema, Int, Mat, MatType, concat_rows, parallel,
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
@@ -849,7 +849,7 @@ impl BgvParams {
 mod tests {
     use super::*;
     use crate::utils::{common, execute_graph, int_input, integers};
-    use mxx_dsl::DslContext;
+    use mxx_lattice_dsl::DslContext;
     use num_integer::Integer;
     use num_traits::Signed;
     use std::collections::BTreeMap;
@@ -1542,7 +1542,7 @@ mod simd_tests {
         Poly,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
-    use mxx_dsl::DslContext;
+    use mxx_lattice_dsl::DslContext;
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
 
@@ -1771,8 +1771,8 @@ mod benchmarks {
         ExecutionConfig, MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
-    use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
+    use mxx_lattice_dsl::DslContext;
     use std::{collections::BTreeMap, time::Instant};
     #[test]
     #[ignore = "manual CPU key-switch timing; excludes key generation"]

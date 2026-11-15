@@ -5,7 +5,7 @@ use mxx_khe::bgg::{
     BggPublicKeyWire, BggSamplerLayout, CircuitEncoding, DynamicBooleanBggError,
     evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
 };
-use mxx_dsl::{
+use mxx_lattice_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, PurePredicateSpec, iterate, parallel, select,
 };
 use mxx_khe::{
@@ -52,7 +52,7 @@ impl DiamondGraphParams {
     const ERROR_BOUND: &'static str = "diamond_error_max_coefficient_bound";
     const PREIMAGE_BOUND: &'static str = "diamond_preimage_max_coefficient_bound";
 
-    fn declare(mut context: DslContext, ring: &mxx_dsl::Ring) -> (DslContext, Self) {
+    fn declare(mut context: DslContext, ring: &mxx_lattice_dsl::Ring) -> (DslContext, Self) {
         for name in [
             Self::INPUT_COUNT,
             Self::DIGIT_BASE,
@@ -130,7 +130,7 @@ fn padded_witness_public_key_indices(
     instance_width: Int,
     witness_size: IntExpr,
     max_layer_width: IntExpr,
-) -> Result<mxx_dsl::Family<Int>, DslError> {
+) -> Result<mxx_lattice_dsl::Family<Int>, DslError> {
     let witness_end = instance_width.clone().add(Int::evaluate(witness_size).sub(Int::constant(1)));
     parallel(max_layer_width, |slot| {
         let active =
@@ -168,11 +168,11 @@ pub struct DiamondWeCompiler {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiamondWeProtocolFamily {
     bgg_tag: Vec<u8>,
-    ring: mxx_dsl::Ring,
+    ring: mxx_lattice_dsl::Ring,
 }
 
 impl DiamondWeProtocolFamily {
-    pub fn new(bgg_tag: impl Into<Vec<u8>>, ring: mxx_dsl::Ring) -> Self {
+    pub fn new(bgg_tag: impl Into<Vec<u8>>, ring: mxx_lattice_dsl::Ring) -> Self {
         Self { bgg_tag: bgg_tag.into(), ring }
     }
 }
@@ -673,7 +673,7 @@ impl DiamondWeProtocolFamily {
             DiamondGraphParams::declare(DslContext::new("diamond-we-ideal"), &self.ring);
         let ideal_ring = ideal_params.input.ring();
         let (ideal_context, _) = BooleanCircuitFamilyParams::declare(ideal_context);
-        let ideal = mxx_dsl::IdealSpec::new(
+        let ideal = mxx_lattice_dsl::IdealSpec::new(
             ideal_context
                 .output(IDEAL_MESSAGE_OUTPUT, ideal_ring.bool_input(MESSAGE_INPUT))?
                 .build()?
@@ -1172,7 +1172,7 @@ mod tests {
             BooleanCircuitFamilyParams::declare(DslContext::new("diamond-parameter-validity"));
         let (context, params) = DiamondGraphParams::declare(
             context,
-            &mxx_dsl::Ring::from_crt_moduli(vec![257.into()], 8),
+            &mxx_lattice_dsl::Ring::from_crt_moduli(vec![257.into()], 8),
         );
         let predicate = diamond_parameter_validity_predicate(context, &circuit, &params).unwrap();
         let execute_with = |bindings: &ParamEnv| {

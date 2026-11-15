@@ -9,8 +9,8 @@ use crate::{
         dcrt::gpu::{GpuDCRTPolyParams, GpuSignedValues, download_device_memory},
     },
 };
-use mxx_dsl::{DslContext, HashTag, Int, Ring, iterate};
 use mxx_ir_core::{IntExpr, ParamEnv, generate_crt_basis};
+use mxx_lattice_dsl::{DslContext, HashTag, Int, Ring, iterate};
 
 fn parameter(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |value| value.parse().unwrap())

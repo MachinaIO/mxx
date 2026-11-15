@@ -1,7 +1,9 @@
 //! BGG-independent input-injection preprocessing shared by Diamond applications.
 
-use mxx_dsl::{DslError, Family, Int, Mat, Preimage, Ring, Trapdoor, iterate, parallel, select};
 use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis};
+use mxx_lattice_dsl::{
+    DslError, Family, Int, Mat, Preimage, Ring, Trapdoor, iterate, parallel, select,
+};
 use num_bigint::BigInt;
 use thiserror::Error;
 
@@ -367,8 +369,8 @@ fn regular_selector(secret: Mat) -> Mat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::DslContext;
     use mxx_ir_core::{ParamEnv, node::NodeKind, types::WireType};
+    use mxx_lattice_dsl::DslContext;
 
     fn config() -> DiamondInputConfig {
         DiamondInputConfig {

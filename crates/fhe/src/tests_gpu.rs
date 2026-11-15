@@ -8,8 +8,8 @@ use mxx_backends::{
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend},
     poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
 };
-use mxx_dsl::{DslContext, Ring};
 use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
+use mxx_lattice_dsl::{DslContext, Ring};
 use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use std::collections::BTreeMap;
@@ -24,9 +24,11 @@ fn test_gpu_integer_family_permutation_across_waves() {
     let count = width * 2;
     let context = DslContext::new("integer-permutation-waves");
     let input_family = context.int_family_input("values", count);
-    let indices =
-        mxx_dsl::Family::pack((0..count).rev().map(mxx_dsl::Int::constant).collect()).unwrap();
-    let result = mxx_dsl::parallel(count, |i| Ok(input_family.at(indices.at(i)))).unwrap();
+    let indices = mxx_lattice_dsl::Family::pack(
+        (0..count).rev().map(mxx_lattice_dsl::Int::constant).collect(),
+    )
+    .unwrap();
+    let result = mxx_lattice_dsl::parallel(count, |i| Ok(input_family.at(indices.at(i)))).unwrap();
     let common = common();
     let ring = crate::utils::ring(&common.ring);
     let graph = context
@@ -104,7 +106,7 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
     let context = DslContext::new("compiled-product-rebinding");
     let input_values = context.int_family_input("values", n);
     let matrix = common.ring().from_coefficients(&input_values);
-    let wide = mxx_dsl::Mat::concat(
+    let wide = mxx_lattice_dsl::Mat::concat(
         mxx_ir_core::node::ConcatAxis::Columns,
         vec![matrix.clone(), matrix.clone(), matrix.clone()],
     );

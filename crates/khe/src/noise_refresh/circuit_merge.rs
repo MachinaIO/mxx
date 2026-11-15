@@ -64,8 +64,8 @@ mod graph_tests {
         },
         transcript::SamplingMode,
     };
-    use mxx_dsl::{DslContext, Mat};
     use mxx_ir_core::ParamEnv;
+    use mxx_lattice_dsl::{DslContext, Mat};
     use num_bigint::BigUint;
     use std::{collections::BTreeMap, convert::Infallible};
 

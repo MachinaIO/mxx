@@ -11,7 +11,7 @@ gpu = ["mxx-backends/gpu"]
 test-utils = []
 
 [dependencies]
-mxx-dsl.workspace = true
+mxx-lattice-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-backends.workspace = true
 bigdecimal.workspace = true

@@ -467,8 +467,9 @@ dependencies = [
  "itertools",
  "keccak-asm",
  "libc",
- "mxx-dsl",
+ "mxx-core",
  "mxx-ir-core",
+ "mxx-lattice-dsl",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -486,15 +487,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "mxx-dsl"
+name = "mxx-core"
 version = "0.1.0"
 dependencies = [
- "bigdecimal",
- "mxx-backends",
- "mxx-ir-core",
- "num-bigint",
+ "rand 0.9.2",
+ "rayon",
  "serde",
- "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -505,8 +504,8 @@ dependencies = [
  "bigdecimal",
  "keccak-asm",
  "mxx-backends",
- "mxx-dsl",
  "mxx-ir-core",
+ "mxx-lattice-dsl",
  "num-bigint",
  "num-traits",
  "rand 0.9.2",
@@ -529,8 +528,9 @@ dependencies = [
  "bigdecimal",
  "cc",
  "mxx-backends",
- "mxx-dsl",
+ "mxx-core",
  "mxx-ir-core",
+ "mxx-lattice-dsl",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -555,9 +555,12 @@ version = "0.1.0"
 name = "mxx-ir-core"
 version = "0.1.0"
 dependencies = [
+ "mxx-core",
+ "mxx-lattice-leaves",
  "num-bigint",
  "num-integer",
  "num-traits",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "sha2",
@@ -575,8 +578,8 @@ dependencies = [
  "itertools",
  "keccak-asm",
  "mxx-backends",
- "mxx-dsl",
  "mxx-ir-core",
+ "mxx-lattice-dsl",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -592,14 +595,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxx-lattice-dsl"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "mxx-backends",
+ "mxx-ir-core",
+ "num-bigint",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "mxx-lattice-leaves"
+version = "0.1.0"
+dependencies = [
+ "rand 0.9.2",
+]
+
+[[package]]
 name = "mxx-pe"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "mxx-backends",
- "mxx-dsl",
  "mxx-exponent-lut",
  "mxx-ir-core",
+ "mxx-lattice-dsl",
  "num-bigint",
  "num-traits",
  "rand 0.9.2",

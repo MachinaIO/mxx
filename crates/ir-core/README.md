@@ -2,7 +2,7 @@
 
 `mxx-ir-core` defines the program that every other mxx crate builds, executes, or analyzes: a
 typed dataflow graph whose nodes are primitive lattice operations. A protocol is written once
-as such a graph (usually through `mxx-dsl`), validated under concrete parameters, and then run by
+as such a graph (usually through `mxx-lattice-dsl`), validated under concrete parameters, and then run by
 the CPU or GPU backend in `mxx-backends` or exported to Lean. This crate depends on no other
 workspace crate.
 
@@ -32,7 +32,7 @@ proof package checks a proof of it. The handwritten Lean package that generated 
 ## Design
 
 ```text
-construction code (mxx-dsl)  --freeze-->  Graph  --validate(bindings)-->  ValidatedGraph
+construction code (mxx-lattice-dsl)  --freeze-->  Graph  --validate(bindings)-->  ValidatedGraph
                                                                             |-> CPU executor (mxx-backends)
                                                                             |-> GPU runtime  (mxx-backends)
                                                                             '-> Lean export  (lean)

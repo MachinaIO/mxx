@@ -26,7 +26,6 @@ use mxx_backends::{
     RuntimeValue, SessionStore,
     poly::{Poly, dcrt::poly::DCRTPoly},
 };
-use mxx_dsl::{DslContext, Int, Mat};
 use mxx_exponent_lut::{
     api::{self, EncryptBuild, StageArtifacts, StageExecution, StageGraph},
     program::InputBinding,
@@ -35,6 +34,7 @@ use mxx_exponent_lut::{
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv};
+use mxx_lattice_dsl::{DslContext, Int, Mat};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::collections::BTreeMap;
@@ -198,7 +198,7 @@ where
     let (s_bar, _) = secret.row().clone();
     let (d_1, d_2) = public_key.message_row(hash_key.clone())?;
     // `chi` over `ring`; a zero sigma (noise-free parameters) adds no error.
-    let error_over = |ring: &mxx_dsl::Ring, columns: usize| -> Result<Mat, PeError> {
+    let error_over = |ring: &mxx_lattice_dsl::Ring, columns: usize| -> Result<Mat, PeError> {
         let contract = parameters.error();
         if contract.sigma().is_zero() {
             return Ok(ring.zero((1, columns)));
@@ -230,7 +230,7 @@ where
             context.transferred_output(RnsBggDynamicSetup::automorphism_helper_role(), helpers)?;
     }
     for (coordinate, family) in exponents {
-        let bottoms = mxx_dsl::parallel(family.count().clone(), |member| {
+        let bottoms = mxx_lattice_dsl::parallel(family.count().clone(), |member| {
             // The bottom row `X^v s G - s_bar a_t + e_t` of `C_t = [a_t; ...]`, whose top row
             // `a_t` is the setup's: `s C_t = X^v s G + e_t` for `s = (s_bar, 1)`.
             setup
@@ -242,7 +242,7 @@ where
                     secret.row(),
                     ring.identity(1).multiply_monomial(family.at(member)),
                 )
-                .map_err(|_| mxx_dsl::DslError::Schema)
+                .map_err(|_| mxx_lattice_dsl::DslError::Schema)
         })?;
         context = context
             .transferred_output(RnsBggDynamicSetup::rhs_bottom_role(coordinate, true), bottoms)?;

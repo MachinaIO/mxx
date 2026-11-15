@@ -11,12 +11,12 @@ fn bench_gpu_matrix_mul() {
         },
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
-    use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::{
         ParamEnv,
         ring::{RingExpr, RingRef},
         types::{ConcreteMatrixType, ConcreteWireType},
     };
+    use mxx_lattice_dsl::{DslContext, Ring};
     use std::{collections::BTreeMap, hint::black_box, sync::Arc, time::Instant};
     use tracing::info;
 

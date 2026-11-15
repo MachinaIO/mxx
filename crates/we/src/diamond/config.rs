@@ -1,4 +1,4 @@
-use mxx_dsl::Ring;
+use mxx_lattice_dsl::Ring;
 use mxx_khe::input_injector::{
     DIAMOND_PREFIX_DIMENSION, DIAMOND_SECRET_DIMENSION, DiamondInputConfig, DiamondInputConfigError,
 };

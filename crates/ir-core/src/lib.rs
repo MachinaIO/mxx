@@ -2,8 +2,8 @@
 //!
 //! This crate owns executable graph structure, compile expressions, rings and CRT bases, concrete
 //! type validation, canonical identities, artifact manifests, protocol declarations, and Lean
-//! export. It depends on no other workspace crate: `mxx-dsl` builds its graphs and `mxx-backends`
-//! executes them.
+//! export. It depends on no other workspace crate: `mxx-lattice-dsl` builds its graphs and
+//! `mxx-backends` executes them.
 //!
 //! A graph goes through three stages. Construction code creates immutable node handles
 //! ([`graph`]); [`graph::Graph::freeze`] keeps the reachable nodes, one scope per body.
@@ -21,6 +21,7 @@ pub mod graph;
 pub mod hash_columns;
 pub mod inventory;
 pub mod lean;
+pub mod lower;
 pub mod merge;
 pub mod node;
 pub mod parallel_reduction;

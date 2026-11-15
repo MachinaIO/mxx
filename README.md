@@ -28,8 +28,8 @@ of `b - a·s`. Every parameter, such as the ring's CRT width and depth, the nois
 width `sigma`, and the gadget base, is a named variable, and it gets a value only when the
 program is bound for a run. The example also exports the Lean statement that every execution
 decrypts its message, which a machine-checked proof establishes. The full program is
-[`crates/dsl/examples/rlwe_encrypt.rs`](crates/dsl/examples/rlwe_encrypt.rs); run it
-with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
+[`crates/lattice-dsl/examples/rlwe_encrypt.rs`](crates/lattice-dsl/examples/rlwe_encrypt.rs); run it
+with `cargo run -r -p mxx-lattice-dsl --example rlwe_encrypt --features gpu`.
 
 ```rust
 use bigdecimal::BigDecimal;
@@ -37,7 +37,7 @@ use mxx_backends::{
     GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
     sampler::bounds::hard_cutoff_from_sigma_bound,
 };
-use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, Int, IntType, Ring};
+use mxx_lattice_dsl::{BuiltGraph, DslContext, DslError, HashTag, Int, IntType, Ring};
 use mxx_ir_core::{IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis};
 use num_bigint::BigInt;
 use std::{collections::BTreeMap, sync::Arc};
@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program = rlwe_program(ring_dimension)?;
 
     // State the program's correctness in Lean: for every seed and message bit, the decrypted bit
-    // is the message. `lake build` in `crates/dsl/examples/rlwe` checks the proof.
+    // is the message. `lake build` in `crates/lattice-dsl/examples/rlwe` checks the proof.
     let lean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated");
     mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean)?;
 
@@ -138,11 +138,11 @@ coefficient decoding, and whose edges carry values between them. Computation hap
 a backend executes the graph. This is why one description can run on a GPU or on a CPU.
 
 The same graph also becomes a Lean theorem. `correctness_protocol`, defined in
-[`crates/dsl/examples/rlwe_encrypt.rs`](crates/dsl/examples/rlwe_encrypt.rs), declares it as a
+[`crates/lattice-dsl/examples/rlwe_encrypt.rs`](crates/lattice-dsl/examples/rlwe_encrypt.rs), declares it as a
 protocol whose ideal functionality returns the message bit, and `main` exports the statement that
 every execution decrypts its message to
-[`crates/dsl/examples/rlwe/generated`](crates/dsl/examples/rlwe/generated). The proof in
-[`crates/dsl/examples/rlwe`](crates/dsl/examples/rlwe) checks it with `lake build`; see
+[`crates/lattice-dsl/examples/rlwe/generated`](crates/lattice-dsl/examples/rlwe/generated). The proof in
+[`crates/lattice-dsl/examples/rlwe`](crates/lattice-dsl/examples/rlwe) checks it with `lake build`; see
 [Correctness in Lean](#choosing-parameters-and-correctness-in-lean).
 
 To see the recorded graph, write `rlwe_program(ring_dimension)?.render_html()` to a file and open
@@ -165,7 +165,7 @@ key-switching matrix product:
 ### Describing a protocol
 
 Every supported value type, primitive operation, and sampler is listed, with how to call it, in
-[`crates/dsl/SPEC.md`](crates/dsl/SPEC.md).
+[`crates/lattice-dsl/SPEC.md`](crates/lattice-dsl/SPEC.md).
 
 - **Lattice objects as values.** You work with matrices of polynomials over RNS rings
   `Z_Q[X]/(X^N + 1)`, where Q is a product of word-sized primes. You also work with matrices of
@@ -266,7 +266,7 @@ make autoresearch in lattice cryptography, research carried out by AI systems, f
 | Crate | Responsibility |
 | --- | --- |
 | [`mxx-ir-core`](crates/ir-core/README.md) | The executable graph IR: rings, compile expressions, validation, artifact manifests, protocol declarations, and Lean export. |
-| [`mxx-dsl`](crates/dsl/README.md) | The Rust-based DSL that builds graphs. |
+| [`mxx-lattice-dsl`](crates/lattice-dsl/README.md) | The Rust-based DSL that builds graphs. |
 | [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA/HIP, and artifacts. |
 | [`mxx-khe`](crates/khe/README.md) | Key-homomorphic encodings: BGG+ keys, encodings, circuit evaluation, lookups, and slot transfer, with the circuits and gadgets they evaluate, and WEE25 commitments. |
 | [`mxx-fhe`](crates/fhe/README.md) | TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and noise tracking. |
@@ -285,7 +285,7 @@ crate it builds on:
   mxx-fhe   mxx-khe   mxx-exponent-lut  applications and the shared Exponent-LUT library
        \       |       /
         v      v      v
-           mxx-dsl                      records a protocol as a program
+           mxx-lattice-dsl                      records a protocol as a program
               |
               v
          mxx-ir-core                    the program: a graph of primitive operations
@@ -300,7 +300,7 @@ never depend on each other. `mxx-exponent-lut` is a shared library rather than a
 `mxx-pe` builds on it, and it depends on no protocol crate.
 
 Each crate's README introduces the crate. The DSL's operations are listed in
-[`crates/dsl/SPEC.md`](crates/dsl/SPEC.md), the API for executing programs in
+[`crates/lattice-dsl/SPEC.md`](crates/lattice-dsl/SPEC.md), the API for executing programs in
 [`crates/backends/SPEC.md`](crates/backends/SPEC.md), and the Lean correctness statements and
 their proofs in [`crates/ir-core/LEAN-SPEC.md`](crates/ir-core/LEAN-SPEC.md). The API
 documentation, built with `cargo doc --workspace --no-deps --features gpu --open`, is the

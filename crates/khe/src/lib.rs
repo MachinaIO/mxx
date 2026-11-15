@@ -24,9 +24,9 @@ pub mod wee25;
 
 pub fn ring_from_params(
     parameters: &mxx_backends::poly::dcrt::params::DCRTPolyParams,
-) -> mxx_dsl::Ring {
+) -> mxx_lattice_dsl::Ring {
     use mxx_backends::poly::PolyParams;
-    mxx_dsl::Ring::from_crt_moduli(
+    mxx_lattice_dsl::Ring::from_crt_moduli(
         parameters.to_crt().0.into_iter().map(Into::into).collect(),
         parameters.ring_dimension(),
     )

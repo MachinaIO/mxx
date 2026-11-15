@@ -10,12 +10,12 @@ use mxx_backends::{
     },
     transcript::SamplingMode,
 };
-use mxx_dsl::BuiltGraph;
 use mxx_ir_core::{
     ParamEnv,
     node::NodeKind,
     types::{NodeId, Port, WireRef},
 };
+use mxx_lattice_dsl::BuiltGraph;
 use std::collections::BTreeMap;
 
 pub fn row(parameters: &DCRTPolyParams, columns: usize, offset: usize) -> DCRTPolyMatrix {

@@ -39,7 +39,7 @@
 //! its helper error and mask remainder once, unamplified; `V_k` acts on the
 //! first helper only. A word of length one is the direct switch.
 use super::*;
-use mxx_dsl::{DslError, Int};
+use mxx_lattice_dsl::{DslError, Int};
 use std::collections::BTreeMap;
 
 /// For every `k` of `automorphisms` (a set of automorphism indices of ring
@@ -313,7 +313,7 @@ pub(crate) fn static_public_lut(
             })
             .collect::<Result<Vec<_>, RnsBggError>>()?;
         let count = IntExpr::constant(positions.len());
-        sum = mxx_dsl::iterate(count, sum, |index, (row_sum, key_sum)| {
+        sum = mxx_lattice_dsl::iterate(count, sum, |index, (row_sum, key_sum)| {
             let index = index.expression()?;
             let position = select(&positions, index.clone());
             let k = select(&sigmas, position.clone());
@@ -490,7 +490,7 @@ pub(crate) fn dynamic_public_lut(
         };
         let switched_parents = (depth.internal > 0)
             .then(|| {
-                let pairs = mxx_dsl::parallel(depth.internal, |position| {
+                let pairs = mxx_lattice_dsl::parallel(depth.internal, |position| {
                     let index = position.expression()?;
                     let (row, key) = switch(
                         parent(index.clone()),
@@ -511,7 +511,7 @@ pub(crate) fn dynamic_public_lut(
             })
             .transpose()?;
         if let Some((rows, keys)) = &switched_parents {
-            sum = mxx_dsl::iterate(
+            sum = mxx_lattice_dsl::iterate(
                 IntExpr::constant(depth.internal),
                 sum,
                 |index, (row_sum, key_sum)| {
@@ -533,23 +533,27 @@ pub(crate) fn dynamic_public_lut(
         }
         let leaves = depth.branches.len() - depth.internal;
         if leaves > 0 {
-            sum = mxx_dsl::iterate(IntExpr::constant(leaves), sum, |index, (row_sum, key_sum)| {
-                let branch =
-                    (IntExpr::constant(depth.internal) + index.expression()?).canonicalize();
-                let (row, branch_key) = switch(
-                    parent(branch.clone()),
-                    &depth.switches,
-                    &depth.branches,
-                    branch,
-                    true,
-                    key,
-                )
-                .map_err(schema)?;
-                Ok((
-                    add_optional(row_sum, row, add_encoding_rows)?,
-                    add_optional(key_sum, branch_key, add_public_matrices)?,
-                ))
-            })
+            sum = mxx_lattice_dsl::iterate(
+                IntExpr::constant(leaves),
+                sum,
+                |index, (row_sum, key_sum)| {
+                    let branch =
+                        (IntExpr::constant(depth.internal) + index.expression()?).canonicalize();
+                    let (row, branch_key) = switch(
+                        parent(branch.clone()),
+                        &depth.switches,
+                        &depth.branches,
+                        branch,
+                        true,
+                        key,
+                    )
+                    .map_err(schema)?;
+                    Ok((
+                        add_optional(row_sum, row, add_encoding_rows)?,
+                        add_optional(key_sum, branch_key, add_public_matrices)?,
+                    ))
+                },
+            )
             .map_err(graph)?;
         }
         parents = switched_parents;

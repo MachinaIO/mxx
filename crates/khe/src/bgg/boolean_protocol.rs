@@ -29,9 +29,6 @@ use crate::{
         evaluate_boolean_family, select_boolean_output,
     },
 };
-use mxx_dsl::{
-    BuiltGraph, Bytes, DslContext, Family, IdealSpec, Int, Mat, MatType, Ring, parallel,
-};
 use mxx_ir_core::{
     Graph, IntExpr, ParamEnv, Rational, RealExpr,
     node::ConcatAxis,
@@ -42,6 +39,9 @@ use mxx_ir_core::{
         ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
         ProtocolStage, StageId, StageInputName, Workflow,
     },
+};
+use mxx_lattice_dsl::{
+    BuiltGraph, Bytes, DslContext, Family, IdealSpec, Int, Mat, MatType, Ring, parallel,
 };
 use num_bigint::{BigInt, BigUint};
 use std::collections::BTreeMap;
@@ -291,7 +291,7 @@ pub fn circuit_bindings(instance_width: u128, depth: usize, max_layer_width: u12
 /// The bindings feeding the consumer input `consumer` from the producer output. Every linked
 /// input is one matrix or one matrix family, a single leaf.
 fn link(consumer: &str, producer: &StageId, output: &str, leaf: &MatType) -> Vec<ArtifactBinding> {
-    mxx_dsl::artifact_bindings(leaf, consumer, producer, output).unwrap()
+    mxx_lattice_dsl::artifact_bindings(leaf, consumer, producer, output).unwrap()
 }
 
 /// The closed protocol of the four stages under the circuit parameters `bindings`: the decrypted

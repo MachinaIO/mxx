@@ -3,10 +3,10 @@
 
 use crate::{FheCommonParams, FheError, TfheParams};
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-#[cfg(test)]
-use mxx_dsl::{DslError, select};
-use mxx_dsl::{Family, Int, Mat, Ring};
 use mxx_ir_core::{IntExpr, node::SampleRange};
+#[cfg(test)]
+use mxx_lattice_dsl::{DslError, select};
+use mxx_lattice_dsl::{Family, Int, Mat, Ring};
 use num_bigint::{BigInt, BigUint};
 
 use num_traits::One;
@@ -310,9 +310,9 @@ use mxx_backends::{
     backend::poly::cpu_backend, execute, transcript::SamplingMode,
 };
 #[cfg(test)]
-use mxx_dsl::BuiltGraph;
-#[cfg(test)]
 use mxx_ir_core::ParamEnv;
+#[cfg(test)]
+use mxx_lattice_dsl::BuiltGraph;
 #[cfg(test)]
 use std::collections::BTreeMap;
 

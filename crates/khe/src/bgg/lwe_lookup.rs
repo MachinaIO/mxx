@@ -13,14 +13,14 @@ use crate::{
         lower_circuit,
     },
 };
-use mxx_dsl::{
-    Bytes, DslContext, DslError, Family, FamilyType, GraphValue, HashTag, Int, Mat, MatType,
-    Preimage, PreimageType, Ring, SmallMatrix, SmallMatrixType, Subgraph, Trapdoor, parallel,
-};
 use mxx_ir_core::{
     IntExpr,
     artifact::{ArtifactAvailability, ProductionId},
     types::{CoefficientBoundDomain, MatrixType},
+};
+use mxx_lattice_dsl::{
+    Bytes, DslContext, DslError, Family, FamilyType, GraphValue, HashTag, Int, Mat, MatType,
+    Preimage, PreimageType, Ring, SmallMatrix, SmallMatrixType, Subgraph, Trapdoor, parallel,
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::Zero;
@@ -1759,13 +1759,13 @@ mod tests {
         },
         transcript::SamplingMode,
     };
-    use mxx_dsl::DslContext;
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
         artifact::{ArtifactAvailability, ProductionId, SpecHash},
         node::{IntBinaryOp, LoopInputMode, MatrixBinaryOp, NodeKind},
         types::WireType,
     };
+    use mxx_lattice_dsl::DslContext;
     use num_bigint::BigUint;
     use std::num::NonZeroUsize;
 

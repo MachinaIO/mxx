@@ -12,11 +12,12 @@ path = "../.lake/packages/mathlib"
 name = "mxx-ir-core"
 path = ".."
 
-# Pinned explicitly; update only as a deliberate change.
+# Pinned explicitly to mathcal-A's revision, so that one package set imports both (section 10,
+# decision 4 of ARCHITECTURE-SPEC.md); update only together with mathcal-A.
 [[require]]
 name = "VCVio"
-git = "https://github.com/Verified-zkEVM/VCV-io.git"
-rev = "1c7ab7e40e8e7ba9f75c88cd495193b7e6bb4248"
+git = "https://github.com/Verified-zkEVM/VCVio"
+rev = "87bc1892fff1982e97cfd8c7303c9d1f2bfdc2f9"
 
 [[lean_lib]]
 name = "MxxSecurity"

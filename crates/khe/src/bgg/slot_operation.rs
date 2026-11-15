@@ -2,8 +2,8 @@
 
 mod naive {
     use crate::bgg::{NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire};
-    use mxx_dsl::{DslError, Family, Mat, Ring};
     use mxx_ir_core::IntExpr;
+    use mxx_lattice_dsl::{DslError, Family, Mat, Ring};
     use rayon::prelude::*;
     use thiserror::Error;
 
@@ -176,8 +176,8 @@ mod naive {
                 dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
             },
         };
-        use mxx_dsl::{DslContext, Family};
         use mxx_ir_core::ParamEnv;
+        use mxx_lattice_dsl::{DslContext, Family};
         use std::collections::BTreeMap;
 
         #[test]
@@ -365,8 +365,8 @@ mod public_key {
         bgg::{BggPublicKeyCompiler, BggPublicKeyWire, CircuitCompileError},
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_dsl::{Bytes, HashTag, Mat};
     use mxx_ir_core::artifact::{ArtifactAvailability, ProductionId};
+    use mxx_lattice_dsl::{Bytes, HashTag, Mat};
     use rayon::prelude::*;
 
     #[derive(Clone)]
@@ -514,8 +514,8 @@ mod public_key {
             circuit::PolyCircuit,
         };
         use mxx_backends::poly::dcrt::poly::DCRTPoly;
-        use mxx_dsl::{DslContext, Ring};
         use mxx_ir_core::ParamEnv;
+        use mxx_lattice_dsl::{DslContext, Ring};
 
         #[test]
         fn public_key_slot_transfer_lowering_builds_and_symbolically_elaborates() {
@@ -569,12 +569,14 @@ fn slot_gate_public_key_name(reduction: bool, identity: &str) -> String {
 
 mod artifact {
     use crate::bgg::BggSlotTransferGateRequest;
-    use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Ring, Trapdoor};
     use mxx_ir_core::{
         IntExpr, RealExpr,
         artifact::{ArtifactAvailability, ProductionId},
         node::{ConcatAxis, ConstantMatrix, IndexRange},
         types::MatrixType,
+    };
+    use mxx_lattice_dsl::{
+        Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Ring, Trapdoor,
     };
     use rayon::prelude::*;
     use std::collections::BTreeMap;
@@ -747,7 +749,7 @@ mod artifact {
             let public_columns = self.gadget_columns();
             let slot_values = {
                 let ring = ring.clone();
-                mxx_dsl::parallel(self.slot_count, |index| {
+                mxx_lattice_dsl::parallel(self.slot_count, |index| {
                     Ok({
                         let mut tag = HashTag::from(b"slot_transfer_slot_a_".as_slice());
                         tag.push_decimal(index)?;
@@ -773,7 +775,7 @@ mod artifact {
                     let b0 = base.b0.clone();
                     let b1_public = b1_public.clone();
                     let identity = identity.clone();
-                    mxx_dsl::parallel(secrets.count().clone(), |index| {
+                    mxx_lattice_dsl::parallel(secrets.count().clone(), |index| {
                         let secret = secrets.at(&index);
                         Ok({
                             let secret_identity =
@@ -805,7 +807,7 @@ mod artifact {
                     let ring = ring.clone();
                     let b1 = base.b1.clone();
                     let gadget = gadget.clone();
-                    mxx_dsl::parallel(secrets.count().clone(), |index| {
+                    mxx_lattice_dsl::parallel(secrets.count().clone(), |index| {
                         let secret = secrets.at(&index);
                         let public_key = public_keys.at(&index);
                         Ok({
@@ -1075,7 +1077,7 @@ mod artifact {
                 let rows = self.b0_public_columns();
                 let columns = range_len(&columns);
                 let b0 = base.b0.clone();
-                return Ok(mxx_dsl::parallel(0, |_| {
+                return Ok(mxx_lattice_dsl::parallel(0, |_| {
                     Ok(b0.sample_preimage(ring.zero((self.secret_size, columns)), (rows, columns)))
                 })?);
             }
@@ -1601,8 +1603,8 @@ mod tall {
         },
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_dsl::{Family, Int, Mat};
     use mxx_ir_core::IntExpr;
+    use mxx_lattice_dsl::{Family, Int, Mat};
     use std::collections::BTreeMap;
 
     /// Public-key slot lowering for the secret-transfer-free Tall subset.
@@ -1984,13 +1986,13 @@ mod tall {
     }
 
     fn identity_repeated_lane_masks(
-        ring: &mxx_dsl::Ring,
+        ring: &mxx_lattice_dsl::Ring,
         total_slots: usize,
         lane_scalars: &[Option<u32>],
-    ) -> Result<Family<Mat>, mxx_dsl::DslError> {
+    ) -> Result<Family<Mat>, mxx_lattice_dsl::DslError> {
         let lanes = lane_scalars.len();
-        mxx_dsl::parallel(total_slots, |index| {
-            mxx_dsl::select(
+        mxx_lattice_dsl::parallel(total_slots, |index| {
+            mxx_lattice_dsl::select(
                 index.rem(Int::constant(lanes)),
                 lane_scalars
                     .iter()
@@ -2008,7 +2010,7 @@ mod tall {
             matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
             poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         };
-        use mxx_dsl::DslContext;
+        use mxx_lattice_dsl::DslContext;
         use std::collections::BTreeMap;
 
         #[test]

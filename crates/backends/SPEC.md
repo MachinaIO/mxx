@@ -3,7 +3,7 @@
 This document covers every API a user needs to execute a validated mxx program: choosing ring
 parameters, creating a CPU or GPU backend, passing inputs, running, and reading outputs. It
 assumes familiarity with lattice cryptography and with the DSL concepts in
-`crates/dsl/SPEC.md` (programs, compile parameters, families, artifacts).
+`crates/lattice-dsl/SPEC.md` (programs, compile parameters, families, artifacts).
 
 ## 1. Concepts
 
@@ -211,6 +211,6 @@ nonce)`. `CpuExecution::new(cpu_backend)` implements it with `execute_prepared`,
 
 ## 7. Example
 
-`crates/dsl/examples/rlwe_encrypt.rs` builds a Ring-LWE encryption and decryption program, binds
+`crates/lattice-dsl/examples/rlwe_encrypt.rs` builds a Ring-LWE encryption and decryption program, binds
 its parameters, creates a GPU backend from generated primes, plans once, and runs the plan on
 several inputs.

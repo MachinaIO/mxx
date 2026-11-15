@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLAIMS = {
     "tfhe": Path("crates/fhe/lean/tfhe/generated"),
     "bgv": Path("crates/fhe/lean/bgv/generated"),
-    "rlwe": Path("crates/dsl/examples/rlwe/generated"),
+    "rlwe": Path("crates/lattice-dsl/examples/rlwe/generated"),
 }
 
 
@@ -59,7 +59,7 @@ def main() -> None:
         output = Path(temporary)
         for command in [
             [args.cargo, "run", "--locked", "-p", "mxx-fhe", "--example", "export_claims", "--", str(output)],
-            [args.cargo, "run", "--locked", "-p", "mxx-dsl", "--example", "rlwe_encrypt", "--", "--export-lean", str(output / "rlwe")],
+            [args.cargo, "run", "--locked", "-p", "mxx-lattice-dsl", "--example", "rlwe_encrypt", "--", "--export-lean", str(output / "rlwe")],
         ]:
             subprocess.run(command, cwd=ROOT, check=True)
         errors = []

@@ -17,7 +17,7 @@ use crate::{
         StructuredCircuitLowering, lower_circuit,
     },
 };
-use mxx_dsl::{GraphValue, Preimage, Subgraph};
+use mxx_lattice_dsl::{GraphValue, Preimage, Subgraph};
 use num_bigint::BigUint;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -188,7 +188,7 @@ where
             Ok(outputs) => Ok(outputs),
             Err(error) => {
                 body_error = Some(error);
-                Err(mxx_dsl::DslError::Schema)
+                Err(mxx_lattice_dsl::DslError::Schema)
             }
         });
         if let Some(error) = body_error {
@@ -249,7 +249,7 @@ pub enum CircuitCompileError {
     #[error(transparent)]
     SlotFamily(#[from] SlotFamilyCompileError),
     #[error(transparent)]
-    Dsl(#[from] mxx_dsl::DslError),
+    Dsl(#[from] mxx_lattice_dsl::DslError),
     #[error(
         "gate {gate} uses a feature that is not represented by the initial declarative BGG evaluator: {feature}"
     )]
@@ -636,7 +636,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for NaivePublicKeyLowering<P> {
             let compiler = self.compiler.public_key.clone();
             let scalar = scalar.clone();
             let reveal = input.reveal_plaintext;
-            mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+            mxx_lattice_dsl::parallel(input.matrices.count().clone(), |index| {
                 let matrix = input.matrices.at(&index);
                 Ok(compiler
                     .small_scalar_mul(
@@ -666,7 +666,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for NaivePublicKeyLowering<P> {
             let compiler = self.compiler.public_key.clone();
             let scalar = scalar.clone();
             let reveal = input.reveal_plaintext;
-            mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+            mxx_lattice_dsl::parallel(input.matrices.count().clone(), |index| {
                 let matrix = input.matrices.at(&index);
                 Ok(compiler
                     .large_scalar_mul(
@@ -871,7 +871,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicKeyLowering<'_, P> {
 
 struct EncodingLowering<'a, P> {
     compiler: &'a BggEncodingCompiler,
-    ring: mxx_dsl::Ring,
+    ring: mxx_lattice_dsl::Ring,
     decompositions: &'a mut dyn FnMut(GateInstance<'_>) -> Result<Preimage, CircuitCompileError>,
     marker: PhantomData<P>,
 }
@@ -952,13 +952,13 @@ mod tests {
         },
         sampler::bounds::default_preimage_cutoff,
     };
-    use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::{
         IntExpr, ParamEnv,
         artifact::{ProductionId, SpecHash},
         node::NodeKind,
         types::MatrixType,
     };
+    use mxx_lattice_dsl::{DslContext, Ring};
     use num_bigint::{BigInt, BigUint};
 
     #[test]

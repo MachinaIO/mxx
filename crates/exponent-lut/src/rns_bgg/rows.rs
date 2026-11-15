@@ -9,8 +9,8 @@
 //! multiplies them by public encodings here.
 
 use super::*;
-use mxx_dsl::GraphValue;
 use mxx_ir_core::node::IndexRange;
+use mxx_lattice_dsl::GraphValue;
 
 impl RnsBggParameters {
     /// The level whose gadget the form `form` of `level` is a multiple of: `level + 1` for the
@@ -353,7 +353,7 @@ pub trait Carrier: GraphValue {
     fn from_components(first: Vec<Mat>, second: Vec<Mat>) -> Self;
 
     /// The zero encoding (zero row and key) of `columns` columns in `ring`.
-    fn zero(ring: &mxx_dsl::Ring, columns: usize) -> Self {
+    fn zero(ring: &mxx_lattice_dsl::Ring, columns: usize) -> Self {
         let zero = vec![ring.zero((1, columns)); Self::WIDTH];
         Self::from_components(zero.clone(), zero)
     }
@@ -528,7 +528,7 @@ mod tests {
     use super::*;
     use crate::test_support::{execute_cpu, full, validate};
     use mxx_backends::{RuntimeValue, poly::Poly};
-    use mxx_dsl::{BuiltGraph, DslContext};
+    use mxx_lattice_dsl::{BuiltGraph, DslContext};
 
     /// Small overridable parameters for key-action tests, with two genuine modulus drops.
     fn parameters() -> RnsBggParameters {

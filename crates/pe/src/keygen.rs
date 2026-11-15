@@ -38,7 +38,6 @@ use mxx_backends::{
     SessionStore,
     poly::{PolyParams, dcrt::poly::DCRTPoly},
 };
-use mxx_dsl::{DslContext, Int, Mat, Ring, SmallMatrix};
 use mxx_exponent_lut::{
     api::{self, PlaintextInputs, StageArtifacts, StageExecution, StageGraph},
     program::{Operand, ProgramData, RhsId, WireId},
@@ -49,6 +48,7 @@ use mxx_ir_core::{
     artifact::ArtifactAvailability,
     node::{ConcatAxis, IndexRange},
 };
+use mxx_lattice_dsl::{DslContext, Int, Mat, Ring, SmallMatrix};
 use std::collections::BTreeMap;
 
 /// The anchor samples `k~_i`, stored as a streamed bounded-matrix family
@@ -184,7 +184,7 @@ pub(crate) fn anchor_keys(
     ring: &Ring,
     parameters: &crate::PeParameters,
     key: &PePredicateKey,
-) -> mxx_dsl::Family<SmallMatrix> {
+) -> mxx_lattice_dsl::Family<SmallMatrix> {
     ring.small_matrix_family_artifact_input(
         key.key().production().clone(),
         ANCHOR_KEY,
@@ -314,7 +314,7 @@ where
     let compressed = public_key
         .compressed_anchor_rows(hash_key.clone())?
         .map(|(first_row, _)| {
-            mxx_dsl::parallel(w, |row| {
+            mxx_lattice_dsl::parallel(w, |row| {
                 let block = gaussian_of(compressed_width);
                 let identity = gaussian_of(1);
                 let i = Group::select(&group.elements, row.expression()?);
@@ -333,7 +333,7 @@ where
     let setup = public_key.setup();
     // Sample and export one compact row before contraction. This production
     // boundary avoids retaining W * p digit columns and publishes only W artifacts.
-    let sampled = mxx_dsl::parallel(w, |_| {
+    let sampled = mxx_lattice_dsl::parallel(w, |_| {
         Ok(ring.small_gaussian((width, p), key_sigma.clone(), key_cutoff.clone()))
     })?;
     let sampled = DslContext::new("mxx-pe/keygen-helpers")
@@ -369,15 +369,15 @@ where
     // term is added into one entry of a `1 x W` row through a unit row, which the
     // GPU lowers to a single-column addition.
     let unit = |index: IntExpr| mxx_exponent_lut::rns_bgg::unit_row(&ring, w, index);
-    let contributions = mxx_dsl::parallel(w, |row| {
+    let contributions = mxx_lattice_dsl::parallel(w, |row| {
         let own = blocks.at(row.clone());
         let row = row.expression()?;
         let gadget_products = gadget_first_row.clone().mul_small_rhs(own.clone());
-        mxx_dsl::iterate(p, ring.zero((1, w)), |k, sum| {
+        mxx_lattice_dsl::iterate(p, ring.zero((1, w)), |k, sum| {
             let k = k.expression()?;
             let helper = setup
                 .helper_key(rns, hash_key.clone(), Group::select(&group.helpers, k.clone()))
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                .map_err(|_| mxx_lattice_dsl::DslError::Schema)?;
             let first_row = Mat::concat(ConcatAxis::Columns, vec![helper.0.0, helper.0.1]);
             let selected =
                 Some(IndexRange { start: k.clone(), end: k.clone() + IntExpr::constant(1) });
@@ -398,7 +398,7 @@ where
         1 => contributions.at(Int::constant(0)),
         count => {
             let first = contributions.at(Int::constant(0)) + contributions.at(Int::constant(1));
-            mxx_dsl::iterate(count - 2, first, |index, sum| {
+            mxx_lattice_dsl::iterate(count - 2, first, |index, sum| {
                 Ok(sum + contributions.at(index.add(2)))
             })?
         }
@@ -406,7 +406,7 @@ where
     // Row targets retain only scalar residuals, never full extension vectors.
     let compressed_residuals =
         compressed.as_ref().map(|blocks| blocks.field(|(_, _, r)| r)).transpose()?;
-    let targets = mxx_dsl::parallel(w, |row| {
+    let targets = mxx_lattice_dsl::parallel(w, |row| {
         let row = row.expression()?;
         let residual = residuals.clone().slice(
             None,
@@ -424,7 +424,7 @@ where
         Ok((indicator * first.clone() - residual)
             .ring_automorphism(Group::select(&group.inverses, row)))
     })?;
-    let anchors = mxx_dsl::parallel(w, |row| {
+    let anchors = mxx_lattice_dsl::parallel(w, |row| {
         // Parallel exports accept bounded matrices. Rebasing to the same ring
         // preserves the sample and its bound, using the compact forwarding path.
         Ok(trapdoor.sample_preimage(targets.at(row), (m_b, 1)).centered_rebase(&ring))

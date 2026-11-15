@@ -5,11 +5,11 @@ use crate::{
     bgg::tall_encoding::{TallCompileError, anchor_matrix_rows, rotate_family, same_matrix_type},
     circuit::{GateParamSource, PolyCircuit, PolyGateType, SlotTransferSpec, SubCircuitParamValue},
 };
-use mxx_dsl::{Bytes, DslContext, Family, HashTag, Mat, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactAvailability, ProductionId},
 };
+use mxx_lattice_dsl::{Bytes, DslContext, Family, HashTag, Mat, Ring};
 use num_bigint::BigUint;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -250,7 +250,7 @@ impl TallRotationEncodingCompiler {
         self.validate_secret_rows(&secret_rows)?;
         let gadget =
             self.ring().gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
-        Ok(mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+        Ok(mxx_lattice_dsl::parallel(secret_rows.count().clone(), |index| {
             let secret = secret_rows.at(&index);
             Ok(secret * gadget.clone())
         })?)
@@ -295,7 +295,7 @@ impl TallRotationEncodingCompiler {
         let sigma = self.error_sigma.clone();
         let bound = self.error_max_coefficient_bound.clone();
         let columns = self.gadget_columns();
-        let rows = mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+        let rows = mxx_lattice_dsl::parallel(secret_rows.count().clone(), |index| {
             let secret = secret_rows.at(&index);
             let shifted = transformed.at(&index);
             Ok(secret * matrix.clone() - shifted +
@@ -387,7 +387,7 @@ impl TallRotationEncodingCompiler {
             let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+            mxx_lattice_dsl::parallel(secret_rows.count().clone(), |index| {
                 let current = secret_rows.at(&index);
                 let shifted = shifted_forward.at(&index);
                 Ok(current * a_forward.clone() - shifted * gadget.clone() +
@@ -404,7 +404,7 @@ impl TallRotationEncodingCompiler {
             let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+            mxx_lattice_dsl::parallel(secret_rows.count().clone(), |index| {
                 let current = secret_rows.at(&index);
                 let shifted = shifted_backward.at(&index);
                 Ok(current * a_backward.clone() - shifted * gadget.clone() +

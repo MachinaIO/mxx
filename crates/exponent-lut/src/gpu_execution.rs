@@ -171,8 +171,8 @@ mod tests {
             dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
         },
     };
-    use mxx_dsl::DslContext;
     use mxx_ir_core::{IntExpr, ParamEnv};
+    use mxx_lattice_dsl::DslContext;
     use num_bigint::BigUint;
     use serial_test::serial as sequential;
     use std::collections::BTreeMap;

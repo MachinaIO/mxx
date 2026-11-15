@@ -16,13 +16,13 @@ use crate::{
     sampler::trapdoor::DCRTTrapdoor,
     session::SessionStore,
 };
-use mxx_dsl::{DslContext, Int, IntType, Ring, parallel};
 use mxx_ir_core::{
     Graph, GraphOutput, IntExpr, NodeHandle, ParamEnv, WireType,
     artifact::ArtifactAvailability,
     node::{ArtifactInput, NodeKind},
     types::ConcreteWireType,
 };
+use mxx_lattice_dsl::{DslContext, Int, IntType, Ring, parallel};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::{collections::BTreeMap, sync::Arc};
@@ -82,7 +82,7 @@ fn parallel_body_reading_an_unloaded_root_family_is_a_planning_error() {
         (1, 1),
         ArtifactAvailability::Cached,
     );
-    let [family] = <[_; 1]>::try_from(mxx_dsl::GraphValue::flatten(&family)).unwrap();
+    let [family] = <[_; 1]>::try_from(mxx_lattice_dsl::GraphValue::flatten(&family)).unwrap();
     let family_type = family.wire_type().clone();
     let WireType::IndexedFamily { element, .. } = &family_type else {
         panic!("an artifact family input is an indexed family")
@@ -1023,9 +1023,10 @@ fn run_family_consumed_by_later_loop(publish: bool) {
     })
     .unwrap();
     let consumed = members.clone();
-    let sum =
-        mxx_dsl::iterate(4, ring.zero((1, 1)), move |index, sum| Ok(sum + consumed.at(index)))
-            .unwrap();
+    let sum = mxx_lattice_dsl::iterate(4, ring.zero((1, 1)), move |index, sum| {
+        Ok(sum + consumed.at(index))
+    })
+    .unwrap();
     let context = DslContext::new("family-consumed-by-later-loop");
     let context =
         if publish { context.transferred_output("members", members).unwrap() } else { context };

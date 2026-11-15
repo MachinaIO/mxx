@@ -41,8 +41,8 @@ mod tests {
         },
         transcript::SamplingMode,
     };
-    use mxx_dsl::{DslContext, Mat, Ring};
     use mxx_ir_core::{IntExpr, ParamEnv};
+    use mxx_lattice_dsl::{DslContext, Mat, Ring};
     use num_bigint::{BigInt, BigUint};
     use std::{collections::BTreeMap, convert::Infallible};
 

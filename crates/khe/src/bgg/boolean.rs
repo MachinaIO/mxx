@@ -7,10 +7,10 @@ use crate::{
         evaluate_boolean_matrix_family,
     },
 };
-use mxx_dsl::{
+use mxx_ir_core::{ValueHandle, WireType};
+use mxx_lattice_dsl::{
     DslError, Family, GraphValue, GraphValueSchema, Mat, MatType, iterate, parallel, select,
 };
-use mxx_ir_core::{ValueHandle, WireType};
 use thiserror::Error;
 
 pub type BggPublicKeyFamily = Family<BggPublicKeyWire>;
@@ -224,8 +224,8 @@ fn encoding_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_lattice_dsl::{DslContext, Ring};
 
     #[test]
     fn public_key_and_encoding_candidates_have_uniform_selected_schemas() {

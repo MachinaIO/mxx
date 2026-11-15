@@ -10890,7 +10890,7 @@ pub(crate) fn plan_physical_graph(
             {
                 for child_node in child.nodes() {
                     if let Some(l) = child_node.source_location() &&
-                        !l.file.contains("crates/dsl") &&
+                        !l.file.contains("crates/lattice-dsl") &&
                         !l.file.contains("crates/ir-core")
                     {
                         inner.insert(format!("{}:{}", l.file, l.line));
@@ -11048,41 +11048,41 @@ mod tests {
         let degree = u32::try_from(crate::env::test_streamed_ring_dimension()).unwrap();
         let cpu = DCRTPolyParams::new(degree, 1, 30, 4, None, None);
         let gpu = GpuDCRTPolyParams::new(degree, cpu.to_crt().0, 4, None);
-        let ring = mxx_dsl::Ring::from_crt_moduli(
+        let ring = mxx_lattice_dsl::Ring::from_crt_moduli(
             cpu.to_crt().0.into_iter().map(IntExpr::from).collect(),
             degree,
         );
         let count = 2 * crate::env::test_streamed_steps() + 3;
         let offset = rand::random_range(1..=7u64);
-        let first = mxx_dsl::parallel(count, |index| {
-            let inner = mxx_dsl::parallel(3usize, |inner| {
+        let first = mxx_lattice_dsl::parallel(count, |index| {
+            let inner = mxx_lattice_dsl::parallel(3usize, |inner| {
                 Ok(index
                     .clone()
                     .add(inner)
                     .add(offset)
                     .lift_to_constant_polynomial(ring.matrix_type((1, 1))))
             })?;
-            Ok(inner.at(mxx_dsl::Int::constant(0)) +
-                inner.at(mxx_dsl::Int::constant(1)) +
-                inner.at(mxx_dsl::Int::constant(2)))
+            Ok(inner.at(mxx_lattice_dsl::Int::constant(0)) +
+                inner.at(mxx_lattice_dsl::Int::constant(1)) +
+                inner.at(mxx_lattice_dsl::Int::constant(2)))
         })
         .unwrap();
-        let second = mxx_dsl::parallel(count, |index| {
+        let second = mxx_lattice_dsl::parallel(count, |index| {
             Ok(index.add(offset + 17).lift_to_constant_polynomial(ring.matrix_type((1, 1))))
         })
         .unwrap();
         // This cached family is also consumed after its producer loop. It
         // cannot use the write-only streamed-family path, but its GPU owners
         // need survive only their exports and real reads, not the host result.
-        let retained = mxx_dsl::parallel(count, |index| {
+        let retained = mxx_lattice_dsl::parallel(count, |index| {
             Ok(index.add(offset + 23).lift_to_constant_polynomial(ring.matrix_type((1, 1))))
         })
         .unwrap();
-        let family_consumer =
-            retained.at(mxx_dsl::Int::constant(count - 1)) + retained.at(mxx_dsl::Int::constant(0));
+        let family_consumer = retained.at(mxx_lattice_dsl::Int::constant(count - 1)) +
+            retained.at(mxx_lattice_dsl::Int::constant(0));
         let family_alias = retained.at(0usize);
         let family_loop_consumer =
-            mxx_dsl::iterate(3usize, ring.zero((1, 1)), |step, accumulated| {
+            mxx_lattice_dsl::iterate(3usize, ring.zero((1, 1)), |step, accumulated| {
                 Ok(accumulated + retained.at(step.rem(count)))
             })
             .unwrap();
@@ -11110,7 +11110,7 @@ mod tests {
             .unwrap()
             .cached_output(
                 "root-second",
-                mxx_dsl::Int::constant(offset + 19)
+                mxx_lattice_dsl::Int::constant(offset + 19)
                     .lift_to_constant_polynomial(ring.matrix_type((1, 1))),
             )
             .unwrap()
@@ -11409,8 +11409,8 @@ mod tests {
         },
         session::SessionStore,
     };
-    use mxx_dsl::{DslContext, HashTag, Int, Ring};
     use mxx_ir_core::IntExpr;
+    use mxx_lattice_dsl::{DslContext, HashTag, Int, Ring};
 
     /// Column widths change device work distribution, not the number of host
     /// values, operation descriptors, bindings, or producer edges.
@@ -11508,9 +11508,10 @@ mod tests {
     fn test_gpu_static_sequential_candidate_does_not_enumerate_iterations() {
         let mut sizes = Vec::new();
         for count in [3u64, u64::MAX] {
-            let output =
-                mxx_dsl::iterate(count, Int::constant(0), |index, state| Ok(state.add(index)))
-                    .unwrap();
+            let output = mxx_lattice_dsl::iterate(count, Int::constant(0), |index, state| {
+                Ok(state.add(index))
+            })
+            .unwrap();
             let graph = DslContext::new("static-sequential-candidate")
                 .output("out", output)
                 .unwrap()
@@ -11545,7 +11546,7 @@ mod tests {
         let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), degree);
         let iterations = crate::env::test_streamed_members().max(2);
         let initial = ring.polynomial([IntExpr::from(u32::from(rand::random::<u16>()) + 1)]);
-        let result = mxx_dsl::iterate(iterations, initial, |index, state| {
+        let result = mxx_lattice_dsl::iterate(iterations, initial, |index, state| {
             let guard = state + ring.polynomial([index.expression()?]);
             let zero = ring.zero((1, 1));
             Ok((guard.clone() + zero) + guard)
@@ -11629,7 +11630,7 @@ mod tests {
         let mut runtime =
             GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
         for nested in [false, true] {
-            let compute = |value: mxx_dsl::Mat| {
+            let compute = |value: mxx_lattice_dsl::Mat| {
                 Ok(value +
                     ring.constant(
                         (1, digits),
@@ -11642,7 +11643,7 @@ mod tests {
             };
             let zero = ring.constant((1, digits), ConstantMatrix::Zero);
             let output = if nested {
-                mxx_dsl::iterate(2usize, zero, |_, value| compute(value)).unwrap()
+                mxx_lattice_dsl::iterate(2usize, zero, |_, value| compute(value)).unwrap()
             } else {
                 compute(zero).unwrap()
             };
@@ -11709,7 +11710,7 @@ mod tests {
         let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), degree);
         let constant = BigInt::from(u32::from(rand::random::<u16>()) + 2);
         let body = |count| {
-            mxx_dsl::parallel(count, |index| {
+            mxx_lattice_dsl::parallel(count, |index| {
                 Ok(ring.polynomial([
                     IntExpr::constant(constant.clone()),
                     IntExpr::constant(constant.clone()),
@@ -11831,8 +11832,8 @@ mod tests {
                 degree,
             );
             let context = DslContext::new("shared-compact-anchor");
-            let selector: Int = context.input("selector", mxx_dsl::IntType).unwrap();
-            let anchors = mxx_dsl::parallel(count, |_| {
+            let selector: Int = context.input("selector", mxx_lattice_dsl::IntType).unwrap();
+            let anchors = mxx_lattice_dsl::parallel(count, |_| {
                 Ok(ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 4_000_000))
             })
             .unwrap();
@@ -12410,7 +12411,7 @@ mod tests {
         let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
         let x = ring.uniform_residue((1, 1));
         let y = ring.uniform_residue((1, 1));
-        let joined = mxx_dsl::Mat::concat(
+        let joined = mxx_lattice_dsl::Mat::concat(
             mxx_ir_core::node::ConcatAxis::Rows,
             vec![x.clone() * y.clone(), x.clone() + y.clone(), x.clone()],
         );
@@ -12696,7 +12697,7 @@ mod tests {
         };
         let window =
             ring.constant((1, 1), ConstantMatrix::Rotation { exponent: IntExpr::from(3u8) });
-        let summed = mxx_dsl::iterate(IntExpr::from(3u8), ring.zero((1, 1)), |i, sum| {
+        let summed = mxx_lattice_dsl::iterate(IntExpr::from(3u8), ring.zero((1, 1)), |i, sum| {
             Ok(sum + hash_at(i.expression()?) * window.clone())
         })
         .unwrap();
@@ -12762,7 +12763,7 @@ mod tests {
             tag.push(member);
             ring.hash_matrix(key.clone(), tag, (1, 1))
         };
-        let summed = mxx_dsl::iterate(width, ring.zero((1, width)), |i, sum| {
+        let summed = mxx_lattice_dsl::iterate(width, ring.zero((1, width)), |i, sum| {
             let start = (IntExpr::constant(width - 1) - i.expression()?).canonicalize();
             let window = ring
                 .constant(
@@ -12871,19 +12872,20 @@ mod tests {
         let digits = ring
             .hash_matrix(key, HashTag::from(b"identity-loop-rhs".as_slice()), (1, 1))
             .decompose(256u64, width);
-        let expand = mxx_dsl::Subgraph::<mxx_dsl::Mat, mxx_dsl::Mat>::define(
-            "identity-expand",
-            mxx_dsl::GraphValue::schema(&identity),
-            |left| Ok(left.mul_small_rhs(digits.clone())),
-        )
-        .unwrap();
-        let parallel = mxx_dsl::parallel(iterations, |_| {
+        let expand =
+            mxx_lattice_dsl::Subgraph::<mxx_lattice_dsl::Mat, mxx_lattice_dsl::Mat>::define(
+                "identity-expand",
+                mxx_lattice_dsl::GraphValue::schema(&identity),
+                |left| Ok(left.mul_small_rhs(digits.clone())),
+            )
+            .unwrap();
+        let parallel = mxx_lattice_dsl::parallel(iterations, |_| {
             Ok(identity.clone().mul_small_rhs(digits.clone()) +
                 ring.identity(width).mul_small_rhs(digits.clone()) +
                 expand.call(identity.clone())?)
         })
         .unwrap();
-        let sequential = mxx_dsl::iterate(iterations, ring.zero((width, 1)), |_, sum| {
+        let sequential = mxx_lattice_dsl::iterate(iterations, ring.zero((width, 1)), |_, sum| {
             Ok(sum + identity.clone().mul_small_rhs(digits.clone()))
         })
         .unwrap();
@@ -12995,10 +12997,11 @@ mod tests {
         let window = ring
             .hash_matrix(key.clone(), HashTag::from(b"rhs".as_slice()), (1, 1))
             .decompose(256u64, digits);
-        let summed = mxx_dsl::iterate(IntExpr::from(iterations), ring.zero((1, 1)), |i, sum| {
-            Ok(sum + hash_at(i.expression()?).mul_small_rhs(window.clone()))
-        })
-        .unwrap();
+        let summed =
+            mxx_lattice_dsl::iterate(IntExpr::from(iterations), ring.zero((1, 1)), |i, sum| {
+                Ok(sum + hash_at(i.expression()?).mul_small_rhs(window.clone()))
+            })
+            .unwrap();
         let validated = DslContext::new("direct-static-constant-loop")
             .output("summed", summed)
             .unwrap()
@@ -13129,14 +13132,14 @@ mod tests {
         let gpu = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
         let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
         let key = ring.bytes_input("key", 32);
-        let plain = mxx_dsl::parallel(40, |i| {
+        let plain = mxx_lattice_dsl::parallel(40, |i| {
             let mut tag = HashTag::from(b"loop-hash/plain:".as_slice());
             tag.push(i.expression()?);
             Ok(ring.hash_matrix(key.clone(), tag, (1, 1)))
         })
         .unwrap();
-        let select = mxx_dsl::parallel(3, |j| {
-            let rows = mxx_dsl::parallel(5, |i| {
+        let select = mxx_lattice_dsl::parallel(3, |j| {
+            let rows = mxx_lattice_dsl::parallel(5, |i| {
                 let mut tag = HashTag::from(b"loop-hash/select:".as_slice());
                 tag.push(IntExpr::Select {
                     selector: Box::new(i.expression()?),
@@ -13155,11 +13158,11 @@ mod tests {
         };
         let first = hash_at("loop-hash/iterate:", IntExpr::from(0u8)) +
             hash_at("loop-hash/iterate:", IntExpr::from(1u8));
-        let iterated = mxx_dsl::iterate(IntExpr::from(3u8), first, |i, state| {
+        let iterated = mxx_lattice_dsl::iterate(IntExpr::from(3u8), first, |i, state| {
             Ok(state + hash_at("loop-hash/iterate:", i.add(2usize).expression()?))
         })
         .unwrap();
-        let single = mxx_dsl::parallel(1, |i| {
+        let single = mxx_lattice_dsl::parallel(1, |i| {
             Ok(hash_at(
                 "loop-hash/single:",
                 IntExpr::Select {
@@ -13335,7 +13338,8 @@ mod tests {
             BigInt::from(1u64 << 8),
         );
         let vector =
-            mxx_dsl::parallel(rows, |index| Ok(raw.at(index).sub(Int::constant(128)))).unwrap();
+            mxx_lattice_dsl::parallel(rows, |index| Ok(raw.at(index).sub(Int::constant(128))))
+                .unwrap();
         let validated = context
             .output("transposed", matrix.vector_matrix_product(&vector))
             .unwrap()
@@ -14407,7 +14411,7 @@ mod tests {
     #[ignore = "requires a supported GPU"]
     #[serial_test::serial(gpu_context)]
     fn direct_integer_record_artifacts_import_on_gpu() {
-        use mxx_dsl::{Family, GraphValue, IntType};
+        use mxx_lattice_dsl::{Family, GraphValue, IntType};
         let device = detected_gpu_device_ids()[0];
         let parameters = DCRTPolyParams::new(32, 1, 28, 8, None, None);
         let modulus = parameters.to_crt().0[0];
@@ -14453,7 +14457,7 @@ mod tests {
         let secret = consumer.int_family_input("secret", 3);
         let dot = imported_mask.matrix_vector_product(&secret).at(0);
         // LWE coordinates are updated lane by lane, as TFHE ciphertext arithmetic does.
-        let negated = mxx_dsl::parallel(3, |index| {
+        let negated = mxx_lattice_dsl::parallel(3, |index| {
             Ok(Int::constant(0).sub(imported_mask.at(index)).rem(Int::constant(1 << 20)))
         })
         .unwrap();
@@ -14543,9 +14547,10 @@ mod tests {
         let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
         let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
         let count = 3usize;
-        let first = mxx_dsl::parallel(count, |_| Ok(ring.uniform_residue((1, 2)))).unwrap();
+        let first = mxx_lattice_dsl::parallel(count, |_| Ok(ring.uniform_residue((1, 2)))).unwrap();
         let three = ring.polynomial([IntExpr::constant(3)]);
-        let second = mxx_dsl::parallel(count, |index| Ok(first.at(index) * three.clone())).unwrap();
+        let second =
+            mxx_lattice_dsl::parallel(count, |index| Ok(first.at(index) * three.clone())).unwrap();
         let mut context = DslContext::new("zip-of-computed-family");
         for member in 0..count {
             let member_index = Int::constant(member);
@@ -14582,7 +14587,7 @@ mod tests {
     #[ignore = "requires a supported GPU"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_indexed_imports_before_nested_carry_consumers() {
-        use mxx_dsl::{Family, GraphValue, Mat};
+        use mxx_lattice_dsl::{Family, GraphValue, Mat};
         let parameter = |name: &str, default: usize| {
             std::env::var(format!("MXX_TEST_INDEXED_IMPORT_{name}"))
                 .ok()
@@ -14601,7 +14606,7 @@ mod tests {
             GpuRuntime::new(gpu_backend_on([gpu_parameters], detected_gpu_device_ids())).unwrap();
         let groups = (0..2)
             .map(|_| {
-                mxx_dsl::parallel(1usize, |_| {
+                mxx_lattice_dsl::parallel(1usize, |_| {
                     Ok((ring.uniform_residue((1, columns)), ring.uniform_residue((1, columns))))
                 })
                 .unwrap()
@@ -14635,23 +14640,25 @@ mod tests {
                 )
                 .unwrap();
             let transition = |step: Int, rows: Vec<Family<(Mat, Mat)>>| {
-                let scalars = mxx_dsl::parallel(2usize, |member| {
-                    let row =
-                        mxx_dsl::select(member, vec![rows[0].at(0usize), rows[1].at(0usize)])?;
-                    let components = mxx_dsl::parallel(2usize, |component| {
-                        Ok(mxx_dsl::select(component, vec![row.0.clone(), row.1.clone()])?
+                let scalars = mxx_lattice_dsl::parallel(2usize, |member| {
+                    let row = mxx_lattice_dsl::select(
+                        member,
+                        vec![rows[0].at(0usize), rows[1].at(0usize)],
+                    )?;
+                    let components = mxx_lattice_dsl::parallel(2usize, |component| {
+                        Ok(mxx_lattice_dsl::select(component, vec![row.0.clone(), row.1.clone()])?
                             .multiply_monomial(step.clone().add(1usize)))
                     })?;
                     Ok((components.at(0usize), components.at(1usize)))
                 })?;
                 (0..2)
-                    .map(|role| mxx_dsl::parallel(1usize, |_| Ok(scalars.at(role))))
-                    .collect::<Result<Vec<_>, mxx_dsl::DslError>>()
+                    .map(|role| mxx_lattice_dsl::parallel(1usize, |_| Ok(scalars.at(role))))
+                    .collect::<Result<Vec<_>, mxx_lattice_dsl::DslError>>()
             };
             let rows = if iterations == 0 {
                 transition(Int::constant(0), groups.clone()).unwrap()
             } else {
-                mxx_dsl::iterate(iterations, groups.clone(), transition).unwrap()
+                mxx_lattice_dsl::iterate(iterations, groups.clone(), transition).unwrap()
             };
             let exponent = if iterations == 0 { 1 } else { iterations * (iterations + 1) / 2 };
             let mut graph = context;
@@ -14734,7 +14741,7 @@ mod tests {
             ring.artifact_input(production.clone(), "stored", (1, 2), ArtifactAvailability::Cached);
         let two = ring.polynomial([IntExpr::constant(2)]);
         let count = 3usize;
-        let lanes = mxx_dsl::parallel(count, |_| Ok(stored.clone() * two.clone())).unwrap();
+        let lanes = mxx_lattice_dsl::parallel(count, |_| Ok(stored.clone() * two.clone())).unwrap();
         let mut context = DslContext::new("wave-import-consumer");
         for member in 0..count {
             context = context

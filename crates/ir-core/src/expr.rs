@@ -11,7 +11,7 @@
 //!
 //! [`ParamEnv`] binds named integer parameters, real parameters, and loop-index slots (managed by
 //! executors). Runtime integer division in a graph differs from `IntExpr` division: see
-//! `mxx_dsl::Int`.
+//! `mxx_lattice_dsl::Int`.
 
 use crate::{
     ring::{RingRef, resolve_ring},

@@ -184,7 +184,7 @@ impl<'a> RnsEncryptBuild<'a> {
                         (1, columns),
                     )
                 });
-                let family = mxx_dsl::parallel(count, |index| {
+                let family = mxx_lattice_dsl::parallel(count, |index| {
                     retarget(
                         level,
                         crate::rns_bgg::RnsBggForm::State,
@@ -247,7 +247,7 @@ impl<'a> RnsEncryptBuild<'a> {
                         else {
                             return Err(ApiError::input("missing public plaintexts"));
                         };
-                        let stored = mxx_dsl::parallel(count.clone(), |index| {
+                        let stored = mxx_lattice_dsl::parallel(count.clone(), |index| {
                             let row = retarget(
                                 level,
                                 form,
@@ -263,7 +263,7 @@ impl<'a> RnsEncryptBuild<'a> {
                         .map_err(ApiError::scheme)?;
                         graph.transferred_output(name, stored)
                     } else {
-                        let stored = mxx_dsl::parallel(count.clone(), |index| {
+                        let stored = mxx_lattice_dsl::parallel(count.clone(), |index| {
                             retarget(level, form, (ports[0].at(index.clone()), ports[1].at(index)))
                         })
                         .map_err(ApiError::scheme)?;
@@ -451,7 +451,7 @@ impl<'a> RnsEncryptBuild<'a> {
             for (name, table) in tables {
                 let sigmas =
                     table.branch_automorphisms(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-                let family = mxx_dsl::parallel(sigmas.len(), |index| {
+                let family = mxx_lattice_dsl::parallel(sigmas.len(), |index| {
                     let sigma = IntExpr::Select {
                         selector: Box::new(index.expression()?),
                         branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
@@ -815,24 +815,26 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                         graph.transferred_output(name, encoding.row)
                     }
                     (InputBinding::Family(plaintexts), true) => {
-                        let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
-                            let plaintext = plaintexts.member(&plaintext_ring, index.clone());
-                            let encoding = encode(Some(index.clone()), plaintext)
-                                .map_err(|_| DslError::Schema)?;
-                            let payload = encoding.public_payload.ok_or(DslError::Schema)?;
-                            Ok((encoding.row.0, encoding.row.1, payload))
-                        })
-                        .map_err(ApiError::scheme)?;
+                        let stored =
+                            mxx_lattice_dsl::parallel(plaintexts.count().clone(), |index| {
+                                let plaintext = plaintexts.member(&plaintext_ring, index.clone());
+                                let encoding = encode(Some(index.clone()), plaintext)
+                                    .map_err(|_| DslError::Schema)?;
+                                let payload = encoding.public_payload.ok_or(DslError::Schema)?;
+                                Ok((encoding.row.0, encoding.row.1, payload))
+                            })
+                            .map_err(ApiError::scheme)?;
                         graph.transferred_output(name, stored)
                     }
                     (InputBinding::Family(plaintexts), false) => {
-                        let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
-                            let plaintext = plaintexts.member(&plaintext_ring, index.clone());
-                            encode(Some(index.clone()), plaintext)
-                                .map(|encoding| encoding.row)
-                                .map_err(|_| DslError::Schema)
-                        })
-                        .map_err(ApiError::scheme)?;
+                        let stored =
+                            mxx_lattice_dsl::parallel(plaintexts.count().clone(), |index| {
+                                let plaintext = plaintexts.member(&plaintext_ring, index.clone());
+                                encode(Some(index.clone()), plaintext)
+                                    .map(|encoding| encoding.row)
+                                    .map_err(|_| DslError::Schema)
+                            })
+                            .map_err(ApiError::scheme)?;
                         graph.transferred_output(name, stored)
                     }
                 }
@@ -981,7 +983,7 @@ mod test {
             for table in program.encryption_inputs().luts() {
                 let sigmas = table.branch_automorphisms(n as usize).unwrap();
                 for port in 0..2 {
-                    let family = mxx_dsl::parallel(sigmas.len(), |index| {
+                    let family = mxx_lattice_dsl::parallel(sigmas.len(), |index| {
                         let sigma = IntExpr::Select {
                             selector: Box::new(index.expression()?),
                             branches: sigmas
@@ -1060,7 +1062,7 @@ mod test {
                             (1, root.columns()),
                         )
                     });
-                    let family = mxx_dsl::parallel(count, |index| {
+                    let family = mxx_lattice_dsl::parallel(count, |index| {
                         Ok((ports[0].at(index.clone()), ports[1].at(index)))
                     })
                     .unwrap();

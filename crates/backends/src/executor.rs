@@ -64,6 +64,8 @@ use std::{
 use thiserror::Error;
 use tracing::info;
 
+#[cfg(test)]
+mod core_lowering_tests;
 mod cpu;
 mod plan_cache;
 
@@ -2727,8 +2729,8 @@ mod tests {
         matrix::{CpuSmallMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
-    use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::{IntExpr, types::CoefficientBoundDomain};
+    use mxx_lattice_dsl::{DslContext, Ring};
 
     fn matrix_type(parameters: &DCRTPolyParams) -> ConcreteMatrixType {
         let ring = Ring::from_crt_moduli(

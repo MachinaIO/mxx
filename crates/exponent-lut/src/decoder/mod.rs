@@ -14,16 +14,16 @@ pub mod unmask;
 /// noisy encoding. Coefficient extraction returns canonical residues, so `q - 1`
 /// represents `-1`. Callers must reject the negative sentinel.
 pub fn monomial_exponent(
-    plaintext: mxx_dsl::Mat,
+    plaintext: mxx_lattice_dsl::Mat,
     modulus: u64,
     dimension: usize,
     stride: usize,
-) -> Result<mxx_dsl::Int, mxx_dsl::DslError> {
-    use mxx_dsl::Int;
+) -> Result<mxx_lattice_dsl::Int, mxx_lattice_dsl::DslError> {
+    use mxx_lattice_dsl::Int;
     if modulus < 3 || modulus % 2 == 0 || dimension == 0 || stride == 0 {
-        return Err(mxx_dsl::DslError::Schema);
+        return Err(mxx_lattice_dsl::DslError::Schema);
     }
-    let (exponent, nonzero, invalid) = mxx_dsl::iterate(
+    let (exponent, nonzero, invalid) = mxx_lattice_dsl::iterate(
         dimension,
         (Int::constant(0), Int::constant(0), Int::constant(0)),
         |k, (exponent, nonzero, invalid)| {
@@ -45,5 +45,5 @@ pub fn monomial_exponent(
         .to_int()
         .mul(invalid.equal(0).to_int())
         .mul(exponent.clone().rem(stride).equal(0).to_int());
-    mxx_dsl::select(valid, vec![Int::constant(-1), exponent.div(stride)])
+    mxx_lattice_dsl::select(valid, vec![Int::constant(-1), exponent.div(stride)])
 }

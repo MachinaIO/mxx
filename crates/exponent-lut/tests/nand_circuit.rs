@@ -19,7 +19,6 @@ use mxx_backends::{
         dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
-use mxx_dsl::{DslContext, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, NandCircuit, api, claim,
     decoder::simulation::{AverageCaseConfig, NoiseModelKind},
@@ -42,6 +41,7 @@ use mxx_ir_core::{
         ProtocolPreconditionSpec, PurePredicateSpec, StageId, Workflow,
     },
 };
+use mxx_lattice_dsl::{DslContext, IdealSpec, Int, IntType};
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
 use std::{cell::RefCell, collections::BTreeMap, env};

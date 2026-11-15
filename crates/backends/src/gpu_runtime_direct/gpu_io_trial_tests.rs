@@ -12,8 +12,8 @@ use crate::{
         dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
     },
 };
-use mxx_dsl::{DslContext, Ring, parallel};
 use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
+use mxx_lattice_dsl::{DslContext, Ring, parallel};
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 /// A producer that exports a family over four waves, and a consumer that
@@ -101,7 +101,8 @@ fn io_trial_plans_without_the_imported_artifacts_and_leaves_no_trial_data() {
     // A runtime Zip base is published outside the measured waves. The trial
     // must model that selector, while real execution must use its nonzero value.
     let offset_context = DslContext::new("io-trial-offset-consumer");
-    let base = offset_context.input::<mxx_dsl::Int>("base", mxx_dsl::IntType).unwrap();
+    let base =
+        offset_context.input::<mxx_lattice_dsl::Int>("base", mxx_lattice_dsl::IntType).unwrap();
     let artifact = ring.family_artifact_input(
         production.clone(),
         "members",
@@ -201,9 +202,10 @@ fn io_trial_exports_the_members_of_skipped_waves() {
     })
     .unwrap();
     let consumed = members.clone();
-    let sum =
-        mxx_dsl::iterate(6, ring.zero((1, 1)), move |index, sum| Ok(sum + consumed.at(index)))
-            .unwrap();
+    let sum = mxx_lattice_dsl::iterate(6, ring.zero((1, 1)), move |index, sum| {
+        Ok(sum + consumed.at(index))
+    })
+    .unwrap();
     let graph = DslContext::new("io-trial-skipped-waves")
         .transferred_output("members", members)
         .unwrap()
@@ -301,10 +303,10 @@ fn test_gpu_io_trial_reuses_structural_groups() {
         let ring = ring.clone();
         let key = key.clone();
         let members = parallel(4, move |index| {
-            let mut tag = mxx_dsl::HashTag::from(b"io-trial".as_slice());
+            let mut tag = mxx_lattice_dsl::HashTag::from(b"io-trial".as_slice());
             tag.push(index.add(constant));
             let initial = ring.hash_matrix(key.clone(), tag, (1, columns));
-            mxx_dsl::iterate(count, initial, |_, carry| Ok(carry.clone() + carry))
+            mxx_lattice_dsl::iterate(count, initial, |_, carry| Ok(carry.clone() + carry))
         })
         .unwrap();
         context = context.transferred_output(name, members).unwrap();
@@ -394,7 +396,7 @@ fn test_gpu_io_trial_reuses_host_loops() {
     );
     let mut context = DslContext::new("io-trial-host-reuse");
     for (name, offset, count) in [("a", 0, 4), ("b", 1, 4), ("count", 0, 3)] {
-        let sum = mxx_dsl::iterate(count, ring.zero((1, 1)), |index, sum| {
+        let sum = mxx_lattice_dsl::iterate(count, ring.zero((1, 1)), |index, sum| {
             Ok(sum + artifact.at(index.add(offset)))
         })
         .unwrap();

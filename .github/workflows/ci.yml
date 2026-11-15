@@ -136,7 +136,7 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Verify proof toolchains
         run: |
-          for package in crates/ir-core/lean crates/ir-core/lean/security crates/fhe/lean/spec crates/fhe/lean/tfhe crates/fhe/lean/bgv crates/dsl/examples/rlwe; do
+          for package in crates/ir-core/lean crates/ir-core/lean/security crates/fhe/lean/spec crates/fhe/lean/tfhe crates/fhe/lean/bgv crates/lattice-dsl/examples/rlwe; do
             test "$(cat "$package/lean-toolchain")" = "leanprover/lean4:v4.35.0"
           done
           lean --version
@@ -159,7 +159,7 @@ jobs:
         working-directory: crates/fhe/lean/bgv
         run: lake build
       - name: Build RLWE certificate
-        working-directory: crates/dsl/examples/rlwe
+        working-directory: crates/lattice-dsl/examples/rlwe
         run: lake build
 
   ci-success:

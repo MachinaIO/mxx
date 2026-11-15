@@ -5,7 +5,7 @@ public keys and encodings, the evaluation of polynomial and Boolean circuits ove
 tables, slot operations, and Tall encodings. The crate also holds what these encodings evaluate
 (scheme-independent circuit models, the framework that lowers a circuit to an encoding scheme,
 and reusable gadgets such as nested-RNS arithmetic, NTT circuits, and Ring-GSW) and WEE25
-commitments. It depends on `mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
+commitments. It depends on `mxx-lattice-dsl`, `mxx-ir-core`, and `mxx-backends`.
 
 ## Contents
 

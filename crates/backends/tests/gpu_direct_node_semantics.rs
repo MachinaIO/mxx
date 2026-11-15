@@ -13,13 +13,13 @@ use mxx_backends::{
     },
     sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
 };
-use mxx_dsl::{DslContext, Mat, Ring};
 use mxx_ir_core::{
     ParamEnv,
     node::{ConcatAxis, IndexRange},
     ring::{RingExpr, RingRef},
     types::{ConcreteMatrixType, ConcreteWireType},
 };
+use mxx_lattice_dsl::{DslContext, Mat, Ring};
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -519,7 +519,7 @@ fn multiply_monomial_matches_cpu_for_runtime_exponents() {
     );
     let context = DslContext::new("direct-multiply-monomial");
     let source = ring.input("source", (2, 2));
-    let exponent: mxx_dsl::Int = context.input("k", mxx_dsl::IntType).unwrap();
+    let exponent: mxx_lattice_dsl::Int = context.input("k", mxx_lattice_dsl::IntType).unwrap();
     let graph = context
         .output("result", source.multiply_monomial(exponent))
         .unwrap()

@@ -1,10 +1,12 @@
 //! Declarative BGG+ encoding graph values.
 
 use crate::bgg::{BggPublicKeyFamily, BggPublicKeyWire};
-use mxx_dsl::{DslError, Family, GraphValue, GraphValueSchema, Mat, MatType, Preimage, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr, ValueHandle, WireType,
     node::{ConcatAxis, IndexRange},
+};
+use mxx_lattice_dsl::{
+    DslError, Family, GraphValue, GraphValueSchema, Mat, MatType, Preimage, Ring,
 };
 use rayon::prelude::*;
 use thiserror::Error;
@@ -199,7 +201,7 @@ pub enum BggSampleError {
     #[error("BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
     MissingGaussianBound,
     #[error(transparent)]
-    Dsl(#[from] mxx_dsl::DslError),
+    Dsl(#[from] mxx_lattice_dsl::DslError),
 }
 
 #[derive(Clone)]
@@ -314,7 +316,7 @@ impl BggEncodingSampler {
             (None, None) => None,
             _ => return Err(BggSampleError::MissingGaussianBound),
         };
-        Ok(mxx_dsl::parallel(count, |index| {
+        Ok(mxx_lattice_dsl::parallel(count, |index| {
             let key = public_keys.at(&index);
             let plaintext = plaintexts.at(&index);
             let error = match &error {
@@ -354,11 +356,11 @@ mod tests {
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_dsl::{DslContext, Ring, Subgraph};
     use mxx_ir_core::{
         ParamEnv,
         node::{ConcatAxis, NodeKind},
     };
+    use mxx_lattice_dsl::{DslContext, Ring, Subgraph};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 

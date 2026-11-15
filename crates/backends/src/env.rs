@@ -24,6 +24,17 @@ pub(crate) fn test_streamed_ring_dimension() -> usize {
     positive_usize("MXX_TEST_STREAMED_RING_DIMENSION", 8).expect("valid streamed test ring")
 }
 
+/// `MXX_TEST_CORE_LOWERING_RING_DIMENSION`, `_CRT_DEPTH`, `_ROWS`, `_COLUMNS`: the ring and matrix
+/// shape of the core-lowering tests (defaults: 8, 2, 2, 3).
+#[cfg(test)]
+pub(crate) fn test_core_lowering_shape() -> (usize, usize, usize, usize) {
+    let get = |name: &str, default| {
+        positive_usize(&format!("MXX_TEST_CORE_LOWERING_{name}"), default)
+            .expect("valid core-lowering test shape")
+    };
+    (get("RING_DIMENSION", 8), get("CRT_DEPTH", 2), get("ROWS", 2), get("COLUMNS", 3))
+}
+
 /// Parameters of the preimage capacity diagnostic. Defaults are deliberately small;
 /// set `MXX_TEST_CAPACITY_N`, `PRIMES`, `CRT_BITS`, and `BASE_BITS` (all with the
 /// `MXX_TEST_CAPACITY_` prefix) to inspect a different sampler shape.

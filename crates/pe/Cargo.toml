@@ -11,7 +11,7 @@ gpu = ["mxx-exponent-lut/gpu", "mxx-backends/gpu"]
 
 [dependencies]
 mxx-exponent-lut.workspace = true
-mxx-dsl.workspace = true
+mxx-lattice-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-backends.workspace = true
 bigdecimal.workspace = true

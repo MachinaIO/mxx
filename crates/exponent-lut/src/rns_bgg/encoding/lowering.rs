@@ -88,13 +88,13 @@ impl<'a> OnlineEvalFamilies<'a> {
         &mut self,
         range: &crate::program::FamilyRange,
         reads: &[(crate::program::WireId, IntExpr)],
-    ) -> Result<Vec<usize>, mxx_dsl::DslError> {
+    ) -> Result<Vec<usize>, mxx_lattice_dsl::DslError> {
         reads
             .iter()
             .map(|(family, index)| {
                 let index = index.clone();
                 let base = self.gather_bases.get(family).cloned();
-                let family = mxx_dsl::parallel(range.count().clone(), move |lane| {
+                let family = mxx_lattice_dsl::parallel(range.count().clone(), move |lane| {
                     let index = Int::evaluate(
                         crate::program::substitute_var(
                             &index,
@@ -549,7 +549,7 @@ pub(super) fn import_rhs_bindings(
 /// `member = (m, members)`, member `m` of the family of `members` instances it is published
 /// as (see `RnsOnlineEvalBuild::with_material_member`).
 fn material_matrix(
-    ring: &mxx_dsl::Ring,
+    ring: &mxx_lattice_dsl::Ring,
     production: &ProductionId,
     name: String,
     shape: (usize, usize),
@@ -576,7 +576,7 @@ fn material_matrix(
 /// of every instance side by side, of which instance `m`'s start at member `m count`. No family
 /// of one instance's members is formed.
 fn material_family(
-    ring: &mxx_dsl::Ring,
+    ring: &mxx_lattice_dsl::Ring,
     production: &ProductionId,
     name: String,
     count: IntExpr,
@@ -657,17 +657,20 @@ impl EncodingLowering<'_> {
                 // one scalar index family (a `parallel` of `Int::evaluate`), and the terms are
                 // summed by one sequential loop over `j` whose monomials are products by runtime
                 // exponents, so the graph does not grow with the table width.
-                let outputs = mxx_dsl::parallel(IntExpr::constant(width), |index| {
-                    Ok(mxx_dsl::Int::evaluate(IntExpr::Select {
+                let outputs = mxx_lattice_dsl::parallel(IntExpr::constant(width), |index| {
+                    Ok(mxx_lattice_dsl::Int::evaluate(IntExpr::Select {
                         selector: Box::new(index.expression()?),
                         branches: values.iter().map(|value| IntExpr::constant(*value)).collect(),
                     }))
                 })
                 .map_err(|_| RnsBggError::Lut)?;
                 let one = ring.polynomial([IntExpr::constant(1)]);
-                let input_stride = mxx_dsl::Int::constant(-BigInt::from(input_layout.stride()));
-                let sum =
-                    mxx_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
+                let input_stride =
+                    mxx_lattice_dsl::Int::constant(-BigInt::from(input_layout.stride()));
+                let sum = mxx_lattice_dsl::iterate(
+                    IntExpr::constant(width),
+                    ring.zero((1, 1)),
+                    |index, sum| {
                         let output = outputs.at(index.clone());
                         let right = one
                             .clone()
@@ -678,14 +681,14 @@ impl EncodingLowering<'_> {
                                 output.lift_to_constant_polynomial(ring.matrix_type((1, 1))) * right
                             }
                             crate::program::LutOutputRepresentation::Exponent(layout) => right
-                                .multiply_monomial(
-                                    output
-                                        .mul(mxx_dsl::Int::constant(BigInt::from(layout.stride()))),
-                                ),
+                                .multiply_monomial(output.mul(mxx_lattice_dsl::Int::constant(
+                                    BigInt::from(layout.stride()),
+                                ))),
                         };
                         Ok(sum + term)
-                    })
-                    .map_err(|_| RnsBggError::Lut)?;
+                    },
+                )
+                .map_err(|_| RnsBggError::Lut)?;
                 return Ok(inverse * sum);
             }
             LutEntries::Graph { family, offset, .. } => (family, *offset),
@@ -695,23 +698,24 @@ impl EncodingLowering<'_> {
         // modulo `2n` as `mono` does.
         let doubled = 2 * parameters.level(level)?.ring_dimension() as i64;
         let stride = input_layout.stride() as i64;
-        let sum = mxx_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
-            let value = family.at(Int::constant(offset as i64) + index.clone());
-            let left = match representation {
-                crate::program::LutOutputRepresentation::Coefficient => {
-                    value.lift_to_constant_polynomial(ring.matrix_type((1, 1)))
-                }
-                crate::program::LutOutputRepresentation::Exponent(layout) => ring
+        let sum =
+            mxx_lattice_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
+                let value = family.at(Int::constant(offset as i64) + index.clone());
+                let left = match representation {
+                    crate::program::LutOutputRepresentation::Coefficient => {
+                        value.lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                    }
+                    crate::program::LutOutputRepresentation::Exponent(layout) => ring
+                        .identity(1)
+                        .multiply_monomial(value.mul(Int::constant(layout.stride() as i64))),
+                };
+                let right = ring
                     .identity(1)
-                    .multiply_monomial(value.mul(Int::constant(layout.stride() as i64))),
-            };
-            let right = ring
-                .identity(1)
-                .multiply_monomial((Int::constant(doubled) - index) * Int::constant(stride))
-                .ring_automorphism(sigma.clone());
-            Ok(sum + left * right)
-        })
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+                    .multiply_monomial((Int::constant(doubled) - index) * Int::constant(stride))
+                    .ring_automorphism(sigma.clone());
+                Ok(sum + left * right)
+            })
+            .map_err(|error| RnsBggError::Graph(error.to_string()))?;
         Ok(inverse * sum)
     }
 
@@ -742,7 +746,7 @@ impl EncodingLowering<'_> {
         // One loop body over the automorphism indices, as preprocessing builds
         // its switching ciphertexts, so the graph does not grow with the
         // square of the table width.
-        let terms = mxx_dsl::parallel(IntExpr::constant(sigmas.len()), |index| {
+        let terms = mxx_lattice_dsl::parallel(IntExpr::constant(sigmas.len()), |index| {
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
@@ -1321,7 +1325,7 @@ impl EncodingLowering<'_> {
         // branch's work; the last branch runs after the loop.
         let last = table.input_width().checked_sub(1).ok_or(RnsBggError::Lut)?;
         let (row, public_key) = {
-            let (sums, b_last) = mxx_dsl::iterate(
+            let (sums, b_last) = mxx_lattice_dsl::iterate(
                 IntExpr::constant(last),
                 (initial, b_at(Int::constant(0))),
                 |index, (sums, b_sigma)| {
@@ -1871,7 +1875,7 @@ mod test {
         assert_action(&family_action.0);
         assert_action(&family_action.1);
         let family_name = format!("rhs/{family_rhs:?}/family");
-        let family_members = mxx_dsl::parallel(IntExpr::constant(2), |index| {
+        let family_members = mxx_lattice_dsl::parallel(IntExpr::constant(2), |index| {
             family_lowerer
                 .rhs_decomposition(&member_at(index.expression()?), 0)
                 .map(&consume_action)

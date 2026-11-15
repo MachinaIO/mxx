@@ -11,9 +11,9 @@ pub(super) fn public_lut_branch<D: super::RightAction>(
 }
 
 pub(in crate::rns_bgg) fn matrix_from_hash(
-    ring: &mxx_dsl::Ring,
+    ring: &mxx_lattice_dsl::Ring,
     key: Bytes,
-    tag: impl Into<mxx_dsl::HashTag>,
+    tag: impl Into<mxx_lattice_dsl::HashTag>,
     columns: usize,
 ) -> RnsBggMatrix {
     // Each component has its own tag, so the four components are independent.
@@ -54,7 +54,7 @@ pub(in crate::rns_bgg) fn lut_public_matrix(
     }
     let ring = parameters.ring(level)?;
     let columns = parameters.component_columns(level)?;
-    let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/lut-a".to_vec());
+    let mut tag = mxx_lattice_dsl::HashTag::from(b"rns-bgg/lut-a".to_vec());
     tag.push(mxx_ir_core::IntExpr::constant(level));
     tag.push(sigma);
     parameters.push_hash_domain(&mut tag);
@@ -66,8 +66,9 @@ pub(in crate::rns_bgg) fn lut_public_matrix(
 /// expression) is static, and a runtime one (a table entry) is a hash
 /// argument hashing the same bytes, so every reader of a member derives the
 /// key encryption sampled for it.
-fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::HashTag {
-    let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/input/{wire:?}/{level}").into_bytes());
+fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_lattice_dsl::HashTag {
+    let mut tag =
+        mxx_lattice_dsl::HashTag::from(format!("rns-bgg/input/{wire:?}/{level}").into_bytes());
     if let Some(member) = member {
         tag.push("member");
         tag.push_integer(member);
@@ -99,8 +100,9 @@ pub(crate) fn rhs_top(
     let columns = parameters.component_columns(next_level)?;
     // The parameter set and the Program are integer components, so chains that differ in them
     // differ only in integers.
-    let mut tag =
-        mxx_dsl::HashTag::from(format!("rns-bgg/rhs/{rhs:?}/{level}/{next_level}").into_bytes());
+    let mut tag = mxx_lattice_dsl::HashTag::from(
+        format!("rns-bgg/rhs/{rhs:?}/{level}/{next_level}").into_bytes(),
+    );
     tag.push("parameters");
     crate::rns_bgg::push_digest(&mut tag, &parameters.parameter_identity());
     tag.push("program");
@@ -302,8 +304,8 @@ mod test {
             .collect::<Vec<_>>();
         let graph = DslContext::new("static-data-lut-tables");
         let values = graph.int_family_input("tables", 4usize);
-        let actual = mxx_dsl::parallel(2usize, |member| {
-            let row = mxx_dsl::parallel(2usize, |entry| {
+        let actual = mxx_lattice_dsl::parallel(2usize, |member| {
+            let row = mxx_lattice_dsl::parallel(2usize, |entry| {
                 Ok(values.at(member.clone().mul(2usize).add(entry)))
             })?;
             let data = BTreeMap::from([(DataId(0), row)]);
@@ -319,8 +321,10 @@ mod test {
             .map_err(|_| DslError::Schema)
         })
         .unwrap();
-        let expected =
-            mxx_dsl::parallel(2usize, |member| mxx_dsl::select(member, constants.clone())).unwrap();
+        let expected = mxx_lattice_dsl::parallel(2usize, |member| {
+            mxx_lattice_dsl::select(member, constants.clone())
+        })
+        .unwrap();
         let graph = graph
             .output("actual", actual)
             .unwrap()

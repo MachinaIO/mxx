@@ -16,8 +16,8 @@
 //! encodings whose key is `A`. The operations are plain DSL values; a scheme
 //! adapter chooses the ring, the key and the encoding row it unmasks.
 
-use mxx_dsl::{Mat, Preimage, Ring, Trapdoor};
 use mxx_ir_core::{IntExpr, RealExpr};
+use mxx_lattice_dsl::{Mat, Preimage, Ring, Trapdoor};
 
 /// Rows of `B`: the length of the mask secret row `(s_bar, 1)`.
 pub const UNMASK_ROWS: usize = 2;
@@ -63,7 +63,7 @@ mod tests {
         poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::bounds::default_preimage_cutoff,
     };
-    use mxx_dsl::DslContext;
+    use mxx_lattice_dsl::DslContext;
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
 

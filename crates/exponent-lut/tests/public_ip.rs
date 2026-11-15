@@ -25,7 +25,6 @@ use mxx_backends::{
         },
     },
 };
-use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, api, claim,
     decoder::simulation::AverageCaseConfig,
@@ -47,6 +46,7 @@ use mxx_ir_core::{
         ProtocolPreconditionSpec, PurePredicateSpec, StageId, Workflow,
     },
 };
+use mxx_lattice_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use num_bigint::{BigInt, BigUint};
 use rand::{Rng, SeedableRng};
 use serial_test::serial as sequential;
@@ -570,11 +570,16 @@ fn public_ip_protocol(
                 .add(Int::constant(1).sub(sign).mul(ring_dimension))
                 .equal(value.mul(2 * stride))
     };
-    let mut valid = mxx_dsl::iterate(members, Int::constant(0).equal(0), |member, valid| {
-        Ok(valid &
-            monomial(coefficient.at(member.clone()), exponent.at(member.clone()), a.at(member)))
-    })
-    .unwrap();
+    let mut valid =
+        mxx_lattice_dsl::iterate(members, Int::constant(0).equal(0), |member, valid| {
+            Ok(valid &
+                monomial(
+                    coefficient.at(member.clone()),
+                    exponent.at(member.clone()),
+                    a.at(member),
+                ))
+        })
+        .unwrap();
     valid = valid & a.at(Int::constant(members as i64 - 1)).equal(0);
     let z = selected
         .iter()

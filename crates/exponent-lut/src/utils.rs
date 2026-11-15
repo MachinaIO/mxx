@@ -12,8 +12,8 @@ use crate::{
 };
 use bigdecimal::{BigDecimal, Zero};
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_dsl::{Family, GraphValue, Int};
 use mxx_ir_core::{ParamEnv, Rational, RealExpr};
+use mxx_lattice_dsl::{Family, GraphValue, Int};
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use std::{env, error::Error, fmt};
@@ -398,7 +398,7 @@ pub(crate) fn reduce_generated_segments<T: GraphValue>(
     element: impl Fn(Int, Int) -> T,
     add: impl Fn(T, T) -> T,
 ) -> Result<Family<T>, ExponentLutError> {
-    let mut current = mxx_dsl::parallel(segment_count * segment_size, |index| {
+    let mut current = mxx_lattice_dsl::parallel(segment_count * segment_size, |index| {
         Ok(element(
             index.clone().div(Int::constant(segment_size)),
             index.rem(Int::constant(segment_size)),
@@ -408,7 +408,7 @@ pub(crate) fn reduce_generated_segments<T: GraphValue>(
     let mut width = segment_size;
     while width > 1 {
         let next_width = width.div_ceil(2);
-        current = mxx_dsl::parallel(segment_count * next_width, |index| {
+        current = mxx_lattice_dsl::parallel(segment_count * next_width, |index| {
             let segment = index.clone().div(Int::constant(next_width));
             let member = index.rem(Int::constant(next_width));
             let base = segment.mul(Int::constant(width));
@@ -419,7 +419,7 @@ pub(crate) fn reduce_generated_segments<T: GraphValue>(
                 Ok(add(left, right))
             } else {
                 let last = member.equal(Int::constant(next_width - 1)).to_int();
-                mxx_dsl::select(last, vec![add(left.clone(), right), left])
+                mxx_lattice_dsl::select(last, vec![add(left.clone(), right), left])
             }
         })
         .map_err(|_| ExponentLutError::InvalidLut)?;
@@ -433,8 +433,8 @@ mod tests {
     use super::*;
     use crate::test_support::{execute_cpu, explicit_ring, full, primes, ring_of, validate};
     use mxx_backends::poly::dcrt::params::DCRTPolyParams;
-    use mxx_dsl::DslContext;
     use mxx_ir_core::IntExpr;
+    use mxx_lattice_dsl::DslContext;
     use std::collections::BTreeMap;
     #[test]
     fn zero_drop_plan_chain_retains_exact_basis_and_successors() {

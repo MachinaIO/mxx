@@ -389,7 +389,7 @@ impl<'a> RnsPreprocessBuild<'a> {
                             .ok()
                             .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
                         InputBinding::Family(
-                            mxx_dsl::parallel(IntExpr::constant(count), |index| {
+                            mxx_lattice_dsl::parallel(IntExpr::constant(count), |index| {
                                 Ok(RhsRef { id: *id, index: Some(index) })
                             })
                             .map_err(ApiError::scheme)?,
@@ -409,7 +409,7 @@ impl<'a> RnsPreprocessBuild<'a> {
                         InputBinding::Scalar(value.clone())
                     }
                     InputBinding::Family(super::RhsPlaintexts::Values(values))
-                        if values.schema().element == mxx_dsl::MatType(schema) =>
+                        if values.schema().element == mxx_lattice_dsl::MatType(schema) =>
                     {
                         InputBinding::Family(super::PlaintextFamily::Graph(
                             super::RhsPlaintexts::Values(values.clone()),
@@ -464,14 +464,14 @@ impl<'a> RnsPreprocessBuild<'a> {
                         return Err(ApiError::input("RHS family count does not match Program"));
                     }
                     evaluator.rhs.insert(*id, InputBinding::Family(plaintexts));
-                    let prepared = mxx_dsl::parallel(members.clone(), |index| {
+                    let prepared = mxx_lattice_dsl::parallel(members.clone(), |index| {
                         evaluator
                             .prepare_rhs_material(&RhsRef { id: *id, index: Some(index) })
                             .map_err(|_| DslError::Schema)
                     })
                     .map_err(ApiError::scheme)?;
                     evaluator.rhs_material.insert(*id, InputBinding::Family(prepared));
-                    let references = mxx_dsl::parallel(members, |index| {
+                    let references = mxx_lattice_dsl::parallel(members, |index| {
                         Ok(RhsRef { id: *id, index: Some(index) })
                     })
                     .map_err(ApiError::scheme)?;
@@ -1021,7 +1021,7 @@ mod test {
                 BTreeMap::from([(
                     rhs,
                     InputBinding::Family(crate::rns_bgg::RhsPlaintexts::Values(
-                        mxx_dsl::parallel(2usize, |index| {
+                        mxx_lattice_dsl::parallel(2usize, |index| {
                             Ok(ring.polynomial([IntExpr::Rem(
                                 Box::new(index.expression()?),
                                 Box::new(IntExpr::constant(2)),
@@ -1200,7 +1200,7 @@ mod test {
         use mxx_backends::{
             MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
         };
-        use mxx_dsl::{Leaf, Mat};
+        use mxx_lattice_dsl::{Leaf, Mat};
         let base = emission_parameters();
         let ring = base.ring(0).unwrap();
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
@@ -1217,13 +1217,13 @@ mod test {
         let context: [u8; 32] = rand::random();
         let hash_key: [u8; 32] = rand::random();
         let bit = u32::from(rand::random::<bool>());
-        let secret = |ring: &mxx_dsl::Ring| ring.uniform_interval((1, 1), -1, 1);
+        let secret = |ring: &mxx_lattice_dsl::Ring| ring.uniform_interval((1, 1), -1, 1);
         let (payload_row, mask_row) = (secret(&ring), secret(&ring));
         // Instance `m` selects RHS member `m`, whose plaintext is `m + 1`.
-        let selections = mxx_dsl::int_family_input("selections", 2usize);
+        let selections = mxx_lattice_dsl::int_family_input("selections", 2usize);
         let (mut descriptor, mut names) = (None, Vec::new());
         let mut runtime = BTreeMap::new();
-        let instances = mxx_dsl::parallel(2usize, |member| {
+        let instances = mxx_lattice_dsl::parallel(2usize, |member| {
             let parameters = base.clone().with_hash_domain(vec![member.clone()]);
             let payload = RnsBggPayloadSecret::from_row(&parameters, payload_row.clone()).unwrap();
             let mask =
@@ -1236,13 +1236,15 @@ mod test {
                     BTreeMap::from([(
                         data,
                         (
-                            mxx_dsl::parallel(1usize, |_| Ok(selections.at(member.clone())))?,
+                            mxx_lattice_dsl::parallel(1usize, |_| {
+                                Ok(selections.at(member.clone()))
+                            })?,
                             Int::constant(0),
                         ),
                     )]),
                 )
                 .unwrap();
-            let plaintexts = mxx_dsl::parallel(2usize, |index| {
+            let plaintexts = mxx_lattice_dsl::parallel(2usize, |index| {
                 Ok(ring.polynomial([IntExpr::Add(
                     Box::new(index.expression()?),
                     Box::new(IntExpr::constant(1)),
@@ -1303,7 +1305,7 @@ mod test {
             let published = match count {
                 None => Leaf::of(family).unwrap(),
                 Some(count) => Leaf::of(
-                    mxx_dsl::parallel(IntExpr::constant(2) * count.clone(), |index| {
+                    mxx_lattice_dsl::parallel(IntExpr::constant(2) * count.clone(), |index| {
                         let per = Int::evaluate(count.clone());
                         Ok(family.at(index.clone().div(per.clone())).at(index.rem(per)).unwrap())
                     })
@@ -1338,7 +1340,7 @@ mod test {
         );
         let instance = rand::random::<bool>() as usize;
         let context_graph = DslContext::new("evaluate-instance");
-        let member = context_graph.input::<Int>("instance", mxx_dsl::IntType).unwrap();
+        let member = context_graph.input::<Int>("instance", mxx_lattice_dsl::IntType).unwrap();
         let parameters = base.clone().with_hash_domain(vec![member.clone()]);
         let selected = |name: &str| -> Mat {
             ring.family_artifact_input(
@@ -1358,8 +1360,9 @@ mod test {
                 BTreeMap::from([(
                     data,
                     (
-                        mxx_dsl::parallel(1usize, |_| {
-                            Ok(mxx_dsl::int_family_input("selections", 2usize).at(member.clone()))
+                        mxx_lattice_dsl::parallel(1usize, |_| {
+                            Ok(mxx_lattice_dsl::int_family_input("selections", 2usize)
+                                .at(member.clone()))
                         })
                         .unwrap(),
                         Int::constant(0),
@@ -1480,7 +1483,8 @@ mod test {
         lower_program(&program, evaluator, families, environment).unwrap();
 
         let ring = parameters.ring(0).unwrap();
-        let plaintexts = mxx_dsl::parallel(count.clone(), |_| Ok(ring.identity(1))).unwrap();
+        let plaintexts =
+            mxx_lattice_dsl::parallel(count.clone(), |_| Ok(ring.identity(1))).unwrap();
         let mut composed = RnsPreprocessBuild::new(&parameters, rand::random())
             .with_artifact_prefix("symbolic-rhs");
         composed
@@ -1586,7 +1590,7 @@ mod test {
         )
         .unwrap();
         let rows = |count| {
-            mxx_dsl::parallel(count, |_| {
+            mxx_lattice_dsl::parallel(count, |_| {
                 Ok((
                     ring.zero((
                         1,
@@ -1604,7 +1608,7 @@ mod test {
             })
             .unwrap()
         };
-        let plaintexts = mxx_dsl::parallel(3usize, |_| Ok(ring.identity(1))).unwrap();
+        let plaintexts = mxx_lattice_dsl::parallel(3usize, |_| Ok(ring.identity(1))).unwrap();
         let mut evaluation = RnsOnlineEvalBuild::new(&parameters, context);
         assert!(
             evaluation
@@ -1917,10 +1921,10 @@ mod test {
             panic!("the row is deferred");
         };
         assert_eq!(row_columns.columns(), columns);
-        let blocks = mxx_dsl::parallel(columns, |block| {
+        let blocks = mxx_lattice_dsl::parallel(columns, |block| {
             Ok(deferred
                 .deferred_block(&program, row_columns, &block.expression()?)
-                .map_err(|_| mxx_dsl::DslError::Schema)?
+                .map_err(|_| mxx_lattice_dsl::DslError::Schema)?
                 .matrix)
         })
         .unwrap();

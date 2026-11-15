@@ -14,8 +14,8 @@ use mxx_backends::{
     },
     transcript::SamplingMode,
 };
-use mxx_dsl::{BuiltGraph, Ring};
 use mxx_ir_core::{ParamEnv, ValidatedGraph};
+use mxx_lattice_dsl::{BuiltGraph, Ring};
 use std::collections::BTreeMap;
 
 /// The DSL ring with the exact ordered CRT basis of `parameters`.

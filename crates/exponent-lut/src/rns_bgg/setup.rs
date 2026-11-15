@@ -497,8 +497,8 @@ impl RnsBggDynamicSetup {
         Ok(())
     }
 
-    fn tag(&self, domain: &str) -> mxx_dsl::HashTag {
-        let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/dynamic".to_vec());
+    fn tag(&self, domain: &str) -> mxx_lattice_dsl::HashTag {
+        let mut tag = mxx_lattice_dsl::HashTag::from(b"rns-bgg/dynamic".to_vec());
         tag.push(hex(&self.schema));
         tag.push(domain.to_owned());
         tag
@@ -507,7 +507,7 @@ impl RnsBggDynamicSetup {
     /// The hash tag of the companion keys of `package`. It names the setup
     /// and the package coordinate only: no logical level, Program, LUT, or
     /// encryption session.
-    pub(crate) fn package_tag(&self, package: &RnsBggPackage) -> mxx_dsl::HashTag {
+    pub(crate) fn package_tag(&self, package: &RnsBggPackage) -> mxx_lattice_dsl::HashTag {
         let mut tag = self.tag("companion-key");
         match package {
             RnsBggPackage::Rhs { coordinate, member } => {
@@ -532,9 +532,9 @@ impl RnsBggDynamicSetup {
     pub fn input_key(
         &self,
         parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
+        hash_key: mxx_lattice_dsl::Bytes,
         coordinate: u32,
-        member: Option<mxx_dsl::Int>,
+        member: Option<mxx_lattice_dsl::Int>,
     ) -> Result<RnsBggMatrix, RnsBggError> {
         let declaration = self
             .inputs
@@ -561,8 +561,8 @@ impl RnsBggDynamicSetup {
         &self,
         parameters: &RnsBggParameters,
         level: usize,
-        hash_key: mxx_dsl::Bytes,
-        tag: mxx_dsl::HashTag,
+        hash_key: mxx_lattice_dsl::Bytes,
+        tag: mxx_lattice_dsl::HashTag,
     ) -> Result<RnsBggMatrix, RnsBggError> {
         let ring = self
             .compact_ring(parameters, level)?
@@ -578,7 +578,7 @@ impl RnsBggDynamicSetup {
     pub fn rhs_public_top(
         &self,
         parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
+        hash_key: mxx_lattice_dsl::Bytes,
         coordinate: u32,
         member: Option<IntExpr>,
     ) -> Result<RnsBggRow, RnsBggError> {
@@ -609,11 +609,11 @@ impl RnsBggDynamicSetup {
     pub fn rhs_bottom(
         &self,
         parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
+        hash_key: mxx_lattice_dsl::Bytes,
         coordinate: u32,
         member: Option<IntExpr>,
         secret: &RnsBggRow,
-        plaintext: mxx_dsl::Mat,
+        plaintext: mxx_lattice_dsl::Mat,
     ) -> Result<RnsBggRow, RnsBggError> {
         let gadget = parameters.public_gadget(0)?;
         let target = (
@@ -638,7 +638,7 @@ impl RnsBggDynamicSetup {
     pub fn helper_key(
         &self,
         parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
+        hash_key: mxx_lattice_dsl::Bytes,
         k: IntExpr,
     ) -> Result<RnsBggMatrix, RnsBggError> {
         let mut tag = self.tag("helper-key");

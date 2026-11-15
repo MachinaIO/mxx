@@ -1,0 +1,12 @@
+[package]
+name = "mxx-lattice-leaves"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "no_std leaf code of the lattice DSL, run on the host and compiled to RV64IM for proof images"
+
+[lib]
+crate-type = ["rlib"]
+
+[dev-dependencies]
+rand.workspace = true

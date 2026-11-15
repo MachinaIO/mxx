@@ -17,8 +17,8 @@ use crate::{
     },
 };
 use keccak_asm::Keccak256;
-use mxx_dsl::{Family, Mat, Ring};
 use mxx_ir_core::RealExpr;
+use mxx_lattice_dsl::{Family, Mat, Ring};
 use num_bigint::BigUint;
 use rayon::prelude::*;
 
@@ -55,7 +55,7 @@ pub fn declare_native_ring_gsw_dsl_inputs(
     wire_count: usize,
     slot_count: usize,
     _ciphertext_error_norm: RealExpr,
-) -> Result<NativeRingGswDslInputs, mxx_dsl::DslError> {
+) -> Result<NativeRingGswDslInputs, mxx_lattice_dsl::DslError> {
     assert!(wire_count.is_multiple_of(2), "Ring-GSW ciphertext must have two equally sized rows");
     let mut scalar_families = Vec::with_capacity(wire_count);
     let mut input_names = Vec::with_capacity(wire_count);
@@ -904,8 +904,8 @@ mod tests {
         test_utils::{build_circuit_graph, diagonal_matrix, execute_circuit_with_shape},
     };
     use mxx_backends::poly::PolyParams;
-    use mxx_dsl::DslContext;
     use mxx_ir_core::node::NodeKind;
+    use mxx_lattice_dsl::DslContext;
     use num_traits::ToPrimitive;
     use rand::Rng;
     use std::sync::Arc;

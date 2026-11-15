@@ -4,7 +4,7 @@
 exponents of monomials and compute on them with private products and table lookups. It evaluates
 these programs over RNS-BGG key-homomorphic encodings and simulates their noise. Protocols
 built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It depends on
-`mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
+`mxx-lattice-dsl`, `mxx-ir-core`, and `mxx-backends`.
 
 ## Contents
 

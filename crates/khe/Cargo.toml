@@ -10,7 +10,7 @@ gpu = ["mxx-backends/gpu"]
 test-support = []
 
 [dependencies]
-mxx-dsl.workspace = true
+mxx-lattice-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-backends.workspace = true
 dashmap.workspace = true

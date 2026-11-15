@@ -26,14 +26,14 @@ mod tests {
     fn test_export_claim_rejects_stage_ids_before_writing_files() {
         let mut protocol = crate::diamond::DiamondWeProtocolFamily::new(
             b"stage-id-test".to_vec(),
-            mxx_dsl::Ring::from_crt_moduli(vec![257.into()], 8),
+            mxx_lattice_dsl::Ring::from_crt_moduli(vec![257.into()], 8),
         )
         .protocol_decl()
         .unwrap();
         // The first stage can export, so validating names only during emission would leave a file.
         protocol.protocol.bundle.workflow.stages[0].graph =
-            mxx_dsl::DslContext::new("stage-id-test")
-                .output("value", mxx_dsl::Bool::constant(true))
+            mxx_lattice_dsl::DslContext::new("stage-id-test")
+                .output("value", mxx_lattice_dsl::Bool::constant(true))
                 .unwrap()
                 .build()
                 .unwrap()

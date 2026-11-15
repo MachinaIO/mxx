@@ -5,7 +5,6 @@
 //! statements).
 
 use mxx_backends::{GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::PolyParams};
-use mxx_dsl::BuiltGraph;
 use mxx_fhe::{
     bgv::{
         fixtures::{self, bgv_params, modswitch_steps},
@@ -14,6 +13,7 @@ use mxx_fhe::{
     spec::{Circuit, graphs, roles},
     utils::gpu::input,
 };
+use mxx_lattice_dsl::BuiltGraph;
 use num_bigint::BigInt;
 use rand::Rng;
 use std::{collections::BTreeMap, time::Instant};

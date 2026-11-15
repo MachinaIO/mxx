@@ -6,8 +6,8 @@
 //! [`Bool`].
 //!
 //! ```
-//! use mxx_dsl::{DslContext, Ring};
 //! use mxx_ir_core::ParamEnv;
+//! use mxx_lattice_dsl::{DslContext, Ring};
 //!
 //! // Ring dimension 8 with a generated basis of two 30-bit CRT primes.
 //! let ring = Ring::new(30, 2, 8);

@@ -1,5 +1,5 @@
 [package]
-name = "mxx-dsl"
+name = "mxx-lattice-dsl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

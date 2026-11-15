@@ -132,9 +132,9 @@ fn test_gpu_measured_noise_against_the_bounds() {
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::Poly,
     };
-    use mxx_dsl::{DslContext, Mat};
     use mxx_exponent_lut::api::{self, StageExecution, StageGraph, StageOutputs};
     use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
+    use mxx_lattice_dsl::{DslContext, Mat};
     use num_bigint::BigUint;
     use std::collections::BTreeMap;
 

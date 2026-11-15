@@ -21,12 +21,12 @@ use crate::{
     session::SessionStore,
     transcript::SamplingMode,
 };
-use mxx_dsl::{DslContext, Family, Int, IntType, Mat, Ring, parallel};
 use mxx_ir_core::{
     IntExpr, ParamEnv, ValidatedGraph,
     artifact::ArtifactAvailability,
     node::{ConcatAxis, ConstantMatrix, IndexRange},
 };
+use mxx_lattice_dsl::{DslContext, Family, Int, IntType, Mat, Ring, parallel};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::collections::BTreeMap;
@@ -112,7 +112,7 @@ fn parallel_hash_capture_matches_root(offset: Option<BigInt>) {
     let columns = crate::env::test_streamed_columns();
     let key = ring.bytes_input("hash-key", 32);
     let hash = |member: Int| {
-        let mut tag = mxx_dsl::HashTag::from(b"nested-hash-capture".as_slice());
+        let mut tag = mxx_lattice_dsl::HashTag::from(b"nested-hash-capture".as_slice());
         if let Some(offset) = &offset {
             tag.push_integer(member.add(Int::constant(offset.clone())));
         } else {
@@ -312,7 +312,7 @@ fn parallel_preimage_workspaces(width: usize) {
 fn test_gpu_direct_flattened_family_exports_every_member() {
     let (cpu, gpu, ring) = parameters();
     let (outer, inner) = (3usize, 4usize);
-    let value = |i: &Int, j: IntExpr| -> Result<IntExpr, mxx_dsl::DslError> {
+    let value = |i: &Int, j: IntExpr| -> Result<IntExpr, mxx_lattice_dsl::DslError> {
         Ok(IntExpr::Add(
             Box::new(IntExpr::Mul(Box::new(i.expression()?), Box::new(IntExpr::constant(16)))),
             Box::new(j),
@@ -508,7 +508,7 @@ fn test_gpu_direct_loop_dependent_powers_and_bits() {
                 Box::new(IntExpr::Sub(Box::new(i.expression()?), Box::new(i.expression()?))),
                 Box::new(i.expression()?),
             )))?;
-            let lift = |bit: mxx_dsl::Bool| {
+            let lift = |bit: mxx_lattice_dsl::Bool| {
                 bit.to_int().lift_to_constant_polynomial(ring.matrix_type((1, 1)))
             };
             let low = lift(low);
@@ -550,12 +550,12 @@ fn test_gpu_direct_loop_dependent_unit_vectors_place_blocks() {
             },
         )
     };
-    let row = mxx_dsl::iterate(blocks, ring.zero((1, 3 * blocks)), |index, row| {
+    let row = mxx_lattice_dsl::iterate(blocks, ring.zero((1, 3 * blocks)), |index, row| {
         Ok(row + unit((1, blocks), &index, true).tensor(block(index)))
     })
     .unwrap();
     let columns = parallel(2, |lane| {
-        mxx_dsl::iterate(blocks, ring.zero((blocks, 3)), |index, column| {
+        mxx_lattice_dsl::iterate(blocks, ring.zero((blocks, 3)), |index, column| {
             let shifted = index.clone().add(lane.clone()).rem(blocks);
             Ok(column + unit((blocks, 1), &shifted, false).tensor(block(index)))
         })
@@ -600,7 +600,7 @@ fn test_gpu_direct_placed_summed_members_add_in_place() {
             (left.0 + right.0, left.1 + right.1, left.2 + right.2)
         };
         let initial = add(terms.at(0usize), terms.at(1usize));
-        mxx_dsl::iterate(columns - 2, initial, |index, total| {
+        mxx_lattice_dsl::iterate(columns - 2, initial, |index, total| {
             Ok(add(total, terms.at(index.add(2usize))))
         })
     };
@@ -667,7 +667,7 @@ fn test_gpu_direct_spilled_nested_family_is_exported_and_read_back() {
             let ring = ring.clone();
             let halves = parallel(halves, move |half| {
                 let read = read.clone();
-                mxx_dsl::iterate(inner / 2, ring.zero((1, 1)), move |k, sum| {
+                mxx_lattice_dsl::iterate(inner / 2, ring.zero((1, 1)), move |k, sum| {
                     Ok(sum + read.at(half.clone().mul(inner / 2).add(k)))
                 })
             })?;
@@ -779,7 +779,7 @@ fn test_gpu_direct_read_flattening_of_nested_families() {
     })
     .unwrap();
     let read = flat.clone();
-    let total = mxx_dsl::iterate(outer * inner - 1, read.at(0usize), move |k, sum| {
+    let total = mxx_lattice_dsl::iterate(outer * inner - 1, read.at(0usize), move |k, sum| {
         Ok(sum + read.at(k.add(1usize)))
     })
     .unwrap();
@@ -805,7 +805,7 @@ fn test_gpu_direct_wave_control_failure_and_recovery() {
     let fault = DslContext::new("wave-control-input").input::<Int>("fault", IntType).unwrap();
     let rows = parallel(3, |lane| {
         let fault = fault.clone();
-        let sum = mxx_dsl::iterate(2, lane, move |index, sum| {
+        let sum = mxx_lattice_dsl::iterate(2, lane, move |index, sum| {
             Ok(sum + Int::constant(1).div(Int::constant(3).sub(fault.clone()).sub(index)))
         })?;
         Ok(sum.lift_to_constant_polynomial(ring.matrix_type((1, 1))))
@@ -844,15 +844,17 @@ fn test_gpu_direct_parallel_scalar_reduction_family() {
     let (cpu, gpu, ring) = parameters();
     let count = crate::env::test_streamed_members();
     let rows = parallel(count, |member| {
-        mxx_dsl::iterate(3, member.clone(), |index, sum| {
+        mxx_lattice_dsl::iterate(3, member.clone(), |index, sum| {
             Ok(sum.add(member.clone().mul(index.add(1))))
         })
     })
     .unwrap();
     let initial = rows.clone();
-    let rows = mxx_dsl::iterate(2, rows, |step, state| {
+    let rows = mxx_lattice_dsl::iterate(2, rows, |step, state| {
         parallel(count, |member| {
-            mxx_dsl::iterate(3, state.at(member), |index, sum| Ok(sum.add(step.clone()).add(index)))
+            mxx_lattice_dsl::iterate(3, state.at(member), |index, sum| {
+                Ok(sum.add(step.clone()).add(index))
+            })
         })
     })
     .unwrap();
@@ -887,7 +889,7 @@ fn test_gpu_direct_nested_parallel_component_results() {
         let parts = parallel(2usize, |component| {
             let scalar = member.clone().mul(2usize).add(component);
             let matrix = scalar.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
-            mxx_dsl::iterate(3usize, matrix.clone(), |_, sum| Ok(sum + matrix.clone()))
+            mxx_lattice_dsl::iterate(3usize, matrix.clone(), |_, sum| Ok(sum + matrix.clone()))
         })?;
         Ok((parts.at(0usize), parts.at(1usize)))
     })
@@ -918,14 +920,14 @@ fn test_gpu_direct_nested_component_streamed_carry() {
         Ok((matrix.clone(), matrix))
     })
     .unwrap();
-    let rows = mxx_dsl::iterate(2usize, initial, |_, previous| {
+    let rows = mxx_lattice_dsl::iterate(2usize, initial, |_, previous| {
         parallel(count, |member| {
             let (left, right) = previous.at(member);
             let parts = parallel(2usize, |component| {
                 let matrix = left.clone() +
                     right.clone() +
                     component.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
-                mxx_dsl::iterate(3usize, matrix.clone(), |_, sum| Ok(sum + matrix.clone()))
+                mxx_lattice_dsl::iterate(3usize, matrix.clone(), |_, sum| Ok(sum + matrix.clone()))
             })?;
             Ok((parts.at(0usize), parts.at(1usize)))
         })

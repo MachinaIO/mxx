@@ -1,10 +1,10 @@
 //! Declarative BGG+ public-key graph values.
 
 use crate::bgg::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
-use mxx_dsl::{
+use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
+use mxx_lattice_dsl::{
     Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Preimage, Ring,
 };
-use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
 #[derive(Clone)]
 pub struct BggPublicKeyWire {
@@ -177,7 +177,7 @@ impl BggPublicKeySampler {
             tag,
             (IntExpr::constant(self.layout.secret_dimension), (&columns * &count)),
         );
-        mxx_dsl::parallel(count, |index| {
+        mxx_lattice_dsl::parallel(count, |index| {
             let start = &columns * index.expression()?;
             Ok(BggPublicKeyWire {
                 matrix: packed.clone().slice(
@@ -227,8 +227,8 @@ mod tests {
         matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
-    use mxx_dsl::DslContext;
     use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_lattice_dsl::DslContext;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 

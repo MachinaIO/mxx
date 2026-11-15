@@ -1220,7 +1220,7 @@ pub(crate) fn lazy_gadget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, GraphValue, Mat, Ring, Subgraph, iterate, parallel};
+    use mxx_lattice_dsl::{DslContext, GraphValue, Mat, Ring, Subgraph, iterate, parallel};
 
     /// n = 8 with two 33-bit limbs: 16 limb coefficients per polynomial.
     fn ring() -> Ring {
@@ -1362,7 +1362,7 @@ mod tests {
         let (left, right) = (ring.input("l", (1, 17)), ring.input("r", (2, 17)));
         let both = counts(
             Mat::concat(
-                mxx_dsl::ConcatAxis::Rows,
+                mxx_lattice_dsl::ConcatAxis::Rows,
                 vec![left.mul_small_rhs(digits.clone()), right.mul_small_rhs(digits)],
             ),
             None,

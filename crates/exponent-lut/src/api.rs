@@ -20,12 +20,12 @@ use mxx_backends::{
     poly::Poly,
     transcript::{DrawSite, RecordedValue},
 };
-use mxx_dsl::{BuiltGraph, DslContext};
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId},
     encoding::spec_hash,
 };
+use mxx_lattice_dsl::{BuiltGraph, DslContext};
 use num_bigint::BigInt;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1160,7 +1160,7 @@ where
 mod tests {
     use super::*;
     use mxx_backends::{MemoryArtifactStore, backend::poly::cpu_backend};
-    use mxx_dsl::{DslContext, Int};
+    use mxx_lattice_dsl::{DslContext, Int};
 
     fn execution() -> CpuExecution {
         CpuExecution::new(cpu_backend([]))

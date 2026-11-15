@@ -63,7 +63,7 @@ LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
 wire constants, named atoms and their extraction theorems). Compile the first to an `.olean` as
 for the linked-claim fixtures below, then check the second against it.
 
-Linked-claim fixtures hold several modules. `cargo test -p mxx-dsl --lib test_lwe_protocol`
+Linked-claim fixtures hold several modules. `cargo test -p mxx-lattice-dsl --lib test_lwe_protocol`
 writes `test_data/lean_ir_fixtures/lwe_protocol/`: a two-stage integer-LWE claim whose ciphertext
 crosses stages as an integer-family artifact, its proof, and the certificate. Check the modules in
 import order, writing each `.olean` into a directory that is also on `LEAN_PATH`:
@@ -138,7 +138,7 @@ linked-claim renderer live in `crates/ir-core/src/lean`.
 
 CI installs Lean `leanprover/lean4:v4.35.0`, fetches mathlib's compiled cache in this package,
 and runs `lake build` here, then in `crates/fhe/lean/tfhe`, `crates/fhe/lean/bgv`, and
-`crates/dsl/examples/rlwe`. All four builds are required by the `ci success` job.
+`crates/lattice-dsl/examples/rlwe`. All four builds are required by the `ci success` job.
 The certificate targets are included in each package's default targets.
 
 After installing the normal Rust/OpenFHE dependencies, check that the committed claims
@@ -160,7 +160,7 @@ To intentionally update the claims after a graph or protocol change:
 output=$(mktemp -d)
 cargo run --locked -p mxx-fhe --example export_claims -- "$output"
 # Review $output/tfhe and $output/bgv before replacing their generated directories.
-cargo run --locked -p mxx-dsl --example rlwe_encrypt -- --export-lean crates/dsl/examples/rlwe/generated
+cargo run --locked -p mxx-lattice-dsl --example rlwe_encrypt -- --export-lean crates/lattice-dsl/examples/rlwe/generated
 ```
 
 The FHE exporter and GPU tests build the same graphs, those of `mxx_fhe::spec::graphs` for the

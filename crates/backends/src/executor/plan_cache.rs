@@ -72,8 +72,8 @@ pub(super) fn get(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::graph::FrozenGraphScopeId;
+    use mxx_lattice_dsl::{DslContext, Ring};
 
     #[test]
     fn root_plan_cache_invalidates_mutable_validation_metadata() {

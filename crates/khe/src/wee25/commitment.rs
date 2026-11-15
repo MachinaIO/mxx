@@ -1,10 +1,10 @@
 //! Standalone WEE25 commitment trees expressed with the declarative DSL.
 
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring};
 use mxx_ir_core::{
     IntExpr,
     node::{ConcatAxis, ConstantMatrix, IndexRange},
 };
+use mxx_lattice_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -279,7 +279,7 @@ mod tests {
         let blocks = (0..2)
             .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
             .collect::<Vec<_>>();
-        let roots = mxx_dsl::parallel(2, |_| {
+        let roots = mxx_lattice_dsl::parallel(2, |_| {
             Ok(compiler
                 .commitment_tree(hash_key.clone(), &blocks)
                 .expect("commitment in parallel body")

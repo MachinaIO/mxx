@@ -21,13 +21,13 @@ use mxx_backends::{
         },
     },
 };
-use mxx_dsl::{DslContext, Mat, Ring};
 use mxx_ir_core::{
     ParamEnv,
     node::ConcatAxis,
     ring::{RingExpr, RingRef},
     types::{ConcreteMatrixType, ConcreteWireType},
 };
+use mxx_lattice_dsl::{DslContext, Mat, Ring};
 use num_bigint::BigUint;
 use std::{collections::BTreeMap, sync::Arc};
 

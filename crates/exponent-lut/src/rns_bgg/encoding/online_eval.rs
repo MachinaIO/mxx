@@ -220,7 +220,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// a composing caller computed from the lowered Program outputs it was given (see
     /// [`crate::api::online_eval`]): the stage returns it beside the Program outputs, which stay
     /// as preprocessing resolved them.
-    pub fn add_output<V: mxx_dsl::GraphValue + 'static>(
+    pub fn add_output<V: mxx_lattice_dsl::GraphValue + 'static>(
         &mut self,
         name: impl Into<String>,
         value: V,
@@ -245,8 +245,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     ) -> Result<Option<(Family<RnsBggRow>, Family<RnsBggMatrix>, Option<Family<Mat>>)>, ApiError>
     {
         let OnlineEvalWireFamily::Stored(family) = family else { return Ok(None) };
-        let error = |error: mxx_dsl::DslError| ApiError::input(error.to_string());
-        let public = mxx_dsl::GraphValue::schema(family).element.public_payload.is_some();
+        let error = |error: mxx_lattice_dsl::DslError| ApiError::input(error.to_string());
+        let public = mxx_lattice_dsl::GraphValue::schema(family).element.public_payload.is_some();
         Ok(Some((
             family.field(|encoding| encoding.row).map_err(error)?,
             family.field(|encoding| encoding.public_key.matrix).map_err(error)?,

@@ -1,8 +1,8 @@
 //! The syntax of a public-key homomorphic encryption scheme and `Eval` of a circuit.
 
 use super::{Circuit, Depth};
-use mxx_dsl::GraphValue;
 use mxx_ir_core::protocol::InputValueContract;
+use mxx_lattice_dsl::GraphValue;
 
 /// A public-key homomorphic encryption scheme built in the DSL.
 ///
